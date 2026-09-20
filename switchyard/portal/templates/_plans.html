@@ -1,9 +1,9 @@
-<div id="plans" hx-get="/fragments/plans" hx-trigger="every 20s" hx-swap="outerHTML">
+<div id="plans" hx-get="/fragments/plans" hx-trigger="every 20s, refresh" hx-swap="outerHTML">
 <div class="panel">
 <table>
   <thead><tr>
-    <th>Plan</th><th>Quota left</th><th>Resets</th><th>Burn</th>
-    <th>This month</th><th>Effective</th><th>14 days</th><th></th>
+    <th>Plan</th><th>Quota left</th><th>Slots</th><th>Pacing</th><th>Resets</th>
+    <th>Burn</th><th>This month</th><th>Effective</th><th>14 days</th><th></th>
   </tr></thead>
   <tbody>
   {% for r in plans %}
@@ -30,6 +30,37 @@
           <span class="muted">no allowance set</span>
           <div class="muted mono" style="font-size:12px">
             used {{ '{:,.0f}'.format(hr.consumed or 0) }}{% if hr.kind == 'dollars' %} dollars{% endif %}</div>
+        {% endif %}
+      </td>
+      <td class="mono nowrap">
+        {% set c = r.capacity %}
+        <strong>{{ c.cap }}</strong>{% if c.configured %}<span class="muted">/{{ c.configured }}</span>{% endif %}
+        <div class="muted" style="font-size:12px">{{ c.reason }}</div>
+      </td>
+      <td class="mono nowrap" style="min-width:120px">
+        {% if r.pace and r.pace.active %}
+          {% set ahead = r.pace.ahead_by %}
+          {% if ahead is not none and ahead > 0 %}
+            <span class="tag warn">holding</span>
+            <div class="muted" style="font-size:12px">
+              {{ '%.0f'|format(ahead / 1000000) }}M ahead of line</div>
+          {% else %}
+            <span class="tag ok">on pace</span>
+            {% if ahead is not none %}
+              <div class="muted" style="font-size:12px">
+                {{ '%.0f'|format(-ahead / 1000000) }}M of headroom</div>
+            {% endif %}
+          {% endif %}
+          {% if r.pace.is_final_window %}
+            <div class="muted" style="font-size:12px">final window</div>
+          {% elif r.windows and r.windows[0] > 0 %}
+            <div class="muted" style="font-size:12px">
+              +{{ r.windows[0] }} window(s), then {{ '%.0f'|format(r.windows[1] / 86400) }}d</div>
+          {% endif %}
+        {% elif r.pace %}
+          <span class="muted">{{ r.pace.reason }}</span>
+        {% else %}
+          <span class="muted">—</span>
         {% endif %}
       </td>
       <td class="mono nowrap">{{ r.reset_human }}</td>

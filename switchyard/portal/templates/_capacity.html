@@ -1,5 +1,5 @@
 <div class="grid lanes" id="capacity"
-     hx-get="/fragments/capacity" hx-trigger="every 3s" hx-swap="outerHTML">
+     hx-get="/fragments/capacity" hx-trigger="every 3s, refresh" hx-swap="outerHTML">
 {% for lane in capacity.lanes %}
   <section class="panel">
     <div class="lane-head">
@@ -25,16 +25,25 @@
         </td>
         <td>
           <div class="slots">
+            {# Slots the effective cap allows, then the ones it has withheld. #}
             {% for i in range(p.cap) %}
               <span class="slot {% if p.cooled %}gone{% elif i < p.in_flight %}used{% endif %}"></span>
             {% endfor %}
+            {% for i in range(p.cap, p.cap_configured) %}
+              <span class="slot gone" title="withheld: {{ p.cap_reason }}"></span>
+            {% endfor %}
           </div>
         </td>
-        <td class="mono nowrap" style="width:30%">
+        <td class="mono nowrap" style="width:32%">
           {% if p.cooled %}
             <span class="tag bad">{{ p.cooldown_reason.replace('_',' ') }} · {{ (p.cooldown_remaining // 60) }}m</span>
+          {% elif p.cap == 0 %}
+            <span class="tag warn">{{ p.cap_reason }}</span>
           {% else %}
             <span class="muted">{{ p.in_flight }}/{{ p.cap }}</span>
+            {% if p.cap != p.cap_configured %}
+              <span class="tag warn" title="configured {{ p.cap_configured }}">{{ p.cap_reason }}</span>
+            {% endif %}
             {% if p.days_left is not none and p.days_left <= 21 %}
               <span class="tag warn">{{ p.days_left }}d left</span>
             {% endif %}

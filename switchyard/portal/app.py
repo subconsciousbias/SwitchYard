@@ -15,7 +15,9 @@ from redis.asyncio import Redis
 
 from .. import models
 from ..picker import Picker
+from ..policy import CapacityPolicy
 from ..slots import SlotTable
+from ..periods import windows_remaining
 from ..usage import Ledger, effective_cost_per_mtok, headroom
 
 BASE = os.path.dirname(__file__)
@@ -30,9 +32,11 @@ async def startup() -> None:
     registry = models.load()
     redis = Redis.from_url(os.environ.get("SWITCHYARD_REDIS_URL", "redis://redis:6379/1"))
     slots = SlotTable(redis, registry.settings.inflight_max_age_seconds)
+    ledger = Ledger(redis)
+    policy = CapacityPolicy(redis, registry.settings, ledger)
     state.update(
-        registry=registry, redis=redis, slots=slots,
-        picker=Picker(registry, slots), ledger=Ledger(redis),
+        registry=registry, redis=redis, slots=slots, ledger=ledger, policy=policy,
+        picker=Picker(registry, slots, policy),
     )
 
 
@@ -50,17 +54,21 @@ def _fmt_reset(ts: float | None) -> str:
 
 
 async def collect_capacity() -> dict:
-    reg, picker = state["registry"], state["picker"]
+    reg, picker, policy = state["registry"], state["picker"], state["policy"]
     lanes = [await picker.capacity(k) for k in reg.lanes]
     return {
         "lanes": lanes,
         "total_available": sum(l["slots_available_now"] for l in lanes),
         "total_in_use": sum(l["slots_in_use"] for l in lanes),
+        "pacing": await policy.pacing_enabled(),
+        "pacing_configured": reg.settings.pacing.enabled,
+        "learning": reg.settings.concurrency_learning.enabled,
     }
 
 
 async def collect_plans() -> list[dict]:
     reg, ledger, slots = state["registry"], state["ledger"], state["slots"]
+    policy = state["policy"]
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     rows = []
     for plan in reg.plans.values():
@@ -74,6 +82,8 @@ async def collect_plans() -> list[dict]:
         cooled, ttl, reason = await slots.cooldown_state(plan.key)
         in_flight = await slots.in_flight(plan.key)
         facts = await ledger.quota_facts(plan.key)
+        capacity = await policy.effective(plan)
+        pace = await policy.pacer.state(plan) if await policy.plan_is_paced(plan) else None
 
         alerting = []
         if hr.get("pct_used") is not None and hr["pct_used"] >= 80:
@@ -88,6 +98,10 @@ async def collect_plans() -> list[dict]:
             alerting.append("credential rejected")
         if cooled and reason == "plan_dead":
             alerting.append("subscription over — remove from plans.yaml")
+        if pace and pace.get("basis") == "observed":
+            alerting.append("pacing on an observed allowance — set it in plans.yaml")
+        if pace and not pace.get("allowance"):
+            alerting.append("pacing idle: no allowance known")
         # A provider refusing us on connection count means max_parallel is set
         # higher than the plan allows. Different fix from a quota wall, so it
         # gets its own warning instead of looking like rate limiting.
@@ -117,6 +131,9 @@ async def collect_plans() -> list[dict]:
             "alerting": alerting,
             "lanes": lanes_used_in,
             "series": series[-14:],
+            "capacity": capacity,
+            "pace": pace,
+            "windows": windows_remaining(plan.quota.period, plan.expires),
         })
     return rows
 
@@ -146,6 +163,10 @@ async def api_state() -> dict:
                 "cap": r["plan"].max_parallel, "in_flight": r["in_flight"],
                 "cooled": r["cooled"], "cooldown_reason": r["cooldown_reason"],
                 "quota": r["headroom"], "burn": r["burn"],
+                "effective_cap": r["capacity"].cap,
+                "learned_cap": r["capacity"].learned,
+                "cap_reason": r["capacity"].reason,
+                "pacing": r["pace"],
                 "month_tokens": r["month_tokens"], "month_cost": r["month_cost"],
                 "effective_cost_per_mtok": r["eff_cost"],
                 "alerting": r["alerting"],
@@ -184,6 +205,25 @@ async def reload_config() -> dict:
     state["registry"] = registry
     state["picker"] = Picker(registry, state["slots"])
     return {"reloaded": True, "plans": len(registry.plans), "lanes": list(registry.lanes)}
+
+
+@app.post("/admin/pacing")
+async def set_pacing(enabled: str = "toggle") -> dict:
+    """Turn pacing mode on or off at runtime.
+
+    `enabled` is on | off | toggle | default (clears the override and returns
+    to whatever plans.yaml says).
+    """
+    policy = state["policy"]
+    want: bool | None
+    if enabled == "default":
+        want = None
+    elif enabled == "toggle":
+        want = not await policy.pacing_enabled()
+    else:
+        want = enabled in ("on", "true", "1", "yes")
+    now_on = await policy.set_pacing(want)
+    return {"pacing": now_on, "configured_default": state["registry"].settings.pacing.enabled}
 
 
 @app.post("/admin/plans/{plan_key}/uncool")

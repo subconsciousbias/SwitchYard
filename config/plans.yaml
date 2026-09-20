@@ -18,13 +18,60 @@ settings:
   # no Retry-After to go on.
   default_cooldown_seconds: 900
 
+  # --------------------------------------------------------------------------
+  # Learn the parallelism each provider really tolerates, instead of trusting
+  # a guess. Halve the cap when a provider refuses us on connection count,
+  # creep back up by one when there is unmet demand and no recent rejection.
+  # Learned per hour of day, because a provider that allows 6 connections at
+  # 04:00 may allow 2 at peak.
+  #
+  # Set a plan's `max_parallel: auto` to learn from scratch (starting at
+  # seed_cap), or leave a number as the starting point and set
+  # `max_parallel_ceiling` to bound how far probing may go.
+  # --------------------------------------------------------------------------
+  concurrency_learning:
+    enabled: true
+    buckets: hour_of_day        # hour_of_day | none
+    seed_cap: 2                 # starting guess for `max_parallel: auto`
+    min_cap: 1                  # never learn our way down to zero
+    decrease_factor: 0.5        # multiplicative backoff on a refusal
+    increase_step: 1            # additive probe upward
+    min_samples: 3              # evidence before trusting an hour bucket
+    probe_interval_seconds: 300 # minimum gap between upward probes
+    probe_cooldown_seconds: 900 # quiet time needed since the last refusal
+    probe_pressure: 3           # denied claims needed before probing up
+
+  # --------------------------------------------------------------------------
+  # PACING MODE — off by default. When on, subscriptions are throttled so each
+  # one lands at ~100% of its allowance right at rollover, instead of burning
+  # out early and spilling. If a caller asks for 10 parallel requests and
+  # spending 10 would exhaust Grok days before its window rolls over,
+  # Switchyard runs fewer — however few the burndown maths calls for.
+  #
+  # Quota resets each period, so this is per-window burndown: unused allowance
+  # in a window is lost, never carried forward. For a cancelled plan the final
+  # window is truncated by the expiry date, so it paces HARDER — same
+  # allowance, less time to spend it.
+  #
+  # While on, the tail is disabled (spilling to a local model would hide that
+  # we are ahead of budget) and metered providers keep their fixed caps, since
+  # there is no allowance to land on. Per-plan override: `pacing: false`.
+  # --------------------------------------------------------------------------
+  pacing:
+    enabled: false
+    min_slots: 1                # never fully close a subscription's lane
+    overshoot: 0.05             # aim 5% hot so we finish at 100%, not 95%
+    disable_tail: true
+    include_metered: false
+
 plans:
 
   # ---------------------------------------------------------- workhorses ----
   minimax-ultra:
     label: "Minimax Ultra Token Plan"
     deployment: sy.minimax-ultra      # must match config/litellm-config.yaml
-    max_parallel: 4
+    max_parallel: 4             # starting point; the learner adjusts from here
+    max_parallel_ceiling: 6
     monthly_cost: 132
     auth: api_key
     provider_family: minimax
@@ -43,6 +90,7 @@ plans:
     label: "Minimax Max Token Plan"
     deployment: sy.minimax-max
     max_parallel: 4
+    max_parallel_ceiling: 6
     monthly_cost: 55
     auth: api_key
     provider_family: minimax
@@ -56,7 +104,7 @@ plans:
   glm:
     label: "GLM Coding Plan"
     deployment: sy.glm
-    max_parallel: 1
+    max_parallel: auto                # "severely limited" — learn the real number
     monthly_cost: 0
     auth: api_key
     provider_family: zai
@@ -86,7 +134,7 @@ plans:
   opencode-go:
     label: "OpenCode Go Plan"
     deployment: sy.opencode-go
-    max_parallel: 1
+    max_parallel: auto                # unknown limit — learn it from scratch
     monthly_cost: 0
     auth: api_key
     expires: "2026-09-27"
@@ -104,6 +152,7 @@ plans:
     label: "Claude Max $200"
     deployment: sy.claude-max
     max_parallel: 1                   # hard: one connection
+    max_parallel_ceiling: 1           # never probe above it
     monthly_cost: 200
     auth: oauth_sidecar               # see sidecars/claude-max
     quota:
@@ -140,6 +189,7 @@ plans:
     label: "OpenAI $100 Plan (seat)"
     deployment: sy.openai
     max_parallel: 2
+    max_parallel_ceiling: 2           # the plan allows 2; do not probe past it
     monthly_cost: 0
     auth: oauth_sidecar               # a ChatGPT seat: OAuth only, no API key
     provider_family: openai
@@ -155,6 +205,7 @@ plans:
     label: "Grok $300 Plan"
     deployment: sy.grok
     max_parallel: 4
+    max_parallel_ceiling: 6
     monthly_cost: 0
     auth: api_key
     expires: "2026-10-09"

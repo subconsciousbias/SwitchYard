@@ -24,6 +24,7 @@ from redis.asyncio import Redis
 from . import models
 from .classify import Outcome, classify, inspect_success_payload
 from .picker import LaneSaturated, Picker
+from .policy import CapacityPolicy
 from .session import derive as derive_session
 from .slots import SlotTable
 from .usage import Ledger
@@ -40,6 +41,7 @@ class SwitchyardHandler(CustomLogger):
         self._slots: SlotTable | None = None
         self._picker: Picker | None = None
         self._ledger: Ledger | None = None
+        self._policy: CapacityPolicy | None = None
         log.info(
             "switchyard: %d plans, lanes=%s",
             len(self.registry.plans), ",".join(self.registry.lanes),
@@ -63,9 +65,15 @@ class SwitchyardHandler(CustomLogger):
         return self._slots
 
     @property
+    def policy(self) -> CapacityPolicy:
+        if self._policy is None:
+            self._policy = CapacityPolicy(self.redis, self.registry.settings, self.ledger)
+        return self._policy
+
+    @property
     def picker(self) -> Picker:
         if self._picker is None:
-            self._picker = Picker(self.registry, self.slots)
+            self._picker = Picker(self.registry, self.slots, self.policy)
         return self._picker
 
     @property
@@ -75,9 +83,15 @@ class SwitchyardHandler(CustomLogger):
         return self._ledger
 
     def reload(self) -> None:
-        """Pick up edits to plans.yaml without restarting the proxy."""
+        """Pick up edits to plans.yaml without restarting the proxy.
+
+        Learned concurrency and pacing state live in Redis, so toggling pacing
+        or changing an allowance takes effect on the next request without
+        losing what the learner already knows.
+        """
         self.registry = models.load()
-        self._picker = Picker(self.registry, self.slots)
+        self._policy = CapacityPolicy(self.redis, self.registry.settings, self.ledger)
+        self._picker = Picker(self.registry, self.slots, self._policy)
 
     # -- inbound: choose a provider ---------------------------------------
     async def async_pre_call_hook(
@@ -119,10 +133,11 @@ class SwitchyardHandler(CustomLogger):
             "session": session,
             "sticky": pick.sticky,
             "claimed_at": time.time(),
+            "cap": pick.cap,
         }
         log.info(
-            "lane=%s -> %s%s%s",
-            lane, pick.plan.key,
+            "lane=%s -> %s [%s]%s%s",
+            lane, pick.plan.key, pick.cap_reason,
             " (sticky)" if pick.sticky else "",
             f" skipped={','.join(pick.considered)}" if pick.considered else "",
         )
@@ -159,12 +174,23 @@ class SwitchyardHandler(CustomLogger):
 
         usage = getattr(response_obj, "usage", None) or {}
         get = (lambda k: usage.get(k, 0)) if isinstance(usage, dict) else (lambda k: getattr(usage, k, 0) or 0)
+        prompt_tokens = int(get("prompt_tokens") or 0)
+        completion_tokens = int(get("completion_tokens") or 0)
+        cost = float(kwargs.get("response_cost") or 0.0)
         await self.ledger.record(
-            plan,
-            prompt_tokens=int(get("prompt_tokens") or 0),
-            completion_tokens=int(get("completion_tokens") or 0),
-            cost=float(kwargs.get("response_cost") or 0.0),
+            plan, prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens, cost=cost,
         )
+
+        # Per-slot throughput drives the pacer: one busy slot delivered this
+        # many units in this many seconds.
+        try:
+            seconds = (end_time - start_time).total_seconds()
+        except (TypeError, AttributeError):
+            seconds = max(0.0, time.time() - float(ctx.get("claimed_at") or time.time()))
+        units = cost if plan.quota.kind == "dollars" else prompt_tokens + completion_tokens
+        await self.policy.pacer.note_throughput(plan, units, seconds)
+
         await self._absorb_limit_headers(plan.key, kwargs)
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
@@ -223,13 +249,14 @@ class SwitchyardHandler(CustomLogger):
                 plan.key, verdict.detail, verdict.cooldown_seconds // 3600,
             )
         elif verdict.outcome is Outcome.CONCURRENCY:
-            # The provider says we opened too many connections, so our cap is
-            # wrong. Record it: the portal surfaces this as a config warning
-            # rather than letting it look like ordinary rate limiting.
+            # The provider says we opened too many connections. Teach the
+            # learner where the ceiling actually is, for this hour of the day.
+            at_cap = int(ctx.get("cap") or plan.max_parallel)
             await self.ledger.note_concurrency_rejection(plan)
+            learned = await self.policy.learner.note_rejection(plan, at_cap)
             log.warning(
-                "plan=%s refused on connection limit at max_parallel=%d — lower it",
-                plan.key, plan.max_parallel,
+                "plan=%s refused on connection limit at %d — learned cap now %d",
+                plan.key, at_cap, learned,
             )
 
         if verdict.should_cool:

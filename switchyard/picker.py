@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 
 from .models import Plan, Registry
+from .policy import CapacityPolicy
 from .slots import SlotTable
 
 log = logging.getLogger("switchyard.picker")
@@ -27,16 +28,34 @@ class Pick:
     session: str | None
     sticky: bool          # True if we honoured an existing lease
     considered: list[str] # plans we skipped, for the capacity board
+    cap: int = 0          # the effective cap this claim was made against
+    cap_reason: str = ""  # configured | learned[h14] | paced 2 of 4 ...
 
 
 class Picker:
-    def __init__(self, registry: Registry, slots: SlotTable):
+    def __init__(self, registry: Registry, slots: SlotTable,
+                 policy: CapacityPolicy | None = None):
         self.registry = registry
         self.slots = slots
+        self.policy = policy
+
+    async def _cap(self, plan: Plan) -> tuple[int, str]:
+        """The cap to claim against: learned, then paced, else configured."""
+        if self.policy is None:
+            return plan.max_parallel, "configured"
+        cap = await self.policy.effective(plan)
+        return cap.cap, cap.reason
+
+    async def _members(self, lane: str) -> list[Plan]:
+        """Lane order, minus the tail when pacing has switched it off."""
+        members = self.registry.lane_members(lane)
+        if self.policy is not None and not await self.policy.tail_enabled():
+            members = [p for p in members if not self.registry.is_tail(lane, p.key)]
+        return members
 
     async def pick(self, lane: str, session: str | None) -> Pick:
         rid = uuid.uuid4().hex
-        members = self.registry.lane_members(lane)
+        members = await self._members(lane)
         if not members:
             raise LaneSaturated(lane, "no live plans (all expired or disabled)")
 
@@ -49,9 +68,10 @@ class Picker:
             held = await self.slots.get_lease(session)
             if held and held in by_key:
                 plan = by_key[held]
-                if await self.slots.try_claim(plan.key, plan.max_parallel, rid) == 1:
+                cap, reason = await self._cap(plan)
+                if cap > 0 and await self.slots.try_claim(plan.key, cap, rid) == 1:
                     await self.slots.touch_lease(session, self.registry.settings.lease_ttl_seconds)
-                    return Pick(lane, plan, rid, session, True, [])
+                    return Pick(lane, plan, rid, session, True, [], cap, reason)
                 # Its slots are full or it just got cooled down; fall through
                 # and re-lease. Sessions follow capacity rather than blocking.
                 skipped.append(f"{held}(lease unusable)")
@@ -61,14 +81,24 @@ class Picker:
         # 2. Ordered fill. First plan with a free slot wins, which is what
         #    makes total lane capacity the sum of the live plans' caps.
         for plan in members:
-            result = await self.slots.try_claim(plan.key, plan.max_parallel, rid)
+            cap, reason = await self._cap(plan)
+            if cap <= 0:
+                # Pacing has closed this plan for now (ahead of budget, or the
+                # allowance is spent). Not an error, just no capacity.
+                skipped.append(f"{plan.key}(paced to 0)")
+                continue
+            result = await self.slots.try_claim(plan.key, cap, rid)
             if result == 1:
                 if session:
                     await self.slots.set_lease(
                         session, plan.key, self.registry.settings.lease_ttl_seconds
                     )
-                return Pick(lane, plan, rid, session, False, skipped)
-            skipped.append(f"{plan.key}({'cooled' if result == -1 else 'full'})")
+                return Pick(lane, plan, rid, session, False, skipped, cap, reason)
+            if result == 0 and self.policy is not None:
+                # Demand the cap refused. That is the signal the learner needs
+                # before it will probe the limit upward.
+                await self.policy.learner.note_pressure(plan.key)
+            skipped.append(f"{plan.key}({'cooled' if result == -1 else f'full at {cap}'})")
 
         raise LaneSaturated(lane, ", ".join(skipped))
 
@@ -79,14 +109,21 @@ class Picker:
         """Live picture of a lane, for the portal's capacity board."""
         rows = []
         total = live = used = 0
+        tail_on = self.policy is None or await self.policy.tail_enabled()
         for plan in self.registry.lane_members(lane):
             cooled, ttl, reason = await self.slots.cooldown_state(plan.key)
             inflight = await self.slots.in_flight(plan.key)
             tail = self.registry.is_tail(lane, plan.key)
+            cap, cap_reason = await self._cap(plan)
+            if tail and not tail_on:
+                cap = 0
+                cap_reason = "tail disabled (pacing)"
             rows.append({
                 "plan": plan.key,
                 "label": plan.label,
-                "cap": plan.max_parallel,
+                "cap": cap,
+                "cap_configured": plan.max_parallel,
+                "cap_reason": cap_reason,
                 "in_flight": inflight,
                 "cooled": cooled,
                 "cooldown_remaining": ttl,
@@ -96,8 +133,10 @@ class Picker:
             })
             total += plan.max_parallel
             used += inflight
+            # The headline number is capacity you can actually rely on now:
+            # effective caps, excluding cooled plans and the emergency tail.
             if not cooled and not tail:
-                live += plan.max_parallel
+                live += cap
         return {
             "lane": lane,
             "label": self.registry.lanes[lane].label,

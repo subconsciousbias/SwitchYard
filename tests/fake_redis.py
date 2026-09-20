@@ -90,6 +90,14 @@ class FakeRedis:
     async def hset(self, key, mapping=None, **_):
         self.hashes.setdefault(key, {}).update({k: str(v) for k, v in (mapping or {}).items()})
 
+    async def hget(self, key, field):
+        return self.hashes.get(key, {}).get(field)
+
+    async def incr(self, key):
+        val = int(float((await self.get(key)) or 0)) + 1
+        await self.set(key, str(val))
+        return val
+
     async def hincrbyfloat(self, key, field, amount):
         h = self.hashes.setdefault(key, {})
         h[field] = str(float(h.get(field, 0)) + float(amount))

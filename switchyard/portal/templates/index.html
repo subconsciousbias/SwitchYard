@@ -3,6 +3,29 @@
 <h1>Switchyard</h1>
 <p class="sub">Every lane's live capacity, and how close each subscription is to running dry.</p>
 
+<div class="panel row" style="margin-bottom:14px">
+  <div>
+    <strong>Pacing mode {{ 'on' if capacity.pacing else 'off' }}</strong>
+    <div class="muted" style="font-size:13px">
+      {% if capacity.pacing %}
+        Subscriptions are throttled to land at ~100% of their allowance at rollover.
+        The tail is disabled; metered providers keep fixed caps.
+      {% else %}
+        Plans run at their full learned caps and spill to the tail when exhausted.
+      {% endif %}
+      {% if capacity.pacing != capacity.pacing_configured %}
+        <span class="tag warn">runtime override — plans.yaml says
+          {{ 'on' if capacity.pacing_configured else 'off' }}</span>
+      {% endif %}
+      {% if capacity.learning %}<span class="tag ok">learning concurrency</span>{% endif %}
+    </div>
+  </div>
+  <button class="tag" hx-post="/admin/pacing?enabled=toggle" hx-swap="none"
+          hx-on::after-request="htmx.trigger('#capacity','refresh');htmx.trigger('#plans','refresh')">
+    turn {{ 'off' if capacity.pacing else 'on' }}
+  </button>
+</div>
+
 <h2>Lanes — ordered capacity</h2>
 {% include "_capacity.html" %}
 

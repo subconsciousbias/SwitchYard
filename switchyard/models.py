@@ -29,6 +29,9 @@ class Plan:
     monthly_cost: float = 0.0
     auth: str = "api_key"
     provider_family: str | None = None   # drives vendor error-code mapping
+    configured_parallel: int | None = None   # None when `max_parallel: auto`
+    max_parallel_ceiling: int | None = None  # hard upper bound for learning
+    pacing: bool | None = None               # per-plan override of the global switch
     metered: bool = False
     enabled: bool = True
     expires: date | None = None
@@ -46,6 +49,19 @@ class Plan:
             return None
         return (self.expires - date.today()).days
 
+    @property
+    def is_subscription(self) -> bool:
+        """A fixed-fee plan with a resetting allowance — the only kind worth
+        pacing. Metered providers and unlimited local models are not."""
+        return not self.metered and self.quota.kind not in ("unlimited", "unknown")
+
+    def paced(self, settings: "Settings") -> bool:
+        if self.pacing is not None:
+            return self.pacing and settings.pacing.enabled
+        if not settings.pacing.enabled:
+            return False
+        return self.is_subscription or (self.metered and settings.pacing.include_metered)
+
 
 @dataclass(frozen=True)
 class Lane:
@@ -56,12 +72,42 @@ class Lane:
     description: str = ""
 
 
+SEED_CAP = 2   # starting guess when a plan says `max_parallel: auto`
+
+
+@dataclass(frozen=True)
+class ConcurrencyLearning:
+    """Discover the parallelism a provider really tolerates (AIMD)."""
+    enabled: bool = True
+    buckets: str = "hour_of_day"     # hour_of_day | none
+    seed_cap: int = SEED_CAP
+    min_cap: int = 1
+    decrease_factor: float = 0.5     # halve on a connection-limit rejection
+    increase_step: int = 1           # creep up by one when demand is unmet
+    min_samples: int = 3             # evidence needed to trust an hour bucket
+    probe_interval_seconds: int = 300
+    probe_cooldown_seconds: int = 900  # quiet time needed since last rejection
+    probe_pressure: int = 3          # denied claims needed before probing up
+
+
+@dataclass(frozen=True)
+class Pacing:
+    """Land each subscription at ~100% consumption exactly at its rollover."""
+    enabled: bool = False            # the on/off switch
+    min_slots: int = 1
+    overshoot: float = 0.05          # aim 5% hot so we finish at 100%, not 95%
+    disable_tail: bool = True        # no local spillover while pacing
+    include_metered: bool = False    # metered providers keep fixed caps
+
+
 @dataclass(frozen=True)
 class Settings:
     drain_within_days: int = 21
     lease_ttl_seconds: int = 1800
     inflight_max_age_seconds: int = 900
     default_cooldown_seconds: int = 900
+    concurrency_learning: ConcurrencyLearning = field(default_factory=ConcurrencyLearning)
+    pacing: Pacing = field(default_factory=Pacing)
 
 
 @dataclass
@@ -120,17 +166,29 @@ def load(path: str | None = None) -> Registry:
     with open(path or CONFIG_PATH) as fh:
         raw = yaml.safe_load(fh)
 
-    settings = Settings(**(raw.get("settings") or {}))
+    sraw = dict(raw.get("settings") or {})
+    settings = Settings(
+        **{k: v for k, v in sraw.items() if k not in ("concurrency_learning", "pacing")},
+        concurrency_learning=ConcurrencyLearning(**(sraw.get("concurrency_learning") or {})),
+        pacing=Pacing(**(sraw.get("pacing") or {})),
+    )
 
     plans: dict[str, Plan] = {}
     for key, body in (raw.get("plans") or {}).items():
         body = dict(body)
         q = dict(body.pop("quota", None) or {})
+        raw_parallel = body.get("max_parallel", 1)
+        auto = str(raw_parallel).lower() == "auto"
+        configured = None if auto else int(raw_parallel)
         plans[key] = Plan(
             key=key,
             label=body.get("label", key),
             deployment=body["deployment"],
-            max_parallel=int(body.get("max_parallel", 1)),
+            max_parallel=configured if configured is not None else settings.concurrency_learning.seed_cap,
+            configured_parallel=configured,
+            max_parallel_ceiling=(int(body["max_parallel_ceiling"])
+                                  if body.get("max_parallel_ceiling") else None),
+            pacing=body.get("pacing"),
             monthly_cost=float(body.get("monthly_cost", 0) or 0),
             auth=body.get("auth", "api_key"),
             provider_family=body.get("provider_family"),

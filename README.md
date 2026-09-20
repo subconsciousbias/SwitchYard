@@ -100,6 +100,84 @@ Two outcomes beyond the obvious ones:
   gets a short sit-out and its own portal warning telling you to lower the cap —
   useful given "probably under 4 connections" was an estimate.
 
+## Learning the real concurrency limit
+
+"Probably under 4 connections" is a guess, and the true number may vary by time
+of day. With `concurrency_learning.enabled`, Switchyard discovers it the way TCP
+discovers bandwidth — additive increase, multiplicative decrease:
+
+- a connection-limit refusal (MiniMax 1041, or any provider saying the same in
+  prose) **halves** the cap and records the hour it happened in;
+- with unmet demand — claims the cap actually denied — and no refusal for a
+  while, the cap **creeps up by one**, never past `max_parallel_ceiling`.
+
+Learning is bucketed by hour of day, so a provider that tolerates 6 connections
+at 04:00 and 2 at peak settles at both instead of averaging into one wrong
+number. An hour's own learning is used once it has `min_samples` of evidence;
+until then it inherits the global figure.
+
+Write `max_parallel: auto` to learn from scratch (GLM and OpenCode Go are set
+that way, since "severely limited" is not a number), or give a starting figure
+plus a ceiling. Claude Max is pinned at `max_parallel_ceiling: 1` so probing can
+never touch it.
+
+## Pacing mode — land every subscription at 100%
+
+Off by default; flip it in `plans.yaml` or from the portal button, which
+overrides the config at runtime with no restart.
+
+Normally a plan runs flat out, exhausts itself early, and the lane spills onward.
+Pacing inverts that: each subscription is throttled so its allowance runs out
+*just as the window rolls over*, so you get everything you paid for and nothing
+is wasted. If a caller asks for 10 parallel requests and spending 10 would drain
+Grok days before its rollover, Switchyard runs however few the maths allows —
+one, if that is what it takes.
+
+Concurrency alone is too coarse a knob for this. At real throughput a single busy
+slot can drain a monthly allowance in a day or two, and you cannot go below one
+slot. So there are two mechanisms:
+
+**A pace line** — the consumption you should have reached by now,
+`allowance × elapsed_fraction × (1 + overshoot)`. While actual consumption is
+*above* the line the plan is held closed; it reopens when the line catches up.
+That duty-cycles the plan, and the average lands on the line regardless of how
+fast individual requests are.
+
+**A throughput cap** for when you are on or behind the line:
+`(remaining ÷ seconds_left) ÷ observed_rate_per_slot`, clamped to the learned
+limit. Pacing can only ever narrow capacity, never talk you past a provider's
+real limit.
+
+`overshoot` (5%) aims deliberately hot so you finish at 100% rather than 95%.
+
+### Windows, and what happens to a cancelled plan
+
+Quota **resets** each window, and unused allowance in a window is gone — it never
+carries forward. So pacing is per-window burndown, never an attempt to spread the
+total remaining allowance across every window that is left:
+
+```
+|---- full month ----|---- full month ----|-- final, 9 days --|
+^ spend it all       ^ spend it all       ^ spend it all, faster  X expiry
+```
+
+A cancelled plan therefore has several ordinary windows plus one final window
+truncated by the expiry date. Each window's deadline is
+`min(next_rollover, expiry)`, which means **the final window paces harder** —
+same allowance, less time. The portal shows how many full windows remain and how
+long the final one is.
+
+### What pacing does not touch
+
+- **The tail is disabled** while pacing. Spilling to a local model would hide the
+  fact that you are ahead of budget, and the point is backpressure: a caller
+  asking for more than the pace allows gets a 429 and slows down.
+- **Metered providers keep fixed caps** — OpenRouter and the Anthropic API have
+  no allowance to land on, so they stay on ordinary spill-and-cooldown. Same for
+  local models. Override per plan with `pacing: true|false`.
+- **A plan with no known allowance cannot be paced.** It says so on the board and
+  keeps its fixed cap until the observed-allowance learning has seen one wall.
+
 ## Expiring plans get drained first
 
 Give a plan an `expires:` date and it is automatically promoted ahead of plans
@@ -200,6 +278,7 @@ it is actually annoying.
 ```bash
 python3 tests/test_routing.py    # ordered fill, affinity, vanishing capacity
 python3 tests/test_classify.py   # real MiniMax and Z.AI error payloads
+python3 tests/test_policy.py     # concurrency learning and pacing control
 ```
 
 Neither needs Redis or a running stack.
