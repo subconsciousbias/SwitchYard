@@ -178,12 +178,20 @@ def test_one_subscription_cannot_be_used_twice_at_once():
 
     async def go():
         reg, slots, picker = build()
-        heavy = replace(reg.plans["claude-max-heavy"], enabled=True)
-        plans = {**reg.plans, "claude-max-heavy": heavy}
+        # Enable the heavy Claude tier and stand the other apex members down, so
+        # this test is about the shared subscription rather than about whichever
+        # plan currently wins apex's ordering. (Enabling astra once moved apex to
+        # it and broke this test — the lane order is config, not a fixture.)
+        plans = dict(reg.plans)
+        plans["claude-max-heavy"] = replace(plans["claude-max-heavy"], enabled=True)
+        for other in ("astra", "anthropic-fable"):
+            if other in plans:
+                plans[other] = replace(plans[other], enabled=False)
         reg = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
         picker = Picker(reg, slots)
 
-        assert heavy.subscription == reg.plans["claude-max"].subscription == "claude-max"
+        assert (reg.plans["claude-max-heavy"].subscription
+                == reg.plans["claude-max"].subscription == "claude-max")
 
         first = await picker.pick("apex", None)
         assert first.plan.key == "claude-max-heavy", first.plan.key
