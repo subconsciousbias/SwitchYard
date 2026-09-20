@@ -84,6 +84,119 @@ def test_max_tokens_becomes_an_instruction():
     print(f"  max_tokens=60 -> {hint.splitlines()[-1][:60]!r}...")
 
 
+# --------------------------------------------------------------------- codex ---
+# Verbatim messages from codex-cli 0.155.1 on a ChatGPT-account seat.
+CODEX_QUOTA = ("You've hit your usage limit. Visit "
+               "https://chatgpt.com/codex/settings/usage to purchase more "
+               "credits or try again at Sep 22nd, 2026 4:37 AM.")
+CODEX_BAD_MODEL = json.dumps({
+    "type": "error",
+    "message": json.dumps({"type": "error", "status": 400, "error": {
+        "type": "invalid_request_error",
+        "message": "The 'gpt-5' model is not supported when using Codex with a "
+                   "ChatGPT account."}}),
+})
+
+
+def test_absolute_reset_time_beats_the_default_cooldown():
+    """A 30-hour lockout must not get a one-hour cooldown.
+
+    Without parsing the stated time, the lane would retry a dead plan every hour
+    for thirty more hours.
+    """
+    secs = server.seconds_until(CODEX_QUOTA)
+    assert secs is not None and 29 * 3600 < secs < 32 * 3600, secs
+    print(f"  '{CODEX_QUOTA[-28:]}' -> {secs / 3600:.1f}h")
+
+
+def test_quota_message_becomes_429_with_that_retry_after():
+    exc = server._limit_error(CODEX_QUOTA)
+    assert exc.status_code == 429, exc.status_code
+    assert int(exc.headers["Retry-After"]) > 29 * 3600, exc.headers
+    print(f"  HTTP 429, Retry-After {exc.headers['Retry-After']}s")
+
+
+def test_implausible_reset_times_are_discarded():
+    """A stated time carries no timezone, so a past or absurd value is dropped
+    rather than trusted."""
+    assert server.seconds_until("try again at Jan 1, 2020 1:00 AM") is None
+    assert server.seconds_until("You've hit your usage limit.") is None
+    print("  past dates and missing dates fall back to the plan default")
+
+
+def test_the_real_error_is_read_from_stdout_not_stderr():
+    """Codex reports failures in stdout JSON and leaves stderr with an unrelated
+    line ('Reading additional input from stdin...'), so a stderr-only handler
+    turned a clear 400 into an opaque 502."""
+    status, message = server.error_from_events(CODEX_BAD_MODEL)
+    assert status == 400, status
+    assert "not supported when using Codex with a ChatGPT account" in message
+    print(f"  extracted status={status}: {message[:60]}...")
+
+
+def test_codex_is_invoked_without_an_explicit_model():
+    """A ChatGPT-account seat rejects every explicit model id, so the CLI picks."""
+    argv = server.build_argv("PROMPT", None)
+    if server.PROVIDER == "codex":
+        assert "--model" not in argv, argv
+        assert "--skip-git-repo-check" in argv, argv
+        print(f"  {' '.join(argv)}")
+    else:
+        print(f"  (skipped: PROVIDER={server.PROVIDER})")
+
+
+CODEX_FIXTURE = os.path.join(HERE, "fixtures", "codex-events.jsonl")
+
+
+def test_codex_stream_yields_text_and_usage():
+    """Codex uses `item.agent_message.text` and a top-level usage object — a
+    different shape from OpenCode's `part` events, and the original parser found
+    neither, so it returned the raw stream as the answer."""
+    out = server.parse_output(open(CODEX_FIXTURE).read())
+    assert out["result"] == "SHAPE OK", out["result"]
+    u = out["usage"]
+    assert u["input_tokens"] == 14159 and u["output_tokens"] == 7, u
+    assert u["cache_read_tokens"] == 12160, u
+    print(f"  text={out['result']!r} in={u['input_tokens']} out={u['output_tokens']} "
+          f"cached={u['cache_read_tokens']}")
+
+
+def test_both_cli_shapes_parse_with_one_parser():
+    for name, text in (("codex-events.jsonl", "SHAPE OK"),
+                       ("opencode-events.jsonl", "OK")):
+        out = server.parse_output(open(os.path.join(HERE, "fixtures", name)).read())
+        assert out["result"] == text, (name, out["result"])
+        assert out["usage"]["input_tokens"] > 0, (name, out["usage"])
+    print("  one parser handles both the part-based and item-based shapes")
+
+
+def test_codex_reasoning_tokens_count_as_output():
+    stream = ('{"type":"turn.completed","usage":{"input_tokens":10,'
+              '"output_tokens":5,"reasoning_output_tokens":40}}'
+              '{"type":"item.completed","item":{"type":"agent_message","text":"x"}}')
+    out = server.parse_output(stream)
+    assert out["usage"]["output_tokens"] == 45, out["usage"]
+    print(f"  reasoning billed into output: {out['usage']}")
+
+
+def test_limit_detection_survives_rewording_and_curly_quotes():
+    """The original pattern demanded the exact phrase "usage limit reached" and a
+    straight apostrophe. Codex says "You\u2019ve hit your usage limit", so an
+    exhausted subscription was reported as a 502 and treated as transient."""
+    cases = {
+        "You\u2019ve hit your usage limit.": True,
+        "You've hit your usage limit.": True,
+        "Claude usage limit reached. Your limit will reset at 3pm.": True,
+        "You have run out of credits for this plan.": True,
+        "purchase more credits": True,
+        "ENOENT: no such file or directory": False,
+    }
+    for msg, expected in cases.items():
+        hit = bool(server._LIMIT.search(server.normalise(msg))) or bool(server.seconds_until(msg))
+        assert hit is expected, (msg, hit)
+    print(f"  {sum(cases.values())} limit wordings matched, 1 unrelated error not")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

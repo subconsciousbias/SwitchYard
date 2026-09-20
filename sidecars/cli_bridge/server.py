@@ -59,6 +59,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import yaml
 
@@ -126,7 +127,15 @@ PROFILES: dict[str, dict] = {
     "codex": {
         "cli": os.environ.get("CODEX_CLI", "codex"),
         "model": os.environ.get("CODEX_MODEL", "gpt-5"),
-        "args": os.environ.get("CODEX_ARGS", "exec --json --model {model} {prompt}").split(),
+        # --skip-git-repo-check: the sidecar's working directory is not a git
+        #   repo, and codex otherwise refuses with "Not inside a trusted directory".
+        # No --model: a ChatGPT-account seat rejects every explicit id with
+        #   "The '<id>' model is not supported when using Codex with a ChatGPT
+        #   account", so the CLI must pick. Add one back via CODEX_ARGS if your
+        #   account does support selection.
+        "args": os.environ.get(
+            "CODEX_ARGS",
+            "exec --json --skip-git-repo-check {prompt}").split(),
         "system_args": [],
         "parser": "codex_jsonl",
         "default_retry_after": 3600,
@@ -264,11 +273,63 @@ async def invoke(prompt: str, system: str | None, model: str | None) -> dict:
         return payload
 
 # The CLI reports exhaustion in prose; these are the shapes worth trusting.
+def normalise(text: str) -> str:
+    """Fold typographic punctuation before matching.
+
+    Codex writes "You\u2019ve hit your usage limit" with a curly apostrophe, so a
+    pattern containing a straight quote silently fails to match — and an exhausted
+    subscription then looks like a transient error, which is the one mistake that
+    makes the router hammer a dead plan.
+    """
+    return (text or "").replace("\u2019", "'").replace("\u2018", "'") \
+                       .replace("\u201c", '"').replace("\u201d", '"')
+
+
+# Deliberately loose. Vendors reword these constantly, and the cost of a miss is
+# asymmetric: a missed limit means a 502 that the router treats as transient and
+# retries, while a false positive merely rests a healthy plan for a while.
 _LIMIT = re.compile(
-    r"(usage limit reached|limit will reset|you've reached your|rate.?limit"
-    r"|out of (credits|usage)|quota)", re.I,
+    r"(usage limit"                       # "hit your usage limit", "usage limit reached"
+    r"|(hit|reached|exceeded) your"       # "you've hit your ...", "reached your ..."
+    r"|limit (will )?reset"
+    r"|purchase more credits"
+    r"|out of (credits|usage|quota)"
+    r"|insufficient (balance|credit|quota)"
+    r"|rate.?limit"
+    r"|too many requests"
+    r"|quota)", re.I,
 )
 _RESET_AT = re.compile(r"reset(?:s|ting)?\s+at\s+([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)", re.I)
+# Codex states an absolute reset: "try again at Sep 22nd, 2026 4:37 AM".
+_TRY_AGAIN_AT = re.compile(
+    r"try again at\s+([A-Z][a-z]{2,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}"
+    r"(?:\s+\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)?)", re.I)
+
+
+def seconds_until(text: str) -> int | None:
+    """Seconds until an absolute reset time stated in a CLI's error message.
+
+    Worth the effort: without it a 31-hour lockout gets the default one-hour
+    cooldown, so the lane retries a dead plan thirty more times. The stated time
+    carries no timezone, so it is read as UTC; a result in the past or absurdly
+    far out is discarded rather than trusted.
+    """
+    m = _TRY_AGAIN_AT.search(normalise(text))
+    if not m:
+        return None
+    stamp = re.sub(r"(\d)(st|nd|rd|th)", r"\1", m.group(1), flags=re.I).replace(".", "")
+    stamp = re.sub(r"\s+", " ", stamp).strip().rstrip(",")
+    for fmt in ("%b %d, %Y %I:%M %p", "%b %d %Y %I:%M %p", "%B %d, %Y %I:%M %p",
+                "%B %d %Y %I:%M %p", "%b %d, %Y %H:%M", "%b %d, %Y", "%B %d, %Y"):
+        try:
+            when = datetime.strptime(stamp, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        delta = (when - datetime.now(timezone.utc)).total_seconds()
+        if 60 <= delta <= 14 * 86400:
+            return int(delta)
+        return None
+    return None
 _AUTH = re.compile(r"(not logged in|please run .?claude login|authentication|invalid credentials)", re.I)
 
 
@@ -382,48 +443,59 @@ def parse_output(stdout: str) -> dict:
         return json.loads(stdout)
 
     if kind in ("events_json", "codex_jsonl"):
-        # Verified against real OpenCode output. Three events for a trivial call:
-        #   {"type":"step_start","part":{"type":"step-start"}}
+        # Two different event shapes, both verified against real output.
+        #
+        # OpenCode nests everything under `part`:
         #   {"type":"text","part":{"type":"text","text":"OK"}}
-        #   {"type":"step_finish","part":{"type":"step-finish","reason":"stop",
-        #      "tokens":{"total":7492,"input":6194,"output":18,"reasoning":0,
-        #                "cache":{"write":0,"read":1280}},"cost":0.0009765}}
-        # So the answer is part.text on text parts, and usage is part.tokens on
-        # the finish part. Reasoning parts are excluded from the answer but their
-        # tokens are counted, because they are billed.
+        #   {"type":"step_finish","part":{"type":"step-finish",
+        #      "tokens":{"input":6194,"output":18,"reasoning":0,
+        #                "cache":{"read":1280}}}}
+        #
+        # Codex uses `item` plus a top-level usage object:
+        #   {"type":"item.completed","item":{"type":"agent_message","text":"OK"}}
+        #   {"type":"turn.completed","usage":{"input_tokens":14159,
+        #      "cached_input_tokens":12160,"output_tokens":7,
+        #      "reasoning_output_tokens":0}}
+        #
+        # Reasoning tokens are counted into output because they are billed, but
+        # reasoning *text* is never part of the answer.
         text_parts: list[str] = []
         usage: dict = {}
 
+        def add(field: str, value) -> None:
+            usage[field] = usage.get(field, 0) + _int(value)
+
         for evt in iter_json_objects(stdout):
             part = evt.get("part") if isinstance(evt.get("part"), dict) else {}
-            ptype = part.get("type") or evt.get("type")
+            item = evt.get("item") if isinstance(evt.get("item"), dict) else {}
 
-            if ptype == "text" and isinstance(part.get("text"), str):
+            # --- OpenCode ------------------------------------------------
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
                 text_parts.append(part["text"])
-
             tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else None
             if tokens:
                 cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
-                usage["input_tokens"] = usage.get("input_tokens", 0) + _int(tokens.get("input"))
-                usage["output_tokens"] = (usage.get("output_tokens", 0)
-                                          + _int(tokens.get("output"))
-                                          + _int(tokens.get("reasoning")))
-                if cache.get("read"):
-                    usage["cache_read_tokens"] = (usage.get("cache_read_tokens", 0)
-                                                  + _int(cache.get("read")))
+                add("input_tokens", tokens.get("input"))
+                add("output_tokens", tokens.get("output"))
+                add("output_tokens", tokens.get("reasoning"))
+                add("cache_read_tokens", cache.get("read"))
             if isinstance(part.get("cost"), (int, float)):
-                # The provider's notional API cost. Recorded for visibility, but
-                # meaningless as *spend* on a prepaid subscription, where the
-                # marginal cost of a request is zero.
+                # The provider's notional API cost. Recorded for visibility only:
+                # on a prepaid subscription the marginal cost of a request is zero.
                 usage["provider_cost"] = usage.get("provider_cost", 0.0) + float(part["cost"])
 
-            # Codex and older shapes: text at the top level, usage as a dict.
-            if not part:
-                if isinstance(evt.get("usage"), dict):
-                    usage.update(evt["usage"])
-                for key in ("input_tokens", "output_tokens", "total_tokens"):
-                    if key in evt:
-                        usage[key] = _int(evt[key])
+            # --- Codex ---------------------------------------------------
+            if item.get("type") in ("agent_message", "message") and isinstance(item.get("text"), str):
+                text_parts.append(item["text"])
+            top = evt.get("usage") if isinstance(evt.get("usage"), dict) else None
+            if top:
+                add("input_tokens", top.get("input_tokens") or top.get("prompt_tokens"))
+                add("output_tokens", top.get("output_tokens") or top.get("completion_tokens"))
+                add("output_tokens", top.get("reasoning_output_tokens"))
+                add("cache_read_tokens", top.get("cached_input_tokens"))
+
+            # --- generic fallbacks for shapes neither of the above covers --
+            if not part and not item:
                 msg = evt.get("message") or evt.get("text") or evt.get("delta")
                 if isinstance(msg, dict):
                     msg = msg.get("content") or msg.get("text")
@@ -431,8 +503,8 @@ def parse_output(stdout: str) -> dict:
                     msg = "".join(str(b.get("text", "")) for b in msg
                                   if isinstance(b, dict))
                 if isinstance(msg, str) and msg.strip() and evt.get("type") in (
-                        None, "message", "assistant", "item.completed",
-                        "agent_message", "response.output_text.delta"):
+                        None, "message", "assistant", "agent_message",
+                        "response.output_text.delta"):
                     text_parts.append(msg)
 
         if not text_parts:
@@ -473,8 +545,13 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None) -> 
     prompt, system = fold_system(prompt, system)
     cmd = build_argv(prompt, system, model)
 
+    # stdin must be closed explicitly: codex reads "additional input from stdin"
+    # and would block forever on an inherited descriptor that never closes.
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
@@ -483,15 +560,27 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None) -> 
         raise HTTPException(status_code=408, detail=f"{PROVIDER} cli timed out")
 
     stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
-    blob = f"{stdout}\n{stderr}"
+    blob = normalise(f"{stdout}\n{stderr}")
 
     if proc.returncode != 0 or not stdout.strip():
         if _AUTH.search(blob):
             raise HTTPException(status_code=401,
                                 detail=f"{PROVIDER} cli not authenticated: {stderr[:300]}")
-        if _LIMIT.search(blob):
+        if _LIMIT.search(blob) or seconds_until(blob):
+            # A stated "try again at <time>" is a limit by definition, even if the
+            # surrounding prose is worded in a way no pattern anticipated.
             raise _limit_error(blob)
-        raise HTTPException(status_code=502, detail=f"{PROVIDER} cli failed ({proc.returncode}): {stderr[:300]}")
+        status, detail = error_from_events(stdout)
+        if status and 400 <= status < 500 and status != 429:
+            # A client error is our fault, not the provider's — surface it as-is
+            # so Switchyard does not cool the plan down over a bad request.
+            raise HTTPException(status_code=status,
+                                detail={"error": {"message": detail or blob[:300],
+                                                  "type": "upstream_client_error"}})
+        raise HTTPException(
+            status_code=502,
+            detail=f"{PROVIDER} cli failed ({proc.returncode}): "
+                   f"{detail or stderr[:300] or stdout[:300]}")
 
     try:
         payload = parse_output(stdout)
@@ -510,13 +599,56 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None) -> 
     return payload
 
 
+def error_from_events(stdout: str) -> tuple[int | None, str]:
+    """(upstream status, message) from a CLI's error events.
+
+    Codex reports failures as `{"type":"error","message":"{...nested json...}"}`
+    on **stdout**, leaving stderr with an unrelated informational line. Reading
+    only stderr turned a clear "model is not supported" into an opaque 502.
+    """
+    status: int | None = None
+    messages: list[str] = []
+    for evt in iter_json_objects(stdout):
+        item = evt.get("item") if isinstance(evt.get("item"), dict) else {}
+        for candidate in (evt, item, evt.get("error") if isinstance(evt.get("error"), dict) else {}):
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("type") in ("error", "turn.failed") or candidate.get("message"):
+                msg = candidate.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    messages.append(msg.strip())
+        # The message is often itself JSON carrying the HTTP status.
+        for msg in list(messages):
+            if msg.startswith("{"):
+                try:
+                    inner = json.loads(msg)
+                except ValueError:
+                    continue
+                if isinstance(inner, dict):
+                    if isinstance(inner.get("status"), int):
+                        status = inner["status"]
+                    err = inner.get("error") if isinstance(inner.get("error"), dict) else {}
+                    if isinstance(err.get("message"), str):
+                        messages.append(err["message"])
+    unique = list(dict.fromkeys(m for m in messages if not m.startswith("{")))
+    return status, " | ".join(unique)[:500]
+
+
 def _limit_error(blob: str) -> HTTPException:
     # Default to the plan's window; if the CLI names a reset time, trust it.
     retry_after = PROFILE["default_retry_after"]
-    m = _RESET_AT.search(blob)
     detail = f"{PROVIDER} usage limit reached"
-    if m:
-        detail = f"{detail} (resets at {m.group(1)})"
+
+    blob = normalise(blob)
+    absolute = seconds_until(blob)
+    if absolute:
+        retry_after = absolute
+        hours = absolute / 3600
+        detail = f"{detail} (resets in {hours:.1f}h)"
+    else:
+        m = _RESET_AT.search(blob)
+        if m:
+            detail = f"{detail} (resets at {m.group(1)})"
     return HTTPException(
         status_code=429,
         detail={"error": {"message": detail, "type": "usage_limit_reached"}},
