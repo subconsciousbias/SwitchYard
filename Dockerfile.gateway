@@ -1,0 +1,16 @@
+# LiteLLM proxy + the Switchyard plugin. The generated LiteLLM config is built
+# at container start from config/plans.yaml, so there is one file to edit.
+FROM ghcr.io/berriai/litellm:main-stable
+
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY switchyard /app/switchyard
+COPY docker/gateway-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+ENV PYTHONPATH=/app
+ENV SWITCHYARD_PLANS=/app/config/plans.yaml
+EXPOSE 4000
+ENTRYPOINT ["/app/entrypoint.sh"]

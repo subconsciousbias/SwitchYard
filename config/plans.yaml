@@ -1,0 +1,261 @@
+# ============================================================================
+# Switchyard — single source of truth for plans, capacity, and lanes.
+# Everything else (routing order, the capacity board, quota headroom, the
+# effective $/Mtok table) is derived from this file. Edit here, hit
+# POST /admin/reload on the portal; no proxy restart needed.
+# ============================================================================
+
+settings:
+  # A plan expiring within this many days is promoted above plans you keep
+  # paying for, so cancelled capacity gets drained before it dies.
+  drain_within_days: 21
+  # How long a session keeps its provider. Refreshed on every request, so an
+  # active session never migrates; an idle one lets its slot go.
+  lease_ttl_seconds: 1800
+  # Safety net: an in-flight slot older than this is assumed leaked and pruned.
+  inflight_max_age_seconds: 900
+  # Default sit-out after a hard quota rejection, when the provider gives us
+  # no Retry-After to go on.
+  default_cooldown_seconds: 900
+
+plans:
+
+  # ---------------------------------------------------------- workhorses ----
+  minimax-ultra:
+    label: "Minimax Ultra Token Plan"
+    deployment: sy.minimax-ultra      # must match config/litellm-config.yaml
+    max_parallel: 4
+    monthly_cost: 132
+    auth: api_key
+    quota:
+      kind: tokens
+      period: month
+      allowance: null                 # TODO: set the plan's token allowance
+      source: estimate                # estimate | headers | probe
+    notes: "Original workhorse. Good at coding with explicit instructions."
+
+  minimax-max:
+    label: "Minimax Max Token Plan"
+    deployment: sy.minimax-max
+    max_parallel: 4
+    monthly_cost: 55
+    auth: api_key
+    quota:
+      kind: tokens
+      period: month
+      allowance: null                 # TODO
+      source: estimate
+    notes: "Second workhorse, added 2026-09-20 to stop the OpenRouter burn."
+
+  glm:
+    label: "GLM Coding Plan"
+    deployment: sy.glm
+    max_parallel: 1
+    monthly_cost: 0
+    auth: api_key
+    expires: "2026-10-13"
+    quota:
+      kind: window
+      period: rolling_5h
+      allowance: null
+      source: estimate
+    notes: "Cancelled. Severely limited — drain whatever is left."
+
+  openrouter-mimo:
+    label: "OpenRouter (Mimo 2.5)"
+    deployment: sy.openrouter-mimo
+    max_parallel: 2
+    monthly_cost: 0
+    auth: api_key
+    metered: true                     # pay-per-token, not a subscription
+    quota:
+      kind: dollars
+      period: month
+      allowance: 50                   # hard ceiling; alerts at 80%
+      source: ledger                  # we know exactly what we spent
+    alert_burn_rate_per_hour: 5       # the $20/hr surprise must page us early
+    notes: "Overflow only. Decent as a workhorse but it is real money."
+
+  # ------------------------------------------------------------ judgement ----
+  claude-max:
+    label: "Claude Max $200"
+    deployment: sy.claude-max
+    max_parallel: 1                   # hard: one connection
+    monthly_cost: 200
+    auth: oauth_sidecar               # see sidecars/claude-max
+    quota:
+      kind: window
+      period: rolling_5h
+      allowance: null
+      source: sidecar                 # the CLI tells us the reset time
+    notes: "Critical logic only. Heaviest non-Paperclip use is interactive."
+
+  anthropic-fable:
+    label: "Fable 5.1 (Anthropic API)"
+    deployment: sy.anthropic-fable
+    max_parallel: 1
+    monthly_cost: 0
+    auth: api_key
+    metered: true
+    quota:
+      kind: dollars
+      period: month
+      allowance: 100
+      source: ledger
+    notes: "Escalation tier. Metered — keep the ceiling tight."
+
+  astra:
+    label: "Astra 6"
+    deployment: sy.astra
+    max_parallel: 1
+    monthly_cost: 0
+    auth: api_key
+    enabled: false                    # flip on once the endpoint is confirmed
+    quota: {kind: unknown, source: estimate}
+
+  openai:
+    label: "OpenAI $100 Plan"
+    deployment: sy.openai
+    max_parallel: 2
+    monthly_cost: 0
+    auth: api_key                     # oauth_sidecar if this is a ChatGPT seat
+    expires: "2026-10-04"
+    quota:
+      kind: window
+      period: week
+      allowance: null
+      source: estimate
+    notes: "Cancelled. Weekly allowance already spent this week — expect 429s."
+
+  grok:
+    label: "Grok $300 Plan"
+    deployment: sy.grok
+    max_parallel: 4
+    monthly_cost: 0
+    auth: api_key
+    expires: "2026-10-09"
+    quota:
+      kind: window
+      period: month
+      allowance: null
+      source: estimate
+    notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
+
+  # ---------------------------------------------------------------- local ----
+  qwen-local:
+    label: "Qwen 3.8 Flash (local)"
+    deployment: sy.qwen-local
+    max_parallel: 2
+    monthly_cost: 0
+    auth: none
+    quota: {kind: unlimited, source: none}
+    notes: "Just under Opus quality. Slow under load — keep parallelism low."
+
+  gemma-local:
+    label: "Gemma 4 (local)"
+    deployment: sy.gemma-local
+    max_parallel: 2
+    monthly_cost: 0
+    auth: none
+    quota: {kind: unlimited, source: none}
+    notes: "Cheap and fast. Summaries, extraction, classification."
+
+# ============================================================================
+# LANES — ordered capacity. Requests fill each plan to its cap, then spill to
+# the next. `tail: true` means the plan is last-resort only: it exists so the
+# lane never hard-fails, not as a lane that runs all the time.
+# ============================================================================
+lanes:
+
+  apex:
+    label: "Judgement — Heavy"
+    description: "Escalations where Opus-class judgement was not enough."
+    order: [anthropic-fable, astra]
+    tail: [claude-max]
+
+  judge:
+    label: "Judgement — Regular"
+    description: "The normal judgement tier. Most judgement tasks land here."
+    order: [claude-max, openai, grok]
+    tail: [qwen-local]
+
+  forge:
+    label: "Coding Workhorse"
+    description: "Getting work done. Ordered fill across every workhorse plan."
+    order: [minimax-ultra, minimax-max, grok, glm, openrouter-mimo]
+    tail: [qwen-local]
+
+  local:
+    label: "Local Only"
+    # No tail and no cloud members on purpose: if the box is busy the caller
+    # gets a 429 and backs off rather than silently spending money.
+    order: [qwen-local, gemma-local]
+    tail: []
+
+  bulk:
+    label: "Basic"
+    description: "Mechanical work — summaries, extraction, commit messages."
+    order: [gemma-local, qwen-local]
+    tail: [minimax-max]
+
+# ============================================================================
+# TRANSPORT — how each plan is actually reached. Kept in the same file as the
+# plan registry so credentials, caps, cost and lane order never drift apart.
+# `model_name` in the generated LiteLLM config is each plan's `deployment`.
+#
+# OAuth-only subscriptions (auth: oauth_sidecar) point at a localhost sidecar
+# that owns the vendor CLI and its token refresh. LiteLLM itself does no OAuth
+# and never sees a subscription credential.
+# ============================================================================
+deployments:
+
+  minimax-ultra:
+    model: openai/MiniMax-M2
+    api_base: os.environ/MINIMAX_ULTRA_API_BASE
+    api_key: os.environ/MINIMAX_ULTRA_API_KEY
+
+  minimax-max:
+    model: openai/MiniMax-M2
+    api_base: os.environ/MINIMAX_MAX_API_BASE
+    api_key: os.environ/MINIMAX_MAX_API_KEY
+
+  glm:
+    model: openai/glm-4.6
+    api_base: os.environ/GLM_API_BASE
+    api_key: os.environ/GLM_API_KEY
+
+  openrouter-mimo:
+    model: openrouter/xiaomi/mimo-2.5     # TODO: confirm slug on openrouter.ai/models
+    api_key: os.environ/OPENROUTER_API_KEY
+
+  claude-max:
+    model: openai/claude-opus-5           # served by the sidecar, OpenAI-shaped
+    api_base: http://claude-max-sidecar:8081/v1
+    api_key: sidecar
+
+  anthropic-fable:
+    model: anthropic/claude-fable-5-1
+    api_key: os.environ/ANTHROPIC_API_KEY
+
+  astra:
+    model: openai/astra-6                 # TODO: confirm provider route
+    api_base: os.environ/ASTRA_API_BASE
+    api_key: os.environ/ASTRA_API_KEY
+
+  openai:
+    model: openai/gpt-5
+    api_key: os.environ/OPENAI_API_KEY
+
+  grok:
+    model: xai/grok-4
+    api_key: os.environ/XAI_API_KEY
+
+  qwen-local:
+    model: openai/qwen-3.8-flash
+    api_base: os.environ/LOCAL_API_BASE
+    api_key: local
+
+  gemma-local:
+    model: openai/gemma-4
+    api_base: os.environ/LOCAL_API_BASE
+    api_key: local

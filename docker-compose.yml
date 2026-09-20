@@ -1,0 +1,101 @@
+# Switchyard — `docker compose up -d` brings up the whole thing.
+#
+#   gateway  :4000  OpenAI- and Anthropic-compatible. Point every tool here.
+#   portal   :4001  capacity board, quota headroom, subscription economics.
+#   sidecar  :8081  Claude Max over the CLI's OAuth (internal only).
+#
+# Local models are expected on the host; LOCAL_API_BASE defaults to
+# host.docker.internal so Ollama/LM Studio work without extra config.
+
+name: switchyard
+
+x-common: &common
+  restart: unless-stopped
+  env_file: [.env]
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    <<: *common
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    <<: *common
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-litellm}
+      POSTGRES_DB: litellm
+    volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build: {context: ., dockerfile: Dockerfile.gateway}
+    <<: *common
+    ports: ["${GATEWAY_PORT:-4000}:4000"]
+    volumes:
+      - ./config:/app/config:ro
+    environment:
+      SWITCHYARD_REDIS_URL: redis://redis:6379/1
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:-litellm}@postgres:5432/litellm
+      LOCAL_API_BASE: ${LOCAL_API_BASE:-http://host.docker.internal:11434/v1}
+      GATEWAY_WORKERS: ${GATEWAY_WORKERS:-2}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      redis: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:4000/health/liveliness')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  portal:
+    build: {context: ., dockerfile: Dockerfile.portal}
+    <<: *common
+    ports: ["${PORTAL_PORT:-4001}:4001"]
+    volumes:
+      - ./config:/app/config:ro
+    environment:
+      SWITCHYARD_REDIS_URL: redis://redis:6379/1
+    depends_on:
+      redis: {condition: service_healthy}
+
+  # Claude Max's quota is OAuth-only, so the CLI owns the credential and this
+  # service just exposes it as HTTP on the internal network. Log in once with
+  # `docker compose exec claude-max-sidecar claude login` (or mount a host
+  # ~/.claude that is already logged in).
+  claude-max-sidecar:
+    build: {context: ., dockerfile: Dockerfile.sidecar}
+    <<: *common
+    expose: ["8081"]
+    environment:
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-opus}
+      SIDECAR_CONCURRENCY: "1"
+      CLAUDE_CONFIG_DIR: /home/node/.claude
+    volumes:
+      - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8081/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  redis-data:
+  pg-data:

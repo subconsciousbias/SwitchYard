@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchyard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/htmx/1.9.12/htmx.min.js"></script>
+<style>
+  :root{
+    --bg:#f7f7f5; --panel:#fff; --ink:#1b1b19; --muted:#6b6b66; --line:#e3e3de;
+    --ok:#2f7d5d; --warn:#b07a10; --bad:#b3402f; --accent:#3a5f9e; --track:#ececea;
+  }
+  @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+    --bg:#161714; --panel:#1e201c; --ink:#eceae4; --muted:#9a9a92; --line:#2e312c;
+    --ok:#6cc39a; --warn:#e0b25c; --bad:#e58873; --accent:#8fb0e8; --track:#2a2d28;
+  }}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;}
+  .wrap{max-width:1180px;margin:0 auto;padding:28px 16px 64px}
+  h1{font-size:20px;margin:0 0 2px;letter-spacing:-.01em}
+  h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
+     margin:32px 0 10px;font-weight:600}
+  .sub{color:var(--muted);margin:0 0 4px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .grid{display:grid;gap:12px}
+  @media(min-width:780px){.grid.lanes{grid-template-columns:repeat(2,1fr)}}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+     color:var(--muted);font-weight:600;padding:0 8px 8px;border-bottom:1px solid var(--line)}
+  td{padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+  tr:last-child td{border-bottom:0}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+  .bar{height:6px;background:var(--track);border-radius:3px;overflow:hidden;min-width:90px}
+  .bar>i{display:block;height:100%;background:var(--ok)}
+  .bar.warn>i{background:var(--warn)} .bar.bad>i{background:var(--bad)}
+  .slots{display:flex;gap:3px;flex-wrap:wrap}
+  .slot{width:11px;height:16px;border-radius:2px;background:var(--track);
+        border:1px solid var(--line)}
+  .slot.used{background:var(--accent);border-color:transparent}
+  .slot.gone{background:repeating-linear-gradient(45deg,var(--track),var(--track)2px,transparent 2px,transparent 4px)}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;
+       border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+  .tag.bad{color:var(--bad);border-color:currentColor}
+  .tag.warn{color:var(--warn);border-color:currentColor}
+  .tag.ok{color:var(--ok);border-color:currentColor}
+  .big{font-size:26px;font-weight:600;letter-spacing:-.02em}
+  .row{display:flex;align-items:center;gap:10px;justify-content:space-between}
+  .muted{color:var(--muted)} .nowrap{white-space:nowrap}
+  .lane-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px}
+  .spark{display:flex;gap:2px;align-items:flex-end;height:22px}
+  .spark>i{width:5px;background:var(--accent);opacity:.55;border-radius:1px;min-height:1px}
+  footer{margin-top:40px;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body><div class="wrap">{% block body %}{% endblock %}</div></body>
+</html>

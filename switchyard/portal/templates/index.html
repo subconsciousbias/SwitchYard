@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Switchyard</h1>
+<p class="sub">Every lane's live capacity, and how close each subscription is to running dry.</p>
+
+<h2>Lanes — ordered capacity</h2>
+{% include "_capacity.html" %}
+
+<h2>Subscriptions — quota, burn, and what they actually cost</h2>
+{% include "_plans.html" %}
+
+<footer>
+  Sessions stick to a provider for {{ settings.lease_ttl_seconds // 60 }} min of inactivity ·
+  plans expiring within {{ settings.drain_within_days }} days are promoted to the front of their lane ·
+  quota exhaustion removes a plan's slots for {{ settings.default_cooldown_seconds // 60 }} min unless the
+  provider tells us its reset time.
+</footer>
+{% endblock %}

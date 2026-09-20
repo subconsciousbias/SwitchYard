@@ -1,0 +1,72 @@
+<div id="plans" hx-get="/fragments/plans" hx-trigger="every 20s" hx-swap="outerHTML">
+<div class="panel">
+<table>
+  <thead><tr>
+    <th>Plan</th><th>Quota left</th><th>Resets</th><th>Burn</th>
+    <th>This month</th><th>Effective</th><th>14 days</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for r in plans %}
+    {% set hr = r.headroom %}
+    {% set pct = hr.pct_used %}
+    <tr>
+      <td>
+        <div><strong>{{ r.plan.label }}</strong></div>
+        <div class="muted" style="font-size:12px">
+          {% if r.plan.monthly_cost %}${{ '%.0f'|format(r.plan.monthly_cost) }}/mo{% else %}metered{% endif %}
+          · {{ r.lanes|join(', ') }}
+          {% if r.plan.auth == 'oauth_sidecar' %}· <span title="OAuth subscription via sidecar">sidecar</span>{% endif %}
+        </div>
+      </td>
+      <td style="min-width:150px">
+        {% if pct is not none %}
+          <div class="bar {% if pct >= 90 %}bad{% elif pct >= 70 %}warn{% endif %}">
+            <i style="width:{{ pct }}%"></i></div>
+          <div class="muted mono" style="font-size:12px">
+            {{ '%.0f'|format(100 - pct) }}% left · {{ hr.basis }}</div>
+        {% elif hr.kind == 'unlimited' %}
+          <span class="tag ok">unlimited</span>
+        {% else %}
+          <span class="muted">no allowance set</span>
+          <div class="muted mono" style="font-size:12px">
+            used {{ '{:,.0f}'.format(hr.consumed or 0) }}{% if hr.kind == 'dollars' %} dollars{% endif %}</div>
+        {% endif %}
+      </td>
+      <td class="mono nowrap">{{ r.reset_human }}</td>
+      <td class="mono nowrap">
+        {% if r.burn.cost_per_hour %}${{ '%.2f'|format(r.burn.cost_per_hour) }}/hr{% endif %}
+        {% if r.burn.tokens_per_hour %}
+          <div class="muted" style="font-size:12px">{{ '{:,.0f}'.format(r.burn.tokens_per_hour) }} tok/hr</div>
+        {% endif %}
+        {% if not r.burn.cost_per_hour and not r.burn.tokens_per_hour %}<span class="muted">idle</span>{% endif %}
+      </td>
+      <td class="mono nowrap">
+        {{ '{:,.1f}'.format(r.month_tokens / 1000000) }}M
+        {% if r.month_cost %}<div class="muted" style="font-size:12px">${{ '%.2f'|format(r.month_cost) }}</div>{% endif %}
+      </td>
+      <td class="mono nowrap">
+        {% if r.eff_cost is not none %}${{ '%.2f'|format(r.eff_cost) }}<span class="muted">/Mtok</span>
+        {% else %}<span class="muted">—</span>{% endif %}
+      </td>
+      <td>
+        {% set peak = (r.series | map(attribute='prompt_tokens') | sum) or 1 %}
+        <div class="spark">
+          {% for d in r.series %}
+            {% set t = d.prompt_tokens + d.completion_tokens %}
+            <i style="height:{{ [ (100 * t / (peak + 1)) | round | int, 100 ] | min }}%"></i>
+          {% endfor %}
+        </div>
+      </td>
+      <td class="nowrap">
+        {% for a in r.alerting %}<span class="tag bad">{{ a }}</span> {% endfor %}
+        {% if r.cooled %}
+          <button hx-post="/admin/plans/{{ r.plan.key }}/uncool" hx-target="#plans"
+                  hx-swap="none" class="tag">re-admit</button>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+</div>
