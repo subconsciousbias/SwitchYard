@@ -210,58 +210,116 @@ def test_models_on_one_plan_share_its_connection_limit():
     """`apex` and `judge` name different models of the same Claude Max plan.
 
     Whatever one lane consumes counts against the other, because the connection
-    limit belongs to the plan. Accounting per model instead would let two lanes
-    each open the plan's full allowance.
+    limit belongs to the plan. Accounting per model instead would let each lane
+    open the plan's full allowance.
+
+    Both lanes are confined to Claude Max here, so the assertion is about the
+    shared plan and not about which member the drain rule happens to promote.
     """
     from dataclasses import replace
 
     async def go():
         reg, slots, picker = build()
         plans = dict(reg.plans)
-
-        # Enable the heavy Claude model and stand the other apex members down, so
-        # this tests the shared plan rather than whichever member wins apex's
-        # ordering (the drain rule reshuffles that whenever an expiry changes).
         cm = plans["claude-max"]
         plans["claude-max"] = replace(cm, models={
             **cm.models, "fable": replace(cm.models["fable"], enabled=True)})
-        seat = plans["openai"]
-        plans["openai"] = replace(seat, models={
-            **seat.models, "astra": replace(seat.models["astra"], enabled=False)})
-        reg = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+
+        lanes = dict(reg.lanes)
+        lanes["apex"] = replace(lanes["apex"], order=["claude-max/fable"], tail=[])
+        lanes["judge"] = replace(lanes["judge"], order=["claude-max/opus"], tail=[])
+
+        reg = models.Registry(settings=reg.settings, plans=plans, lanes=lanes)
         picker = Picker(reg, slots)
+        cap = plans["claude-max"].max_parallel
+        assert cap == 2, cap
 
-        cap = first_plan_cap = plans["claude-max"].max_parallel
+        # apex takes one (fable caps itself at 1).
+        a = await picker.pick("apex", None)
+        assert a.ref == "claude-max/fable", a.ref
+        after_apex = await slots.in_flight("claude-max")
 
-        # Fill the plan through apex, which names claude-max/fable.
-        held = []
-        for _ in range(cap):
-            try:
-                pick = await picker.pick("apex", None)
-            except LaneSaturated:
-                break
-            assert pick.plan.key == "claude-max", pick.ref
-            held.append(pick)
-        # fable caps itself at 1, so apex reaches the plan's limit only if the
-        # plan's limit is 1; otherwise it fills what it can and apex saturates.
-        used = await slots.in_flight("claude-max")
+        # judge may take the plan's remaining slot, and no more.
+        b = await picker.pick("judge", None)
+        assert b.ref == "claude-max/opus", b.ref
+        full = await slots.in_flight("claude-max")
 
-        # judge names claude-max/opus first. Whatever apex consumed counts
-        # against the same plan, so judge may only use what is left.
-        second = await picker.pick("judge", None)
-        after = await slots.in_flight("claude-max")
-        assert after <= cap, (after, cap)
+        try:
+            await picker.pick("judge", None)
+            raise AssertionError("the plan's limit of 2 was exceeded across lanes")
+        except LaneSaturated as exc:
+            refusal = str(exc)
 
-        for pick in held:
-            await picker.release(pick.plan.key, pick.request_id, pick.ref)
+        await picker.release(a.plan.key, a.request_id, a.ref)
         freed = await slots.in_flight("claude-max")
-        return [p.ref for p in held], second.ref, used, after, freed, cap
+        return after_apex, full, refusal, freed, cap
 
-    taken, b, used, after, freed, cap = run(go())
-    assert after <= cap
-    print(f"  apex filled the plan with {', '.join(taken)} ({used}/{cap})")
-    print(f"  judge then got {b}, plan still {after}/{cap} — never above its limit")
-    print(f"  after releasing apex's slots the plan sat at {freed}")
+    after_apex, full, refusal, freed, cap = run(go())
+    assert after_apex == 1 and full == cap and freed == 1
+    assert "plan full at 2" in refusal, refusal
+    print(f"  apex took claude-max/fable -> plan {after_apex}/{cap}")
+    print(f"  judge took claude-max/opus -> plan {full}/{cap}, then refused: "
+          f"{refusal.split(': ', 1)[1]}")
+    print(f"  releasing apex's slot returned the plan to {freed}/{cap}")
+
+
+def test_plan_and_model_caps_are_separate_limits():
+    """Two counters, not one.
+
+    `local-box` allows 2 connections; each of its models allows 1. So one qwen
+    and one gemma may run together, a *second* qwen may not, and nothing more
+    may run at all. Enforcing the model's cap against the plan's counter — which
+    is what a single counter forces — would let only one request through in
+    total.
+    """
+    async def go():
+        reg, slots, picker = build()
+        box = reg.plans["local-box"]
+        assert box.max_parallel == 2
+        assert all(m.max_parallel == 1 for m in box.models.values())
+
+        first = await picker.pick("local", None)          # qwen
+        second = await picker.pick("local", None)         # qwen full -> gemma
+        assert first.ref != second.ref, (first.ref, second.ref)
+        assert {first.ref, second.ref} == {"local-box/qwen", "local-box/gemma"}
+
+        # The plan is now full, so nothing else fits — and the refusal names the
+        # plan's limit, because that is genuinely what bit.
+        try:
+            await picker.pick("local", None)
+            raise AssertionError("plan cap of 2 was exceeded")
+        except LaneSaturated as exc:
+            saturated = str(exc)
+        assert "plan full at 2" in saturated, saturated
+
+        # Free gemma: the plan now has room, but qwen is still at its own cap of
+        # 1. So the next pick must skip qwen *for a model reason* and take gemma.
+        gemma = first if first.ref.endswith("gemma") else second
+        await picker.release(gemma.plan.key, gemma.request_id, gemma.ref)
+        third = await picker.pick("local", None)
+        assert third.ref == gemma.ref, third.ref
+        return saturated, third
+
+    saturated, third = run(go())
+    skipped = ", ".join(third.considered)
+    assert "model full at 1" in skipped, skipped
+    print("  plan=2, models=1 each: qwen+gemma run together; a third is refused")
+    print(f"  plan full: {saturated.split(': ', 1)[1]}")
+    print(f"  with room on the plan but not the model: skipped {skipped}, "
+          f"took {third.ref}")
+
+
+def test_expiring_plans_are_drained_first():
+    """Cancelled capacity is promoted ahead of plans you keep paying for."""
+    reg = models.load()
+    order = reg.lane_members("judge")
+    window = reg.settings.drain_within_days
+    days = [reg.plan_of(m).days_left for m in order]
+    expiring = [i for i, d in enumerate(days) if d is not None and d <= window]
+    keeping = [i for i, d in enumerate(days) if d is None]
+    assert expiring, "expected some expiring plans in the judge lane"
+    assert min(expiring) < min(keeping), list(zip((m.ref for m in order), days))
+    print("  judge lane order:", " -> ".join(m.ref for m in order))
 
 
 def test_tool_calls_never_reach_a_cli_backed_plan():
@@ -296,18 +354,53 @@ def test_tool_calls_never_reach_a_cli_backed_plan():
     print(f"  a tool-using forge request landed on {picked}")
 
 
-def test_a_lane_with_no_tool_capable_plan_says_so():
-    """apex is entirely CLI-backed, so a tool-using apex request must fail
-    with an explanation rather than quietly losing the tools."""
+def test_a_lane_with_no_tool_capable_member_says_so():
+    """A lane whose every member is CLI-backed must refuse a tool-using request
+    with an explanation, rather than quietly losing the tool definitions.
+
+    Built here rather than read from the config: every lane now ends in a local
+    tail, which *is* tool-capable, so no real lane exhibits this any more. That is
+    a happy consequence of the local-tail rule — tool-using requests fall to
+    local instead of failing — but the refusal path still needs testing.
+    """
+    from dataclasses import replace
+
     async def go():
         reg, slots, picker = build()
-        assert not [p for p in await picker._members("apex", needs_tools=True)]
+        lanes = dict(reg.lanes)
+        # Strip apex's local tail, leaving only CLI-backed members.
+        lanes["apex"] = replace(lanes["apex"], tail=[])
+        reg = models.Registry(settings=reg.settings, plans=reg.plans, lanes=lanes)
+        picker = Picker(reg, slots)
+
+        members = await picker._members("apex")
+        assert members, "apex should still have its CLI-backed order"
+        assert not await picker._members("apex", needs_tools=True)
         try:
             await picker.pick("apex", None, needs_tools=True)
         except LaneSaturated as exc:
-            return str(exc)
+            return [m.ref for m in members], str(exc)
         raise AssertionError("expected apex to refuse a tool-using request")
-    print(f"  {run(go())}")
+
+    members, message = run(go())
+    print(f"  apex without its local tail is {members} — all CLI-backed")
+    print(f"  {message}")
+
+
+def test_every_lane_can_serve_tools_through_its_local_tail():
+    """The flip side: with the local tail in place, no lane hard-fails on tools."""
+    async def go():
+        reg, slots, picker = build()
+        out = {}
+        for lane in reg.lanes:
+            capable = [m.ref for m in await picker._members(lane, needs_tools=True)]
+            out[lane] = capable
+        return out
+    out = run(go())
+    for lane, capable in out.items():
+        assert capable, f"{lane} cannot serve tool calls at all"
+    print("  tool-capable members per lane: " + ", ".join(
+        f"{lane}={len(c)}" for lane, c in out.items()))
 
 
 if __name__ == "__main__":

@@ -179,10 +179,13 @@ plans:
         source: estimate
     notes: "Cancelled. Severely limited — drain whatever is left."
     models:
-      glm-4.7:
-        model: openai/glm-4.7
+      glm-5.3:
+        # Judgement-regular tier. Ids confirmed against the coding endpoint's
+        # catalogue: glm-4.5 … glm-5.3, glm-5.3-flash, glm-5.3-flashx.
+        model: openai/glm-5.3
         max_parallel: 2
       glm-5.3-flash:
+        # Workhorse tier.
         model: openai/glm-5.3-flash
         max_parallel: 2
 
@@ -389,6 +392,11 @@ plans:
 #
 # `tail` is last-resort capacity: it keeps a lane from hard-failing but never
 # carries normal traffic, and is excluded from the lane's advertised slots.
+#
+# A TAIL MUST BE LOCAL. Its whole job is to still be there when the paid capacity
+# has run out, so a subscription in the tail defeats the purpose — that is exactly
+# what will be exhausted at the moment the tail is needed. OpenRouter would work
+# too (it fails on money, not quota) but is deliberately not used for this.
 # ============================================================================
 lanes:
 
@@ -398,13 +406,13 @@ lanes:
       Escalations where Opus-class judgement was not enough. Note that both
       members ride plans whose other models serve `judge`, so the connection
       limits are shared — by design.
-    order: [openai/astra, claude-max/fable]
-    tail: [claude-max/opus]
+    order: [claude-max/fable, openai/astra]
+    tail: [local-box/qwen]
 
   judge:
     label: "Judgement — Regular"
     description: "The normal judgement tier. Most judgement tasks land here."
-    order: [claude-max/opus, openai/sol, grok/grok-4.6]
+    order: [claude-max/opus, openai/sol, glm/glm-5.3]
     tail: [local-box/qwen]
 
   forge:
@@ -414,7 +422,7 @@ lanes:
       - minimax-ultra/m3
       - minimax-max/m3
       - grok/grok-4.6
-      - glm/glm-4.7
+      - glm/glm-5.3-flash
       - opencode-go/glm-5.3-flash
       - openrouter/mimo
     tail: [local-box/qwen]
@@ -430,4 +438,5 @@ lanes:
     label: "Basic"
     description: "Mechanical work — summaries, extraction, commit messages."
     order: [local-box/gemma, local-box/qwen]
-    tail: [glm/glm-5.3-flash]
+    # Already all local, so a tail would add nothing.
+    tail: []

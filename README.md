@@ -82,16 +82,26 @@ the 20 its plans' limits sum to, because several members cap themselves lower.
 
 | Lane | Was | Ordered capacity | Tail |
 |---|---|---|---|
-| `apex` | Judgement — Heavy | `openai/astra` → `claude-max/fable`* → `anthropic-api/fable`* | `claude-max/opus` |
-| `judge` | Judgement — Regular | `claude-max/opus` → `openai/sol` → `grok/grok-4.6` | `local-box/qwen` |
-| `forge` | Coding Workhorse | Minimax Ultra → Minimax Max → Grok → GLM → OpenCode Go → OpenRouter | `local-box/qwen` |
+| `apex` | Judgement — Heavy | `claude-max/fable` → `openai/astra` | `local-box/qwen` |
+| `judge` | Judgement — Regular | `claude-max/opus` → `openai/sol` → `glm/glm-5.3` | `local-box/qwen` |
+| `forge` | Coding Workhorse | Minimax Ultra → Minimax Max → Grok → GLM Flash → OpenCode Go → OpenRouter | `local-box/qwen` |
 | `local` | Local Only | `local-box/qwen` → `local-box/gemma` | *(none, on purpose)* |
-| `bulk` | Basic | `local-box/gemma` → `local-box/qwen` | `minimax-max/m2` |
-
-\* Disabled until confirmed — see *No API key? Then apex is just Opus*.
+| `bulk` | Basic | `local-box/gemma` → `local-box/qwen` | *(none — already local)* |
 
 A **tail** member is last-resort capacity: it keeps a lane from hard-failing but
 never carries normal traffic, and is excluded from the lane's advertised slots.
+
+**A tail must be local.** Its entire job is to still be there once the paid
+capacity is exhausted, so a subscription in the tail is self-defeating — it is
+precisely what will have run out at the moment the tail is needed. A metered
+provider would also do (it fails on money, not quota), but local is preferred.
+`load()` rejects a subscription tail outright rather than letting it look fine
+until the day it matters.
+
+A happy side effect: because every tail is an API-keyed local model, **no lane
+hard-fails on tool calls any more**. A tool-using request that cannot use any
+CLI-backed member falls through to local instead of being refused.
+
 The `local` lane has no tail and no cloud members deliberately — when the box is
 busy you get a 429 and back off rather than silently spending money.
 

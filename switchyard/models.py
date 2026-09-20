@@ -435,4 +435,19 @@ def load(path: str | None = None) -> Registry:
                 raise ValueError(
                     f"lane {lane.key!r} references unknown model {ref!r}; "
                     f"known models: {sorted(known)}")
+
+    # A tail must survive the moment it is needed. Its entire job is to keep a
+    # lane alive once the paid capacity is exhausted, so a subscription in the
+    # tail is self-defeating: that is precisely what will have run out. Local
+    # models never run out, and a metered provider fails on money rather than
+    # quota, so both are admissible; a subscription is not.
+    for lane in lanes.values():
+        for ref in lane.tail:
+            plan = registry.plan_of(registry.models[ref])
+            if plan.is_subscription and not plan.metered:
+                raise ValueError(
+                    f"lane {lane.key!r} has {ref!r} in its tail, but plan "
+                    f"{plan.key!r} is a subscription. A tail exists for when the "
+                    "paid capacity is gone, so it must be a local or metered "
+                    "plan — otherwise it is exhausted exactly when needed.")
     return registry
