@@ -264,7 +264,7 @@ class SwitchyardHandler(CustomLogger):
             )
 
         if verdict.should_cool:
-            await self.slots.cool_down(plan.key, verdict.cooldown_seconds, verdict.outcome.value)
+            await self.slots.cool_down(plan.subscription, verdict.cooldown_seconds, verdict.outcome.value)
         if verdict.outcome in (Outcome.QUOTA_EXHAUSTED, Outcome.PLAN_DEAD, Outcome.AUTH) and ctx.get("session"):
             # Do not strand the session on dead capacity; let it re-lease.
             await self.slots.drop_lease(ctx["session"])
@@ -289,7 +289,8 @@ class SwitchyardHandler(CustomLogger):
             remaining = _as_float(headers.get((q.headers.get("remaining") or "").lower()))
             reset = _as_float(headers.get((q.headers.get("reset") or "").lower()))
             if remaining is not None or reset is not None:
-                await self.ledger.note_reported(plan_key, remaining, reset, window=q.label)
+                await self.ledger.note_reported(plan.subscription, remaining, reset,
+                                                window=q.label)
 
 
 def _payload_of(response_obj: Any) -> Any:

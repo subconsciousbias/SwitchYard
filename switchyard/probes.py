@@ -136,7 +136,7 @@ class Prober:
         if probe is None:
             return ProbeResult(False, "no probe configured for this plan")
 
-        cookie = await self._cookie(plan.key)
+        cookie = await self._cookie(plan.subscription)
         if probe.kind == "cookie" and not cookie:
             return ProbeResult(False, "no session cookie stored", needs_reauth=True)
 
@@ -148,7 +148,7 @@ class Prober:
             if probe.referer:
                 headers.setdefault("Referer", probe.referer)
 
-        await self.redis.hset(K_PROBE.format(plan=plan.key),
+        await self.redis.hset(K_PROBE.format(plan=plan.subscription),
                               mapping={"last_attempt_at": time.time()})
         try:
             async with httpx.AsyncClient(timeout=probe.timeout_seconds) as client:
@@ -183,9 +183,9 @@ class Prober:
                 False, raw=body[:1500])
 
         if record:
-            await self.ledger.note_reported(plan.key, remaining, reset_at,
+            await self.ledger.note_reported(plan.subscription, remaining, reset_at,
                                             window=probe.window or plan.quota.label)
-        await self.redis.hset(K_PROBE.format(plan=plan.key), mapping={
+        await self.redis.hset(K_PROBE.format(plan=plan.subscription), mapping={
             "last_ok_at": time.time(), "last_error": "", "needs_reauth": 0,
             "remaining": remaining, "total": total if total is not None else "",
         })
@@ -194,7 +194,7 @@ class Prober:
 
     async def _fail(self, plan: Plan, detail: str, needs_reauth: bool,
                     raw: str = "") -> ProbeResult:
-        await self.redis.hset(K_PROBE.format(plan=plan.key), mapping={
+        await self.redis.hset(K_PROBE.format(plan=plan.subscription), mapping={
             "last_error": detail, "needs_reauth": 1 if needs_reauth else 0,
         })
         log.warning("probe %s failed: %s", plan.key, detail)
@@ -204,7 +204,7 @@ class Prober:
         """Poll on the configured interval, and never against a dead cookie."""
         if plan.probe is None:
             return False
-        st = await self.status(plan.key)
+        st = await self.status(plan.subscription)
         if not st["has_cookie"] or st["needs_reauth"]:
             return False
         last = st["last_attempt_at"] or 0

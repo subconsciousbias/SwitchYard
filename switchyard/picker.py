@@ -39,6 +39,9 @@ class Picker:
         self.slots = slots
         self.policy = policy
 
+    # Slots, cooldowns and leases are keyed by *subscription*, not plan, so two
+    # model tiers on one Claude Max plan cannot open two connections between
+    # them. For most plans the subscription is the plan itself.
     async def _cap(self, plan: Plan) -> tuple[int, str]:
         """The cap to claim against: learned, then paced, else configured."""
         if self.policy is None:
@@ -69,7 +72,7 @@ class Picker:
             if held and held in by_key:
                 plan = by_key[held]
                 cap, reason = await self._cap(plan)
-                if cap > 0 and await self.slots.try_claim(plan.key, cap, rid) == 1:
+                if cap > 0 and await self.slots.try_claim(plan.subscription, cap, rid) == 1:
                     await self.slots.touch_lease(session, self.registry.settings.lease_ttl_seconds)
                     return Pick(lane, plan, rid, session, True, [], cap, reason)
                 # Its slots are full or it just got cooled down; fall through
@@ -87,7 +90,7 @@ class Picker:
                 # allowance is spent). Not an error, just no capacity.
                 skipped.append(f"{plan.key}(paced to 0)")
                 continue
-            result = await self.slots.try_claim(plan.key, cap, rid)
+            result = await self.slots.try_claim(plan.subscription, cap, rid)
             if result == 1:
                 if session:
                     await self.slots.set_lease(
@@ -97,13 +100,13 @@ class Picker:
             if result == 0 and self.policy is not None:
                 # Demand the cap refused. That is the signal the learner needs
                 # before it will probe the limit upward.
-                await self.policy.learner.note_pressure(plan.key)
+                await self.policy.learner.note_pressure(plan.subscription)
             skipped.append(f"{plan.key}({'cooled' if result == -1 else f'full at {cap}'})")
 
         raise LaneSaturated(lane, ", ".join(skipped))
 
     async def release(self, plan_key: str, request_id: str) -> None:
-        await self.slots.release(plan_key, request_id)
+        await self.slots.release(self.registry.subscription_of(plan_key), request_id)
 
     async def capacity(self, lane: str) -> dict:
         """Live picture of a lane, for the portal's capacity board."""
@@ -111,8 +114,8 @@ class Picker:
         total = live = used = 0
         tail_on = self.policy is None or await self.policy.tail_enabled()
         for plan in self.registry.lane_members(lane):
-            cooled, ttl, reason = await self.slots.cooldown_state(plan.key)
-            inflight = await self.slots.in_flight(plan.key)
+            cooled, ttl, reason = await self.slots.cooldown_state(plan.subscription)
+            inflight = await self.slots.in_flight(plan.subscription)
             tail = self.registry.is_tail(lane, plan.key)
             cap, cap_reason = await self._cap(plan)
             if tail and not tail_on:
@@ -130,6 +133,7 @@ class Picker:
                 "cooldown_reason": reason,
                 "tail": tail,
                 "days_left": plan.days_left,
+                "shares_with": [p.key for p in self.registry.siblings(plan)],
             })
             total += plan.max_parallel
             used += inflight

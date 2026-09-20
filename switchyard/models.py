@@ -69,6 +69,7 @@ class Plan:
     monthly_cost: float = 0.0
     auth: str = "api_key"
     provider_family: str | None = None   # drives vendor error-code mapping
+    subscription_key: str | None = None      # shared-state group; see `subscription`
     configured_parallel: int | None = None   # None when `max_parallel: auto`
     max_parallel_ceiling: int | None = None  # hard upper bound for learning
     pacing: bool | None = None               # per-plan override of the global switch
@@ -102,6 +103,23 @@ class Plan:
         if self.expires is None:
             return None
         return (self.expires - date.today()).days
+
+    @property
+    def subscription(self) -> str:
+        """The billable entity that owns the connection slots and the quota.
+
+        Usually the plan itself. But one subscription can expose several model
+        tiers — a Claude Max plan serving both a regular and a heavy model — and
+        those tiers share *one* connection limit and *one* quota. Declaring
+        `subscription: claude-max` on each makes them share slots, cooldowns,
+        usage accounting, learned concurrency and pacing, so two lanes cannot
+        between them open two connections against a one-connection plan.
+        """
+        return self.subscription_key or self.key
+
+    @property
+    def shares_subscription(self) -> bool:
+        return self.subscription_key is not None and self.subscription_key != self.key
 
     @property
     def is_subscription(self) -> bool:
@@ -173,6 +191,16 @@ class Registry:
     settings: Settings
     plans: dict[str, Plan]
     lanes: dict[str, Lane]
+
+    def subscription_of(self, plan_key: str) -> str:
+        """Shared-state key for a plan named by string."""
+        plan = self.plans.get(plan_key)
+        return plan.subscription if plan else plan_key
+
+    def siblings(self, plan: Plan) -> list[Plan]:
+        """Other plans sharing this subscription's slots and quota."""
+        return [p for p in self.plans.values()
+                if p.subscription == plan.subscription and p.key != plan.key]
 
     def plan_for_deployment(self, deployment: str) -> Plan | None:
         for p in self.plans.values():
@@ -285,6 +313,7 @@ def load(path: str | None = None) -> Registry:
             monthly_cost=float(body.get("monthly_cost", 0) or 0),
             auth=body.get("auth", "api_key"),
             provider_family=body.get("provider_family"),
+            subscription_key=body.get("subscription"),
             metered=bool(body.get("metered", False)),
             enabled=bool(body.get("enabled", True)),
             expires=_parse_date(body.get("expires")),

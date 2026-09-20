@@ -42,7 +42,7 @@ down and the lane moves on, so you can start with one.
 | `GLM_API_BASE` | **`https://api.z.ai/api/coding/paas/v4`** — a Coding Plan key is rejected by the general endpoint. |
 | `XAI_API_KEY` | console.x.ai → API Keys. Only if your Grok plan includes API credits; if it is a chat-only seat it needs a sidecar instead. |
 | `OPENROUTER_API_KEY` | openrouter.ai/keys. Set a spend limit on the key itself as a second line of defence. |
-| `ANTHROPIC_API_KEY` | console.anthropic.com → API keys. For the `apex` lane (Fable), metered. |
+| `ANTHROPIC_API_KEY` | **Not needed.** A Claude subscription does not grant API access, and the metered Fable plan ships disabled. Set this only if you deliberately add API credits. |
 | `OPENCODE_API_BASE`, `OPENCODE_API_KEY` | From your OpenCode Go account. Expires 2026-09-27 — skip if not worth it. |
 | `LOCAL_API_BASE` | Ollama: `http://host.docker.internal:11434/v1`. LM Studio: `...:1234/v1`. |
 | `CLAUDE_CONFIG_DIR` | `/Users/temporalis/.claude` — no API key; the sidecar uses your existing login. |
@@ -177,7 +177,35 @@ curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
 (the seat expires 2026-10-04, so it drains first), falling back to `grok` then
 `claude-max`.
 
-### 4e. `apex` — escalation only, metered
+### 4e. `apex` — escalation
+
+**First, find out whether you even have a tier above Opus.** A Max subscription
+gives no API access, so `apex` ships resolving to `claude-max` — the same model
+`judge` uses. Check what aliases your plan accepts:
+
+```bash
+docker compose exec claude-max-sidecar claude --model bogus 2>&1 | head -20
+docker compose exec claude-max-sidecar claude --help | grep -A3 -- --model
+```
+
+**Expect:** an error listing the valid aliases. If one of them is a heavier tier
+than `opus`, wire it up:
+
+1. set `CLAUDE_MODEL_ALLOW=<alias>` in `.env`;
+2. set `model: openai/<alias>` under `claude-max-heavy` in `deployments:`;
+3. set `enabled: true` on the `claude-max-heavy` plan;
+4. `docker compose up -d claude-max-sidecar && curl -X POST $PORTAL/admin/reload`.
+
+Verify the sidecar will actually run it:
+
+```bash
+docker compose exec claude-max-sidecar curl -s localhost:8081/health
+```
+
+**Expect:** `"models":["<alias>","opus"]`. If your alias is missing from that
+list, the sidecar will silently run `opus` instead — and log a warning saying so.
+
+Then test the lane:
 
 ```bash
 curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
@@ -187,8 +215,26 @@ curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
     "max_tokens":200}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
 ```
 
-**Expect:** a completion, and `lane=apex -> anthropic-fable` in the log. This one
-costs real money per call — one test is enough.
+**Expect:** a completion, and `lane=apex -> claude-max` in the log — or
+`-> claude-max-heavy` if you enabled the heavy tier above.
+
+Then confirm the shared connection is respected. With the heavy tier enabled,
+run an `apex` call and a `judge` call at the same time:
+
+```bash
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"apex","messages":[{"role":"user","content":"count to 300 slowly"}],"max_tokens":500}' >/dev/null &
+sleep 1
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"judge","messages":[{"role":"user","content":"say hi"}],"max_tokens":20}' >/dev/null
+wait
+docker compose logs --tail=10 gateway | grep -E 'lane=(apex|judge)'
+```
+
+**Expect:** the `judge` line shows `claude-max(full at 1)` among its skipped
+plans and picks a different provider. Both tiers share one connection because
+`claude-max-heavy` declares `subscription: claude-max` — if `judge` had also
+picked `claude-max`, the sharing is broken and that is a bug worth reporting.
 
 ### 4f. The Anthropic protocol (what Claude Code speaks)
 
@@ -343,8 +389,11 @@ them first if something misbehaves:
    surface as a 502 instead of cooling down. Worth one deliberate exhaustion
    test on each when convenient.
 4. **The OpenRouter Mimo 2.5 slug** — confirm at openrouter.ai/models.
-5. **Whether your Grok plan has API credits or is a chat seat.** If
+5. **Whether your Max plan exposes a model above Opus at all**, and under what
+   alias. Step 4e finds out. If it does not, `apex` and `judge` land on the same
+   model, which is the honest outcome rather than a misconfiguration.
+6. **Whether your Grok plan has API credits or is a chat seat.** If
    `XAI_API_KEY` calls 401, it is a seat and needs a sidecar like the others.
-6. **Real token allowances.** Everything works without them, but pacing stays
+7. **Real token allowances.** Everything works without them, but pacing stays
    idle and headroom stays estimated until either you set them or a plan hits a
    wall once and the observed-allowance learning records it.

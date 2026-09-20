@@ -103,7 +103,7 @@ class ConcurrencyLearner:
         new = max(floor, int(at_concurrency * cfg.decrease_factor))
         now = time.time()
         for bucket in {_bucket(self.settings), "global"}:
-            key = K_LEARN.format(plan=plan.key, bucket=bucket)
+            key = K_LEARN.format(plan=plan.subscription, bucket=bucket)
             current = _f((await self.redis.hget(key, "cap")), new)
             await self.redis.hset(key, mapping={
                 "cap": min(new, current) if current else new,
@@ -111,7 +111,7 @@ class ConcurrencyLearner:
                 "last_rejection_at": now,
             })
             await self.redis.hincrbyfloat(key, "rejections", 1)
-        await self.redis.delete(K_PRESSURE.format(plan=plan.key))
+        await self.redis.delete(K_PRESSURE.format(plan=plan.subscription))
         return new
 
     async def note_pressure(self, plan_key: str) -> None:
@@ -130,8 +130,8 @@ class ConcurrencyLearner:
             return max(1, seed), "configured"
 
         bucket = _bucket(self.settings)
-        local = await self._read(plan.key, bucket)
-        glob = await self._read(plan.key, "global")
+        local = await self._read(plan.subscription, bucket)
+        glob = await self._read(plan.subscription, "global")
 
         # Prefer this hour's learning once it has seen enough evidence.
         if local.get("samples", 0) >= cfg.min_samples and local.get("cap"):
@@ -147,15 +147,15 @@ class ConcurrencyLearner:
         # Probe upward: only with unmet demand, a quiet period since the last
         # rejection, and a gap since the last change.
         now = time.time()
-        pressure = _f(await self.redis.get(K_PRESSURE.format(plan=plan.key)))
+        pressure = _f(await self.redis.get(K_PRESSURE.format(plan=plan.subscription)))
         quiet = now - state.get("last_rejection_at", 0) > cfg.probe_cooldown_seconds
         settled = now - state.get("changed_at", 0) > cfg.probe_interval_seconds
         if pressure >= cfg.probe_pressure and quiet and settled and cap < ceiling:
             cap = min(ceiling, cap + cfg.increase_step)
-            key = K_LEARN.format(plan=plan.key, bucket=bucket)
+            key = K_LEARN.format(plan=plan.subscription, bucket=bucket)
             await self.redis.hset(key, mapping={"cap": cap, "changed_at": now})
             await self.redis.hincrbyfloat(key, "samples", 1)
-            await self.redis.delete(K_PRESSURE.format(plan=plan.key))
+            await self.redis.delete(K_PRESSURE.format(plan=plan.subscription))
             source += "+probe"
 
         return max(1, min(cap, ceiling)), source
@@ -171,7 +171,7 @@ class Pacer:
         """One slot delivered `units` in `seconds`: that is the per-slot rate."""
         if units <= 0 or seconds <= 0:
             return
-        key = K_PACE.format(plan=plan.key)
+        key = K_PACE.format(plan=plan.subscription)
         prior = _f(await self.redis.hget(key, "rate"))
         sample = units / seconds
         rate = sample if prior <= 0 else (EWMA_ALPHA * sample + (1 - EWMA_ALPHA) * prior)
@@ -180,7 +180,7 @@ class Pacer:
     async def _window(self, plan: Plan, q: Quota, now: datetime) -> dict:
         """Everything about one quota window: where we are, and the rate it allows."""
         used = await self.ledger.window_usage(plan, q, now)
-        facts = await self.ledger.window_facts(plan.key, q.label)
+        facts = await self.ledger.window_facts(plan.subscription, q.label)
         consumed = (used["cost"] if q.kind == "dollars"
                     else used["prompt_tokens"] + used["completion_tokens"])
 
@@ -238,7 +238,7 @@ class Pacer:
         now = now or datetime.now(timezone.utc)
         windows = [await self._window(plan, q, now) for q in plan.quotas]
         target = next((w for w in windows if w["role"] == "target"), windows[0])
-        rate_per_slot = _f(await self.redis.hget(K_PACE.format(plan=plan.key), "rate"))
+        rate_per_slot = _f(await self.redis.hget(K_PACE.format(plan=plan.subscription), "rate"))
 
         out = {
             "active": False, "reason": "", "windows": windows, "target": target,
@@ -310,7 +310,7 @@ class Pacer:
 
         # Smooth upward moves so one unusually fast request cannot open the
         # floodgates, but keep a floor so an open plan is always usable.
-        key = K_PACE.format(plan=plan.key)
+        key = K_PACE.format(plan=plan.subscription)
         prior = _f(await self.redis.hget(key, "slots"))
         smoothed = slots if prior <= 0 else EWMA_ALPHA * slots + (1 - EWMA_ALPHA) * prior
         await self.redis.hset(key, mapping={"slots": smoothed})

@@ -33,11 +33,14 @@ The model name you ask for is a **lane**, not a provider.
 
 | Lane | Was | Ordered capacity | Tail |
 |---|---|---|---|
-| `apex` | Judgement — Heavy | Fable 5.1 → Astra 6 | Claude Max |
+| `apex` | Judgement — Heavy | Claude Max heavy tier* → Fable 5.1 (metered)* → Astra 6* | Claude Max |
 | `judge` | Judgement — Regular | Claude Max → OpenAI → Grok | Qwen local |
 | `forge` | Coding Workhorse | Minimax Ultra → Minimax Max → Grok → GLM → OpenCode Go → OpenRouter | Qwen local |
 | `local` | Local Only | Qwen → Gemma | *(none, on purpose)* |
 | `bulk` | Basic | Gemma → Qwen | Minimax Max |
+
+\* All three are disabled out of the box — see *No API key? Then apex is just
+Opus* below. `apex` currently resolves to Claude Max.
 
 A **tail** plan is last-resort capacity: it keeps the lane from hard-failing but
 never carries normal traffic, and it is excluded from the lane's advertised slot
@@ -208,6 +211,51 @@ opening eight vendor dashboards.
 
 `GET /api/state` returns all of it as JSON for Paperclip. `POST /admin/reload`
 picks up `plans.yaml` edits without a restart.
+
+## No API key? Then apex is just Opus
+
+Worth stating plainly, because it is easy to paper over: **a Claude subscription
+does not grant API access.** `console.anthropic.com` keys are metered billing,
+separate from a Max plan. So Fable 5.1 via the API is only available if you
+choose to add API credits, and it ships `enabled: false`.
+
+That leaves two honest options for a tier above Opus:
+
+1. **A heavier alias on the subscription itself**, if your plan exposes one. The
+   `claude-max-heavy` plan is wired for exactly this — same sidecar, same
+   connection, different `--model`. Find the aliases your plan accepts with:
+
+   ```bash
+   docker compose exec claude-max-sidecar claude --model bogus 2>&1 | head
+   ```
+
+   Then set the alias in `deployments:`, add it to `CLAUDE_MODEL_ALLOW` in
+   `.env`, and flip `enabled: true`.
+
+2. **Accept that there is no tier above Opus** and let `apex` resolve to
+   `claude-max`, the same place `judge` lands. That is the current default. It
+   is not a broken lane — it means escalation gets the best model you have, and
+   the lane is there for the day you add one.
+
+The sidecar will not run an alias that is not in `MODEL_ALLOW`; it falls back to
+the default and logs loudly, because an `apex` escalation silently served by the
+`judge` model is the kind of bug you would never notice.
+
+### One subscription, several tiers, one connection
+
+`claude-max-heavy` declares `subscription: claude-max`. That makes the two plans
+share **one** set of connection slots, one quota, one cooldown, and one learned
+concurrency figure — so `apex` and `judge` cannot between them open two
+connections against a one-connection plan:
+
+```
+apex took claude-max-heavy; judge fell through to openai rather than
+double-booking; after release judge could reach the subscription again
+```
+
+Use `subscription:` for any plan that is really a second view of an existing one.
+Without it, each plan gets its own slot counter and you would quietly exceed the
+real limit.
 
 ## OAuth subscriptions (Claude Max and the OpenAI seat)
 

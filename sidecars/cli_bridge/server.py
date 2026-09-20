@@ -19,10 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
 import uuid
+
+log = logging.getLogger("cli_bridge")
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -67,6 +70,15 @@ PROFILE = PROFILES[PROVIDER]
 CLI = PROFILE["cli"]
 MODEL = PROFILE["model"]
 
+# Model aliases a request is allowed to ask for, beyond the default. One
+# subscription often exposes several tiers, and Switchyard keys them as separate
+# plans sharing one `subscription:` — so one process, one connection, two tiers.
+# Anything not listed falls back to MODEL rather than being passed through, so a
+# caller cannot make the CLI invoke an arbitrary model string.
+MODEL_ALLOW = {MODEL} | {
+    m.strip() for m in os.environ.get("MODEL_ALLOW", "").split(",") if m.strip()
+}
+
 _gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
 # The CLI reports exhaustion in prose; these are the shapes worth trusting.
@@ -107,9 +119,21 @@ def flatten(messages: list[dict]) -> tuple[str, str | None]:
     return "\n\n".join(turns), ("\n\n".join(system) or None)
 
 
-def build_argv(prompt: str, system: str | None) -> list[str]:
+def resolve_model(requested: str | None) -> tuple[str, str | None]:
+    """(model to run, warning). An unlisted request falls back to the default."""
+    if not requested or requested == MODEL:
+        return MODEL, None
+    if requested in MODEL_ALLOW:
+        return requested, None
+    return MODEL, (f"model {requested!r} is not in MODEL_ALLOW "
+                   f"({sorted(MODEL_ALLOW)}); ran {MODEL} instead")
+
+
+def build_argv(prompt: str, system: str | None, model: str | None = None) -> list[str]:
+    model = model or MODEL
+
     def fill(tpl: str) -> str:
-        return tpl.replace("{prompt}", prompt).replace("{model}", MODEL).replace(
+        return tpl.replace("{prompt}", prompt).replace("{model}", model).replace(
             "{system}", system or "")
 
     argv = [CLI] + [fill(a) for a in PROFILE["args"]]
@@ -163,8 +187,8 @@ def parse_output(stdout: str) -> dict:
     return {"result": stdout.strip()}
 
 
-async def run_cli(prompt: str, system: str | None) -> dict:
-    cmd = build_argv(prompt, system)
+async def run_cli(prompt: str, system: str | None, model: str | None = None) -> dict:
+    cmd = build_argv(prompt, system, model)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -240,13 +264,15 @@ def to_openai(payload: dict, model: str) -> dict:
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "provider": PROVIDER, "model": MODEL,
-            "concurrency": MAX_CONCURRENCY,
+            "models": sorted(MODEL_ALLOW), "concurrency": MAX_CONCURRENCY,
             "in_flight": MAX_CONCURRENCY - _gate._value}
 
 
 @app.get("/v1/models")
 async def models() -> dict:
-    return {"object": "list", "data": [{"id": MODEL, "object": "model", "owned_by": f"switchyard-{PROVIDER}"}]}
+    return {"object": "list",
+            "data": [{"id": m, "object": "model", "owned_by": f"switchyard-{PROVIDER}"}
+                     for m in sorted(MODEL_ALLOW)]}
 
 
 @app.post("/v1/chat/completions")
@@ -255,7 +281,11 @@ async def chat(request: Request):
     prompt, system = flatten(body.get("messages") or [])
     if not prompt:
         raise HTTPException(status_code=400, detail="no usable message content")
-    model = body.get("model") or MODEL
+    model, warning = resolve_model(body.get("model"))
+    if warning:
+        # Loud, because silently running a weaker model than the lane asked for
+        # would make an `apex` escalation quietly indistinguishable from `judge`.
+        log.warning("%s", warning)
 
     if _gate.locked() and _gate._value == 0:
         # Never queue: Switchyard needs to hear "full" immediately so it can
@@ -264,7 +294,7 @@ async def chat(request: Request):
                             headers={"Retry-After": "5"})
 
     async with _gate:
-        payload = await run_cli(prompt, system)
+        payload = await run_cli(prompt, system, model)
     result = to_openai(payload, model)
 
     if not body.get("stream"):

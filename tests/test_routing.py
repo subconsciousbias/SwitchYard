@@ -12,7 +12,7 @@ os.environ.setdefault("SWITCHYARD_PLANS", os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "plans.yaml"))
 
 from switchyard import models                      # noqa: E402
-from switchyard.picker import LaneSaturated, Picker  # noqa: E402
+from switchyard.picker import LaneSaturated, Picker  # noqa: F401  # noqa: E402
 from switchyard.slots import SlotTable             # noqa: E402
 from tests.fake_redis import FakeRedis             # noqa: E402
 
@@ -129,6 +129,44 @@ def test_expiring_plans_are_drained_first():
     assert expiring, "expected some expiring plans in the judge lane"
     assert order.index(reg.plans[expiring[0]]) < order.index(reg.plans[keeping[0]])
     print("  judge lane order:", " -> ".join(p.key for p in order))
+
+
+def test_one_subscription_cannot_be_used_twice_at_once():
+    """Two model tiers on one Claude Max plan share its single connection.
+
+    `apex` (heavy tier) and `judge` (regular tier) are different lanes pointing
+    at different deployments, but the same subscription. Without shared slot
+    accounting they would happily open two connections against a plan that
+    allows one.
+    """
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker = build()
+        heavy = replace(reg.plans["claude-max-heavy"], enabled=True)
+        plans = {**reg.plans, "claude-max-heavy": heavy}
+        reg = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+        picker = Picker(reg, slots)
+
+        assert heavy.subscription == reg.plans["claude-max"].subscription == "claude-max"
+
+        first = await picker.pick("apex", None)
+        assert first.plan.key == "claude-max-heavy", first.plan.key
+
+        # judge's turn: claude-max must now look full, so it walks past it.
+        second = await picker.pick("judge", None)
+        assert second.plan.key != "claude-max", "shared connection was double-booked"
+
+        # Once the heavy call finishes, the connection is free again.
+        await picker.release(first.plan.key, first.request_id)
+        third = await picker.pick("judge", None)
+        return first.plan.key, second.plan.key, third.plan.key, slots
+
+    a, b, c, slots = run(go())
+    inflight = run(slots.in_flight("claude-max"))
+    print(f"  apex took {a}; judge fell through to {b} rather than double-booking; "
+          f"after release judge could reach the subscription again (picked {c})")
+    assert inflight <= 1
 
 
 if __name__ == "__main__":

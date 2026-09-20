@@ -87,7 +87,9 @@ services:
       PROVIDER: claude
       SIDECAR_PORT: "8081"
       CLAUDE_MODEL: ${CLAUDE_MODEL:-opus}
-      SIDECAR_CONCURRENCY: "1"          # your one Claude connection
+      MODEL_ALLOW: ${CLAUDE_MODEL_ALLOW:-}
+      SIDECAR_CONCURRENCY: "1"          # your one Claude connection, shared by
+                                        # every tier on this subscription
       CLAUDE_CONFIG_DIR: /home/node/.claude
     volumes:
       - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude

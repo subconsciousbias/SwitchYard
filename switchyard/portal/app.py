@@ -115,11 +115,11 @@ async def collect_plans() -> list[dict]:
             d["prompt_tokens"] + d["completion_tokens"] for d in series if d["day"].startswith(month)
         )
         month_cost = sum(d["cost"] for d in series if d["day"].startswith(month))
-        cooled, ttl, reason = await slots.cooldown_state(plan.key)
-        in_flight = await slots.in_flight(plan.key)
-        facts = await ledger.quota_facts(plan.key)
+        cooled, ttl, reason = await slots.cooldown_state(plan.subscription)
+        in_flight = await slots.in_flight(plan.subscription)
+        facts = await ledger.quota_facts(plan.subscription)
         capacity = await policy.effective(plan)
-        probe = await state["prober"].status(plan.key) if plan.probe else None
+        probe = await state["prober"].status(plan.subscription) if plan.probe else None
         pace = await policy.pace_state(plan) if await policy.plan_is_paced(plan) else None
 
         alerting = []

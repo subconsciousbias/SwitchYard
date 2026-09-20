@@ -231,12 +231,50 @@ plans:
       Critical logic only. Heaviest non-Paperclip use is interactive, so the
       5-hour window is the one that bites; weekly is what we pace to fill.
 
+  # Requires metered API billing at console.anthropic.com — a Claude subscription
+  # does not grant API access. Disabled: enable only if you add API credits.
+  # The heavy tier of the Claude Max subscription, if your plan exposes one.
+  # `subscription: claude-max` is the important part: this shares the single
+  # connection, the quota windows, the cooldowns and the learned concurrency
+  # with `claude-max`, so `apex` and `judge` can never open two connections
+  # between them.
+  #
+  # Disabled until you confirm the alias your plan actually offers:
+  #   docker compose exec claude-max-sidecar claude --model bogus 2>&1 | head
+  # That prints the valid aliases. Set it in `deployments:` below, add it to
+  # MODEL_ALLOW in .env, then flip enabled: true.
+  claude-max-heavy:
+    label: "Claude Max — heavy tier"
+    deployment: sy.claude-max-heavy
+    subscription: claude-max
+    max_parallel: 1
+    max_parallel_ceiling: 1
+    monthly_cost: 0                   # billed as part of claude-max
+    auth: oauth_sidecar
+    enabled: false                    # flip on once the alias is confirmed
+    quotas:
+      - name: 5h
+        role: constraint
+        kind: tokens
+        period: rolling_5h
+        allowance: null
+        source: sidecar
+      - name: weekly
+        role: target
+        kind: tokens
+        period: week
+        allowance: null
+        source: sidecar
+    notes: >
+      Shares every limit with claude-max — same subscription, one connection.
+
   anthropic-fable:
-    label: "Fable 5.1 (Anthropic API)"
+    label: "Fable 5.1 (Anthropic API, metered)"
     deployment: sy.anthropic-fable
     max_parallel: 1
     monthly_cost: 0
     auth: api_key
+    enabled: false
     metered: true
     quota:
       kind: dollars
@@ -329,8 +367,12 @@ lanes:
 
   apex:
     label: "Judgement — Heavy"
-    description: "Escalations where Opus-class judgement was not enough."
-    order: [anthropic-fable, astra]
+    description: >
+      Escalations where Opus-class judgement was not enough. Note that without
+      metered API billing or a heavier alias on your subscription, there is no
+      tier above Opus available — apex then resolves to claude-max, the same
+      place judge lands, and that is worth knowing rather than pretending.
+    order: [claude-max-heavy, anthropic-fable, astra]
     tail: [claude-max]
 
   judge:
@@ -393,6 +435,14 @@ deployments:
 
   claude-max:
     model: openai/claude-opus-5           # served by the sidecar, OpenAI-shaped
+    api_base: http://claude-max-sidecar:8081/v1
+    api_key: sidecar
+
+  claude-max-heavy:
+    # Same sidecar, same connection. The model string after `openai/` is passed
+    # to `claude --model`, and the sidecar only honours it if it is listed in
+    # MODEL_ALLOW — otherwise it runs the default and logs loudly.
+    model: openai/fable                   # TODO: confirm the alias your plan offers
     api_base: http://claude-max-sidecar:8081/v1
     api_key: sidecar
 
