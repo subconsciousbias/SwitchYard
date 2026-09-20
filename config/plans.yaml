@@ -291,10 +291,8 @@ plans:
   # quota windows, cooldowns and expiry date — so apex and judge cannot between
   # them exceed the seat's 2 connections.
   #
-  # Disabled until you confirm the alias the Codex CLI accepts:
-  #   docker compose exec codex-sidecar codex --help | grep -A3 -- --model
-  # Put it in `deployments:` below, then flip enabled: true. The sidecar derives
-  # its model allowlist from this config, so no .env change is needed.
+  # gpt-6-astra, confirmed working on this seat. The sidecar derives its model
+  # allowlist from this config, so enabling a plan here is all it takes.
   astra:
     label: "Astra 6 (GPT 6, on the OpenAI seat)"
     deployment: sy.astra
@@ -304,7 +302,6 @@ plans:
     monthly_cost: 0
     auth: oauth_sidecar
     provider_family: openai
-    enabled: false                    # flip on once the alias is confirmed
     expires: "2026-10-04"             # dies with the seat
     quotas:
       - name: 5h
@@ -512,15 +509,30 @@ deployments:
     api_key: os.environ/ANTHROPIC_API_KEY
 
   astra:
-    # Same codex sidecar, same seat, different --model.
-    model: openai/gpt-6                   # TODO: confirm the alias codex accepts
+    # Same codex sidecar, same seat, different --model. Confirmed working:
+    # gpt-6-astra is what "Astra 6" refers to.
+    model: openai/gpt-6-astra
     api_base: http://codex-sidecar:8082/v1
     api_key: sidecar
 
   openai:
-    # Seat-based plan: the Codex CLI owns the OAuth login, the sidecar exposes
-    # it as HTTP. Concurrency is whatever the sidecar allows (2 here).
-    model: openai/gpt-5
+    # Seat-based plan: the Codex CLI owns the OAuth login, the sidecar exposes it
+    # as HTTP. Concurrency comes from this file, not the compose file.
+    #
+    # Verified working ids on a ChatGPT seat, in capability order — sol is the
+    # strongest, then terra, with luna the weakest (prompt overhead for a
+    # 5-token reply in brackets):
+    #   gpt-5.6-sol   [13293]  <- used here; judge is the regular judgement tier
+    #   gpt-5.6-terra [13293]
+    #   gpt-5.6-luna  [11728]
+    #   gpt-6-astra   [14154]  <- the apex tier, see the astra plan
+    # Note the scheme: gpt-5, gpt-5-codex and codex-1 are all rejected.
+    #
+    # Swap freely — no rebuild needed, the sidecar re-reads this file every 30s.
+    # If you want the seat's remaining quota to serve cheap work too, add a
+    # second plan on `subscription: openai` pointing at gpt-5.6-luna; it would
+    # share the seat's connections and quota automatically.
+    model: openai/gpt-5.6-sol
     api_base: http://codex-sidecar:8082/v1
     api_key: sidecar
 

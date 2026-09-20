@@ -129,13 +129,13 @@ PROFILES: dict[str, dict] = {
         "model": os.environ.get("CODEX_MODEL", "gpt-5"),
         # --skip-git-repo-check: the sidecar's working directory is not a git
         #   repo, and codex otherwise refuses with "Not inside a trusted directory".
-        # No --model: a ChatGPT-account seat rejects every explicit id with
-        #   "The '<id>' model is not supported when using Codex with a ChatGPT
-        #   account", so the CLI must pick. Add one back via CODEX_ARGS if your
-        #   account does support selection.
+        # --model: the ids follow a scheme I guessed wrong at first — not
+        #   gpt-5/gpt-5-codex but gpt-5.6-sol / -terra / -luna and gpt-6-astra.
+        #   An unknown id is rejected with "The '<id>' model is not supported when
+        #   using Codex with a ChatGPT account", so confirm before setting one.
         "args": os.environ.get(
             "CODEX_ARGS",
-            "exec --json --skip-git-repo-check {prompt}").split(),
+            "exec --json --skip-git-repo-check --model {model} {prompt}").split(),
         "system_args": [],
         "parser": "codex_jsonl",
         "default_retry_after": 3600,
