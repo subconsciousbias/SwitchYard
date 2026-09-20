@@ -115,6 +115,21 @@ Or log in for real if you also pull private images from GHCR:
 echo "<PAT>" | docker login ghcr.io -u <your-github-username> --password-stdin
 ```
 
+**If a build fails with `no space left on device`**, that is the Docker VM's disk,
+not your Mac's. Check and reclaim:
+
+```bash
+docker system df                 # what is using it, and what is reclaimable
+docker builder prune -f          # build cache only — always safe, just rebuilds slower
+docker image prune -f            # dangling (untagged) images only — safe
+```
+
+Those two are non-destructive to anything you are running. `docker image prune -a`
+removes every image not backing a running container, which will hit your other
+projects — only reach for it if the safe prunes are not enough. The whole
+Switchyard stack needs roughly 3GB: about 1.7GB for the gateway, 790MB for the
+one shared sidecar image and 280MB for the portal.
+
 **Expect:** `redis`, `postgres`, `gateway`, `portal`, `claude-max-sidecar`,
 `codex-sidecar` all `running`, with redis/postgres `healthy`.
 

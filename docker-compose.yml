@@ -52,8 +52,10 @@ services:
     <<: *common
     ports: ["${GATEWAY_PORT:-4000}:4000"]
     volumes:
-      - ./config:/app/config:ro
+      # /switchyard, not /app: /app is LiteLLM's own application directory.
+      - ./config:/switchyard/config:ro
     environment:
+      SWITCHYARD_PLANS: /switchyard/config/plans.yaml
       SWITCHYARD_REDIS_URL: redis://redis:6379/1
       REDIS_HOST: redis
       REDIS_PORT: "6379"
@@ -89,8 +91,14 @@ services:
   # service just exposes it as HTTP on the internal network. Log in once with
   # `docker compose exec claude-max-sidecar claude login`, or mount a host
   # ~/.claude that is already logged in.
+  # The four sidecars are the SAME image; only their environment differs. Only
+  # this service declares `build`, and the rest reference the tag it produces —
+  # otherwise compose builds the identical image four times and writes four tags,
+  # which wastes build time and (with concurrent exports) can fail with
+  # "image already exists".
   claude-max-sidecar:
     build: {context: ., dockerfile: Dockerfile.sidecar}
+    image: switchyard-sidecar:latest
     <<: *common
     expose: ["8081"]
     # Concurrency and model aliases come from config/plans.yaml — the plans
@@ -118,7 +126,7 @@ services:
       start_period: 20s
 
   codex-sidecar:
-    build: {context: ., dockerfile: Dockerfile.sidecar}
+    image: switchyard-sidecar:latest     # built by claude-max-sidecar
     <<: *common
     expose: ["8082"]
     # Serves both the `openai` seat (gpt-5) and `astra` (GPT 6) — one seat, one
@@ -147,7 +155,7 @@ services:
   # Log in with: docker compose exec grok-sidecar opencode auth login
   # Expires 2026-10-09 — delete this service and the plan then.
   grok-sidecar:
-    build: {context: ., dockerfile: Dockerfile.sidecar}
+    image: switchyard-sidecar:latest     # built by claude-max-sidecar
     <<: *common
     expose: ["8083"]
     environment:
@@ -172,7 +180,7 @@ services:
   # gates independent.
   # Expires 2026-09-27 — delete this service and the plan then.
   opencode-go-sidecar:
-    build: {context: ., dockerfile: Dockerfile.sidecar}
+    image: switchyard-sidecar:latest     # built by claude-max-sidecar
     <<: *common
     expose: ["8084"]
     environment:

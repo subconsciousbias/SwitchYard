@@ -1,16 +1,43 @@
-# LiteLLM proxy + the Switchyard plugin. The generated LiteLLM config is built
-# at container start from config/plans.yaml, so there is one file to edit.
+# LiteLLM proxy + the Switchyard plugin. The generated LiteLLM config is built at
+# container start from config/plans.yaml, so there is one file to edit.
+#
+# This image is venv-based (/app/.venv) and ships NO pip — `pip install` here
+# fails with "pip: not found". It does not need one: every dependency Switchyard
+# uses (pyyaml, redis, fastapi, httpx, jinja2) is already in that venv, because
+# LiteLLM itself depends on them. The RUN below asserts that rather than assuming
+# it, so a base-image change fails the build with a clear message instead of an
+# ImportError at request time.
+#
+# Switchyard lives in /switchyard, not /app: /app is the image's own application
+# directory and copying into it risks clobbering LiteLLM's files.
 FROM ghcr.io/berriai/litellm:main-stable
 
-WORKDIR /app
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN python3 - <<'PY'
+import importlib, sys
+required = {"yaml": "pyyaml", "redis": "redis", "fastapi": "fastapi",
+            "litellm": "litellm"}
+missing = []
+for module, package in required.items():
+    try:
+        importlib.import_module(module)
+    except ImportError:
+        missing.append(package)
+if missing:
+    sys.exit(
+        "Switchyard needs these packages, and this base image no longer ships "
+        f"them: {', '.join(missing)}. The image has no pip, so either pin a base "
+        "image that includes them or add a build stage that vendors them into "
+        "/app/.venv/lib/python3.*/site-packages."
+    )
+print("switchyard: base image provides every required package")
+PY
 
-COPY switchyard /app/switchyard
-COPY docker/gateway-entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY switchyard /switchyard/switchyard
+COPY docker/gateway-entrypoint.sh /switchyard/entrypoint.sh
+RUN chmod +x /switchyard/entrypoint.sh
 
-ENV PYTHONPATH=/app
-ENV SWITCHYARD_PLANS=/app/config/plans.yaml
+ENV PYTHONPATH=/switchyard
+ENV SWITCHYARD_PLANS=/switchyard/config/plans.yaml
+WORKDIR /switchyard
 EXPOSE 4000
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/switchyard/entrypoint.sh"]
