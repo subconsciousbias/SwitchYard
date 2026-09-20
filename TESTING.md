@@ -51,7 +51,7 @@ down and the lane moves on, so you can start with one.
 | `MINIMAX_ULTRA_API_KEY`, `MINIMAX_MAX_API_KEY` | platform.minimax.io → API Keys. **Use a separate key per plan** so the two plans' quotas stay distinguishable. |
 | `MINIMAX_*_API_BASE` | `https://api.minimax.io/v1` (or the `api.minimaxi.com` host if that is what your account shows). |
 | `GLM_API_KEY` | z.ai → API keys. |
-| `GLM_API_BASE` | **`https://api.z.ai/api/coding/paas/v4`** — a Coding Plan key is rejected by the general endpoint. |
+| `GLM_API_BASE` | **`https://api.z.ai/api/coding/paas/v4`** — a Coding Plan key works only on the coding endpoint. See the warning below; getting this wrong looks exactly like an exhausted plan. |
 | ~~`XAI_API_KEY`~~ | **Not needed.** Your SuperGrok subscription is OAuth and runs through OpenCode; metered `api.x.ai` credits are separate billing. |
 | `OPENROUTER_API_KEY` | openrouter.ai/keys. Set a spend limit on the key itself as a second line of defence. |
 | `ANTHROPIC_API_KEY` | **Not needed.** A Claude subscription does not grant API access, and the metered Fable plan ships disabled. Set this only if you deliberately add API credits. |
@@ -574,6 +574,36 @@ warm.
 Then move `judge`, then the rest.
 
 ---
+
+## A trap worth knowing: GLM's base URL
+
+Verified by direct call with a Coding Plan key:
+
+| Endpoint | Result |
+|---|---|
+| `https://api.z.ai/api/coding/paas/v4` | **200**, real completion |
+| `https://api.z.ai/api/paas/v4` | 429, code 1113 "Insufficient balance or no resource package" |
+| `https://open.bigmodel.cn/api/paas/v4` | 429, code 1113 (same, in Chinese) |
+
+So a wrong base URL returns **exactly the signal that means "this plan is
+spent"**. Switchyard will correctly classify code 1113 as quota exhaustion and
+cool GLM down for 15 minutes, then do it again on the next attempt — a perfectly
+reasoned conclusion from a false premise. **If GLM reports quota exhaustion
+immediately, check the URL before believing it.**
+
+(`open.bigmodel.cn` is the mainland-China BigModel host, which is a separate
+account system from z.ai — not merely a different region of the same one.)
+
+Two related notes:
+
+- **GLM 4.6 is a reasoning model.** At `max_tokens: 8` it returned
+  `finish_reason: length`, empty `content`, and its text in `reasoning_content` —
+  the whole budget went on reasoning. The local Qwen behaves the same way. Give
+  these plans generous `max_tokens` when smoke-testing, or you will think they
+  are broken.
+- This also confirms the researched Z.AI error mapping against a live response:
+  business code 1113 really does arrive wrapped in an HTTP 429, which is why the
+  classifier reads the body rather than trusting the status.
 
 ## What I could not verify, and what to watch
 
