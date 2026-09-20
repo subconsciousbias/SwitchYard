@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "switchyard": {
+      "description": "Plain completion relay for Switchyard",
+      "mode": "primary",
+      "prompt": "Answer the user directly and concisely. Do not describe your process.",
+      "tools": {
+        "bash": false, "edit": false, "write": false, "read": false,
+        "grep": false, "glob": false, "list": false, "patch": false,
+        "todowrite": false, "todoread": false, "webfetch": false,
+        "websearch": false, "task": false, "multiedit": false
+      }
+    }
+  }
+}

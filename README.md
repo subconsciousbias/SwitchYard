@@ -398,6 +398,36 @@ Concurrency is N CLI **subprocesses inside one container**, not N containers. So
   what makes "refuse immediately when full" possible, so Switchyard can spill to
   the next plan instead of holding a worker open.
 
+### Keeping the CLI's own prompt small
+
+This matters more than it looks: high-volume work goes to subscriptions, and a CLI
+harness injects its own system prompt and tool schema into *every* call. Left
+alone that is thousands of tokens of your quota per request, spent on instructions
+you did not write.
+
+Each CLI offers a different lever, all now applied:
+
+| CLI | Mechanism | Prompt tokens, trivial call |
+|---|---|---|
+| `claude -p` | `--system-prompt` (true replace), `--disallowed-tools`, `--exclude-dynamic-system-prompt-sections` | **2** |
+| `opencode run` | `--agent switchyard` — a custom agent (`harness/opencode.json`) with a one-line prompt and every tool disabled | 7,239 → **575** |
+| `codex exec` | `-c model_instructions_file=<path>` replaces the compiled-in base instructions | 14,255 → **9,768** |
+
+Measured through the bridge, not inferred. OpenCode's 92% cut is the important
+one, since Grok and OpenCode Go are the CLI-backed workhorses.
+
+Codex is the stubborn case. `model_instructions_file` is the key that works;
+`experimental_instructions_file` barely moves it (14,154), and
+`include_plan_tool=false`, `include_apply_patch_tool=false` and
+`tools.web_search=false` had **no effect at all**. The residual ~9,800 is codex's
+own tool schema. Worth revisiting if that seat outlives its 2026-10-04 expiry.
+
+**On system prompts specifically**, all three now take the caller's prompt as an
+override rather than a layer: Claude via `--system-prompt`, Codex via a temp
+`model_instructions_file` written per request, and OpenCode — which has no
+override mechanism — by folding it into the prompt on top of a deliberately
+minimal agent prompt. That last one is a real inconsistency, not a solved problem.
+
 **`max_tokens` is not enforced on these lanes.** No CLI has a token cap — Claude
 Code offers `--max-turns`, not a token limit — so a caller's `max_tokens` is
 converted into a prompt instruction ("answer in at most roughly N words"). That

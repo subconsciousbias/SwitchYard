@@ -52,10 +52,12 @@ a transient blip and the lane would keep feeding requests to dead capacity.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -117,10 +119,16 @@ PROFILES: dict[str, dict] = {
     # and it serves OpenCode Zen plans the same way.
     "opencode": {
         "cli": os.environ.get("OPENCODE_CLI", "opencode"),
-        "model": os.environ.get("OPENCODE_MODEL", "xai/grok-4"),
+        "model": os.environ.get("OPENCODE_MODEL", "xai/grok-4.6"),
+        # --agent switchyard selects the minimal agent in harness/opencode.json:
+        # a one-line prompt with every tool disabled. Measured on a trivial call,
+        # that takes the prompt from 7,239 tokens to 575 — a 92% cut, and the
+        # difference between a subscription being usable for volume and not.
+        # (`--pure` changes nothing here; there are no plugins installed.)
         "args": os.environ.get(
-            "OPENCODE_ARGS", "run --model {model} --format json {prompt}").split(),
-        "system_args": [],
+            "OPENCODE_ARGS",
+            "run --model {model} --format json --agent switchyard {prompt}").split(),
+        "system_args": [],     # no --system flag exists; see fold_system
         "parser": "events_json",
         "default_retry_after": 3600,
     },
@@ -136,9 +144,19 @@ PROFILES: dict[str, dict] = {
         #   gpt-5/gpt-5-codex but gpt-5.6-sol / -terra / -luna and gpt-6-astra.
         #   An unknown id is rejected with "The '<id>' model is not supported when
         #   using Codex with a ChatGPT account", so confirm before setting one.
+        # model_instructions_file replaces the compiled-in base instructions.
+        #   Measured: 14,255 -> 10,015 tokens on a trivial call. The residue is
+        #   codex's own tool schema; include_plan_tool / include_apply_patch_tool /
+        #   tools.web_search all had no effect, and experimental_instructions_file
+        #   barely moved it (14,154), so this is the key that works.
         "args": os.environ.get(
             "CODEX_ARGS",
             "exec --json --skip-git-repo-check --model {model} {prompt}").split(),
+        # Written per request from the caller's system prompt, which makes this a
+        # real override rather than an append — the same contract as Claude's
+        # --system-prompt.
+        "instructions_arg": "-c model_instructions_file={path}",
+        "instructions_default": "/app/harness/codex-instructions.md",
         "system_args": [],
         "parser": "codex_jsonl",
         "default_retry_after": 3600,
@@ -548,9 +566,49 @@ def fold_max_tokens(system: str | None, max_tokens: int | None) -> str | None:
     return f"{system}\n\n{hint}" if system else hint
 
 
+@contextlib.contextmanager
+def instructions_file(system: str | None):
+    """Yield the argv fragment that overrides this CLI's base instructions.
+
+    Codex takes its system prompt as a *file path* in config rather than a flag,
+    so the caller's prompt is written to a temp file per request. That makes it a
+    real replacement of the built-in instructions — the same contract as Claude's
+    --system-prompt — instead of yet another layer stacked on top.
+
+    Yields ([], system) for CLIs with no such mechanism, leaving the caller's
+    text to be folded into the prompt instead.
+    """
+    template = PROFILE.get("instructions_arg")
+    if not template:
+        yield [], system
+        return
+
+    path = PROFILE.get("instructions_default")
+    tmp = None
+    if system:
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+        tmp.write(system if system.endswith("\n") else system + "\n")
+        tmp.close()
+        path = tmp.name
+    try:
+        # The template is one token like `-c key={path}`; split so the value is
+        # passed as a single argv element even when the path contains spaces.
+        parts = [p.replace("{path}", path) for p in template.split(" ")]
+        yield parts, None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+
 def fold_system(prompt: str, system: str | None) -> tuple[str, str | None]:
     """When a CLI has no system-prompt flag, put the caller's instructions at
     the top of the prompt rather than discarding them silently."""
+    if PROFILE.get("instructions_arg"):
+        # Handled by instructions_file(), which overrides rather than appends.
+        return prompt, system
     key = ("system_args_replace" if SYSTEM_MODE == "replace"
            and PROFILE.get("system_args_replace") else "system_args")
     if system and not PROFILE.get(key):
@@ -560,7 +618,13 @@ def fold_system(prompt: str, system: str | None) -> tuple[str, str | None]:
 
 async def run_cli(prompt: str, system: str | None, model: str | None = None) -> dict:
     prompt, system = fold_system(prompt, system)
-    cmd = build_argv(prompt, system, model)
+    with instructions_file(system) as (extra_args, system):
+        return await _run_cli(prompt, system, model, extra_args)
+
+
+async def _run_cli(prompt: str, system: str | None, model: str | None,
+                   extra_args: list) -> dict:
+    cmd = build_argv(prompt, system, model) + list(extra_args)
 
     # stdin must be closed explicitly: codex reads "additional input from stdin"
     # and would block forever on an inherited descriptor that never closes.

@@ -15,6 +15,13 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
 
 WORKDIR /app
 COPY sidecars/cli_bridge/server.py /app/server.py
+# Minimal harness configs. opencode.json is read as the project config from the
+# working directory and defines the `switchyard` agent (one-line prompt, every
+# tool disabled); codex-instructions.md is the default base-instruction override.
+# Together these are what makes a subscription viable for volume: they cut the
+# CLI's own prompt from thousands of tokens per call to hundreds.
+COPY sidecars/cli_bridge/harness /app/harness
+RUN cp /app/harness/opencode.json /app/opencode.json
 RUN pip install --no-cache-dir --break-system-packages \
       fastapi "uvicorn[standard]" pyyaml
 

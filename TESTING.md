@@ -233,6 +233,24 @@ OpenCode sidecar (`xAI oauth`, `OpenCode Go api`). `0 credentials` means the log
 `$HOME` inside the container matches where the credential directory is mounted
 (`docker compose exec grok-sidecar sh -c 'echo $HOME; opencode auth list'`).
 
+You can also check the harness overhead, which is quota you spend on the CLI's own
+prompt rather than your work:
+
+```bash
+docker compose exec -T grok-sidecar sh -c \
+  'opencode run --model xai/grok-4.6 --format json --agent switchyard "Say OK"' \
+  | python3 -c 'import json,sys
+for l in sys.stdin:
+    e=json.loads(l) if l.strip().startswith("{") else {}
+    t=(e.get("part") or {}).get("tokens")
+    if t: print("input tokens:", t["input"])'
+```
+
+**Expect roughly 600.** Without `--agent switchyard` it is about 7,200 — the
+agent's minimal prompt and disabled tools are what make a subscription viable for
+volume. Claude sits at 2; codex at ~9,800, which is its own tool schema and has
+resisted every config key tried.
+
 **This is the check that matters most.** `concurrency` comes from
 `config/plans.yaml`, not from the compose file — if it does not match the
 `max_parallel` you set, the sidecar could not read the config and is falling back
