@@ -10,8 +10,10 @@
       <div class="mono nowrap">
         <span class="big">{{ lane.slots_in_use }}</span
         ><span class="muted">/{{ lane.slots_available_now }}</span>
-        {% if lane.slots_configured != lane.slots_available_now %}
-          <span class="tag bad" title="capacity removed by cooldowns or tail-only plans">
+        {% if lane.tail_only %}
+          <span class="tag warn" title="only the emergency tail is live in this lane">tail only</span>
+        {% elif lane.slots_configured != lane.slots_available_now %}
+          <span class="tag bad" title="capacity removed by cooldowns, sharing, or the tail">
             {{ lane.slots_configured - lane.slots_available_now }} gone</span>
         {% endif %}
       </div>

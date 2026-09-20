@@ -110,7 +110,7 @@ async def collect_plans() -> list[dict]:
     for plan in reg.plans.values():
         hr = await headroom(ledger, plan)
         burn = await ledger.burn_rate(plan)
-        series = await ledger.daily_series(plan.key, days=31)
+        series = await ledger.daily_series(plan.subscription, days=31)
         month_tokens = sum(
             d["prompt_tokens"] + d["completion_tokens"] for d in series if d["day"].startswith(month)
         )
@@ -174,6 +174,9 @@ async def collect_plans() -> list[dict]:
             "pace": pace,
             "probe": probe,
             "windows": windows_remaining(plan.quota.period, plan.expires),
+            # Usage is booked per subscription, so these numbers are shared with
+            # any sibling plan. Naming them stops the board looking double-counted.
+            "shares_usage_with": [p.key for p in reg.siblings(plan)],
         })
     return rows
 

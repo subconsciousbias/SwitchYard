@@ -122,6 +122,12 @@ class Picker:
         rows = []
         total = live = used = 0
         tail_on = self.policy is None or await self.policy.tail_enabled()
+        # Slots belong to a subscription, so two plans sharing one must be
+        # counted once. Summing per plan overstated shared capacity.
+        counted_live: set[str] = set()
+        counted_total: set[str] = set()
+        counted_used: set[str] = set()
+        live_members = 0
         for plan in self.registry.lane_members(lane):
             cooled, ttl, reason = await self.slots.cooldown_state(plan.subscription)
             inflight = await self.slots.in_flight(plan.subscription)
@@ -144,17 +150,29 @@ class Picker:
                 "days_left": plan.days_left,
                 "shares_with": [p.key for p in self.registry.siblings(plan)],
             })
-            total += plan.max_parallel
-            used += inflight
+            sub = plan.subscription
+            if sub not in counted_total:
+                counted_total.add(sub)
+                total += plan.max_parallel
+            if sub not in counted_used:
+                counted_used.add(sub)
+                used += inflight
             # The headline number is capacity you can actually rely on now:
             # effective caps, excluding cooled plans and the emergency tail.
             if not cooled and not tail:
-                live += cap
+                live_members += 1
+                if sub not in counted_live:
+                    counted_live.add(sub)
+                    live += cap
         return {
             "lane": lane,
             "label": self.registry.lanes[lane].label,
             "slots_configured": total,
             "slots_available_now": live,   # excludes cooled plans and the tail
             "slots_in_use": used,
+            # BUG 2 was showing apex as 0/0: its only live plan is the emergency
+            # tail, which is excluded from the headline. Say so rather than
+            # implying the lane has no capacity at all.
+            "tail_only": live_members == 0 and bool(rows),
             "plans": rows,
         }

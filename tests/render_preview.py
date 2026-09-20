@@ -51,7 +51,8 @@ def fixture(reg):
                       "slots_configured": sum(x["cap_configured"] for x in plans),
                       "slots_available_now": sum(x["cap"] for x in plans
                                                  if not x["cooled"] and not x["tail"]),
-                      "slots_in_use": sum(x["in_flight"] for x in plans), "plans": plans})
+                      "slots_in_use": sum(x["in_flight"] for x in plans),
+                      "tail_only": False, "plans": plans})
 
     rows = []
     for p in reg.plans.values():
@@ -86,6 +87,7 @@ def fixture(reg):
                       "remaining_seconds": 8e4, "consumed_frac": 0.3,
                       "projected_end_frac": 0.7} if p.is_subscription else None),
             "windows": windows_remaining(p.quota.period, p.expires),
+            "shares_usage_with": [s.key for s in reg.siblings(p)],
         })
 
     capacity = {"lanes": lanes, "total_available": sum(l["slots_available_now"] for l in lanes),

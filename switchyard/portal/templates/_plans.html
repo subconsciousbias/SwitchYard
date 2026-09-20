@@ -16,6 +16,10 @@
           {% if r.plan.monthly_cost %}${{ '%.0f'|format(r.plan.monthly_cost) }}/mo{% else %}metered{% endif %}
           · {{ r.lanes|join(', ') }}
           {% if r.plan.auth == 'oauth_sidecar' %}· <span title="OAuth subscription via sidecar">sidecar</span>{% endif %}
+          {% if r.shares_usage_with %}
+            · <span title="one subscription: slots, quota and usage are shared">shares with
+              {{ r.shares_usage_with|join(', ') }}</span>
+          {% endif %}
         </div>
       </td>
       <td style="min-width:190px">
