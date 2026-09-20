@@ -30,15 +30,20 @@ def build(plans_path: str) -> dict:
         # real gate, but if a caller names a deployment directly (bypassing
         # the lane) we still refuse to exceed the plan's connection limit.
         params["max_parallel_requests"] = plan.max_parallel
+        info = {
+            "switchyard_plan": key,
+            "monthly_cost": plan.monthly_cost,
+            "expires": str(plan.expires) if plan.expires else None,
+            "auth": plan.auth,
+            "subscription": plan.subscription,
+            "supports_tools": plan.can_use_tools,
+        }
+        if plan.context_window:
+            info["max_input_tokens"] = plan.context_window
         model_list.append({
             "model_name": plan.deployment,
             "litellm_params": params,
-            "model_info": {
-                "switchyard_plan": key,
-                "monthly_cost": plan.monthly_cost,
-                "expires": str(plan.expires) if plan.expires else None,
-                "auth": plan.auth,
-            },
+            "model_info": info,
         })
 
     # Lane aliases exist so that /v1/models advertises the lanes and virtual
@@ -69,6 +74,30 @@ def build(plans_path: str) -> dict:
         if members:
             fallbacks.append({lane_key: [p.deployment for p in members]})
 
+    # Context-window fallbacks: when a prompt is too big for the plan we picked,
+    # hand it to the largest-context plan we have rather than failing. Only plans
+    # that declare `context_window` take part, so an unknown window never
+    # silently becomes a wrong routing decision.
+    sized = sorted((p for p in reg.plans.values() if p.enabled and not p.expired
+                    and p.context_window),
+                   key=lambda p: p.context_window, reverse=True)
+    context_fallbacks: list[dict[str, list[str]]] = []
+    for plan in reg.plans.values():
+        if not plan.enabled or plan.expired or not plan.context_window:
+            continue
+        bigger = [p.deployment for p in sized
+                  if p.key != plan.key and p.context_window > plan.context_window][:2]
+        if bigger:
+            context_fallbacks.append({plan.deployment: bigger})
+    for lane_key in reg.lanes:
+        members = reg.lane_members(lane_key)
+        if not members or not members[0].context_window:
+            continue
+        bigger = [p.deployment for p in sized
+                  if p.context_window > members[0].context_window][:2]
+        if bigger:
+            context_fallbacks.append({lane_key: bigger})
+
     return {
         "model_list": model_list,
         "litellm_settings": {
@@ -81,6 +110,7 @@ def build(plans_path: str) -> dict:
             "enable_pre_call_checks": True,
             "routing_strategy": "simple-shuffle",
             "fallbacks": fallbacks,
+            "context_window_fallbacks": context_fallbacks,
             "allowed_fails": 1,
             "cooldown_time": 60,   # short: the real cooldowns live in Redis
             "redis_host": "os.environ/REDIS_HOST",

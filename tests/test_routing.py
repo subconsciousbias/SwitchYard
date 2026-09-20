@@ -112,15 +112,47 @@ def test_local_lane_never_escapes_to_cloud():
         # mode, since a local server may well require a key.
         assert all(reg.plans[k].quota.kind == "unlimited" for k in members), members
         assert all(not reg.plans[k].metered for k in members), members
-        total = sum(reg.plans[k].max_parallel for k in members)
+
+        # Capacity is per *subscription*, not per plan: every local model runs on
+        # the same machine, so they share one pool of slots.
+        subs = {reg.plans[k].subscription: reg.plans[k].max_parallel for k in members}
+        total = sum(subs.values())
         for _ in range(total):
             await picker.pick("local", None)
         try:
             await picker.pick("local", None)
         except LaneSaturated:
-            return members
+            return members, subs, total
         raise AssertionError("local lane must refuse rather than spill")
-    print("  local lane:", run(go()), "— refuses instead of spilling")
+
+    members, subs, total = run(go())
+    print(f"  local lane: {members} share {subs} = {total} slot(s) — "
+          f"refuses instead of spilling")
+
+
+def test_local_models_share_one_machine():
+    """Three local plans on one box must not hand out three plans' worth of
+    slots. Without shared accounting, six requests would land on hardware that
+    handles one or two."""
+    async def go():
+        reg, slots, picker = build()
+        local = [p for p in reg.plans.values() if p.quota.kind == "unlimited"]
+        assert len({p.subscription for p in local}) == 1, \
+            [(p.key, p.subscription) for p in local]
+        naive = sum(p.max_parallel for p in local)
+        shared = max(p.max_parallel for p in local)
+
+        # Saturate through the `local` lane, then confirm `bulk` — which also
+        # contains a local model — sees no free local capacity.
+        for _ in range(shared):
+            await picker.pick("local", None)
+        pick = await picker.pick("bulk", None)
+        return [p.key for p in local], naive, shared, pick.plan.key
+
+    keys, naive, shared, spilled = run(go())
+    assert shared < naive
+    print(f"  {len(keys)} local plans would naively offer {naive} slots; "
+          f"they share {shared}. With those busy, bulk spilled to {spilled}")
 
 
 def test_expiring_plans_are_drained_first():

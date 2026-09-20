@@ -20,9 +20,13 @@ caller's workspace, and their results never reach the caller.
 
 Two mitigations, neither of which makes these lanes agentic:
   * SYSTEM_MODE=replace passes the caller's system prompt with the CLI's
-    override flag instead of appending to the built-in one, so only one agent
-    prompt is in play. Verify the flag exists on your CLI version first —
-    `claude --help | grep system-prompt` — because a wrong flag is a hard error.
+    override flag (`--system-prompt`) instead of appending to the built-in one,
+    so only one agent prompt is in play. In that mode the Claude CLI also gets
+    `--exclude-dynamic-system-prompt-sections`, which drops the working
+    directory, git state and environment blurbs it would otherwise inject — noise
+    the caller pays for on every request. Verify both flags exist on your CLI
+    version (`claude --help | grep system-prompt`); a wrong flag is a hard error,
+    which is why the code default stays `append`.
   * BARE=1 strips the inner harness's tools and caps it at one turn, which is
     as close to a plain completion as a CLI gets.
 Switchyard additionally refuses to route a request containing `tools` to any
@@ -93,6 +97,11 @@ PROFILES: dict[str, dict] = {
         # container, not the caller's workspace, and the caller never sees them.
         "bare_args": ["--max-turns", "1", "--disallowed-tools",
                       "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit"],
+        # Only valid alongside --system-prompt. Drops the CLI's dynamically
+        # injected sections (working directory, git state, environment), which
+        # are pure noise when the caller supplies its own prompt — and which the
+        # caller is paying for on every single request.
+        "replace_extra_args": ["--exclude-dynamic-system-prompt-sections"],
         "parser": "claude_json",
         # Reset-window hint the CLI prints when the 5h limit is hit.
         "default_retry_after": 5 * 3600,
@@ -305,6 +314,9 @@ def build_argv(prompt: str, system: str | None, model: str | None = None) -> lis
 
     if BARE and PROFILE.get("bare_args"):
         argv += [fill(a) for a in PROFILE["bare_args"]]
+
+    if key == "system_args_replace" and system and PROFILE.get("replace_extra_args"):
+        argv += [fill(a) for a in PROFILE["replace_extra_args"]]
 
     return argv + EXTRA_ARGS
 

@@ -375,23 +375,44 @@ plans:
     notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
 
   # ---------------------------------------------------------------- local ----
+  # All three local plans run on the SAME machine, so `subscription: local-box`
+  # makes them share one pool of 2 slots. Without that, three plans at 2 each
+  # would let six requests onto hardware that handles one or two.
   qwen-local:
-    label: "Qwen 3.8 Flash (local)"
+    label: "Qwen 3.8 Flash Next (local)"
     deployment: sy.qwen-local
+    subscription: local-box
     max_parallel: 2
+    context_window: 262144
     monthly_cost: 0
     auth: api_key                     # local, but the server still wants a key
     quota: {kind: unlimited, source: none}
     notes: "Just under Opus quality. Slow under load — keep parallelism low."
 
   gemma-local:
-    label: "Gemma 4 (local)"
+    label: "Gemma 4 26B (local)"
     deployment: sy.gemma-local
+    subscription: local-box
     max_parallel: 2
+    context_window: 262144
     monthly_cost: 0
-    auth: api_key                     # local, but the server still wants a key
+    auth: api_key
     quota: {kind: unlimited, source: none}
     notes: "Cheap and fast. Summaries, extraction, classification."
+
+  # 1M context — kept out of the normal lane order on purpose. It exists as the
+  # target for context-window fallbacks, so a prompt too large for whichever
+  # plan was chosen lands somewhere that can actually hold it.
+  glm-local:
+    label: "GLM 5.3 Flash (local, 1M context)"
+    deployment: sy.glm-local
+    subscription: local-box
+    max_parallel: 1
+    context_window: 1048576
+    monthly_cost: 0
+    auth: api_key
+    quota: {kind: unlimited, source: none}
+    notes: "Long-context rescue. Not in any lane order; context fallback only."
 
 # ============================================================================
 # LANES — ordered capacity. Requests fill each plan to its cap, then spill to
@@ -513,11 +534,16 @@ deployments:
     api_key: sidecar
 
   qwen-local:
-    model: openai/qwen-3.8-flash
+    model: openai/Qwen3.8-Flash-Next-oQ4e-mtp
     api_base: os.environ/LOCAL_API_BASE
     api_key: os.environ/LOCAL_API_KEY
 
   gemma-local:
-    model: openai/gemma-4
+    model: openai/gemma-4-26B-A4B-it-oQ4e-mtp
+    api_base: os.environ/LOCAL_API_BASE
+    api_key: os.environ/LOCAL_API_KEY
+
+  glm-local:
+    model: openai/GLM-5.3-Flash-oQ4e
     api_base: os.environ/LOCAL_API_BASE
     api_key: os.environ/LOCAL_API_KEY

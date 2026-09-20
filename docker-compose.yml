@@ -102,6 +102,11 @@ services:
       SWITCHYARD_SUBSCRIPTION: claude-max
       SWITCHYARD_PLANS: /app/config/plans.yaml
       CLAUDE_CONFIG_DIR: /home/node/.claude
+      # Verified present on this CLI version: --system-prompt overrides the
+      # built-in agent prompt instead of stacking on it, and replace mode also
+      # passes --exclude-dynamic-system-prompt-sections. Set to `append` if you
+      # downgrade the CLI to a version without those flags.
+      SYSTEM_MODE: replace
     volumes:
       - ./config:/app/config:ro
       - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude

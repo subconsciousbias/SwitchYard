@@ -56,9 +56,29 @@ export LOCAL_API_KEY=$(grep '^LOCAL_API_KEY=' .env | cut -d= -f2)
 curl -s $LOCAL_API_BASE/models -H "Authorization: Bearer $LOCAL_API_KEY" | head -c 400
 ```
 
-**Expect:** JSON listing your local models. Note the exact ids — if they are not
-`qwen-3.8-flash` and `gemma-4`, fix the `model:` lines under `deployments:` in
-`config/plans.yaml`.
+**Expect:** JSON listing your local models. The config is wired for these ids:
+
+| Plan | Model id | Context |
+|---|---|---|
+| `qwen-local` | `Qwen3.8-Flash-Next-oQ4e-mtp` | 262144 |
+| `gemma-local` | `gemma-4-26B-A4B-it-oQ4e-mtp` | 262144 |
+| `glm-local` | `GLM-5.3-Flash-oQ4e` | 1048576 |
+
+If your ids differ, fix the `model:` lines under `deployments:` in
+`config/plans.yaml`. To see the full list with context sizes:
+
+```bash
+curl -s $LOCAL_API_BASE/models -H "Authorization: Bearer $LOCAL_API_KEY" \
+  | python3 -c 'import json,sys; [print(m["id"], m.get("max_model_len")) for m in json.load(sys.stdin)["data"]]'
+```
+
+`glm-local` is deliberately **not** in any lane order — it is the target for
+context-window fallbacks, so a prompt too large for the chosen plan lands
+somewhere that can hold it rather than erroring.
+
+All three share `subscription: local-box`, so they draw on **one** pool of 2
+slots. They run on the same machine; three plans at 2 each would put six
+concurrent requests on hardware that handles one or two.
 
 `{"error":{"message":"API key required",...}}` means `LOCAL_API_KEY` is unset or
 wrong. Without the header it will fail the same way, so keep the `-H` on every

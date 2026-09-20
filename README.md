@@ -37,8 +37,15 @@ The model name you ask for is a **lane**, not a provider.
 | `judge` | Judgement — Regular | Claude Max → OpenAI → Grok | Qwen local |
 | `forge` | Coding Workhorse | Minimax Ultra → Minimax Max → Grok → GLM → OpenCode Go → OpenRouter | Qwen local |
 
-| `local` | Local Only | Qwen → Gemma | *(none, on purpose)* |
-| `bulk` | Basic | Gemma → Qwen | Minimax Max |
+| `local` | Local Only | Qwen 3.8 Flash Next → Gemma 4 26B | *(none, on purpose)* |
+| `bulk` | Basic | Gemma 4 26B → Qwen 3.8 Flash Next | Minimax Max |
+
+The local models share `subscription: local-box` — one machine, one pool of 2
+slots, however many plans point at it. `glm-local` (GLM 5.3 Flash, 1M context)
+sits outside every lane order as the context-window fallback target: a prompt too
+large for the chosen plan goes there instead of erroring. Only plans that declare
+`context_window` take part in that, so an undeclared window never becomes a wrong
+routing decision.
 
 \* All three are disabled out of the box — see *No API key? Then apex is just
 Opus* below. `apex` currently resolves to Claude Max.

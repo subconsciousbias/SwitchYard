@@ -74,6 +74,7 @@ class Plan:
     max_parallel_ceiling: int | None = None  # hard upper bound for learning
     pacing: bool | None = None               # per-plan override of the global switch
     supports_tools: bool | None = None       # None -> inferred from `auth`
+    context_window: int | None = None        # tokens; drives context fallbacks
     metered: bool = False
     enabled: bool = True
     expires: date | None = None
@@ -327,6 +328,8 @@ def load(path: str | None = None) -> Registry:
                                   if body.get("max_parallel_ceiling") else None),
             pacing=body.get("pacing"),
             supports_tools=body.get("supports_tools"),
+            context_window=(int(body["context_window"])
+                            if body.get("context_window") else None),
             monthly_cost=float(body.get("monthly_cost", 0) or 0),
             auth=body.get("auth", "api_key"),
             provider_family=body.get("provider_family"),
