@@ -1,5 +1,15 @@
 # ============================================================================
 # Switchyard — single source of truth for plans, capacity, and lanes.
+#
+# QUOTA WINDOWS. Most subscriptions enforce more than one limit at a time — a
+# short burst window (commonly 5 hours) *and* a weekly allowance. Declare them
+# all under `quotas:` and mark exactly one `role: target`: the allowance
+# pacing tries to fill, which is almost always the weekly one. The others are
+# `role: constraint` — limits not to overshoot, but not goals in themselves.
+#
+# Pacing then spends at the slowest rate any window allows, so the weekly
+# allowance gets used up while the 5-hour window is never blown. If you leave
+# `role` off entirely, the longest period becomes the target.
 # Everything else (routing order, the capacity board, quota headroom, the
 # effective $/Mtok table) is derived from this file. Edit here, hit
 # POST /admin/reload on the portal; no proxy restart needed.
@@ -75,16 +85,36 @@ plans:
     monthly_cost: 132
     auth: api_key
     provider_family: minimax
-    quota:
-      kind: tokens
-      period: month
-      allowance: null                 # TODO: set the plan's token allowance
-      source: estimate                # estimate | headers | probe
-      # MiniMax's /coding_plan/remains endpoint would give exact headroom, but
-      # it only accepts a browser cookie session — an API key gets
-      # "cookie is missing" (1004). So headroom here is ledger-estimated, and
-      # sharpened by the observed-allowance learning after the first wall.
+    quotas:
+      # A token plan is a single budget rather than a burst window plus an
+      # allowance, so there is only one window here. Add a `rolling_5h`
+      # constraint if MiniMax turns out to throttle within the day.
+      - name: monthly
+        role: target
+        kind: tokens
+        period: month
+        allowance: null               # TODO, or let the probe report it
+        source: probe                 # estimate | headers | probe | ledger
     notes: "Original workhorse. Good at coding with explicit instructions."
+    # MiniMax publishes exact Token Plan headroom at /coding_plan/remains, but
+    # that endpoint only answers a browser session — an API key gets
+    # "cookie is missing (1004)". Paste the session cookie once in the portal
+    # (Subscriptions -> "real usage") and this polls it for real numbers.
+    # A cookie is full account access; see switchyard/probes.py for the caveats.
+    probe:
+      kind: cookie
+      url: https://api.minimax.io/v1/coding_plan/remains   # TODO: confirm host/path
+      method: GET
+      window: monthly
+      interval_seconds: 600
+      referer: https://platform.minimax.io/
+      # Candidate field paths; run the probe once and the portal prints the raw
+      # response so you can correct these.
+      fields:
+        remaining: [data.remains, data.remaining_tokens, data.remain, remains]
+        total: [data.total, data.total_tokens, data.quota]
+        reset_at: [data.reset_at, data.next_reset_time, data.expire_time]
+
 
   minimax-max:
     label: "Minimax Max Token Plan"
@@ -94,12 +124,33 @@ plans:
     monthly_cost: 55
     auth: api_key
     provider_family: minimax
-    quota:
-      kind: tokens
-      period: month
-      allowance: null                 # TODO
-      source: estimate
+    quotas:
+      - name: monthly
+        role: target
+        kind: tokens
+        period: month
+        allowance: null               # TODO, or let the probe report it
+        source: probe
     notes: "Second workhorse, added 2026-09-20 to stop the OpenRouter burn."
+    # MiniMax publishes exact Token Plan headroom at /coding_plan/remains, but
+    # that endpoint only answers a browser session — an API key gets
+    # "cookie is missing (1004)". Paste the session cookie once in the portal
+    # (Subscriptions -> "real usage") and this polls it for real numbers.
+    # A cookie is full account access; see switchyard/probes.py for the caveats.
+    probe:
+      kind: cookie
+      url: https://api.minimax.io/v1/coding_plan/remains   # TODO: confirm host/path
+      method: GET
+      window: monthly
+      interval_seconds: 600
+      referer: https://platform.minimax.io/
+      # Candidate field paths; run the probe once and the portal prints the raw
+      # response so you can correct these.
+      fields:
+        remaining: [data.remains, data.remaining_tokens, data.remain, remains]
+        total: [data.total, data.total_tokens, data.quota]
+        reset_at: [data.reset_at, data.next_reset_time, data.expire_time]
+
 
   glm:
     label: "GLM Coding Plan"
@@ -109,11 +160,19 @@ plans:
     auth: api_key
     provider_family: zai
     expires: "2026-10-13"
-    quota:
-      kind: window
-      period: rolling_5h
-      allowance: null
-      source: estimate
+    quotas:
+      - name: 5h
+        role: constraint              # Z.AI enforces a 5-hour prompt window
+        kind: tokens
+        period: rolling_5h
+        allowance: null               # TODO: confirm on the Z.AI plan page
+        source: estimate
+      - name: weekly
+        role: target
+        kind: tokens
+        period: week
+        allowance: null               # TODO: confirm; may be monthly instead
+        source: estimate
     notes: "Cancelled. Severely limited — drain whatever is left."
 
   openrouter-mimo:
@@ -155,12 +214,22 @@ plans:
     max_parallel_ceiling: 1           # never probe above it
     monthly_cost: 200
     auth: oauth_sidecar               # see sidecars/claude-max
-    quota:
-      kind: window
-      period: rolling_5h
-      allowance: null
-      source: sidecar                 # the CLI tells us the reset time
-    notes: "Critical logic only. Heaviest non-Paperclip use is interactive."
+    quotas:
+      - name: 5h
+        role: constraint              # do not blow the burst window
+        kind: tokens
+        period: rolling_5h
+        allowance: null               # TODO: fill from a cycle of observation
+        source: sidecar               # the CLI reports the reset time
+      - name: weekly
+        role: target                  # this is the allowance worth filling
+        kind: tokens
+        period: week
+        allowance: null               # TODO
+        source: sidecar
+    notes: >
+      Critical logic only. Heaviest non-Paperclip use is interactive, so the
+      5-hour window is the one that bites; weekly is what we pace to fill.
 
   anthropic-fable:
     label: "Fable 5.1 (Anthropic API)"
@@ -194,11 +263,19 @@ plans:
     auth: oauth_sidecar               # a ChatGPT seat: OAuth only, no API key
     provider_family: openai
     expires: "2026-10-04"
-    quota:
-      kind: window
-      period: week
-      allowance: null
-      source: estimate
+    quotas:
+      - name: 5h
+        role: constraint
+        kind: tokens
+        period: rolling_5h
+        allowance: null               # TODO
+        source: estimate
+      - name: weekly
+        role: target
+        kind: tokens
+        period: week
+        allowance: null               # TODO
+        source: estimate
     notes: "Cancelled. Weekly allowance already spent this week — expect 429s."
 
   grok:
@@ -209,11 +286,19 @@ plans:
     monthly_cost: 0
     auth: api_key
     expires: "2026-10-09"
-    quota:
-      kind: window
-      period: month
-      allowance: null
-      source: estimate
+    quotas:
+      - name: burst
+        role: constraint
+        kind: tokens
+        period: rolling_5h
+        allowance: null               # TODO: confirm xAI's burst window size
+        source: estimate
+      - name: monthly
+        role: target
+        kind: tokens
+        period: month
+        allowance: null               # TODO
+        source: estimate
     notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
 
   # ---------------------------------------------------------------- local ----

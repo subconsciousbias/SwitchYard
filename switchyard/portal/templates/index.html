@@ -29,6 +29,11 @@
 <h2>Lanes — ordered capacity</h2>
 {% include "_capacity.html" %}
 
+{% if probes %}
+<h2>Real usage — providers that need a browser session</h2>
+{% include "_probes.html" %}
+{% endif %}
+
 <h2>Subscriptions — quota, burn, and what they actually cost</h2>
 {% include "_plans.html" %}
 

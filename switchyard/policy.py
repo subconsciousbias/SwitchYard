@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 
 from redis.asyncio import Redis
 
-from .models import Plan, Settings
+from .models import Plan, Quota, Settings
 from .periods import deadline as window_deadline
 from .periods import period_bounds
 from .usage import Ledger
@@ -177,85 +177,128 @@ class Pacer:
         rate = sample if prior <= 0 else (EWMA_ALPHA * sample + (1 - EWMA_ALPHA) * prior)
         await self.redis.hset(key, mapping={"rate": rate, "rate_at": time.time()})
 
-    async def state(self, plan: Plan) -> dict:
-        """Everything the portal needs to explain the pacing decision."""
-        now = datetime.now(timezone.utc)
-        used = await self.ledger.current_period(plan)
-        facts = await self.ledger.quota_facts(plan.key)
-        consumed = (used["cost"] if plan.quota.kind == "dollars"
+    async def _window(self, plan: Plan, q: Quota, now: datetime) -> dict:
+        """Everything about one quota window: where we are, and the rate it allows."""
+        used = await self.ledger.window_usage(plan, q, now)
+        facts = await self.ledger.window_facts(plan.key, q.label)
+        consumed = (used["cost"] if q.kind == "dollars"
                     else used["prompt_tokens"] + used["completion_tokens"])
 
-        allowance = plan.quota.allowance
-        basis = "configured"
+        allowance, basis = q.allowance, "configured"
         if allowance is None:
-            observed = facts.get("observed_allowance_cost" if plan.quota.kind == "dollars"
+            observed = facts.get("observed_allowance_cost" if q.kind == "dollars"
                                  else "observed_allowance_tokens")
             if isinstance(observed, float) and observed > 0:
                 allowance, basis = observed, "observed"
+        if allowance is None:
+            basis = "unknown"
 
-        dl, is_final = window_deadline(plan.quota.period, plan.expires, now)
-        start, _ = period_bounds(plan.quota.period, now)
+        dl, is_final = window_deadline(q.period, plan.expires, now)
+        start, _ = period_bounds(q.period, now)
         total_s = max(1.0, (dl - start).total_seconds())
         remaining_s = max(0.0, (dl - now).total_seconds())
         elapsed_frac = 1.0 - remaining_s / total_s
 
-        out = {
-            "active": False, "reason": "", "allowance": allowance, "basis": basis,
-            "consumed": consumed, "deadline": dl.timestamp(), "is_final_window": is_final,
+        w = {
+            "window": q.label, "role": q.role, "period": q.period,
+            "allowance": allowance, "basis": basis, "consumed": consumed,
+            "deadline": dl.timestamp(), "is_final_window": is_final,
             "elapsed_frac": round(elapsed_frac, 4), "remaining_seconds": remaining_s,
-            "rate_per_slot": _f(await self.redis.hget(K_PACE.format(plan=plan.key), "rate")),
-            "target_rate": None, "desired_slots": None, "consumed_frac": None,
-            "pace_line": None, "ahead_by": None, "projected_end_frac": None,
+            "total_seconds": total_s, "consumed_frac": None, "pace_line": None,
+            "ahead_by": None, "allowed_rate": None, "spent": False,
+        }
+        if not allowance or allowance <= 0 or remaining_s <= 0:
+            return w
+
+        remaining = allowance - consumed
+        w["consumed_frac"] = round(consumed / allowance, 4)
+        if remaining <= 0:
+            w.update(spent=True, allowed_rate=0.0, pace_line=allowance,
+                     ahead_by=consumed - allowance)
+            return w
+
+        # The target window is aimed slightly hot so it finishes at ~100%.
+        # A constraint window gets no overshoot — overshooting it is precisely
+        # what we are trying to avoid.
+        overshoot = (1.0 + self.settings.pacing.overshoot) if q.is_target else 1.0
+        w["pace_line"] = allowance * min(1.0, elapsed_frac * overshoot)
+        w["ahead_by"] = consumed - w["pace_line"]
+        w["allowed_rate"] = (remaining / remaining_s) * overshoot
+        return w
+
+    async def state(self, plan: Plan, paced: bool = True,
+                    now: datetime | None = None) -> dict:
+        """Everything the portal needs to explain the pacing decision.
+
+        With several windows the rule is: **spend at the slowest rate any window
+        allows**, and hold entirely when the target window is ahead of its pace
+        line or any window is spent. That fills the weekly allowance while never
+        overshooting the 5-hour one.
+        """
+        now = now or datetime.now(timezone.utc)
+        windows = [await self._window(plan, q, now) for q in plan.quotas]
+        target = next((w for w in windows if w["role"] == "target"), windows[0])
+        rate_per_slot = _f(await self.redis.hget(K_PACE.format(plan=plan.key), "rate"))
+
+        out = {
+            "active": False, "reason": "", "windows": windows, "target": target,
+            "rate_per_slot": rate_per_slot, "desired_slots": None,
+            "binding": None, "target_rate": None, "projected_end_frac": None,
+            # Flattened target-window fields, so existing callers keep working.
+            "allowance": target["allowance"], "basis": target["basis"],
+            "consumed": target["consumed"], "consumed_frac": target["consumed_frac"],
+            "pace_line": target["pace_line"], "ahead_by": target["ahead_by"],
+            "deadline": target["deadline"], "is_final_window": target["is_final_window"],
+            "elapsed_frac": target["elapsed_frac"],
+            "remaining_seconds": target["remaining_seconds"],
         }
 
-        if not plan.paced(self.settings):
+        if not paced:
             out["reason"] = "not a subscription" if not plan.is_subscription else "pacing off"
             return out
-        if not allowance or allowance <= 0:
+
+        known = [w for w in windows if w["allowed_rate"] is not None]
+        if not known:
             out["reason"] = "no allowance known yet"
             return out
 
-        out["consumed_frac"] = round(consumed / allowance, 4)
-
-        # Where consumption should have reached by now, aimed slightly hot so
-        # the allowance lands at ~100% rather than short of it.
-        overshoot = 1.0 + self.settings.pacing.overshoot
-        pace_line = allowance * min(1.0, elapsed_frac * overshoot)
-        out["pace_line"] = pace_line
-        out["ahead_by"] = consumed - pace_line
-
-        remaining = allowance - consumed
-        if remaining <= 0:
-            out.update(active=True, reason="allowance spent", desired_slots=0, target_rate=0.0)
-            return out
-        if remaining_s <= 0:
-            out["reason"] = "window closed"
+        spent = [w for w in known if w["spent"]]
+        if spent:
+            out.update(active=True, desired_slots=0, binding=spent[0]["window"],
+                       reason=f"{spent[0]['window']} allowance spent")
             return out
 
-        target_rate = (remaining / remaining_s) * overshoot
-        out["target_rate"] = target_rate
-        rate = out["rate_per_slot"]
-        if rate > 0:
-            # How far into the window this burn rate would exhaust the plan.
+        # Slowest window wins: respect the 5-hour limit while filling weekly.
+        binding = min(known, key=lambda w: w["allowed_rate"])
+        out["binding"] = binding["window"]
+        out["target_rate"] = binding["allowed_rate"]
+
+        # Holding is driven by the window we are trying to *fill*. A constraint
+        # window running ahead of its own line is fine — the rate cap handles it.
+        if target["ahead_by"] is not None and target["ahead_by"] > 0:
+            out.update(active=True, desired_slots=0,
+                       reason=f"ahead of pace on {target['window']}, holding")
+            return out
+
+        if rate_per_slot <= 0:
+            out.update(active=True, reason="measuring per-slot rate")
+            return out
+
+        if target["allowance"]:
+            # Where in the window this burn rate would exhaust the target.
+            burn = rate_per_slot * max(1, self.settings.pacing.min_slots)
+            secs_to_empty = (target["allowance"] - target["consumed"]) / burn
             out["projected_end_frac"] = round(
-                elapsed_frac + (remaining / (rate * max(1, self.settings.pacing.min_slots))
-                                ) / max(1.0, total_s), 4)
+                target["elapsed_frac"] + secs_to_empty / target["total_seconds"], 4)
 
-        # Ahead of the line: close the plan and let the line catch up. This is
-        # the mechanism that actually slows us below one continuous slot.
-        if consumed > pace_line:
-            out.update(active=True, reason="ahead of pace, holding", desired_slots=0)
-            return out
-
-        if rate <= 0:
-            out.update(active=True, reason="measuring per-slot rate", desired_slots=None)
-            return out
-
-        out.update(active=True, reason="pacing to deadline", desired_slots=target_rate / rate)
+        note = "" if binding is target else f" (capped by {binding['window']})"
+        out.update(active=True, desired_slots=binding["allowed_rate"] / rate_per_slot,
+                   reason=f"pacing {target['window']}{note}")
         return out
 
-    async def desired_slots(self, plan: Plan) -> tuple[int | None, str, dict]:
-        st = await self.state(plan)
+    async def desired_slots(self, plan: Plan, paced: bool = True,
+                            now: datetime | None = None) -> tuple[int | None, str, dict]:
+        st = await self.state(plan, paced, now)
         if not st["active"] or st["desired_slots"] is None:
             return None, st["reason"], st
 
@@ -306,7 +349,7 @@ class CapacityPolicy:
             return bool(plan.pacing)
         return plan.is_subscription or (plan.metered and self.settings.pacing.include_metered)
 
-    async def effective(self, plan: Plan) -> Capacity:
+    async def effective(self, plan: Plan, now: datetime | None = None) -> Capacity:
         learned, source = await self.learner.effective(plan)
         cap = Capacity(cap=learned, reason=source, learned=learned,
                        configured=plan.configured_parallel)
@@ -314,7 +357,7 @@ class CapacityPolicy:
         if not await self.plan_is_paced(plan):
             return cap
 
-        paced, reason, _ = await self.pacer.desired_slots(plan)
+        paced, reason, _ = await self.pacer.desired_slots(plan, True, now)
         if paced is None:
             cap.reason = f"{source} (pacing: {reason})"
             return cap
@@ -325,6 +368,10 @@ class CapacityPolicy:
         cap.cap = min(learned, paced)
         cap.reason = f"paced {paced} of {learned} ({reason})"
         return cap
+
+    async def pace_state(self, plan: Plan, now: datetime | None = None) -> dict:
+        """Pacing state for the portal, with the on/off resolution applied."""
+        return await self.pacer.state(plan, await self.plan_is_paced(plan), now)
 
     async def tail_enabled(self) -> bool:
         """In pacing mode the tail is off: narrowing is the point, and falling

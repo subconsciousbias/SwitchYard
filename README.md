@@ -240,6 +240,48 @@ Caps, cost, expiry, quota model, lane order, and credentials are all in that one
 file; the LiteLLM config is generated from it at container start
 (`python -m switchyard.gen_litellm`). There is no second file to keep in sync.
 
+## Quota windows: a 5-hour limit *and* a weekly allowance
+
+Most subscriptions enforce several limits at once — a short burst window
+(commonly 5 hours) and a weekly allowance, sometimes a monthly one too. Declare
+them all and mark exactly one `role: target`:
+
+```yaml
+quotas:
+  - name: 5h
+    role: constraint        # must not overshoot this
+    period: rolling_5h
+    allowance: null
+  - name: weekly
+    role: target            # this is the allowance worth filling
+    period: week
+    allowance: null
+```
+
+The target is what pacing tries to fill — **the weekly allowance, nearly always,
+not the 5-hour window**. The constraint is a limit to respect, not a goal. Leave
+`role` off and the longest period becomes the target.
+
+Pacing then **spends at the slowest rate any window allows**, so the weekly
+allowance gets used up while the burst window is never blown:
+
+```
+weekly 2.5% used but 5h 95% used  -> binding=5h,     1 slot: pacing weekly (capped by 5h)
+fresh 5h window, weekly behind    -> binding=weekly, 2 slots: pacing weekly
+5h window spent                   -> 0 slots, weekly untouched at 2.5%
+```
+
+Holding is driven only by the *target* window. A constraint window running ahead
+of its own line is fine — the rate cap already handles it — so you never stall
+needlessly.
+
+**Attributing a wall to the right window.** A provider says "you are out of
+quota" without saying which limit you hit, and writing a 5-hour figure into the
+weekly window's observed allowance would corrupt every later decision. The reset
+time gives it away: a couple of hours means the burst window, a few days means
+weekly. With no hint at all, the shortest window gets the blame, since that is
+both the likelier culprit and the safer guess.
+
 ## Quota headroom, per plan
 
 Only some of these plans will tell you anything, so headroom resolves in
@@ -248,12 +290,28 @@ preference order: a number the provider reported → your configured `allowance:
 last one is why a plan with `allowance: null` still gets a real headroom bar
 after one wall.
 
-MiniMax is the awkward one. It *has* an exact endpoint — `/coding_plan/remains` —
-but it only accepts a browser cookie session; an API key gets `cookie is missing
-(1004)`, and there is no documented API-key alternative. So MiniMax headroom is
-ledger-estimated and sharpened by observed-allowance learning. If you want it
-exact, the only route is a scraped session cookie, which I would not build until
-it is actually annoying.
+### Real numbers from a browser session
+
+MiniMax is the awkward one: it *has* an exact endpoint, `/coding_plan/remains`,
+but the endpoint only answers a logged-in browser. An API key gets `cookie is
+missing (1004)` and there is no documented API-key route. Rather than settle for
+estimates, the portal has a **"Real usage"** panel: paste the session cookie
+once, and a poller keeps genuine headroom on the board.
+
+- The cookie is stored in Redis on this host, **never logged, never returned by
+  the API** — status shows only a fingerprint like `412 chars ending 9f2a`.
+- When it expires the probe flips to `needs re-auth`, the board says so, and
+  polling **stops** until you paste a fresh one. An expired session never
+  becomes a request every minute forever.
+- Field paths in `plans.yaml` are candidate lists, because vendors rename
+  things. Hit **test now** and the panel prints the raw response so you can map
+  the real field names.
+
+Worth being clear-eyed about: a session cookie is as powerful as being logged in
+— anything the account can do, including billing, it can do. Revoke it by
+logging out at the provider, which invalidates the session. If that trade is not
+worth it to you, delete the `probe:` block and headroom falls back to
+ledger estimates plus observed-allowance learning.
 
 ## Before this is live — worth checking
 
@@ -279,6 +337,8 @@ it is actually annoying.
 python3 tests/test_routing.py    # ordered fill, affinity, vanishing capacity
 python3 tests/test_classify.py   # real MiniMax and Z.AI error payloads
 python3 tests/test_policy.py     # concurrency learning and pacing control
+python3 tests/test_probes.py     # quota probe field mapping and re-auth
+python3 tests/render_preview.py  # every portal template, against a fixture
 ```
 
 Neither needs Redis or a running stack.

@@ -18,19 +18,36 @@
           {% if r.plan.auth == 'oauth_sidecar' %}· <span title="OAuth subscription via sidecar">sidecar</span>{% endif %}
         </div>
       </td>
-      <td style="min-width:150px">
-        {% if pct is not none %}
-          <div class="bar {% if pct >= 90 %}bad{% elif pct >= 70 %}warn{% endif %}">
-            <i style="width:{{ pct }}%"></i></div>
-          <div class="muted mono" style="font-size:12px">
-            {{ '%.0f'|format(100 - pct) }}% left · {{ hr.basis }}</div>
-        {% elif hr.kind == 'unlimited' %}
-          <span class="tag ok">unlimited</span>
-        {% else %}
-          <span class="muted">no allowance set</span>
-          <div class="muted mono" style="font-size:12px">
-            used {{ '{:,.0f}'.format(hr.consumed or 0) }}{% if hr.kind == 'dollars' %} dollars{% endif %}</div>
+      <td style="min-width:190px">
+        {# One bar per quota window. The window closest to biting is marked,
+           because a 5-hour burst limit can stop you while weekly looks fine. #}
+        {% for w in hr.windows %}
+          {% set wp = w.pct_used %}
+          <div style="margin-bottom:{{ '6px' if not loop.last else '0' }}">
+            <div class="row" style="gap:6px">
+              <span class="mono" style="font-size:12px">
+                {{ w.window }}{% if w.role == 'target' %}<span class="muted"> · target</span>{% endif %}
+              </span>
+              {% if wp is not none %}
+                <span class="mono muted" style="font-size:12px">{{ '%.0f'|format(100 - wp) }}% left</span>
+              {% endif %}
+            </div>
+            {% if wp is not none %}
+              <div class="bar {% if wp >= 90 %}bad{% elif wp >= 70 %}warn{% endif %}">
+                <i style="width:{{ wp }}%"></i></div>
+            {% elif w.kind == 'unlimited' %}
+              <span class="tag ok">unlimited</span>
+            {% else %}
+              <span class="muted" style="font-size:12px">
+                no allowance set · used {{ '{:,.0f}'.format(w.consumed or 0) }}</span>
+            {% endif %}
+          </div>
+        {% endfor %}
+        {% if not hr.binding_is_target %}
+          <div class="muted" style="font-size:12px">
+            <span class="tag warn">{{ hr.binding.window }} binds first</span></div>
         {% endif %}
+        <div class="muted" style="font-size:12px">{{ hr.basis }}</div>
       </td>
       <td class="mono nowrap">
         {% set c = r.capacity %}

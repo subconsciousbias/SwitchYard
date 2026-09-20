@@ -8,7 +8,10 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request
+import asyncio
+import contextlib
+
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
 from redis.asyncio import Redis
@@ -16,9 +19,12 @@ from redis.asyncio import Redis
 from .. import models
 from ..picker import Picker
 from ..policy import CapacityPolicy
+from ..probes import Prober
 from ..slots import SlotTable
 from ..periods import windows_remaining
 from ..usage import Ledger, effective_cost_per_mtok, headroom
+
+import logging
 
 BASE = os.path.dirname(__file__)
 app = FastAPI(title="Switchyard")
@@ -36,8 +42,38 @@ async def startup() -> None:
     policy = CapacityPolicy(redis, registry.settings, ledger)
     state.update(
         registry=registry, redis=redis, slots=slots, ledger=ledger, policy=policy,
-        picker=Picker(registry, slots, policy),
+        picker=Picker(registry, slots, policy), prober=Prober(redis, ledger),
     )
+    state["poller"] = asyncio.create_task(_poll_probes())
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    task = state.get("poller")
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _poll_probes() -> None:
+    """Keep probe-backed headroom fresh.
+
+    Deliberately quiet: a plan whose cookie has expired is skipped entirely
+    (`due()` returns False) until a new one is pasted, so an expired session
+    does not turn into a request every minute forever.
+    """
+    while True:
+        try:
+            reg, prober = state["registry"], state["prober"]
+            for plan in reg.plans.values():
+                if await prober.due(plan):
+                    await prober.run(plan)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                      # never let the loop die
+            logging.getLogger("switchyard.portal").exception("probe poll failed")
+        await asyncio.sleep(60)
 
 
 def _fmt_reset(ts: float | None) -> str:
@@ -83,7 +119,8 @@ async def collect_plans() -> list[dict]:
         in_flight = await slots.in_flight(plan.key)
         facts = await ledger.quota_facts(plan.key)
         capacity = await policy.effective(plan)
-        pace = await policy.pacer.state(plan) if await policy.plan_is_paced(plan) else None
+        probe = await state["prober"].status(plan.key) if plan.probe else None
+        pace = await policy.pace_state(plan) if await policy.plan_is_paced(plan) else None
 
         alerting = []
         if hr.get("pct_used") is not None and hr["pct_used"] >= 80:
@@ -102,6 +139,8 @@ async def collect_plans() -> list[dict]:
             alerting.append("pacing on an observed allowance — set it in plans.yaml")
         if pace and not pace.get("allowance"):
             alerting.append("pacing idle: no allowance known")
+        if probe and probe["needs_reauth"]:
+            alerting.append("quota probe needs a fresh session cookie")
         # A provider refusing us on connection count means max_parallel is set
         # higher than the plan allows. Different fix from a quota wall, so it
         # gets its own warning instead of looking like rate limiting.
@@ -133,6 +172,7 @@ async def collect_plans() -> list[dict]:
             "series": series[-14:],
             "capacity": capacity,
             "pace": pace,
+            "probe": probe,
             "windows": windows_remaining(plan.quota.period, plan.expires),
         })
     return rows
@@ -181,7 +221,8 @@ async def index(request: Request):
     return templates.TemplateResponse(
         "index.html",
         {"request": request, "capacity": await collect_capacity(),
-         "plans": await collect_plans(), "settings": state["registry"].settings},
+         "plans": await collect_plans(), "probes": await collect_probes(),
+         "settings": state["registry"].settings},
     )
 
 
@@ -189,6 +230,69 @@ async def index(request: Request):
 async def frag_capacity(request: Request):
     return templates.TemplateResponse(
         "_capacity.html", {"request": request, "capacity": await collect_capacity()}
+    )
+
+
+@app.get("/fragments/probes")
+async def frag_probes(request: Request):
+    return templates.TemplateResponse(
+        "_probes.html", {"request": request, "probes": await collect_probes()}
+    )
+
+
+async def collect_probes() -> list[dict]:
+    """Plans whose real headroom comes from a console endpoint."""
+    reg, prober = state["registry"], state["prober"]
+    out = []
+    for plan in reg.plans.values():
+        if plan.probe is None:
+            continue
+        out.append({"plan": plan, "status": await prober.status(plan.key),
+                    "last_test": state.get("probe_tests", {}).get(plan.key)})
+    return out
+
+
+@app.post("/admin/probes/{plan_key}/cookie")
+async def save_cookie(plan_key: str, request: Request, cookie: str = Form("")):
+    """Store a pasted session cookie. Never echoed back, only fingerprinted."""
+    plan = state["registry"].plans.get(plan_key)
+    if plan is None or plan.probe is None:
+        return JSONResponse({"error": "no probe for that plan"}, status_code=404)
+    try:
+        await state["prober"].set_cookie(plan_key, cookie)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    result = await state["prober"].run(plan)
+    state.setdefault("probe_tests", {})[plan_key] = {
+        "ok": result.ok, "detail": result.detail, "remaining": result.remaining,
+        "total": result.total, "raw": result.raw, "at": datetime.now(timezone.utc).timestamp(),
+    }
+    return templates.TemplateResponse(
+        "_probes.html", {"request": request, "probes": await collect_probes()}
+    )
+
+
+@app.post("/admin/probes/{plan_key}/test")
+async def test_probe(plan_key: str, request: Request):
+    plan = state["registry"].plans.get(plan_key)
+    if plan is None or plan.probe is None:
+        return JSONResponse({"error": "no probe for that plan"}, status_code=404)
+    result = await state["prober"].run(plan)
+    state.setdefault("probe_tests", {})[plan_key] = {
+        "ok": result.ok, "detail": result.detail, "remaining": result.remaining,
+        "total": result.total, "raw": result.raw, "at": datetime.now(timezone.utc).timestamp(),
+    }
+    return templates.TemplateResponse(
+        "_probes.html", {"request": request, "probes": await collect_probes()}
+    )
+
+
+@app.post("/admin/probes/{plan_key}/forget")
+async def forget_cookie(plan_key: str, request: Request):
+    await state["prober"].clear_cookie(plan_key)
+    state.setdefault("probe_tests", {}).pop(plan_key, None)
+    return templates.TemplateResponse(
+        "_probes.html", {"request": request, "probes": await collect_probes()}
     )
 
 

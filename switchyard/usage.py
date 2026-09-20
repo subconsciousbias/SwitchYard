@@ -17,7 +17,8 @@ from datetime import datetime, timedelta, timezone
 
 from redis.asyncio import Redis
 
-from .models import Plan
+from .models import Plan, Quota
+from .periods import period_bounds
 
 
 def _now() -> datetime:
@@ -42,7 +43,8 @@ def period_key(period: str | None, at: datetime | None = None) -> str:
 K_PERIOD = "sy:usage:{plan}:p:{period}"
 K_HOUR = "sy:usage:{plan}:h:{hour}"
 K_DAY = "sy:usage:{plan}:d:{day}"
-K_QUOTA = "sy:quota:{plan}"
+K_QUOTA = "sy:quota:{plan}"                 # plan-level facts
+K_WINDOW = "sy:qwin:{plan}:{window}"        # per-window facts (observed allowance)
 
 FIELDS = ("requests", "prompt_tokens", "completion_tokens", "cost", "failures")
 
@@ -61,9 +63,13 @@ class Ledger:
         failed: bool = False,
     ) -> None:
         now = _now()
-        pk = period_key(plan.quota.period, now)
+        # One bucket per quota window: a plan with a 5-hour *and* a weekly
+        # allowance needs both counted, or pacing can only see one of them.
         keys = [
-            (K_PERIOD.format(plan=plan.key, period=pk), 90 * 86400),
+            (K_PERIOD.format(plan=plan.key, period=period_key(q.period, now)), 90 * 86400)
+            for q in plan.quotas
+        ]
+        keys += [
             (K_HOUR.format(plan=plan.key, hour=now.strftime("%Y-%m-%dT%H")), 7 * 86400),
             (K_DAY.format(plan=plan.key, day=now.strftime("%Y-%m-%d")), 400 * 86400),
         ]
@@ -89,10 +95,20 @@ class Ledger:
                 pass
         return out
 
-    async def current_period(self, plan: Plan) -> dict[str, float]:
+    async def window_usage(self, plan: Plan, quota: Quota,
+                           at: datetime | None = None) -> dict[str, float]:
+        """Consumption inside one specific quota window.
+
+        `at` exists so the pacer can be driven from an injected clock in tests;
+        in production it is always now.
+        """
         return await self.bucket(
-            plan.key, K_PERIOD.format(plan=plan.key, period=period_key(plan.quota.period))
+            plan.key, K_PERIOD.format(plan=plan.key, period=period_key(quota.period, at))
         )
+
+    async def current_period(self, plan: Plan) -> dict[str, float]:
+        """Consumption in the target window (the one pacing aims to fill)."""
+        return await self.window_usage(plan, plan.quota)
 
     async def burn_rate(self, plan: Plan, hours: int = 3) -> dict[str, float]:
         """Cost and tokens per hour over the last `hours` completed buckets."""
@@ -115,17 +131,52 @@ class Ledger:
         return out
 
     # -- learning where the wall is ----------------------------------------
-    async def note_exhaustion(self, plan: Plan, reset_at: float | None) -> None:
-        used = await self.current_period(plan)
+    async def note_exhaustion(self, plan: Plan, reset_at: float | None) -> Quota:
+        """Record where a plan actually ran out, against the right window.
+
+        A provider says "you are out of quota" without saying *which* limit you
+        hit. The reset time gives it away: a couple of hours means the 5-hour
+        burst window, several days means the weekly allowance. Attributing this
+        correctly matters — writing a 5-hour figure into the weekly window's
+        observed allowance would corrupt every pacing decision after it.
+        """
+        window = self.attribute_window(plan, reset_at)
+        used = await self.window_usage(plan, window)
         consumed_tokens = used["prompt_tokens"] + used["completion_tokens"]
+        now = time.time()
         pipe = self.redis.pipeline()
-        pipe.hset(K_QUOTA.format(plan=plan.key), mapping={
-            "last_exhausted_at": time.time(),
+        pipe.hset(K_WINDOW.format(plan=plan.key, window=window.label), mapping={
+            "last_exhausted_at": now,
             "observed_allowance_tokens": consumed_tokens,
             "observed_allowance_cost": used["cost"],
             "reset_at": reset_at or "",
         })
+        pipe.hset(K_QUOTA.format(plan=plan.key), mapping={
+            "last_exhausted_at": now,
+            "last_exhausted_window": window.label,
+            "reset_at": reset_at or "",
+        })
         await pipe.execute()
+        return window
+
+    @staticmethod
+    def attribute_window(plan: Plan, reset_at: float | None) -> Quota:
+        """Which window did we just hit? Pick the one whose own rollover is
+        closest to the reset time the provider gave us."""
+        if len(plan.quotas) == 1 or not reset_at:
+            # No reset hint: blame the shortest window, which is the one you hit
+            # far more often, rather than poisoning the weekly figure.
+            order = {"rolling_5h": 0, "day": 1, "week": 2, "month": 3, None: 4}
+            return min(plan.quotas, key=lambda q: order.get(q.period, 4))
+        now = _now()
+        target_delta = reset_at - now.timestamp()
+        best, best_gap = plan.quotas[0], None
+        for q in plan.quotas:
+            _, end = period_bounds(q.period, now)
+            gap = abs((end - now).total_seconds() - target_delta)
+            if best_gap is None or gap < best_gap:
+                best, best_gap = q, gap
+        return best
 
     async def note_concurrency_rejection(self, plan: Plan) -> None:
         """A provider refusing us on connection count means our cap is wrong.
@@ -140,19 +191,29 @@ class Ledger:
             "concurrency_rejected_at_cap": plan.max_parallel,
         })
 
-    async def note_reported(self, plan_key: str, remaining: float | None, reset_at: float | None) -> None:
+    async def note_reported(self, plan_key: str, remaining: float | None,
+                            reset_at: float | None, window: str | None = None) -> None:
         """Record limits a provider actually told us about (headers/sidecar)."""
         mapping = {}
         if remaining is not None:
             mapping["reported_remaining"] = remaining
         if reset_at is not None:
             mapping["reset_at"] = reset_at
-        if mapping:
-            mapping["reported_at"] = time.time()
-            await self.redis.hset(K_QUOTA.format(plan=plan_key), mapping=mapping)
+        if not mapping:
+            return
+        mapping["reported_at"] = time.time()
+        key = (K_WINDOW.format(plan=plan_key, window=window) if window
+               else K_QUOTA.format(plan=plan_key))
+        await self.redis.hset(key, mapping=mapping)
+
+    async def window_facts(self, plan_key: str, window: str) -> dict[str, float | str]:
+        return await self._facts(K_WINDOW.format(plan=plan_key, window=window))
 
     async def quota_facts(self, plan_key: str) -> dict[str, float | str]:
-        raw = await self.redis.hgetall(K_QUOTA.format(plan=plan_key))
+        return await self._facts(K_QUOTA.format(plan=plan_key))
+
+    async def _facts(self, key: str) -> dict[str, float | str]:
+        raw = await self.redis.hgetall(key)
         out: dict[str, float | str] = {}
         for k, v in (raw or {}).items():
             k = k.decode() if isinstance(k, bytes) else k
@@ -165,18 +226,34 @@ class Ledger:
 
 
 async def headroom(ledger: Ledger, plan: Plan) -> dict:
-    """What the board shows in the 'quota left' column."""
-    used = await ledger.current_period(plan)
-    facts = await ledger.quota_facts(plan.key)
+    """Headroom for every quota window, plus which one is closest to biting.
+
+    The target window (weekly, usually) is what pacing fills; a constraint
+    window (the 5-hour burst) can still be the one that stops you first, so the
+    board needs both.
+    """
+    windows = [await window_headroom(ledger, plan, q) for q in plan.quotas]
+    target = next((w for w in windows if w["role"] == "target"), windows[0])
+    rated = [w for w in windows if w.get("pct_used") is not None]
+    binding = max(rated, key=lambda w: w["pct_used"]) if rated else target
+    return {**target, "windows": windows, "binding": binding,
+            "binding_is_target": binding is target}
+
+
+async def window_headroom(ledger: Ledger, plan: Plan, q: Quota) -> dict:
+    """What the board shows in the 'quota left' column, for one window."""
+    used = await ledger.window_usage(plan, q)
+    facts = await ledger.window_facts(plan.key, q.label)
     tokens = used["prompt_tokens"] + used["completion_tokens"]
-    q = plan.quota
 
     basis: str | None = None
     limit: float | None = None
     consumed: float = 0.0
 
+    meta = {"window": q.label, "role": q.role, "period": q.period}
+
     if q.kind == "unlimited":
-        return {"kind": "unlimited", "pct_used": None, "basis": "local, unmetered",
+        return {**meta, "kind": "unlimited", "pct_used": None, "basis": "local, unmetered",
                 "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
 
     if q.kind == "dollars":
@@ -191,7 +268,7 @@ async def headroom(ledger: Ledger, plan: Plan) -> dict:
         # A number the provider gave us always beats our own estimate.
         rem = float(facts["reported_remaining"])
         total = rem + consumed
-        return {"kind": q.kind, "pct_used": _pct(consumed, total), "limit": total,
+        return {**meta, "kind": q.kind, "pct_used": _pct(consumed, total), "limit": total,
                 "consumed": consumed, "basis": "reported by provider",
                 "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
 
@@ -200,7 +277,7 @@ async def headroom(ledger: Ledger, plan: Plan) -> dict:
         if obs > 0:
             limit, basis = obs, "observed (where it ran out last time)"
 
-    return {"kind": q.kind, "pct_used": _pct(consumed, limit), "limit": limit,
+    return {**meta, "kind": q.kind, "pct_used": _pct(consumed, limit), "limit": limit,
             "consumed": consumed, "basis": basis,
             "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
 

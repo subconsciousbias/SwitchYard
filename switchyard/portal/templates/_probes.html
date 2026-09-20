@@ -1,0 +1,90 @@
+<div id="probes">
+{% if probes %}
+<div class="panel">
+  <div class="muted" style="font-size:13px;margin-bottom:10px">
+    These providers publish exact headroom only to a logged-in browser session,
+    so pasting a session cookie is the only way to see real numbers instead of
+    estimates. <strong>A session cookie is full account access</strong> — it is
+    stored in Redis on this host, never logged and never returned by the API.
+    Log out at the provider to revoke it.
+  </div>
+  <table>
+    <thead><tr>
+      <th>Plan</th><th>Session</th><th>Last read</th><th>Paste cookie</th><th></th>
+    </tr></thead>
+    <tbody>
+    {% for p in probes %}
+      {% set st = p.status %}
+      <tr>
+        <td>
+          <strong>{{ p.plan.label }}</strong>
+          <div class="muted mono" style="font-size:12px">
+            {{ p.plan.probe.window or 'target' }} window · every
+            {{ p.plan.probe.interval_seconds // 60 }}m</div>
+        </td>
+        <td class="nowrap">
+          {% if st.needs_reauth %}
+            <span class="tag bad">needs re-auth</span>
+          {% elif st.has_cookie %}
+            <span class="tag ok">active</span>
+          {% else %}
+            <span class="tag">not set</span>
+          {% endif %}
+          {% if st.fingerprint %}
+            <div class="muted mono" style="font-size:12px">{{ st.fingerprint }}</div>
+          {% endif %}
+        </td>
+        <td class="mono nowrap">
+          {% if st.remaining is not none %}
+            {{ '{:,.0f}'.format(st.remaining) }} left
+            {% if st.total %}<span class="muted">/ {{ '{:,.0f}'.format(st.total) }}</span>{% endif %}
+          {% else %}
+            <span class="muted">—</span>
+          {% endif %}
+          {% if st.last_error %}
+            <div class="mono" style="font-size:12px;color:var(--bad)">{{ st.last_error }}</div>
+          {% endif %}
+        </td>
+        <td>
+          <form hx-post="/admin/probes/{{ p.plan.key }}/cookie" hx-target="#probes"
+                hx-swap="outerHTML" style="display:flex;gap:6px">
+            <input type="password" name="cookie" placeholder="paste document.cookie"
+                   autocomplete="off" style="flex:1;min-width:150px;font-family:ui-monospace;
+                   font-size:12px;padding:5px 7px;border:1px solid var(--line);
+                   border-radius:6px;background:var(--bg);color:var(--ink)">
+            <button class="tag" type="submit">save &amp; test</button>
+          </form>
+        </td>
+        <td class="nowrap">
+          <button class="tag" hx-post="/admin/probes/{{ p.plan.key }}/test"
+                  hx-target="#probes" hx-swap="outerHTML">test now</button>
+          {% if st.has_cookie %}
+            <button class="tag" hx-post="/admin/probes/{{ p.plan.key }}/forget"
+                    hx-target="#probes" hx-swap="outerHTML">forget</button>
+          {% endif %}
+        </td>
+      </tr>
+      {% if p.last_test %}
+      <tr>
+        <td colspan="5" style="padding-top:0">
+          <div class="muted" style="font-size:12px">
+            {{ 'Read OK' if p.last_test.ok else 'Failed' }}: {{ p.last_test.detail }}
+            {% if not p.last_test.ok and p.last_test.raw %}
+              — the raw response is below; correct the field paths in
+              <span class="mono">plans.yaml</span> to match it.
+            {% endif %}
+          </div>
+          {% if p.last_test.raw %}
+            <pre class="mono" style="font-size:11px;white-space:pre-wrap;word-break:break-all;
+                 background:var(--track);padding:8px;border-radius:6px;margin:6px 0 0;
+                 max-height:140px;overflow:auto">{{ p.last_test.raw }}</pre>
+          {% endif %}
+        </td>
+      </tr>
+      {% endif %}
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+</div>

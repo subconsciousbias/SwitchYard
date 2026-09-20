@@ -237,10 +237,14 @@ class SwitchyardHandler(CustomLogger):
             return  # a bad prompt is not the provider's problem
 
         if verdict.outcome is Outcome.QUOTA_EXHAUSTED:
-            await self.ledger.note_exhaustion(plan, time.time() + verdict.cooldown_seconds)
+            # Which window did we hit? The reset time tells us, and attributing
+            # it correctly keeps a 5-hour wall out of the weekly figures.
+            window = await self.ledger.note_exhaustion(
+                plan, time.time() + verdict.cooldown_seconds)
             log.warning(
-                "plan=%s quota exhausted (%s) — dropping its %d slots for %ds",
-                plan.key, verdict.detail, plan.max_parallel, verdict.cooldown_seconds,
+                "plan=%s exhausted its %s window (%s) — dropping its %d slots for %ds",
+                plan.key, window.label, verdict.detail, plan.max_parallel,
+                verdict.cooldown_seconds,
             )
         elif verdict.outcome is Outcome.PLAN_DEAD:
             log.error(
@@ -268,7 +272,7 @@ class SwitchyardHandler(CustomLogger):
     async def _absorb_limit_headers(self, plan_key: str, kwargs: dict) -> None:
         """Prefer a provider's own remaining-quota headers over our estimate."""
         plan = self.registry.plans.get(plan_key)
-        if not plan or not plan.quota.headers:
+        if not plan or not any(q.headers for q in plan.quotas):
             return
         headers = {}
         for src in ("response_headers", "_response_headers"):
@@ -277,12 +281,15 @@ class SwitchyardHandler(CustomLogger):
                 headers.update({k.lower(): v for k, v in h.items()})
         if not headers:
             return
-        rem_h = (plan.quota.headers.get("remaining") or "").lower()
-        reset_h = (plan.quota.headers.get("reset") or "").lower()
-        remaining = _as_float(headers.get(rem_h))
-        reset = _as_float(headers.get(reset_h))
-        if remaining is not None or reset is not None:
-            await self.ledger.note_reported(plan_key, remaining, reset)
+        # Each window may name its own headers, so a provider that reports both
+        # a 5-hour and a weekly remaining count populates both.
+        for q in plan.quotas:
+            if not q.headers:
+                continue
+            remaining = _as_float(headers.get((q.headers.get("remaining") or "").lower()))
+            reset = _as_float(headers.get((q.headers.get("reset") or "").lower()))
+            if remaining is not None or reset is not None:
+                await self.ledger.note_reported(plan_key, remaining, reset, window=q.label)
 
 
 def _payload_of(response_obj: Any) -> Any:

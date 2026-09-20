@@ -13,11 +13,51 @@ CONFIG_PATH = os.environ.get("SWITCHYARD_PLANS", "/app/config/plans.yaml")
 
 @dataclass(frozen=True)
 class Quota:
+    """One quota window.
+
+    Providers usually enforce several at once — a 5-hour burst window *and* a
+    weekly allowance, sometimes a monthly one too. Exactly one window per plan
+    is the `target`: the allowance worth maximising, normally the weekly one.
+    The others are `constraint`s — we must not blow them, but landing them at
+    100% is not a goal in itself.
+    """
     kind: str = "unknown"          # tokens | dollars | window | unlimited | unknown
-    period: str | None = None      # month | week | rolling_5h
+    period: str | None = None      # month | week | rolling_5h | day
     allowance: float | None = None
     source: str = "estimate"       # estimate | headers | probe | ledger | sidecar | none
     headers: dict[str, str] = field(default_factory=dict)
+    name: str = ""                 # display name, defaults to the period
+    role: str = "target"           # target | constraint
+
+    @property
+    def label(self) -> str:
+        return self.name or (self.period or "window")
+
+    @property
+    def is_target(self) -> bool:
+        return self.role == "target"
+
+
+@dataclass(frozen=True)
+class Probe:
+    """How to read real headroom from a provider's own console endpoint.
+
+    Some consoles (MiniMax's `/coding_plan/remains`) only answer a browser
+    session, so `kind: cookie` pairs with a cookie the portal stores for you.
+    Field paths are lists of candidates because vendors rename things without
+    notice; run the probe once and the portal shows the raw response to map.
+    """
+    url: str
+    kind: str = "cookie"              # cookie | bearer | none
+    method: str = "GET"
+    window: str | None = None         # which quota window these numbers describe
+    interval_seconds: int = 600
+    timeout_seconds: float = 15.0
+    fields: dict[str, list[str]] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+    referer: str = ""
+    user_agent: str = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36")
 
 
 @dataclass(frozen=True)
@@ -35,9 +75,23 @@ class Plan:
     metered: bool = False
     enabled: bool = True
     expires: date | None = None
-    quota: Quota = field(default_factory=Quota)
+    quotas: tuple[Quota, ...] = field(default_factory=lambda: (Quota(),))
+    probe: Probe | None = None
     alert_burn_rate_per_hour: float | None = None
     notes: str = ""
+
+    @property
+    def quota(self) -> Quota:
+        """The window pacing aims to fill — the weekly allowance, usually."""
+        for q in self.quotas:
+            if q.is_target:
+                return q
+        return self.quotas[0] if self.quotas else Quota()
+
+    @property
+    def constraints(self) -> tuple[Quota, ...]:
+        """Windows we must not overshoot, e.g. a 5-hour burst limit."""
+        return tuple(q for q in self.quotas if not q.is_target)
 
     @property
     def expired(self) -> bool:
@@ -54,6 +108,10 @@ class Plan:
         """A fixed-fee plan with a resetting allowance — the only kind worth
         pacing. Metered providers and unlimited local models are not."""
         return not self.metered and self.quota.kind not in ("unlimited", "unknown")
+
+    @property
+    def known_allowances(self) -> int:
+        return sum(1 for q in self.quotas if q.allowance)
 
     def paced(self, settings: "Settings") -> bool:
         if self.pacing is not None:
@@ -154,6 +212,40 @@ class Registry:
         return plan_key in self.lanes[lane_key].tail
 
 
+def _parse_probe(raw: Any) -> Probe | None:
+    if not raw:
+        return None
+    body = dict(raw)
+    fields = {k: (v if isinstance(v, list) else [v])
+              for k, v in (body.pop("fields", None) or {}).items()}
+    return Probe(fields=fields, **body)
+
+
+def _parse_quotas(body: dict) -> tuple[Quota, ...]:
+    """`quotas:` (a list) wins; `quota:` (a single mapping) still works.
+
+    With several windows and none marked, the longest period becomes the target
+    — maximising the weekly allowance is nearly always what you want, and the
+    5-hour window is nearly always the thing not to overshoot.
+    """
+    raw = body.pop("quotas", None)
+    if raw is None:
+        single = dict(body.pop("quota", None) or {})
+        return (Quota(**single),) if single else (Quota(),)
+
+    order = {"rolling_5h": 0, "day": 1, "week": 2, "month": 3, None: 4}
+    parsed = [Quota(**dict(entry)) for entry in raw]
+    if not any(q.is_target for q in parsed):
+        longest = max(parsed, key=lambda q: order.get(q.period, 4))
+        parsed = [
+            Quota(**{**q.__dict__, "role": "target" if q is longest else "constraint"})
+            for q in parsed
+        ]
+    elif sum(1 for q in parsed if q.is_target) > 1:
+        raise ValueError(f"only one quota window may be role: target, got {raw}")
+    return tuple(parsed)
+
+
 def _parse_date(v: Any) -> date | None:
     if v in (None, ""):
         return None
@@ -176,7 +268,8 @@ def load(path: str | None = None) -> Registry:
     plans: dict[str, Plan] = {}
     for key, body in (raw.get("plans") or {}).items():
         body = dict(body)
-        q = dict(body.pop("quota", None) or {})
+        quotas = _parse_quotas(body)
+        probe_raw = body.pop("probe", None)
         raw_parallel = body.get("max_parallel", 1)
         auto = str(raw_parallel).lower() == "auto"
         configured = None if auto else int(raw_parallel)
@@ -195,7 +288,8 @@ def load(path: str | None = None) -> Registry:
             metered=bool(body.get("metered", False)),
             enabled=bool(body.get("enabled", True)),
             expires=_parse_date(body.get("expires")),
-            quota=Quota(**q),
+            quotas=quotas,
+            probe=_parse_probe(probe_raw),
             alert_burn_rate_per_hour=body.get("alert_burn_rate_per_hour"),
             notes=body.get("notes", ""),
         )
