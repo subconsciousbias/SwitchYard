@@ -360,6 +360,13 @@ Concurrency is N CLI **subprocesses inside one container**, not N containers. So
   what makes "refuse immediately when full" possible, so Switchyard can spill to
   the next plan instead of holding a worker open.
 
+**`max_tokens` is not enforced on these lanes.** No CLI has a token cap — Claude
+Code offers `--max-turns`, not a token limit — so a caller's `max_tokens` is
+converted into a prompt instruction ("answer in at most roughly N words"). That
+genuinely shortens output and therefore saves subscription quota, but the model
+can exceed it; `/health` reports `enforces_max_tokens: false`. If you need a hard
+cap, use an API-keyed lane.
+
 The one hazard of a shared credential store is a cold start where the token is
 due for refresh: every concurrent subprocess would race to refresh and rewrite
 the same file. The first request therefore runs alone, and full concurrency is

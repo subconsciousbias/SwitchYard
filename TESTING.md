@@ -596,6 +596,9 @@ account system from z.ai — not merely a different region of the same one.)
 
 Two related notes:
 
+- **`max_tokens` is advisory on the sidecar lanes.** The CLIs have no token cap,
+  so it becomes a prompt instruction rather than a hard limit. An API-keyed lane
+  enforces it properly.
 - **GLM 4.6 is a reasoning model.** At `max_tokens: 8` it returned
   `finish_reason: length`, empty `content`, and its text in `reasoning_content` —
   the whole budget went on reasoning. The local Qwen behaves the same way. Give

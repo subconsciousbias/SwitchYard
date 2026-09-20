@@ -405,6 +405,23 @@ def parse_output(stdout: str) -> dict:
     return {"result": stdout.strip()}
 
 
+def fold_max_tokens(system: str | None, max_tokens: int | None) -> str | None:
+    """Turn the caller's max_tokens into an instruction, since no CLI has a flag.
+
+    `claude -p` and `opencode run` expose turn limits, not token caps, so a
+    caller asking for 50 tokens would otherwise get a full-length answer — and
+    pay the subscription quota for it. An instruction is a soft limit the model
+    can ignore, but it genuinely shortens output, which is the point. /health
+    reports enforces_max_tokens: false so this is not mistaken for a hard cap.
+    """
+    if not max_tokens or max_tokens <= 0:
+        return system
+    words = max(10, int(max_tokens * 0.7))
+    hint = (f"Answer in at most roughly {words} words. Be direct: no preamble, "
+            "no restating the question.")
+    return f"{system}\n\n{hint}" if system else hint
+
+
 def fold_system(prompt: str, system: str | None) -> tuple[str, str | None]:
     """When a CLI has no system-prompt flag, put the caller's instructions at
     the top of the prompt rather than discarding them silently."""
@@ -495,6 +512,9 @@ async def health() -> dict:
     cfg = config()
     return {"ok": True, "provider": PROVIDER, "supports_tools": False,
             "home": os.environ.get("HOME", ""), "warm": _warm.is_set(),
+            # The CLIs have no token cap, so max_tokens becomes a prompt
+            # instruction: a real reduction, but not a guarantee.
+            "enforces_max_tokens": False,
             "system_mode": SYSTEM_MODE, "bare": BARE,
             "subscription": SUBSCRIPTION or PROVIDER, "model": cfg.model,
             "models": sorted(cfg.models), "concurrency": cfg.concurrency,
@@ -525,6 +545,9 @@ async def chat(request: Request):
                 "type": "tools_unsupported"}})
 
     prompt, system = flatten(body.get("messages") or [])
+    # No CLI accepts a token cap, so express it as an instruction instead of
+    # dropping it on the floor.
+    system = fold_max_tokens(system, body.get("max_tokens"))
     if not prompt:
         raise HTTPException(status_code=400, detail="no usable message content")
     model, warning = resolve_model(body.get("model"))
