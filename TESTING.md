@@ -93,6 +93,28 @@ docker compose up -d --build
 docker compose ps
 ```
 
+**If the gateway build fails with `failed to fetch oauth token: denied: denied`**
+on `ghcr.io/berriai/litellm:main-stable`, the image is fine — Docker is sending
+broken credentials. A stale or placeholder `ghcr.io` login makes Docker send them
+instead of falling back to anonymous, and GHCR refuses. Check what it holds:
+
+```bash
+echo ghcr.io | docker-credential-osxkeychain get   # macOS; prints the secret
+```
+
+A username like `USERNAME` means a copy-pasted `docker login` placeholder. Clear
+it and the anonymous pull works:
+
+```bash
+docker logout ghcr.io && docker compose up -d --build
+```
+
+Or log in for real if you also pull private images from GHCR:
+
+```bash
+echo "<PAT>" | docker login ghcr.io -u <your-github-username> --password-stdin
+```
+
 **Expect:** `redis`, `postgres`, `gateway`, `portal`, `claude-max-sidecar`,
 `codex-sidecar` all `running`, with redis/postgres `healthy`.
 

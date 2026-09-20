@@ -25,6 +25,16 @@ duplicate any of them — the sidecars read `plans.yaml` themselves. If you find
 yourself setting the same number in two places, the config is the source of
 truth and the other place is a bug.
 
+## Don't touch credential stores
+
+Same reasoning as `.env`: never run `docker login`/`docker logout`, never write to
+the keychain, and never delete a stored token. Diagnose read-only, then give the
+user the exact command to run themselves. Print `KEY=<set>` or a length, never a
+secret's value.
+
+Also: macOS has no `timeout(1)`. Use `gtimeout` if coreutils is installed, or
+leave the command unbounded.
+
 ## Tests run without services
 
 `tests/*.py` are plain scripts, no pytest plugins, no Redis, no network:
