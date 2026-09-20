@@ -176,6 +176,14 @@ directories is not a substitute:
 - **Claude on macOS keeps its OAuth token in the login Keychain**, not in a
   file, so there is nothing in `~/.claude` for a Linux container to read.
   Mounting it yields settings and history but zero credentials.
+
+**Use a device-code flow, not the default browser flow.** A plain `codex login`
+starts a callback listener *inside the container* and sends your host browser to
+`localhost:<port>`, which reaches your Mac, not the container — so it hangs.
+`codex login --device-auth` gives you a code to enter on the website instead, with
+no callback. (That flag is real but missing from `codex login --help`; it is
+accepted.) `opencode auth login --provider <id>` skips the interactive picker,
+which also matters when the terminal is a `docker compose exec` pipe.
 - Sharing a host directory read-write lets a containerised CLI rewrite the config
   of the CLI you are using interactively, and OAuth refresh *requires* write
   access. See `secrets/README.md`.
@@ -185,10 +193,10 @@ If your `.env` pins `CLAUDE_CONFIG_DIR` / `CODEX_CONFIG_DIR` /
 lines out to use the isolated stores, then `docker compose up -d` to recreate.
 
 ```bash
-docker compose exec claude-max-sidecar   claude login          # follow the URL
-docker compose exec codex-sidecar        codex login
-docker compose exec grok-sidecar         opencode auth login   # choose xAI
-docker compose exec opencode-go-sidecar  opencode auth login   # choose OpenCode Zen
+docker compose exec claude-max-sidecar   claude login
+docker compose exec codex-sidecar        codex login --device-auth
+docker compose exec grok-sidecar         opencode auth login --provider xai
+docker compose exec opencode-go-sidecar  opencode auth login --provider opencode
 
 for p in 8081 8082 8083 8084; do
   docker compose exec gateway python -c "

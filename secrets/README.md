@@ -5,12 +5,21 @@ from your host CLIs. Log in once per sidecar:
 
 ```bash
 docker compose exec claude-max-sidecar   claude login
-docker compose exec codex-sidecar        codex login
-docker compose exec grok-sidecar         opencode auth login   # choose xAI
-docker compose exec opencode-go-sidecar  opencode auth login   # choose OpenCode Zen
+docker compose exec codex-sidecar        codex login --device-auth
+docker compose exec grok-sidecar         opencode auth login --provider xai
+docker compose exec opencode-go-sidecar  opencode auth login --provider opencode
 ```
 
-The logins persist here across restarts and rebuilds.
+The logins persist here across restarts and rebuilds — the directory is a host
+bind mount, so it is genuinely one-time.
+
+**Device-code flows only.** A browser-callback login starts its listener inside
+the container and points your host browser at `localhost:<port>`, which resolves
+to your Mac rather than the container, so it never completes.
+`codex login --device-auth` avoids that by giving you a code to type into the
+website. Claude's login already works this way. OpenCode takes
+`--provider <id>` to skip the picker, which matters over a `docker compose exec`
+pipe.
 
 ## Why not just mount your host `~/.claude`?
 

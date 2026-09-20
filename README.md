@@ -337,9 +337,13 @@ One image, four services, selected by `PROVIDER`:
 | Subscription | `PROVIDER` | CLI | Port | Log in with |
 |---|---|---|---|---|
 | Claude Max $200 | `claude` | `claude -p` | 8081 | `claude login` |
-| OpenAI seat (+ Astra 6) | `codex` | `codex exec` | 8082 | `codex login` |
-| Grok $300 (SuperGrok) | `opencode` | `opencode run` | 8083 | `opencode auth login` |
-| OpenCode Go | `opencode` | `opencode run` | 8084 | `opencode auth login` |
+| OpenAI seat (+ Astra 6) | `codex` | `codex exec` | 8082 | `codex login --device-auth` |
+| Grok $300 (SuperGrok) | `opencode` | `opencode run` | 8083 | `opencode auth login --provider xai` |
+| OpenCode Go | `opencode` | `opencode run` | 8084 | `opencode auth login --provider opencode` |
+
+Device-code flows, not browser callbacks: a callback listener started inside the
+container sends your host browser to a `localhost` port that resolves to your Mac,
+so it never completes.
 
 ### One container per subscription, not one per request
 
