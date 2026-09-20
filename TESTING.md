@@ -261,10 +261,10 @@ for l in sys.stdin:
     if t: print("input tokens:", t["input"])'
 ```
 
-**Expect roughly 600.** Without `--agent switchyard` it is about 7,200 — the
-agent's minimal prompt and disabled tools are what make a subscription viable for
-volume. Claude sits at 2; codex at ~9,800, which is its own tool schema and has
-resisted every config key tried.
+**Expect roughly 425.** Without `--agent switchyard` it is about 7,200 — the
+agent's disabled tools are what make a subscription viable for volume. Claude sits
+at 2; codex at ~9,800, which is its own tool schema and has resisted every config
+key tried.
 
 **This is the check that matters most.** `concurrency` comes from
 `config/plans.yaml`, not from the compose file — if it does not match the

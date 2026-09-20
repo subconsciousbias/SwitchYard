@@ -239,7 +239,9 @@ def check_harness_overhead() -> None:
         except (ValueError, IndexError):
             check(f"{svc} harness overhead", False, raw[:120])
             continue
-        budget = {"claude-max-sidecar": 100, "grok-sidecar": 1500,
+        # Budgets sit a little above the measured figures (2 / 423 / 9,768), so a
+        # regression that reintroduces the CLI's own prompt trips this.
+        budget = {"claude-max-sidecar": 100, "grok-sidecar": 900,
                   "codex-sidecar": 11000}[svc]
         check(f"{svc} harness overhead within budget", tokens <= budget,
               f"{tokens} prompt tokens (budget {budget})")

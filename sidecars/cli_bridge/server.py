@@ -121,10 +121,14 @@ PROFILES: dict[str, dict] = {
         "cli": os.environ.get("OPENCODE_CLI", "opencode"),
         "model": os.environ.get("OPENCODE_MODEL", "xai/grok-4.6"),
         # --agent switchyard selects the minimal agent in harness/opencode.json:
-        # a one-line prompt with every tool disabled. Measured on a trivial call,
-        # that takes the prompt from 7,239 tokens to 575 — a 92% cut, and the
-        # difference between a subscription being usable for volume and not.
-        # (`--pure` changes nothing here; there are no plugins installed.)
+        # every tool disabled and NO prompt field. Measured on a trivial call,
+        # 7,239 -> 423 tokens, a 94% cut — the difference between a subscription
+        # being usable for volume and not.
+        #
+        # The agent deliberately has no `prompt:`. Carrying a one-line prompt cost
+        # 582 tokens against 423 without it, for identical answers, and it was
+        # redundant anyway: the caller's system prompt is folded into the message,
+        # so it governs. (`--pure` changes nothing; no plugins are installed.)
         "args": os.environ.get(
             "OPENCODE_ARGS",
             "run --model {model} --format json --agent switchyard {prompt}").split(),

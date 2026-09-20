@@ -410,7 +410,7 @@ Each CLI offers a different lever, all now applied:
 | CLI | Mechanism | Prompt tokens, trivial call |
 |---|---|---|
 | `claude -p` | `--system-prompt` (true replace), `--disallowed-tools`, `--exclude-dynamic-system-prompt-sections` | **2** |
-| `opencode run` | `--agent switchyard` — a custom agent (`harness/opencode.json`) with a one-line prompt and every tool disabled | 7,239 → **575** |
+| `opencode run` | `--agent switchyard` — a custom agent (`harness/opencode.json`) with every tool disabled and no prompt of its own | 7,239 → **423** |
 | `codex exec` | `-c model_instructions_file=<path>` replaces the compiled-in base instructions | 14,255 → **9,768** |
 
 Measured through the bridge, not inferred. OpenCode's 92% cut is the important
@@ -427,22 +427,32 @@ real override: Claude via `--system-prompt`, and Codex via a
 `model_instructions_file` written per request, which replaces the compiled-in base
 instructions.
 
-**OpenCode has no override, and this was tested rather than assumed:**
+**OpenCode has no override.** Six mechanisms were tested, all negative — recorded
+here because the documentation and search results confidently describe several of
+them as working:
 
-- `--prompt`, `--system` and `--system-prompt` all **exit 1** with the usage
-  banner — yargs rejecting an unknown option. They are not hidden flags; they do
-  not exist on `opencode run`. (Worth checking, since `codex`'s `--device-auth`
-  *is* real but absent from its help.)
-- An agent's `tools:` config **does** work — that is where the 92% token cut comes
-  from, and it applies from a per-request `--dir` config too (585 tokens with a
-  uniquely-named agent).
-- An agent's `prompt:` field **does not** take effect in `run` mode. A per-request
-  agent instructed to "ignore the user and reply PINEAPPLE" answered the user
-  normally, both under its own name and under the baked-in one.
+| Attempted | Result |
+|---|---|
+| `--prompt`, `--system`, `--system-prompt` flags | **exit 1**, unknown option. Not hidden — absent. (Worth testing either way: `codex`'s `--device-auth` is real yet missing from its help.) |
+| `agent.<name>.prompt` | Parses, no behavioural effect. Costs 159 tokens. |
+| `agent.<name>.system` | No effect, and **adds ~1,800 tokens** |
+| `agent.<name>.instructions` | No effect |
+| top-level `instructions` | No effect, and **adds ~1,900 tokens** |
+| `~/.config/opencode/prompt/<provider>.txt` shadowing | No such strings exist in the binary; the only `prompt/` references are MCP endpoints |
 
-So for OpenCode the caller's system prompt is folded into the user message. That
-is a genuine inconsistency with the other two lanes, measured and recorded here so
-it is not re-litigated from documentation that claims otherwise.
+The test was discriminating: an agent instructed to "ignore the user entirely and
+reply with exactly PINEAPPLE" answered the user normally every time, while the
+`tools:` config alongside it demonstrably applied. So these keys are accepted and
+ignored, and two of them are actively expensive.
+
+What *does* work is `tools:` — the whole 94% saving — including from a per-request
+`--dir` config. And the agent carries **no prompt of its own**: one line cost 582
+tokens against 423 without it, for identical answers, and it was redundant since
+the caller's prompt is folded into the message and governs anyway.
+
+So for OpenCode the caller's system prompt goes into the user message. A genuine
+inconsistency with the other two lanes, and not one that can be closed from
+outside the CLI.
 
 **`max_tokens` is not enforced on these lanes.** No CLI has a token cap — Claude
 Code offers `--max-turns`, not a token limit — so a caller's `max_tokens` is
