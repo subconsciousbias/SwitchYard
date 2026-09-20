@@ -59,6 +59,9 @@ services:
       REDIS_PORT: "6379"
       DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:-litellm}@postgres:5432/litellm
       LOCAL_API_BASE: ${LOCAL_API_BASE:-http://host.docker.internal:11434/v1}
+      # Reaches the container via env_file too, but named here so the
+      # dependency is visible when the local lane 401s.
+      LOCAL_API_KEY: ${LOCAL_API_KEY:-}
       GATEWAY_WORKERS: ${GATEWAY_WORKERS:-2}
     extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
