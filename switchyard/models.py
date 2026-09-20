@@ -28,6 +28,7 @@ class Plan:
     max_parallel: int
     monthly_cost: float = 0.0
     auth: str = "api_key"
+    provider_family: str | None = None   # drives vendor error-code mapping
     metered: bool = False
     enabled: bool = True
     expires: date | None = None
@@ -96,8 +97,11 @@ class Registry:
             return out
 
         body = live(lane.order)
-        # Stable sort: expiring-soon first, otherwise keep configured position.
-        body.sort(key=lambda p: 0 if (p.days_left is not None and p.days_left <= window) else 1)
+        # Expiring plans first, soonest death first, so the capacity with the
+        # least time left gets drained first. Everything else keeps its
+        # configured position (the sort is stable).
+        body.sort(key=lambda p: (0, p.days_left)
+                  if (p.days_left is not None and p.days_left <= window) else (1, 0))
         return body + live(lane.tail)
 
     def is_tail(self, lane_key: str, plan_key: str) -> bool:
@@ -129,6 +133,7 @@ def load(path: str | None = None) -> Registry:
             max_parallel=int(body.get("max_parallel", 1)),
             monthly_cost=float(body.get("monthly_cost", 0) or 0),
             auth=body.get("auth", "api_key"),
+            provider_family=body.get("provider_family"),
             metered=bool(body.get("metered", False)),
             enabled=bool(body.get("enabled", True)),
             expires=_parse_date(body.get("expires")),

@@ -1,17 +1,18 @@
-# Owns the Claude Code CLI and its OAuth credentials. Mount the host's
-# ~/.claude so `claude` uses the login you already have; this image never
-# handles a token itself.
+# Owns the vendor CLIs and their OAuth credentials. One image, two services:
+# PROVIDER=claude for Claude Max, PROVIDER=codex for the ChatGPT seat. Mount the
+# host's credential directory so each CLI uses a login you already have; this
+# image never handles a token itself.
 FROM node:22-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code @openai/codex
 
 WORKDIR /app
-COPY sidecars/claude-max/server.py /app/server.py
+COPY sidecars/cli_bridge/server.py /app/server.py
 RUN pip install --no-cache-dir --break-system-packages fastapi "uvicorn[standard]"
 
-ENV CLAUDE_CLI=claude SIDECAR_CONCURRENCY=1
+ENV PROVIDER=claude SIDECAR_CONCURRENCY=1
 EXPOSE 8081
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8081"]
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${SIDECAR_PORT:-8081}"]

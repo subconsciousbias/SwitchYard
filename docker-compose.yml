@@ -77,20 +77,46 @@ services:
 
   # Claude Max's quota is OAuth-only, so the CLI owns the credential and this
   # service just exposes it as HTTP on the internal network. Log in once with
-  # `docker compose exec claude-max-sidecar claude login` (or mount a host
-  # ~/.claude that is already logged in).
+  # `docker compose exec claude-max-sidecar claude login`, or mount a host
+  # ~/.claude that is already logged in.
   claude-max-sidecar:
     build: {context: ., dockerfile: Dockerfile.sidecar}
     <<: *common
     expose: ["8081"]
     environment:
+      PROVIDER: claude
+      SIDECAR_PORT: "8081"
       CLAUDE_MODEL: ${CLAUDE_MODEL:-opus}
-      SIDECAR_CONCURRENCY: "1"
+      SIDECAR_CONCURRENCY: "1"          # your one Claude connection
       CLAUDE_CONFIG_DIR: /home/node/.claude
     volumes:
       - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8081/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Same image, same reason: the OpenAI $100 plan is a seat, so the Codex CLI
+  # holds the OAuth login. Log in with
+  # `docker compose exec codex-sidecar codex login`.
+  # Expires 2026-10-04 — delete this service and the plan then.
+  codex-sidecar:
+    build: {context: ., dockerfile: Dockerfile.sidecar}
+    <<: *common
+    expose: ["8082"]
+    environment:
+      PROVIDER: codex
+      SIDECAR_PORT: "8082"
+      CODEX_MODEL: ${CODEX_MODEL:-gpt-5}
+      SIDECAR_CONCURRENCY: "2"          # 2 connections allowed on this plan
+      CODEX_HOME: /home/node/.codex
+      CLI_EXTRA_ARGS: ${CODEX_EXTRA_ARGS:-}
+    volumes:
+      - ${CODEX_CONFIG_DIR:-~/.codex}:/home/node/.codex
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8082/health')\""]
       interval: 30s
       timeout: 5s
       retries: 3

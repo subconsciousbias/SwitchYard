@@ -27,11 +27,16 @@ plans:
     max_parallel: 4
     monthly_cost: 132
     auth: api_key
+    provider_family: minimax
     quota:
       kind: tokens
       period: month
       allowance: null                 # TODO: set the plan's token allowance
       source: estimate                # estimate | headers | probe
+      # MiniMax's /coding_plan/remains endpoint would give exact headroom, but
+      # it only accepts a browser cookie session — an API key gets
+      # "cookie is missing" (1004). So headroom here is ledger-estimated, and
+      # sharpened by the observed-allowance learning after the first wall.
     notes: "Original workhorse. Good at coding with explicit instructions."
 
   minimax-max:
@@ -40,6 +45,7 @@ plans:
     max_parallel: 4
     monthly_cost: 55
     auth: api_key
+    provider_family: minimax
     quota:
       kind: tokens
       period: month
@@ -53,6 +59,7 @@ plans:
     max_parallel: 1
     monthly_cost: 0
     auth: api_key
+    provider_family: zai
     expires: "2026-10-13"
     quota:
       kind: window
@@ -75,6 +82,22 @@ plans:
       source: ledger                  # we know exactly what we spent
     alert_burn_rate_per_hour: 5       # the $20/hr surprise must page us early
     notes: "Overflow only. Decent as a workhorse but it is real money."
+
+  opencode-go:
+    label: "OpenCode Go Plan"
+    deployment: sy.opencode-go
+    max_parallel: 1
+    monthly_cost: 0
+    auth: api_key
+    expires: "2026-09-27"
+    quota:
+      kind: window
+      period: month
+      allowance: null
+      source: estimate
+    notes: >
+      Cancelled, 7 days left as of 2026-09-20. Severely limited, so cap 1 —
+      but the drain rule puts it at the FRONT of the forge lane until it dies.
 
   # ------------------------------------------------------------ judgement ----
   claude-max:
@@ -114,11 +137,12 @@ plans:
     quota: {kind: unknown, source: estimate}
 
   openai:
-    label: "OpenAI $100 Plan"
+    label: "OpenAI $100 Plan (seat)"
     deployment: sy.openai
     max_parallel: 2
     monthly_cost: 0
-    auth: api_key                     # oauth_sidecar if this is a ChatGPT seat
+    auth: oauth_sidecar               # a ChatGPT seat: OAuth only, no API key
+    provider_family: openai
     expires: "2026-10-04"
     quota:
       kind: window
@@ -182,7 +206,7 @@ lanes:
   forge:
     label: "Coding Workhorse"
     description: "Getting work done. Ordered fill across every workhorse plan."
-    order: [minimax-ultra, minimax-max, grok, glm, openrouter-mimo]
+    order: [minimax-ultra, minimax-max, grok, glm, opencode-go, openrouter-mimo]
     tail: [qwen-local]
 
   local:
@@ -220,6 +244,9 @@ deployments:
     api_key: os.environ/MINIMAX_MAX_API_KEY
 
   glm:
+    # A GLM Coding Plan key MUST use the coding endpoint; the general endpoint
+    # rejects it. https://api.z.ai/api/coding/paas/v4 (not open.bigmodel.cn,
+    # which is the mainland general-API host).
     model: openai/glm-4.6
     api_base: os.environ/GLM_API_BASE
     api_key: os.environ/GLM_API_KEY
@@ -243,12 +270,20 @@ deployments:
     api_key: os.environ/ASTRA_API_KEY
 
   openai:
+    # Seat-based plan: the Codex CLI owns the OAuth login, the sidecar exposes
+    # it as HTTP. Concurrency is whatever the sidecar allows (2 here).
     model: openai/gpt-5
-    api_key: os.environ/OPENAI_API_KEY
+    api_base: http://codex-sidecar:8082/v1
+    api_key: sidecar
 
   grok:
     model: xai/grok-4
     api_key: os.environ/XAI_API_KEY
+
+  opencode-go:
+    model: openai/grok-code           # TODO: confirm model id + base URL
+    api_base: os.environ/OPENCODE_API_BASE
+    api_key: os.environ/OPENCODE_API_KEY
 
   qwen-local:
     model: openai/qwen-3.8-flash

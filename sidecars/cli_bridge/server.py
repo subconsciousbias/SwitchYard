@@ -1,14 +1,19 @@
-"""OpenAI-compatible shim over the Claude Code CLI.
+"""OpenAI-compatible shim over a vendor's own CLI, for OAuth-only plans.
 
 Why this exists: LiteLLM authenticates with static API keys, but a Claude Max
-subscription is OAuth-only and its token lives in the CLI's own credential
-store. So the CLI stays the client — it owns login and refresh — and this shim
-just speaks HTTP on one side and `claude -p` on the other.
+subscription and a ChatGPT seat are both OAuth-only, and their tokens live in
+the respective CLI's credential store. So the CLI stays the client — it owns
+login and refresh — and this shim just speaks HTTP on one side and the CLI on
+the other. No OAuth token ever reaches LiteLLM.
 
-The one thing it must get exactly right is error mapping: a usage-limit
-rejection has to leave here as **HTTP 429 with Retry-After**, because that is
-the signal Switchyard uses to drop the plan's slots out of the lane. A 500
-would look like a transient blip and the lane would keep picking dead capacity.
+One process per plan, selected with PROVIDER:
+    PROVIDER=claude   -> `claude -p`      (Claude Max)
+    PROVIDER=codex    -> `codex exec`     (ChatGPT seat)
+
+The thing it must get exactly right is error mapping: a usage-limit rejection
+has to leave here as **HTTP 429 with Retry-After**, because that is the signal
+Switchyard uses to drop the plan's slots out of the lane. A 500 would look like
+a transient blip and the lane would keep feeding requests to dead capacity.
 """
 from __future__ import annotations
 
@@ -22,12 +27,45 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="claude-max-sidecar")
+app = FastAPI(title="switchyard-cli-bridge")
 
-CLI = os.environ.get("CLAUDE_CLI", "claude")
-MODEL = os.environ.get("CLAUDE_MODEL", "opus")
+PROVIDER = os.environ.get("PROVIDER", "claude").lower()
 MAX_CONCURRENCY = int(os.environ.get("SIDECAR_CONCURRENCY", "1"))
 TIMEOUT = int(os.environ.get("SIDECAR_TIMEOUT", "600"))
+# Escape hatch for CLI flags that differ by version, e.g. "--full-auto".
+EXTRA_ARGS = [a for a in os.environ.get("CLI_EXTRA_ARGS", "").split() if a]
+
+# Per-provider invocation. `prompt` and `system` are substituted; `system` is
+# dropped entirely when the CLI has no equivalent flag.
+PROFILES: dict[str, dict] = {
+    "claude": {
+        "cli": os.environ.get("CLAUDE_CLI", "claude"),
+        "model": os.environ.get("CLAUDE_MODEL", "opus"),
+        "args": ["-p", "{prompt}", "--output-format", "json", "--model", "{model}"],
+        "system_args": ["--append-system-prompt", "{system}"],
+        "parser": "claude_json",
+        # Reset-window hint the CLI prints when the 5h limit is hit.
+        "default_retry_after": 5 * 3600,
+    },
+    # NOTE: the Codex CLI's flags move between releases. Verify against the
+    # installed version with `codex exec --help`; override with CLI_EXTRA_ARGS
+    # or CODEX_ARGS rather than editing this file.
+    "codex": {
+        "cli": os.environ.get("CODEX_CLI", "codex"),
+        "model": os.environ.get("CODEX_MODEL", "gpt-5"),
+        "args": os.environ.get("CODEX_ARGS", "exec --json --model {model} {prompt}").split(),
+        "system_args": [],
+        "parser": "codex_jsonl",
+        "default_retry_after": 3600,
+    },
+}
+
+if PROVIDER not in PROFILES:
+    raise SystemExit(f"PROVIDER must be one of {sorted(PROFILES)}, got {PROVIDER!r}")
+
+PROFILE = PROFILES[PROVIDER]
+CLI = PROFILE["cli"]
+MODEL = PROFILE["model"]
 
 _gate = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -69,10 +107,64 @@ def flatten(messages: list[dict]) -> tuple[str, str | None]:
     return "\n\n".join(turns), ("\n\n".join(system) or None)
 
 
+def build_argv(prompt: str, system: str | None) -> list[str]:
+    def fill(tpl: str) -> str:
+        return tpl.replace("{prompt}", prompt).replace("{model}", MODEL).replace(
+            "{system}", system or "")
+
+    argv = [CLI] + [fill(a) for a in PROFILE["args"]]
+    if system and PROFILE["system_args"]:
+        argv += [fill(a) for a in PROFILE["system_args"]]
+    return argv + EXTRA_ARGS
+
+
+def parse_output(stdout: str) -> dict:
+    """Normalise a CLI's output into {result, usage}."""
+    kind = PROFILE["parser"]
+
+    if kind == "claude_json":
+        return json.loads(stdout)
+
+    if kind == "codex_jsonl":
+        # A stream of JSON events; the last assistant message is the answer and
+        # a token-count event carries usage. Unknown event shapes are ignored
+        # rather than fatal, so a CLI update degrades instead of breaking.
+        text_parts: list[str] = []
+        usage: dict = {}
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for key in ("input_tokens", "output_tokens", "total_tokens"):
+                if key in evt:
+                    usage[key] = evt[key]
+            if isinstance(evt.get("usage"), dict):
+                usage.update(evt["usage"])
+            msg = evt.get("message") or evt.get("text") or evt.get("delta")
+            if isinstance(msg, dict):
+                msg = msg.get("content") or msg.get("text")
+            if isinstance(msg, list):
+                msg = "".join(
+                    str(b.get("text", "")) for b in msg if isinstance(b, dict)
+                )
+            if isinstance(msg, str) and msg.strip():
+                if evt.get("type") in (None, "message", "assistant", "item.completed",
+                                       "agent_message", "response.output_text.delta"):
+                    text_parts.append(msg)
+        if not text_parts:
+            raise json.JSONDecodeError("no assistant text in codex output", stdout, 0)
+        return {"result": text_parts[-1] if len(text_parts) == 1 else "".join(text_parts),
+                "usage": usage}
+
+    return {"result": stdout.strip()}
+
+
 async def run_cli(prompt: str, system: str | None) -> dict:
-    cmd = [CLI, "-p", prompt, "--output-format", "json", "--model", MODEL]
-    if system:
-        cmd += ["--append-system-prompt", system]
+    cmd = build_argv(prompt, system)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -81,21 +173,22 @@ async def run_cli(prompt: str, system: str | None) -> dict:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
     except asyncio.TimeoutError:
         proc.kill()
-        raise HTTPException(status_code=408, detail="claude cli timed out")
+        raise HTTPException(status_code=408, detail=f"{PROVIDER} cli timed out")
 
     stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
     blob = f"{stdout}\n{stderr}"
 
     if proc.returncode != 0 or not stdout.strip():
         if _AUTH.search(blob):
-            raise HTTPException(status_code=401, detail=f"claude cli not authenticated: {stderr[:300]}")
+            raise HTTPException(status_code=401,
+                                detail=f"{PROVIDER} cli not authenticated: {stderr[:300]}")
         if _LIMIT.search(blob):
             raise _limit_error(blob)
-        raise HTTPException(status_code=502, detail=f"claude cli failed ({proc.returncode}): {stderr[:300]}")
+        raise HTTPException(status_code=502, detail=f"{PROVIDER} cli failed ({proc.returncode}): {stderr[:300]}")
 
     try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
+        payload = parse_output(stdout)
+    except (json.JSONDecodeError, ValueError):
         payload = {"result": stdout.strip()}
 
     # The CLI can exit 0 while reporting a limit inside the JSON envelope.
@@ -103,7 +196,7 @@ async def run_cli(prompt: str, system: str | None) -> dict:
         text = json.dumps(payload)
         if _LIMIT.search(text):
             raise _limit_error(text)
-        raise HTTPException(status_code=502, detail=f"claude cli error: {text[:300]}")
+        raise HTTPException(status_code=502, detail=f"{PROVIDER} cli error: {text[:300]}")
     if _LIMIT.search(str(payload.get("result", ""))) and not payload.get("usage"):
         raise _limit_error(str(payload.get("result")))
 
@@ -111,10 +204,10 @@ async def run_cli(prompt: str, system: str | None) -> dict:
 
 
 def _limit_error(blob: str) -> HTTPException:
-    # Default to the 5-hour window; if the CLI names a reset time, trust it.
-    retry_after = 5 * 3600
+    # Default to the plan's window; if the CLI names a reset time, trust it.
+    retry_after = PROFILE["default_retry_after"]
     m = _RESET_AT.search(blob)
-    detail = "claude max usage limit reached"
+    detail = f"{PROVIDER} usage limit reached"
     if m:
         detail = f"{detail} (resets at {m.group(1)})"
     return HTTPException(
@@ -146,13 +239,14 @@ def to_openai(payload: dict, model: str) -> dict:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "model": MODEL, "concurrency": MAX_CONCURRENCY,
+    return {"ok": True, "provider": PROVIDER, "model": MODEL,
+            "concurrency": MAX_CONCURRENCY,
             "in_flight": MAX_CONCURRENCY - _gate._value}
 
 
 @app.get("/v1/models")
 async def models() -> dict:
-    return {"object": "list", "data": [{"id": MODEL, "object": "model", "owned_by": "claude-max"}]}
+    return {"object": "list", "data": [{"id": MODEL, "object": "model", "owned_by": f"switchyard-{PROVIDER}"}]}
 
 
 @app.post("/v1/chat/completions")

@@ -22,7 +22,7 @@ from litellm.proxy._types import UserAPIKeyAuth
 from redis.asyncio import Redis
 
 from . import models
-from .classify import Outcome, classify
+from .classify import Outcome, classify, inspect_success_payload
 from .picker import LaneSaturated, Picker
 from .session import derive as derive_session
 from .slots import SlotTable
@@ -143,6 +143,20 @@ class SwitchyardHandler(CustomLogger):
         if not plan:
             return
 
+        # A 200 is not proof of success. MiniMax can return HTTP 200 with the
+        # real failure in base_resp.status_code; recording that as a success
+        # would leave a quota-dead plan looking healthy and collecting every
+        # request the lane can give it.
+        verdict = inspect_success_payload(plan.provider_family, _payload_of(response_obj))
+        if verdict is not None:
+            log.warning(
+                "plan=%s returned HTTP 200 carrying a failure: %s",
+                plan.key, verdict.detail,
+            )
+            await self.ledger.record(plan, failed=True)
+            await self._apply_verdict(plan, verdict, ctx)
+            return
+
         usage = getattr(response_obj, "usage", None) or {}
         get = (lambda k: usage.get(k, 0)) if isinstance(usage, dict) else (lambda k: getattr(usage, k, 0) or 0)
         await self.ledger.record(
@@ -184,19 +198,43 @@ class SwitchyardHandler(CustomLogger):
         retry_after = _retry_after(exc)
         verdict = classify(
             status, str(getattr(exc, "message", None) or exc),
+            family=plan.provider_family,
+            body=_error_body(exc),
             retry_after=retry_after,
             default_cooldown=self.registry.settings.default_cooldown_seconds,
         )
+        await self._apply_verdict(plan, verdict, ctx)
+
+    async def _apply_verdict(self, plan, verdict, ctx: dict) -> None:
+        """Act on a classified failure: cool the plan, learn, release the lease."""
+        if verdict.is_our_fault:
+            return  # a bad prompt is not the provider's problem
+
         if verdict.outcome is Outcome.QUOTA_EXHAUSTED:
-            reset_at = time.time() + verdict.cooldown_seconds
-            await self.ledger.note_exhaustion(plan, reset_at)
+            await self.ledger.note_exhaustion(plan, time.time() + verdict.cooldown_seconds)
             log.warning(
                 "plan=%s quota exhausted (%s) — dropping its %d slots for %ds",
                 plan.key, verdict.detail, plan.max_parallel, verdict.cooldown_seconds,
             )
+        elif verdict.outcome is Outcome.PLAN_DEAD:
+            log.error(
+                "plan=%s subscription is over (%s) — out of every lane for %dh. "
+                "Remove it from config/plans.yaml.",
+                plan.key, verdict.detail, verdict.cooldown_seconds // 3600,
+            )
+        elif verdict.outcome is Outcome.CONCURRENCY:
+            # The provider says we opened too many connections, so our cap is
+            # wrong. Record it: the portal surfaces this as a config warning
+            # rather than letting it look like ordinary rate limiting.
+            await self.ledger.note_concurrency_rejection(plan)
+            log.warning(
+                "plan=%s refused on connection limit at max_parallel=%d — lower it",
+                plan.key, plan.max_parallel,
+            )
+
         if verdict.should_cool:
             await self.slots.cool_down(plan.key, verdict.cooldown_seconds, verdict.outcome.value)
-        if verdict.outcome in (Outcome.QUOTA_EXHAUSTED, Outcome.AUTH) and ctx.get("session"):
+        if verdict.outcome in (Outcome.QUOTA_EXHAUSTED, Outcome.PLAN_DEAD, Outcome.AUTH) and ctx.get("session"):
             # Do not strand the session on dead capacity; let it re-lease.
             await self.slots.drop_lease(ctx["session"])
 
@@ -218,6 +256,44 @@ class SwitchyardHandler(CustomLogger):
         reset = _as_float(headers.get(reset_h))
         if remaining is not None or reset is not None:
             await self.ledger.note_reported(plan_key, remaining, reset)
+
+
+def _payload_of(response_obj: Any) -> Any:
+    """Best-effort dict view of a response, whatever shape LiteLLM handed us."""
+    if isinstance(response_obj, dict):
+        return response_obj
+    for attr in ("model_dump", "dict", "json"):
+        fn = getattr(response_obj, attr, None)
+        if callable(fn):
+            try:
+                out = fn()
+                if isinstance(out, (dict, str)):
+                    return out
+            except Exception:
+                continue
+    hidden = getattr(response_obj, "_hidden_params", None)
+    return hidden if isinstance(hidden, dict) else None
+
+
+def _error_body(exc: Exception) -> Any:
+    """The raw error body, where the vendor business code actually lives."""
+    for attr in ("body", "response_body", "error"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, (dict, str)):
+            return val
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        for attr in ("json", "text"):
+            fn = getattr(resp, attr, None)
+            if callable(fn):
+                try:
+                    return fn()
+                except Exception:
+                    continue
+            elif isinstance(fn, str):
+                return fn
+    # Last resort: the message itself often carries "(1008)".
+    return str(getattr(exc, "message", None) or exc)
 
 
 def _retry_after(exc: Exception) -> float | None:

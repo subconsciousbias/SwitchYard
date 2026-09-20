@@ -73,6 +73,7 @@ async def collect_plans() -> list[dict]:
         month_cost = sum(d["cost"] for d in series if d["day"].startswith(month))
         cooled, ttl, reason = await slots.cooldown_state(plan.key)
         in_flight = await slots.in_flight(plan.key)
+        facts = await ledger.quota_facts(plan.key)
 
         alerting = []
         if hr.get("pct_used") is not None and hr["pct_used"] >= 80:
@@ -85,6 +86,18 @@ async def collect_plans() -> list[dict]:
             alerting.append("out of quota")
         if cooled and reason == "auth":
             alerting.append("credential rejected")
+        if cooled and reason == "plan_dead":
+            alerting.append("subscription over — remove from plans.yaml")
+        # A provider refusing us on connection count means max_parallel is set
+        # higher than the plan allows. Different fix from a quota wall, so it
+        # gets its own warning instead of looking like rate limiting.
+        rejections = facts.get("concurrency_rejections")
+        if isinstance(rejections, float) and rejections >= 1:
+            at_cap = facts.get("concurrency_rejected_at_cap")
+            alerting.append(
+                f"refused on connection limit {int(rejections)}x"
+                + (f" at cap {int(at_cap)} — lower it" if isinstance(at_cap, float) else "")
+            )
 
         lanes_used_in = [k for k, l in reg.lanes.items()
                          if plan.key in l.order or plan.key in l.tail]

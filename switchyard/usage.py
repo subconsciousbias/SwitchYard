@@ -127,6 +127,19 @@ class Ledger:
         })
         await pipe.execute()
 
+    async def note_concurrency_rejection(self, plan: Plan) -> None:
+        """A provider refusing us on connection count means our cap is wrong.
+
+        Tracked separately from rate limiting because the fix is different:
+        lower `max_parallel` in plans.yaml rather than wait it out.
+        """
+        key = K_QUOTA.format(plan=plan.key)
+        await self.redis.hincrbyfloat(key, "concurrency_rejections", 1)
+        await self.redis.hset(key, mapping={
+            "concurrency_rejected_at": time.time(),
+            "concurrency_rejected_at_cap": plan.max_parallel,
+        })
+
     async def note_reported(self, plan_key: str, remaining: float | None, reset_at: float | None) -> None:
         """Record limits a provider actually told us about (headers/sidecar)."""
         mapping = {}
