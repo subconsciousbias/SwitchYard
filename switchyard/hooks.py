@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import sys
 import time
 from typing import Any
 
@@ -31,6 +32,27 @@ from .usage import Ledger
 
 log = logging.getLogger("switchyard")
 
+
+def _configure_logging() -> None:
+    """Attach our own handler at our own level.
+
+    LiteLLM owns the root logger configuration, and under it our INFO records
+    were dropped — so the startup banner and every `lane=... -> plan` line went
+    missing while routing worked fine. A silently invisible router is worse than
+    a noisy one: you cannot tell it apart from one that never loaded.
+    """
+    level = os.environ.get("SWITCHYARD_LOG", "INFO").upper()
+    log.setLevel(getattr(logging, level, logging.INFO))
+    if not log.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("switchyard: %(message)s"))
+        log.addHandler(handler)
+    # Don't also hand records to the root logger, or every line appears twice.
+    log.propagate = False
+
+
+_configure_logging()
+
 META_KEY = "switchyard"
 
 
@@ -43,8 +65,9 @@ class SwitchyardHandler(CustomLogger):
         self._ledger: Ledger | None = None
         self._policy: CapacityPolicy | None = None
         log.info(
-            "switchyard: %d plans, lanes=%s",
+            "%d plans, lanes=%s, tool-capable=%d",
             len(self.registry.plans), ",".join(self.registry.lanes),
+            sum(1 for p in self.registry.plans.values() if p.can_use_tools),
         )
 
     # -- wiring ------------------------------------------------------------

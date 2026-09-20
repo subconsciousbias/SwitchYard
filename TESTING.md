@@ -7,10 +7,22 @@ Set these once in your shell:
 
 ```bash
 cd ~/Documents/GitHub/switchyard
-export KEY=$(grep '^LITELLM_MASTER_KEY=' .env | cut -d= -f2)
 export GW=http://localhost:4000
 export PORTAL=http://localhost:4001
 ```
+
+For the key, ask the **gateway** rather than parsing `.env` — that is
+authoritative, and it sidesteps a real trap: Docker Compose strips inline
+`# comments` from `.env` values, while `cut`/`grep` one-liners do not. Parse it by
+hand and you can end up sending the key *plus a comment* and getting a confusing
+401 from a stack that is working perfectly.
+
+```bash
+export KEY=$(docker compose exec -T gateway printenv LITELLM_MASTER_KEY | tr -d '\r\n')
+```
+
+(Before the stack is up, read it from `.env` with
+`sed -n 's/^LITELLM_MASTER_KEY=//p' .env | sed 's/[[:space:]]*#.*//'`.)
 
 ---
 
@@ -52,7 +64,7 @@ down and the lane moves on, so you can start with one.
 Then confirm the local models are actually reachable from your host:
 
 ```bash
-export LOCAL_API_KEY=$(grep '^LOCAL_API_KEY=' .env | cut -d= -f2)
+export LOCAL_API_KEY=$(sed -n 's/^LOCAL_API_KEY=//p' .env | sed 's/[[:space:]]*#.*//')
 curl -s $LOCAL_API_BASE/models -H "Authorization: Bearer $LOCAL_API_KEY" | head -c 400
 ```
 
@@ -209,15 +221,37 @@ curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
     "max_tokens":16}' | python3 -m json.tool | head -20
 ```
 
-**Expect:** a completion containing `LOCAL OK`. Then confirm Switchyard routed
-it rather than LiteLLM guessing:
+**Expect:** a completion mentioning `LOCAL OK`. Note that the local Qwen is a
+*reasoning* model — at `max_tokens: 16` you will see its thinking truncated
+mid-sentence rather than the clean answer. That is the model, not the routing.
+Raise `max_tokens` to 200 if you want a tidy reply.
+
+Then confirm Switchyard routed it, rather than LiteLLM quietly using the lane
+alias's default deployment:
 
 ```bash
-docker compose logs --tail=20 gateway | grep 'lane='
+docker compose logs --tail=20 gateway | grep 'switchyard:'
 ```
 
-**Expect:** `lane=local -> qwen-local [configured]`. The `[...]` is the cap
-reason — `configured`, `learned[h14]`, or a pacing decision.
+**Expect:** `switchyard: lane=local -> qwen-local [configured]`. The `[...]` is
+the cap reason — `configured`, `learned[h14]`, or a pacing decision.
+
+**The definitive check** is Redis, because it cannot be faked by a fallback path:
+
+```bash
+docker compose exec -T redis redis-cli -n 1 --scan --pattern 'sy:*'
+```
+
+**Expect** keys like these after a request:
+
+```
+sy:usage:local-box:d:2026-09-20     usage booked against the SUBSCRIPTION, not the plan
+sy:pace:local-box                   a per-slot throughput sample for pacing
+sy:lease:<keyhash>:fp:<digest>      a session lease from the conversation fingerprint
+```
+
+No `sy:*` keys means the plugin is not loaded and every request is bypassing the
+slot accounting, affinity and pacing — while still returning 200s.
 
 ### 4b. `bulk` — mechanical work
 
