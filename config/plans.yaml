@@ -1,25 +1,27 @@
 # ============================================================================
-# Switchyard — single source of truth for plans, capacity, and lanes.
+# Switchyard — single source of truth for plans, models, capacity and lanes.
 #
-# QUOTA WINDOWS. Most subscriptions enforce more than one limit at a time — a
-# short burst window (commonly 5 hours) *and* a weekly allowance. Declare them
-# all under `quotas:` and mark exactly one `role: target`: the allowance
-# pacing tries to fill, which is almost always the weekly one. The others are
-# `role: constraint` — limits not to overshoot, but not goals in themselves.
+# THE MODEL, in two sentences. A **plan** is a thing you pay for: it owns the
+# credentials, the quota windows, the connection limit, the monthly cost and the
+# expiry date. A **model** is something a plan can serve; models carry no
+# credentials of their own, and **lanes reference models, never plans**.
 #
-# Pacing then spends at the slowest rate any window allows, so the weekly
-# allowance gets used up while the 5-hour window is never blown. If you leave
-# `role` off entirely, the longest period becomes the target.
-# Everything else (routing order, the capacity board, quota headroom, the
-# effective $/Mtok table) is derived from this file. Edit here, hit
-# POST /admin/reload on the portal; no proxy restart needed.
+# Everything that is shared is therefore shared because it belongs to the plan:
+# two models on one plan draw on the same connection limit, the same quota, the
+# same cooldown and the same learned concurrency. That is not a special case —
+# it is the point of the structure.
+#
+# A model may narrow its plan's connection limit with its own `max_parallel`
+# (useful for a slow local model on a shared box), but never widen it.
+#
+# Lane members are written `plan/model`.
 # ============================================================================
 
 settings:
   # A plan expiring within this many days is promoted above plans you keep
-  # paying for, so cancelled capacity gets drained before it dies.
+  # paying for, soonest death first, so cancelled capacity gets drained.
   drain_within_days: 21
-  # How long a session keeps its provider. Refreshed on every request, so an
+  # How long a session keeps its model. Refreshed on every request, so an
   # active session never migrates; an idle one lets its slot go.
   lease_ttl_seconds: 1800
   # Safety net: an in-flight slot older than this is assumed leaked and pruned.
@@ -29,545 +31,407 @@ settings:
   default_cooldown_seconds: 900
 
   # --------------------------------------------------------------------------
-  # Learn the parallelism each provider really tolerates, instead of trusting
-  # a guess. Halve the cap when a provider refuses us on connection count,
-  # creep back up by one when there is unmet demand and no recent rejection.
-  # Learned per hour of day, because a provider that allows 6 connections at
-  # 04:00 may allow 2 at peak.
-  #
-  # Set a plan's `max_parallel: auto` to learn from scratch (starting at
-  # seed_cap), or leave a number as the starting point and set
-  # `max_parallel_ceiling` to bound how far probing may go.
+  # Learn the parallelism each plan really tolerates instead of trusting a
+  # guess. Halve on a connection-limit refusal, creep back up by one when there
+  # is unmet demand and no recent refusal. Bucketed by hour of day, because a
+  # provider that allows 6 connections at 04:00 may allow 2 at peak.
+  # Learning is per PLAN, since the connection limit belongs to the plan.
   # --------------------------------------------------------------------------
   concurrency_learning:
     enabled: true
     buckets: hour_of_day        # hour_of_day | none
     seed_cap: 2                 # starting guess for `max_parallel: auto`
-    min_cap: 1                  # never learn our way down to zero
-    decrease_factor: 0.5        # multiplicative backoff on a refusal
-    increase_step: 1            # additive probe upward
-    min_samples: 3              # evidence before trusting an hour bucket
-    probe_interval_seconds: 300 # minimum gap between upward probes
-    probe_cooldown_seconds: 900 # quiet time needed since the last refusal
-    probe_pressure: 3           # denied claims needed before probing up
+    min_cap: 1
+    decrease_factor: 0.5
+    increase_step: 1
+    min_samples: 3
+    probe_interval_seconds: 300
+    probe_cooldown_seconds: 900
+    probe_pressure: 3
 
   # --------------------------------------------------------------------------
   # PACING MODE — off by default. When on, subscriptions are throttled so each
-  # one lands at ~100% of its allowance right at rollover, instead of burning
-  # out early and spilling. If a caller asks for 10 parallel requests and
-  # spending 10 would exhaust Grok days before its window rolls over,
-  # Switchyard runs fewer — however few the burndown maths calls for.
+  # lands at ~100% of its allowance right at rollover rather than burning out
+  # early and spilling. Quota resets per window, so this is per-window burndown:
+  # unused allowance is lost, never carried forward. A cancelled plan's final
+  # window is truncated by its expiry, so it paces harder.
   #
-  # Quota resets each period, so this is per-window burndown: unused allowance
-  # in a window is lost, never carried forward. For a cancelled plan the final
-  # window is truncated by the expiry date, so it paces HARDER — same
-  # allowance, less time to spend it.
-  #
-  # While on, the tail is disabled (spilling to a local model would hide that
-  # we are ahead of budget) and metered providers keep their fixed caps, since
-  # there is no allowance to land on. Per-plan override: `pacing: false`.
+  # While on, the tail is disabled and metered providers keep fixed caps.
+  # Pacing is per PLAN, because the quota is the plan's.
   # --------------------------------------------------------------------------
   pacing:
     enabled: false
-    min_slots: 1                # never fully close a subscription's lane
+    min_slots: 1
     overshoot: 0.05             # aim 5% hot so we finish at 100%, not 95%
     disable_tail: true
     include_metered: false
 
+# ============================================================================
+# PLANS — what you pay for. Credentials, quota, connection limit, cost, expiry.
+# ============================================================================
 plans:
 
   # ---------------------------------------------------------- workhorses ----
   minimax-ultra:
     label: "Minimax Ultra Token Plan"
-    deployment: sy.minimax-ultra      # must match config/litellm-config.yaml
-    max_parallel: 4             # starting point; the learner adjusts from here
-    max_parallel_ceiling: 6
-    monthly_cost: 132
     auth: api_key
     provider_family: minimax
+    monthly_cost: 132
+    max_parallel: 4               # starting point; the learner adjusts
+    max_parallel_ceiling: 6
+    api_base: os.environ/MINIMAX_ULTRA_API_BASE
+    api_key: os.environ/MINIMAX_ULTRA_API_KEY
     quotas:
-      # A token plan is a single budget rather than a burst window plus an
-      # allowance, so there is only one window here. Add a `rolling_5h`
-      # constraint if MiniMax turns out to throttle within the day.
+      # A token plan is one budget, not a burst window plus an allowance.
       - name: monthly
         role: target
         kind: tokens
         period: month
-        allowance: null               # TODO, or let the probe report it
-        source: probe                 # estimate | headers | probe | ledger
-    notes: "Original workhorse. Good at coding with explicit instructions."
-    # MiniMax publishes exact Token Plan headroom at /coding_plan/remains, but
-    # that endpoint only answers a browser session — an API key gets
-    # "cookie is missing (1004)". Paste the session cookie once in the portal
-    # (Subscriptions -> "real usage") and this polls it for real numbers.
-    # A cookie is full account access; see switchyard/probes.py for the caveats.
+        allowance: null           # TODO, or let the probe report it
+        source: probe
     probe:
+      # MiniMax publishes exact headroom here, but the endpoint only answers a
+      # browser session — an API key gets "cookie is missing (1004)". Paste the
+      # cookie in the portal; see switchyard/probes.py for the caveats.
       kind: cookie
-      url: https://api.minimax.io/v1/coding_plan/remains   # TODO: confirm host/path
+      url: https://api.minimax.io/v1/coding_plan/remains   # TODO: confirm
       method: GET
       window: monthly
       interval_seconds: 600
       referer: https://platform.minimax.io/
-      # Candidate field paths; run the probe once and the portal prints the raw
-      # response so you can correct these.
       fields:
         remaining: [data.remains, data.remaining_tokens, data.remain, remains]
         total: [data.total, data.total_tokens, data.quota]
         reset_at: [data.reset_at, data.next_reset_time, data.expire_time]
-
+    notes: "Original workhorse. Good at coding with explicit instructions."
+    models:
+      m2:
+        model: openai/MiniMax-M2
 
   minimax-max:
     label: "Minimax Max Token Plan"
-    deployment: sy.minimax-max
-    max_parallel: 4
-    max_parallel_ceiling: 6
-    monthly_cost: 55
     auth: api_key
     provider_family: minimax
+    monthly_cost: 55
+    max_parallel: 4
+    max_parallel_ceiling: 6
+    api_base: os.environ/MINIMAX_MAX_API_BASE
+    api_key: os.environ/MINIMAX_MAX_API_KEY
     quotas:
       - name: monthly
         role: target
         kind: tokens
         period: month
-        allowance: null               # TODO, or let the probe report it
+        allowance: null
         source: probe
-    notes: "Second workhorse, added 2026-09-20 to stop the OpenRouter burn."
-    # MiniMax publishes exact Token Plan headroom at /coding_plan/remains, but
-    # that endpoint only answers a browser session — an API key gets
-    # "cookie is missing (1004)". Paste the session cookie once in the portal
-    # (Subscriptions -> "real usage") and this polls it for real numbers.
-    # A cookie is full account access; see switchyard/probes.py for the caveats.
     probe:
       kind: cookie
-      url: https://api.minimax.io/v1/coding_plan/remains   # TODO: confirm host/path
+      url: https://api.minimax.io/v1/coding_plan/remains
       method: GET
       window: monthly
       interval_seconds: 600
       referer: https://platform.minimax.io/
-      # Candidate field paths; run the probe once and the portal prints the raw
-      # response so you can correct these.
       fields:
         remaining: [data.remains, data.remaining_tokens, data.remain, remains]
         total: [data.total, data.total_tokens, data.quota]
         reset_at: [data.reset_at, data.next_reset_time, data.expire_time]
-
+    notes: "Second workhorse, added 2026-09-20 to stop the OpenRouter burn."
+    models:
+      m2:
+        model: openai/MiniMax-M2
 
   glm:
-    label: "GLM Coding Plan"
-    deployment: sy.glm
-    max_parallel: auto                # "severely limited" — learn the real number
-    monthly_cost: 0
+    label: "GLM Coding Plan (Z.AI)"
     auth: api_key
     provider_family: zai
+    monthly_cost: 0
+    max_parallel: auto            # "severely limited" is not a number
     expires: "2026-10-13"
+    # A Coding Plan key works ONLY on the coding endpoint. Verified by direct
+    # call: coding returns 200, while api.z.ai/api/paas/v4 and
+    # open.bigmodel.cn/api/paas/v4 both return 429 code 1113 "insufficient
+    # balance". A wrong base URL therefore looks exactly like an exhausted plan
+    # — check the URL before believing a GLM quota error.
+    api_base: os.environ/GLM_API_BASE
+    api_key: os.environ/GLM_API_KEY
     quotas:
       - name: 5h
-        role: constraint              # Z.AI enforces a 5-hour prompt window
+        role: constraint          # Z.AI enforces a 5-hour prompt window
         kind: tokens
         period: rolling_5h
-        allowance: null               # TODO: confirm on the Z.AI plan page
+        allowance: null           # TODO: confirm on the Z.AI plan page
         source: estimate
       - name: weekly
         role: target
         kind: tokens
         period: week
-        allowance: null               # TODO: confirm; may be monthly instead
+        allowance: null           # TODO: confirm; may be monthly instead
         source: estimate
     notes: "Cancelled. Severely limited — drain whatever is left."
+    models:
+      glm-4.6:
+        model: openai/glm-4.6
 
-  openrouter-mimo:
-    label: "OpenRouter (Mimo 2.5)"
-    deployment: sy.openrouter-mimo
-    max_parallel: 2
-    monthly_cost: 0
+  openrouter:
+    label: "OpenRouter"
     auth: api_key
-    metered: true                     # pay-per-token, not a subscription
-    quota:
-      kind: dollars
-      period: month
-      allowance: 50                   # hard ceiling; alerts at 80%
-      source: ledger                  # we know exactly what we spent
-    alert_burn_rate_per_hour: 5       # the $20/hr surprise must page us early
-    notes: "Overflow only. Decent as a workhorse but it is real money."
+    monthly_cost: 0
+    metered: true                 # pay-per-token, not a subscription
+    max_parallel: 2
+    api_key: os.environ/OPENROUTER_API_KEY
+    quotas:
+      - name: monthly
+        role: target
+        kind: dollars
+        period: month
+        allowance: 50             # hard ceiling; alerts at 80%
+        source: ledger
+    alert_burn_rate_per_hour: 5   # the $20/hr surprise must page us early
+    notes: >
+      Model-agnostic and the only non-subscription plan. Add models freely —
+      they all share the one dollar budget and the one connection limit.
+    models:
+      mimo:
+        model: openrouter/xiaomi/mimo-2.5     # TODO: confirm slug
 
   opencode-go:
     label: "OpenCode Go Plan"
-    deployment: sy.opencode-go
-    max_parallel: auto                # unknown limit — learn it from scratch
+    # Reached through the OpenCode CLI's own login — a credential the CLI holds,
+    # so no API key here. Its own sidecar process because its quota is separate
+    # from the Grok plan's, even though both use the same CLI.
+    auth: cli_sidecar
     monthly_cost: 0
-    # Same OpenCode CLI as the Grok plan, but a different login and a separate
-    # quota — hence its own sidecar process. Sharing one process would put two
-    # subscriptions behind a single connection gate.
-    auth: oauth_sidecar
+    max_parallel: auto
     expires: "2026-09-27"
-    quota:
-      kind: window
-      period: month
-      allowance: null
-      source: estimate
+    api_base: http://opencode-go-sidecar:8084/v1
+    api_key: sidecar
+    quotas:
+      - name: monthly
+        role: target
+        kind: tokens
+        period: month
+        allowance: null
+        source: estimate
     notes: >
-      Cancelled, 7 days left as of 2026-09-20. Severely limited, so cap 1 —
-      but the drain rule puts it at the FRONT of the forge lane until it dies.
+      Cancelled, 7 days left as of 2026-09-20. The drain rule puts it at the
+      front of the workhorse lane until it dies.
+    models:
+      # provider/model as OpenCode names it — `opencode` and `opencode-go` are
+      # DIFFERENT providers there (free/community versus this paid plan).
+      glm-5.3-flash:
+        model: openai/opencode-go/glm-5.3-flash
 
   # ------------------------------------------------------------ judgement ----
   claude-max:
     label: "Claude Max $200"
-    deployment: sy.claude-max
-    max_parallel: 1                   # hard: one connection
-    max_parallel_ceiling: 1           # never probe above it
+    auth: cli_sidecar             # OAuth; the Claude CLI holds the credential
     monthly_cost: 200
-    auth: oauth_sidecar               # see sidecars/claude-max
+    max_parallel: 1               # hard: one connection, shared by both models
+    max_parallel_ceiling: 1       # never probe above it
+    api_base: http://claude-max-sidecar:8081/v1
+    api_key: sidecar
     quotas:
       - name: 5h
-        role: constraint              # do not blow the burst window
+        role: constraint          # do not blow the burst window
         kind: tokens
         period: rolling_5h
-        allowance: null               # TODO: fill from a cycle of observation
-        source: sidecar               # the CLI reports the reset time
+        allowance: null           # TODO: fill after a cycle of observation
+        source: sidecar
       - name: weekly
-        role: target                  # this is the allowance worth filling
+        role: target              # this is the allowance worth filling
         kind: tokens
         period: week
-        allowance: null               # TODO
+        allowance: null           # TODO
         source: sidecar
     notes: >
-      Critical logic only. Heaviest non-Paperclip use is interactive, so the
-      5-hour window is the one that bites; weekly is what we pace to fill.
-
-  # Requires metered API billing at console.anthropic.com — a Claude subscription
-  # does not grant API access. Disabled: enable only if you add API credits.
-  # The heavy tier of the Claude Max subscription, if your plan exposes one.
-  # `subscription: claude-max` is the important part: this shares the single
-  # connection, the quota windows, the cooldowns and the learned concurrency
-  # with `claude-max`, so `apex` and `judge` can never open two connections
-  # between them.
-  #
-  # Disabled until you confirm the alias your plan actually offers:
-  #   docker compose exec claude-max-sidecar claude --model bogus 2>&1 | head
-  # That prints the valid aliases. Set it in `deployments:` below, add it to
-  # MODEL_ALLOW in .env, then flip enabled: true.
-  claude-max-heavy:
-    label: "Claude Max — heavy tier"
-    deployment: sy.claude-max-heavy
-    subscription: claude-max
-    max_parallel: 1
-    max_parallel_ceiling: 1
-    monthly_cost: 0                   # billed as part of claude-max
-    auth: oauth_sidecar
-    enabled: false                    # flip on once the alias is confirmed
-    quotas:
-      - name: 5h
-        role: constraint
-        kind: tokens
-        period: rolling_5h
-        allowance: null
-        source: sidecar
-      - name: weekly
-        role: target
-        kind: tokens
-        period: week
-        allowance: null
-        source: sidecar
-    notes: >
-      Shares every limit with claude-max — same subscription, one connection.
-
-  anthropic-fable:
-    label: "Fable 5.1 (Anthropic API, metered)"
-    deployment: sy.anthropic-fable
-    max_parallel: 1
-    monthly_cost: 0
-    auth: api_key
-    enabled: false
-    metered: true
-    quota:
-      kind: dollars
-      period: month
-      allowance: 100
-      source: ledger
-    notes: "Escalation tier. Metered — keep the ceiling tight."
-
-  # Astra 6 (GPT 6) is a model on the OpenAI/Codex seat, not a separate
-  # provider. `subscription: openai` makes it share that seat's connections,
-  # quota windows, cooldowns and expiry date — so apex and judge cannot between
-  # them exceed the seat's 2 connections.
-  #
-  # gpt-6-astra, confirmed working on this seat. The sidecar derives its model
-  # allowlist from this config, so enabling a plan here is all it takes.
-  astra:
-    label: "Astra 6 (GPT 6, on the OpenAI seat)"
-    deployment: sy.astra
-    subscription: openai
-    max_parallel: 2                   # the seat's limit, shared with `openai`
-    max_parallel_ceiling: 2
-    monthly_cost: 0
-    auth: oauth_sidecar
-    provider_family: openai
-    expires: "2026-10-04"             # dies with the seat
-    quotas:
-      - name: 5h
-        role: constraint
-        kind: tokens
-        period: rolling_5h
-        allowance: null
-        source: estimate
-      - name: weekly
-        role: target
-        kind: tokens
-        period: week
-        allowance: null
-        source: estimate
-    notes: "Shares every limit with the openai seat — same subscription."
+      Critical logic only. Both models below share the single connection and the
+      quota windows, so apex and judge can never open two connections here.
+    models:
+      opus:
+        model: openai/claude-opus-5
+      fable:
+        # Fable 5.1 as served by the subscription, not the metered API. Enable
+        # once you confirm the CLI accepts this alias:
+        #   docker compose exec claude-max-sidecar claude --model bogus 2>&1 | head
+        model: openai/claude-fable-5-1
+        enabled: false
 
   openai:
-    label: "OpenAI $100 Plan (seat)"
-    deployment: sy.openai
-    max_parallel: 2
-    max_parallel_ceiling: 2           # the plan allows 2; do not probe past it
-    monthly_cost: 0
-    auth: oauth_sidecar               # a ChatGPT seat: OAuth only, no API key
+    label: "OpenAI $100 Plan (ChatGPT seat)"
+    # A seat has no API key: the Codex CLI owns the OAuth login.
+    auth: cli_sidecar
     provider_family: openai
+    monthly_cost: 0
+    max_parallel: 2
+    max_parallel_ceiling: 2       # the seat allows 2; do not probe past it
     expires: "2026-10-04"
+    api_base: http://codex-sidecar:8082/v1
+    api_key: sidecar
     quotas:
       - name: 5h
         role: constraint
         kind: tokens
         period: rolling_5h
-        allowance: null               # TODO
+        allowance: null
         source: estimate
       - name: weekly
         role: target
         kind: tokens
         period: week
-        allowance: null               # TODO
+        allowance: null
         source: estimate
-    notes: "Cancelled. Weekly allowance already spent this week — expect 429s."
+    notes: "Cancelled. Both models share the seat's 2 connections and its quota."
+    models:
+      # Verified ids on a ChatGPT seat, in capability order — sol strongest, then
+      # terra, luna weakest. Prompt overhead for a 5-token reply in brackets.
+      # Note the scheme: gpt-5, gpt-5-codex and codex-1 are all rejected.
+      sol:
+        model: openai/gpt-5.6-sol        # [13293]
+      terra:
+        model: openai/gpt-5.6-terra      # [13293]
+        enabled: false
+      luna:
+        model: openai/gpt-5.6-luna       # [11728] — weakest; cheap work only
+        enabled: false
+      astra:
+        model: openai/gpt-6-astra        # [14154] — "Astra 6", the apex tier
 
   grok:
-    label: "Grok $300 Plan (SuperGrok Heavy)"
-    deployment: sy.grok
+    label: "Grok $300 Plan (SuperGrok)"
+    # OAuth-only, reached through OpenCode logged in to xAI. This rides the
+    # subscription, on a quota entirely separate from metered api.x.ai credits.
+    auth: cli_sidecar
+    provider_family: xai
+    monthly_cost: 0
     max_parallel: 4
     max_parallel_ceiling: 6
-    monthly_cost: 0
-    # A SuperGrok subscription is OAuth-only and rides xAI's CLI proxy, on a
-    # completely separate quota from metered api.x.ai credits. Reached through
-    # OpenCode logged in to xAI (rather than Grok Build, which requires
-    # SuperGrok Heavy specifically).
-    # If you also hold api.x.ai credits, add a second plan with auth: api_key.
-    auth: oauth_sidecar
-    provider_family: xai
     expires: "2026-10-09"
+    api_base: http://grok-sidecar:8083/v1
+    api_key: sidecar
     quotas:
       - name: burst
         role: constraint
         kind: tokens
         period: rolling_5h
-        allowance: null               # TODO: confirm xAI's burst window size
+        allowance: null           # TODO: confirm xAI's burst window size
         source: estimate
       - name: monthly
         role: target
         kind: tokens
         period: month
-        allowance: null               # TODO
+        allowance: null           # TODO
         source: estimate
     notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
+    models:
+      grok-4.6:
+        model: openai/xai/grok-4.6
+      grok-build:
+        # Grok Build's coding-agent model; may suit forge better than 4.6.
+        model: openai/xai/grok-build-0.1
+        enabled: false
 
   # ---------------------------------------------------------------- local ----
-  # All three local plans run on the SAME machine, so `subscription: local-box`
-  # makes them share one pool of 2 slots. Without that, three plans at 2 each
-  # would let six requests onto hardware that handles one or two.
-  qwen-local:
-    label: "Qwen 3.8 Flash Next (local)"
-    deployment: sy.qwen-local
-    subscription: local-box
-    max_parallel: 2
-    context_window: 262144
+  local-box:
+    label: "Local models (this machine)"
+    auth: api_key                 # local, but the server still wants a key
     monthly_cost: 0
-    auth: api_key                     # local, but the server still wants a key
-    quota: {kind: unlimited, source: none}
-    notes: "Just under Opus quality. Slow under load — keep parallelism low."
+    # ONE machine, so one connection limit however many models point at it.
+    # Three models at 2 each would put six concurrent requests on hardware that
+    # handles one or two.
+    max_parallel: 2
+    api_base: os.environ/LOCAL_API_BASE
+    api_key: os.environ/LOCAL_API_KEY
+    quotas:
+      - name: unlimited
+        role: target
+        kind: unlimited
+        source: none
+    notes: "Unmetered. Slow under load — keep parallelism low."
+    models:
+      qwen:
+        label: "Qwen 3.8 Flash Next"
+        model: openai/Qwen3.8-Flash-Next-oQ4e-mtp
+        context_window: 262144
+      gemma:
+        label: "Gemma 4 26B"
+        model: openai/gemma-4-26B-A4B-it-oQ4e-mtp
+        context_window: 262144
+      glm-flash:
+        label: "GLM 5.3 Flash (1M context)"
+        model: openai/GLM-5.3-Flash-oQ4e
+        context_window: 1048576
+        max_parallel: 1           # narrows the plan's limit for this model
+        # Deliberately outside every lane order: it exists as the target for
+        # context-window fallbacks, so a prompt too large for the chosen model
+        # lands somewhere that can hold it.
 
-  gemma-local:
-    label: "Gemma 4 26B (local)"
-    deployment: sy.gemma-local
-    subscription: local-box
-    max_parallel: 2
-    context_window: 262144
-    monthly_cost: 0
+  # ------------------------------------------------- metered API (opt-in) ----
+  anthropic-api:
+    label: "Anthropic API (metered)"
+    # A Claude subscription grants no API access; this needs separate billing at
+    # console.anthropic.com. Disabled: enable only if you add credits.
     auth: api_key
-    quota: {kind: unlimited, source: none}
-    notes: "Cheap and fast. Summaries, extraction, classification."
-
-  # 1M context — kept out of the normal lane order on purpose. It exists as the
-  # target for context-window fallbacks, so a prompt too large for whichever
-  # plan was chosen lands somewhere that can actually hold it.
-  glm-local:
-    label: "GLM 5.3 Flash (local, 1M context)"
-    deployment: sy.glm-local
-    subscription: local-box
+    enabled: false
+    metered: true
+    monthly_cost: 0
     max_parallel: 1
-    context_window: 1048576
-    monthly_cost: 0
-    auth: api_key
-    quota: {kind: unlimited, source: none}
-    notes: "Long-context rescue. Not in any lane order; context fallback only."
+    api_key: os.environ/ANTHROPIC_API_KEY
+    quotas:
+      - name: monthly
+        role: target
+        kind: dollars
+        period: month
+        allowance: 100
+        source: ledger
+    models:
+      fable:
+        model: anthropic/claude-fable-5-1
 
 # ============================================================================
-# LANES — ordered capacity. Requests fill each plan to its cap, then spill to
-# the next. `tail: true` means the plan is last-resort only: it exists so the
-# lane never hard-fails, not as a lane that runs all the time.
+# LANES — ordered capacity, written as `plan/model`. Requests fill each model's
+# plan to its connection limit, then spill to the next.
+#
+# `tail` is last-resort capacity: it keeps a lane from hard-failing but never
+# carries normal traffic, and is excluded from the lane's advertised slots.
 # ============================================================================
 lanes:
 
   apex:
     label: "Judgement — Heavy"
     description: >
-      Escalations where Opus-class judgement was not enough. Note that without
-      metered API billing or a heavier alias on your subscription, there is no
-      tier above Opus available — apex then resolves to claude-max, the same
-      place judge lands, and that is worth knowing rather than pretending.
-    order: [claude-max-heavy, astra, anthropic-fable]
-    tail: [claude-max]
+      Escalations where Opus-class judgement was not enough. Note that both
+      members ride plans whose other models serve `judge`, so the connection
+      limits are shared — by design.
+    order: [openai/astra, claude-max/fable, anthropic-api/fable]
+    tail: [claude-max/opus]
 
   judge:
     label: "Judgement — Regular"
     description: "The normal judgement tier. Most judgement tasks land here."
-    order: [claude-max, openai, grok]
-    tail: [qwen-local]
+    order: [claude-max/opus, openai/sol, grok/grok-4.6]
+    tail: [local-box/qwen]
 
   forge:
     label: "Coding Workhorse"
     description: "Getting work done. Ordered fill across every workhorse plan."
-    order: [minimax-ultra, minimax-max, grok, glm, opencode-go, openrouter-mimo]
-    tail: [qwen-local]
+    order:
+      - minimax-ultra/m2
+      - minimax-max/m2
+      - grok/grok-4.6
+      - glm/glm-4.6
+      - opencode-go/glm-5.3-flash
+      - openrouter/mimo
+    tail: [local-box/qwen]
 
   local:
     label: "Local Only"
     # No tail and no cloud members on purpose: if the box is busy the caller
     # gets a 429 and backs off rather than silently spending money.
-    order: [qwen-local, gemma-local]
+    order: [local-box/qwen, local-box/gemma]
     tail: []
 
   bulk:
     label: "Basic"
     description: "Mechanical work — summaries, extraction, commit messages."
-    order: [gemma-local, qwen-local]
-    tail: [minimax-max]
-
-# ============================================================================
-# TRANSPORT — how each plan is actually reached. Kept in the same file as the
-# plan registry so credentials, caps, cost and lane order never drift apart.
-# `model_name` in the generated LiteLLM config is each plan's `deployment`.
-#
-# OAuth-only subscriptions (auth: oauth_sidecar) point at a localhost sidecar
-# that owns the vendor CLI and its token refresh. LiteLLM itself does no OAuth
-# and never sees a subscription credential.
-# ============================================================================
-deployments:
-
-  minimax-ultra:
-    model: openai/MiniMax-M2
-    api_base: os.environ/MINIMAX_ULTRA_API_BASE
-    api_key: os.environ/MINIMAX_ULTRA_API_KEY
-
-  minimax-max:
-    model: openai/MiniMax-M2
-    api_base: os.environ/MINIMAX_MAX_API_BASE
-    api_key: os.environ/MINIMAX_MAX_API_KEY
-
-  glm:
-    # A GLM Coding Plan key MUST use the coding endpoint:
-    #   https://api.z.ai/api/coding/paas/v4
-    # Verified by direct call: that endpoint returns 200, while both
-    # api.z.ai/api/paas/v4 and open.bigmodel.cn/api/paas/v4 return 429 with code
-    # 1113 ("insufficient balance"). Note what that means for diagnosis — a wrong
-    # base URL looks exactly like an exhausted plan, and the classifier will
-    # dutifully cool the plan down for 15 minutes on repeat. Check the URL before
-    # believing a GLM quota error.
-    model: openai/glm-4.6
-    api_base: os.environ/GLM_API_BASE
-    api_key: os.environ/GLM_API_KEY
-
-  openrouter-mimo:
-    model: openrouter/xiaomi/mimo-2.5     # TODO: confirm slug on openrouter.ai/models
-    api_key: os.environ/OPENROUTER_API_KEY
-
-  claude-max:
-    model: openai/claude-opus-5           # served by the sidecar, OpenAI-shaped
-    api_base: http://claude-max-sidecar:8081/v1
-    api_key: sidecar
-
-  claude-max-heavy:
-    # Same sidecar, same connection. The model string after `openai/` is passed
-    # to `claude --model`, and the sidecar only honours it if it is listed in
-    # MODEL_ALLOW — otherwise it runs the default and logs loudly.
-    model: openai/fable                   # TODO: confirm the alias your plan offers
-    api_base: http://claude-max-sidecar:8081/v1
-    api_key: sidecar
-
-  anthropic-fable:
-    model: anthropic/claude-fable-5-1
-    api_key: os.environ/ANTHROPIC_API_KEY
-
-  astra:
-    # Same codex sidecar, same seat, different --model. Confirmed working:
-    # gpt-6-astra is what "Astra 6" refers to.
-    model: openai/gpt-6-astra
-    api_base: http://codex-sidecar:8082/v1
-    api_key: sidecar
-
-  openai:
-    # Seat-based plan: the Codex CLI owns the OAuth login, the sidecar exposes it
-    # as HTTP. Concurrency comes from this file, not the compose file.
-    #
-    # Verified working ids on a ChatGPT seat, in capability order — sol is the
-    # strongest, then terra, with luna the weakest (prompt overhead for a
-    # 5-token reply in brackets):
-    #   gpt-5.6-sol   [13293]  <- used here; judge is the regular judgement tier
-    #   gpt-5.6-terra [13293]
-    #   gpt-5.6-luna  [11728]
-    #   gpt-6-astra   [14154]  <- the apex tier, see the astra plan
-    # Note the scheme: gpt-5, gpt-5-codex and codex-1 are all rejected.
-    #
-    # Swap freely — no rebuild needed, the sidecar re-reads this file every 30s.
-    # If you want the seat's remaining quota to serve cheap work too, add a
-    # second plan on `subscription: openai` pointing at gpt-5.6-luna; it would
-    # share the seat's connections and quota automatically.
-    model: openai/gpt-5.6-sol
-    api_base: http://codex-sidecar:8082/v1
-    api_key: sidecar
-
-  grok:
-    # Served by OpenCode over its xAI login, not api.x.ai. Everything after the
-    # first slash is passed to `opencode run --model`, which wants
-    # provider/model — so this resolves to `--model xai/grok-4`.
-    # Verified against `opencode models`: the provider id is `xai` and the model
-    # is `grok-4.6`. `xai/grok-4` does not exist.
-    model: openai/xai/grok-4.6
-    api_base: http://grok-sidecar:8083/v1
-    api_key: sidecar
-
-  opencode-go:
-    # `opencode` and `opencode-go` are DIFFERENT providers in OpenCode: the
-    # former is free/community models, the latter is the paid Go plan.
-    #
-    # `opencode models` lists the CATALOGUE, not what your plan is entitled to —
-    # mimo-v2.5-pro is listed but not available on this plan. Confirm a model
-    # with a real call before trusting it.
-    model: openai/opencode-go/glm-5.3-flash
-    api_base: http://opencode-go-sidecar:8084/v1
-    api_key: sidecar
-
-  qwen-local:
-    model: openai/Qwen3.8-Flash-Next-oQ4e-mtp
-    api_base: os.environ/LOCAL_API_BASE
-    api_key: os.environ/LOCAL_API_KEY
-
-  gemma-local:
-    model: openai/gemma-4-26B-A4B-it-oQ4e-mtp
-    api_base: os.environ/LOCAL_API_BASE
-    api_key: os.environ/LOCAL_API_KEY
-
-  glm-local:
-    model: openai/GLM-5.3-Flash-oQ4e
-    api_base: os.environ/LOCAL_API_BASE
-    api_key: os.environ/LOCAL_API_KEY
+    order: [local-box/gemma, local-box/qwen]
+    tail: [minimax-max/m2]

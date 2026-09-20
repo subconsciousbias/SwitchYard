@@ -103,6 +103,8 @@ async def collect_capacity() -> dict:
 
 
 async def collect_plans() -> list[dict]:
+    """One row per PLAN, because quota, cost and connection limits are the
+    plan's. Each row lists the models it serves, which is what lanes name."""
     reg, ledger, slots = state["registry"], state["ledger"], state["slots"]
     policy = state["policy"]
     month = datetime.now(timezone.utc).strftime("%Y-%m")
@@ -152,8 +154,9 @@ async def collect_plans() -> list[dict]:
                 + (f" at cap {int(at_cap)} — lower it" if isinstance(at_cap, float) else "")
             )
 
-        lanes_used_in = [k for k, l in reg.lanes.items()
-                         if plan.key in l.order or plan.key in l.tail]
+        # A plan appears in a lane through its models.
+        lanes_used_in = sorted({lane for m in plan.models.values()
+                                for lane in reg.lanes_using(m)})
 
         rows.append({
             "plan": plan,
@@ -174,9 +177,8 @@ async def collect_plans() -> list[dict]:
             "pace": pace,
             "probe": probe,
             "windows": windows_remaining(plan.quota.period, plan.expires),
-            # Usage is booked per subscription, so these numbers are shared with
-            # any sibling plan. Naming them stops the board looking double-counted.
-            "shares_usage_with": [p.key for p in reg.siblings(plan)],
+            "models": models,
+            "cli_backed": plan.is_cli_backed,
         })
     return rows
 
@@ -200,6 +202,7 @@ async def api_state() -> dict:
         "plans": [
             {
                 "key": r["plan"].key, "label": r["plan"].label,
+                "models": [m["ref"] for m in r["models"] if m["enabled"]],
                 "monthly_cost": r["plan"].monthly_cost,
                 "expires": str(r["plan"].expires) if r["plan"].expires else None,
                 "days_left": r["plan"].days_left,

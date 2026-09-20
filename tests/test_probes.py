@@ -93,7 +93,7 @@ def test_polling_skips_plans_with_a_dead_or_missing_cookie():
         await prober.clear_cookie(plan.key)
         after_expiry = await prober.due(plan)
         # A plan with no probe configured is never due.
-        never = await prober.due(reg.plans["qwen-local"])
+        never = await prober.due(reg.plans["local-box"])
         return no_cookie, with_cookie, after_expiry, never
     no_cookie, with_cookie, after_expiry, never = run(go())
     assert not no_cookie and with_cookie and not after_expiry and not never

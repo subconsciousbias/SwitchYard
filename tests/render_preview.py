@@ -35,62 +35,81 @@ def _window(q, frac, allowance, ahead):
 
 
 def fixture(reg):
+    """Synthetic board state: one row per plan, capacity rows per model."""
     lanes = []
-    for k in reg.lanes:
-        plans = []
-        for i, p in enumerate(reg.lane_members(k)):
-            plans.append({"plan": p.key, "label": p.label,
-                          "cap": 0 if i == 2 else 1, "cap_configured": p.max_parallel,
-                          "cap_reason": "ahead of pace on weekly, holding" if i == 2
-                          else "paced 1 of 4 (capped by 5h)",
-                          "in_flight": 0 if i == 2 else 1, "cooled": i == 1,
-                          "cooldown_remaining": 540,
-                          "cooldown_reason": "quota_exhausted" if i == 1 else "",
-                          "tail": reg.is_tail(k, p.key), "days_left": p.days_left})
-        lanes.append({"lane": k, "label": reg.lanes[k].label,
-                      "slots_configured": sum(x["cap_configured"] for x in plans),
-                      "slots_available_now": sum(x["cap"] for x in plans
-                                                 if not x["cooled"] and not x["tail"]),
-                      "slots_in_use": sum(x["in_flight"] for x in plans),
-                      "tail_only": False, "plans": plans})
+    for key in reg.lanes:
+        rows = []
+        for i, model in enumerate(reg.lane_members(key)):
+            plan = reg.plan_of(model)
+            cap = 0 if i == 2 else plan.cap_for(model)
+            rows.append({
+                "ref": model.ref, "model": model.key, "model_label": model.display,
+                "plan": plan.key, "plan_label": plan.label,
+                "cap": cap, "cap_configured": plan.cap_for(model),
+                "cap_reason": "ahead of pace on weekly, holding" if cap == 0
+                              else f"paced {cap} of {plan.max_parallel}",
+                "in_flight": min(cap, 1), "cooled": i == 1,
+                "cooldown_remaining": 540,
+                "cooldown_reason": "quota_exhausted" if i == 1 else "",
+                "tail": reg.is_tail(key, model.ref), "days_left": plan.days_left,
+                "shares_plan_with": [m.key for m in reg.siblings(model)],
+                "cli_backed": plan.is_cli_backed,
+            })
+        lanes.append({
+            "lane": key, "label": reg.lanes[key].label,
+            "slots_configured": sum(r["cap_configured"] for r in rows),
+            "slots_available_now": sum(r["cap"] for r in rows
+                                       if not r["cooled"] and not r["tail"]),
+            "slots_in_use": sum(r["in_flight"] for r in rows),
+            "tail_only": False, "plans": rows,
+        })
 
     rows = []
-    for p in reg.plans.values():
+    for plan in reg.plans.values():
         ws = [_window(q, 0.95 if q.role == "constraint" else 0.30,
                       2e6 if q.role == "constraint" else 4e7,
-                      8e5 if q.role == "constraint" else -4e6) for q in p.quotas]
+                      8e5 if q.role == "constraint" else -4e6) for q in plan.quotas]
         tgt = next((w for w in ws if w["role"] == "target"), ws[0])
         binding = max(ws, key=lambda w: w["pct_used"])
         rows.append({
-            "plan": p,
+            "plan": plan,
             "headroom": {**tgt, "windows": ws, "binding": binding,
                          "binding_is_target": binding is tgt},
             "reset_human": "in 22h",
-            "burn": {"cost_per_hour": 21.4 if p.metered else 0.0, "tokens_per_hour": 5e5},
-            "month_tokens": 1.2e7, "month_cost": 12.5 if p.metered else 0.0,
-            "eff_cost": 16.6 if p.monthly_cost else None, "in_flight": 1,
+            "burn": {"cost_per_hour": 21.4 if plan.metered else 0.0,
+                     "tokens_per_hour": 5e5},
+            "month_tokens": 1.2e7, "month_cost": 12.5 if plan.metered else 0.0,
+            "eff_cost": 16.6 if plan.monthly_cost else None, "in_flight": 1,
             "cooled": False, "cooldown_remaining": 0, "cooldown_reason": "",
-            "alerting": ["95% of quota used"] if p.is_subscription else [],
-            "lanes": [k for k, l in reg.lanes.items() if p.key in l.order or p.key in l.tail],
+            "alerting": ["95% of quota used"] if plan.is_subscription else [],
+            "lanes": sorted({l for m in plan.models.values() for l in reg.lanes_using(m)}),
             "series": [{"day": f"2026-09-{d:02d}", "prompt_tokens": d * 1e6,
                         "completion_tokens": 0, "requests": d, "cost": 0.0,
                         "failures": 0} for d in range(1, 15)],
             "capacity": Capacity(cap=1, reason="paced 1 of 4 (capped by 5h)",
-                                 learned=4, configured=p.configured_parallel),
+                                 learned=plan.max_parallel,
+                                 configured=plan.configured_parallel),
             "pace": ({"active": True, "reason": "pacing weekly (capped by 5h)",
                       "windows": ws, "target": tgt, "binding": binding["window"],
                       "ahead_by": tgt["ahead_by"], "pace_line": tgt["pace_line"],
-                      "is_final_window": p.key == "opencode-go",
-                      "allowance": tgt["allowance"], "basis": "configured",
-                      "elapsed_frac": 0.5, "target_rate": 100.0, "rate_per_slot": 200.0,
+                      "is_final_window": False, "allowance": tgt["allowance"],
+                      "basis": "configured", "elapsed_frac": 0.5,
+                      "target_rate": 100.0, "rate_per_slot": 200.0,
                       "consumed": tgt["consumed"], "deadline": tgt["deadline"],
                       "remaining_seconds": 8e4, "consumed_frac": 0.3,
-                      "projected_end_frac": 0.7} if p.is_subscription else None),
-            "windows": windows_remaining(p.quota.period, p.expires),
-            "shares_usage_with": [s.key for s in reg.siblings(p)],
+                      "projected_end_frac": 0.7} if plan.is_subscription else None),
+            "windows": windows_remaining(plan.quota.period, plan.expires),
+            "models": [{"key": m.key, "ref": m.ref, "label": m.display,
+                        "provider_model": m.model, "enabled": m.enabled,
+                        "cap": plan.cap_for(m), "narrowed": m.max_parallel is not None,
+                        "context_window": m.context_window,
+                        "lanes": reg.lanes_using(m)} for m in plan.models.values()],
+            "cli_backed": plan.is_cli_backed,
+            "probe": None,
         })
 
-    capacity = {"lanes": lanes, "total_available": sum(l["slots_available_now"] for l in lanes),
+    capacity = {"lanes": lanes,
+                "total_available": sum(l["slots_available_now"] for l in lanes),
                 "total_in_use": sum(l["slots_in_use"] for l in lanes),
                 "pacing": True, "pacing_configured": False, "learning": True}
     return capacity, rows
@@ -134,7 +153,8 @@ def main() -> int:
     for name in ("_capacity.html", "_plans.html", "_probes.html"):
         env.get_template(name).render(**ctx)
     print(f"rendered index.html + fragments ({len(html)} bytes) -> {out}")
-    print(f"  {len(rows)} plans, {len(capacity['lanes'])} lanes, "
+    print(f"  {len(rows)} plans, {sum(len(r['models']) for r in rows)} models, "
+          f"{len(capacity['lanes'])} lanes, "
           f"{sum(len(r['headroom']['windows']) for r in rows)} quota windows, "
           f"{len(ctx['probes'])} probes")
     return 0

@@ -150,11 +150,12 @@ class SwitchyardHandler(CustomLogger):
                 headers={"Retry-After": "20"},
             ) from exc
 
-        data["model"] = pick.plan.deployment
+        data["model"] = pick.model.deployment
         meta = data.setdefault("metadata", {})
         meta[META_KEY] = {
             "lane": lane,
             "plan": pick.plan.key,
+            "model": pick.model.ref,
             "request_id": pick.request_id,
             "session": session,
             "sticky": pick.sticky,
@@ -163,7 +164,7 @@ class SwitchyardHandler(CustomLogger):
         }
         log.info(
             "lane=%s -> %s [%s]%s%s%s",
-            lane, pick.plan.key, pick.cap_reason,
+            lane, pick.model.ref, pick.cap_reason,
             " tools" if needs_tools else "",
             " (sticky)" if pick.sticky else "",
             f" skipped={','.join(pick.considered)}" if pick.considered else "",
@@ -280,7 +281,7 @@ class SwitchyardHandler(CustomLogger):
             )
         elif verdict.outcome is Outcome.PLAN_DEAD:
             log.error(
-                "plan=%s subscription is over (%s) — out of every lane for %dh. "
+                "plan=%s is over (%s) — out of every lane for %dh. "
                 "Remove it from config/plans.yaml.",
                 plan.key, verdict.detail, verdict.cooldown_seconds // 3600,
             )
@@ -296,7 +297,7 @@ class SwitchyardHandler(CustomLogger):
             )
 
         if verdict.should_cool:
-            await self.slots.cool_down(plan.subscription, verdict.cooldown_seconds, verdict.outcome.value)
+            await self.slots.cool_down(plan.key, verdict.cooldown_seconds, verdict.outcome.value)
         if verdict.outcome in (Outcome.QUOTA_EXHAUSTED, Outcome.PLAN_DEAD, Outcome.AUTH) and ctx.get("session"):
             # Do not strand the session on dead capacity; let it re-lease.
             await self.slots.drop_lease(ctx["session"])
@@ -321,7 +322,7 @@ class SwitchyardHandler(CustomLogger):
             remaining = _as_float(headers.get((q.headers.get("remaining") or "").lower()))
             reset = _as_float(headers.get((q.headers.get("reset") or "").lower()))
             if remaining is not None or reset is not None:
-                await self.ledger.note_reported(plan.subscription, remaining, reset,
+                await self.ledger.note_reported(plan.key, remaining, reset,
                                                 window=q.label)
 
 

@@ -72,11 +72,11 @@ curl -s $LOCAL_API_BASE/models -H "Authorization: Bearer $LOCAL_API_KEY" | head 
 
 | Plan | Model id | Context |
 |---|---|---|
-| `qwen-local` | `Qwen3.8-Flash-Next-oQ4e-mtp` | 262144 |
-| `gemma-local` | `gemma-4-26B-A4B-it-oQ4e-mtp` | 262144 |
-| `glm-local` | `GLM-5.3-Flash-oQ4e` | 1048576 |
+| `local-box/qwen` | `Qwen3.8-Flash-Next-oQ4e-mtp` | 262144 |
+| `local-box/gemma` | `gemma-4-26B-A4B-it-oQ4e-mtp` | 262144 |
+| `local-box/glm-flash` | `GLM-5.3-Flash-oQ4e` | 1048576 |
 
-If your ids differ, fix the `model:` lines under `deployments:` in
+If your ids differ, fix the `model:` line for that model under its plan in
 `config/plans.yaml`. To see the full list with context sizes:
 
 ```bash
@@ -84,13 +84,13 @@ curl -s $LOCAL_API_BASE/models -H "Authorization: Bearer $LOCAL_API_KEY" \
   | python3 -c 'import json,sys; [print(m["id"], m.get("max_model_len")) for m in json.load(sys.stdin)["data"]]'
 ```
 
-`glm-local` is deliberately **not** in any lane order — it is the target for
+`local-box/glm-flash` is deliberately **not** in any lane order — it is the target for
 context-window fallbacks, so a prompt too large for the chosen plan lands
 somewhere that can hold it rather than erroring.
 
-All three share `subscription: local-box`, so they draw on **one** pool of 2
-slots. They run on the same machine; three plans at 2 each would put six
-concurrent requests on hardware that handles one or two.
+All three are models of the **one** `local-box` plan, so they draw on its single
+pool of 2 slots. They run on the same machine; three models at 2 each would put
+six concurrent requests on hardware that handles one or two.
 
 `{"error":{"message":"API key required",...}}` means `LOCAL_API_KEY` is unset or
 wrong. Without the header it will fail the same way, so keep the `-H` on every
@@ -267,8 +267,10 @@ alias's default deployment:
 docker compose logs --tail=20 gateway | grep 'switchyard:'
 ```
 
-**Expect:** `switchyard: lane=local -> qwen-local [configured]`. The `[...]` is
-the cap reason — `configured`, `learned[h14]`, or a pacing decision.
+**Expect:** `switchyard: lane=local -> local-box/qwen [configured]`. Members are
+named `plan/model`: the plan owns the credential, the quota and the connection
+limit; the model is what the lane names. The `[...]` is the cap reason —
+`configured`, `learned[h14]`, or a pacing decision.
 
 **The definitive check** is Redis, because it cannot be faked by a fallback path:
 
@@ -279,10 +281,13 @@ docker compose exec -T redis redis-cli -n 1 --scan --pattern 'sy:*'
 **Expect** keys like these after a request:
 
 ```
-sy:usage:local-box:d:2026-09-20     usage booked against the SUBSCRIPTION, not the plan
+sy:usage:local-box:d:2026-09-20     usage booked against the PLAN, not the model
 sy:pace:local-box                   a per-slot throughput sample for pacing
-sy:lease:<keyhash>:fp:<digest>      a session lease from the conversation fingerprint
+sy:lease:<keyhash>:fp:<digest>      a session lease, holding a plan/model ref
 ```
+
+Note that the keys name `local-box`, the plan — not `qwen` or `gemma`. Quota,
+slots and cooldowns belong to the plan, so its models share them.
 
 No `sy:*` keys means the plugin is not loaded and every request is bypassing the
 slot accounting, affinity and pacing — while still returning 200s.
@@ -347,9 +352,8 @@ docker compose exec codex-sidecar codex --help | grep -A3 -- --model
 **Expect:** an error listing the valid aliases. If one of them is a heavier tier
 than `opus`, wire it up:
 
-1. set `model: openai/<alias>` under `claude-max-heavy` (or `astra`) in
-   `deployments:`;
-2. set `enabled: true` on that plan;
+1. set `model: openai/<alias>` on that model under its plan;
+2. set `enabled: true` on the model;
 3. `curl -X POST $PORTAL/admin/reload`.
 
 No `.env` change and no rebuild: the sidecar re-reads `plans.yaml` every 30
@@ -391,10 +395,10 @@ wait
 docker compose logs --tail=10 gateway | grep -E 'lane=(apex|judge)'
 ```
 
-**Expect:** the `judge` line shows `claude-max(full at 1)` among its skipped
-plans and picks a different provider. Both tiers share one connection because
-`claude-max-heavy` declares `subscription: claude-max` — if `judge` had also
-picked `claude-max`, the sharing is broken and that is a bug worth reporting.
+**Expect:** the `judge` line shows `claude-max/opus(full at 1)` among its skipped
+members and picks something else. Both models share the plan's one connection —
+if `judge` had also reached `claude-max`, the sharing is broken and that is a bug
+worth reporting.
 
 ### 4f. The Anthropic protocol (what Claude Code speaks)
 
@@ -430,9 +434,9 @@ curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
 docker compose logs --tail=5 gateway | grep 'lane=judge'
 ```
 
-**Expect:** the log line to include `tools` and to pick a plan that is *not*
-`claude-max`, `openai` or `grok` — for `judge` that means `qwen-local`, since
-every other plan in that lane is CLI-backed. The response should contain a
+**Expect:** the log line to include `tools` and to pick a member whose plan is
+*not* CLI-backed — for `judge` that means `local-box/qwen`, since every other
+member of that lane rides a CLI-backed plan. The response should contain a
 proper `tool_calls` block.
 
 Then confirm the refusal path is explicit rather than silent:

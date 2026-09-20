@@ -14,12 +14,15 @@
         <div><strong>{{ r.plan.label }}</strong></div>
         <div class="muted" style="font-size:12px">
           {% if r.plan.monthly_cost %}${{ '%.0f'|format(r.plan.monthly_cost) }}/mo{% else %}metered{% endif %}
-          · {{ r.lanes|join(', ') }}
-          {% if r.plan.auth == 'oauth_sidecar' %}· <span title="OAuth subscription via sidecar">sidecar</span>{% endif %}
-          {% if r.shares_usage_with %}
-            · <span title="one subscription: slots, quota and usage are shared">shares with
-              {{ r.shares_usage_with|join(', ') }}</span>
-          {% endif %}
+          {% if r.lanes %}· {{ r.lanes|join(', ') }}{% endif %}
+          {% if r.cli_backed %}· <span title="a CLI holds the credential; cannot serve tool calls">cli</span>{% endif %}
+        </div>
+        {# Models are what lanes name; the plan is what owns the limits. #}
+        <div class="muted mono" style="font-size:12px;margin-top:3px">
+          {% for m in r.models %}
+            <span title="{{ m.provider_model }}{% if m.context_window %} · {{ '{:,}'.format(m.context_window) }} ctx{% endif %}"
+                  {% if not m.enabled %}style="opacity:.45"{% endif %}>{{ m.key }}{% if m.narrowed %}·{{ m.cap }}{% endif %}</span>{% if not loop.last %} · {% endif %}
+          {% endfor %}
         </div>
       </td>
       <td style="min-width:190px">

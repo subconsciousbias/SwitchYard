@@ -66,12 +66,12 @@ class Ledger:
         # One bucket per quota window: a plan with a 5-hour *and* a weekly
         # allowance needs both counted, or pacing can only see one of them.
         keys = [
-            (K_PERIOD.format(plan=plan.subscription, period=period_key(q.period, now)), 90 * 86400)
+            (K_PERIOD.format(plan=plan.key, period=period_key(q.period, now)), 90 * 86400)
             for q in plan.quotas
         ]
         keys += [
-            (K_HOUR.format(plan=plan.subscription, hour=now.strftime("%Y-%m-%dT%H")), 7 * 86400),
-            (K_DAY.format(plan=plan.subscription, day=now.strftime("%Y-%m-%d")), 400 * 86400),
+            (K_HOUR.format(plan=plan.key, hour=now.strftime("%Y-%m-%dT%H")), 7 * 86400),
+            (K_DAY.format(plan=plan.key, day=now.strftime("%Y-%m-%d")), 400 * 86400),
         ]
         pipe = self.redis.pipeline()
         for key, ttl in keys:
@@ -103,7 +103,7 @@ class Ledger:
         in production it is always now.
         """
         return await self.bucket(
-            plan.subscription, K_PERIOD.format(plan=plan.subscription, period=period_key(quota.period, at))
+            plan.key, K_PERIOD.format(plan=plan.key, period=period_key(quota.period, at))
         )
 
     async def current_period(self, plan: Plan) -> dict[str, float]:
@@ -116,7 +116,7 @@ class Ledger:
         cost = tokens = 0.0
         for i in range(hours):
             at = now - timedelta(hours=i)
-            b = await self.bucket(plan.subscription, K_HOUR.format(plan=plan.subscription, hour=at.strftime("%Y-%m-%dT%H")))
+            b = await self.bucket(plan.key, K_HOUR.format(plan=plan.key, hour=at.strftime("%Y-%m-%dT%H")))
             cost += b["cost"]
             tokens += b["prompt_tokens"] + b["completion_tokens"]
         return {"cost_per_hour": cost / hours, "tokens_per_hour": tokens / hours}
@@ -145,13 +145,13 @@ class Ledger:
         consumed_tokens = used["prompt_tokens"] + used["completion_tokens"]
         now = time.time()
         pipe = self.redis.pipeline()
-        pipe.hset(K_WINDOW.format(plan=plan.subscription, window=window.label), mapping={
+        pipe.hset(K_WINDOW.format(plan=plan.key, window=window.label), mapping={
             "last_exhausted_at": now,
             "observed_allowance_tokens": consumed_tokens,
             "observed_allowance_cost": used["cost"],
             "reset_at": reset_at or "",
         })
-        pipe.hset(K_QUOTA.format(plan=plan.subscription), mapping={
+        pipe.hset(K_QUOTA.format(plan=plan.key), mapping={
             "last_exhausted_at": now,
             "last_exhausted_window": window.label,
             "reset_at": reset_at or "",
@@ -185,7 +185,7 @@ class Ledger:
         Tracked separately from rate limiting because the fix is different:
         lower `max_parallel` in plans.yaml rather than wait it out.
         """
-        key = K_QUOTA.format(plan=plan.subscription)
+        key = K_QUOTA.format(plan=plan.key)
         await self.redis.hincrbyfloat(key, "concurrency_rejections", 1)
         await self.redis.hset(key, mapping={
             "concurrency_rejected_at": time.time(),
@@ -244,7 +244,7 @@ async def headroom(ledger: Ledger, plan: Plan) -> dict:
 async def window_headroom(ledger: Ledger, plan: Plan, q: Quota) -> dict:
     """What the board shows in the 'quota left' column, for one window."""
     used = await ledger.window_usage(plan, q)
-    facts = await ledger.window_facts(plan.subscription, q.label)
+    facts = await ledger.window_facts(plan.key, q.label)
     tokens = used["prompt_tokens"] + used["completion_tokens"]
 
     basis: str | None = None

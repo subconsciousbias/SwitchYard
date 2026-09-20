@@ -197,7 +197,8 @@ def test_intermediate_windows_are_not_merged():
 def test_metered_and_local_plans_are_never_paced():
     async def go():
         reg, _, _, policy, _ = build(pacing=True)
-        for key in ("openrouter-mimo", "anthropic-fable", "qwen-local", "gemma-local"):
+        # Metered plans and the unmetered local box have no allowance to land on.
+        for key in ("openrouter", "anthropic-api", "local-box"):
             assert not await policy.plan_is_paced(reg.plans[key]), key
         for key in ("minimax-ultra", "grok", "claude-max", "glm"):
             assert await policy.plan_is_paced(reg.plans[key]), key
@@ -223,10 +224,10 @@ def test_pacing_mode_disables_the_tail():
     async def go():
         reg_off, *_, picker_off = build(pacing=False)
         reg_on, *_, picker_on = build(pacing=True)
-        return ([p.key for p in await picker_off._members("forge")],
-                [p.key for p in await picker_on._members("forge")])
+        return ([m.ref for m in await picker_off._members("forge")],
+                [m.ref for m in await picker_on._members("forge")])
     off, on = run(go())
-    assert "qwen-local" in off and "qwen-local" not in on
+    assert "local-box/qwen" in off and "local-box/qwen" not in on
     print(f"  tail present when pacing off ({off[-1]}), absent when on")
 
 
@@ -246,7 +247,7 @@ async def _multi(consumed_5h: float, consumed_week: float,
     from switchyard.usage import K_PERIOD, period_key
     reg, redis, ledger, policy, _ = build(pacing=True)
     base = reg.plans["claude-max"]
-    plan = replace(base, max_parallel=4, configured_parallel=4,
+    plan = replace(base, configured_parallel=4,
                    max_parallel_ceiling=4, quotas=(
         Quota(name="5h", role="constraint", kind="tokens",
               period="rolling_5h", allowance=allow_5h),
@@ -339,7 +340,7 @@ def test_partial_knowledge_still_protects_the_known_window():
         from switchyard.models import Quota
         from switchyard.usage import K_PERIOD, period_key
         reg, redis, ledger, policy, _ = build(pacing=True)
-        plan = replace(reg.plans["claude-max"], max_parallel=4, configured_parallel=4,
+        plan = replace(reg.plans["claude-max"], configured_parallel=4,
                        max_parallel_ceiling=4, quotas=(
             Quota(name="5h", role="constraint", kind="tokens",
                   period="rolling_5h", allowance=2_000_000),

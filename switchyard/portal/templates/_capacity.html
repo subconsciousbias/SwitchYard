@@ -21,9 +21,15 @@
     <table>
       {% for p in lane.plans %}
       <tr>
-        <td style="width:34%">
-          {{ p.label }}
+        <td style="width:36%">
+          <span class="mono">{{ p.plan }}</span><span class="muted">/{{ p.model }}</span>
           {% if p.tail %}<span class="tag" title="last resort only">tail</span>{% endif %}
+          {% if p.cli_backed %}<span class="tag" title="CLI-backed: cannot serve tool calls">cli</span>{% endif %}
+          {% if p.shares_plan_with %}
+            <div class="muted" style="font-size:12px"
+                 title="same plan: one connection limit and one quota">
+              shares {{ p.plan }} with {{ p.shares_plan_with|join(', ') }}</div>
+          {% endif %}
         </td>
         <td>
           <div class="slots">

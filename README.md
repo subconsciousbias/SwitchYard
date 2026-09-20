@@ -29,31 +29,67 @@ OPENAI_BASE_URL=http://host:4000/v1  OPENAI_API_KEY=$KEY         # model: forge
 
 The model name you ask for is a **lane**, not a provider.
 
+## Plans and models
+
+The structure mirrors what you actually buy:
+
+- A **plan** is a thing you pay for. It owns the credentials, the quota windows,
+  the connection limit, the monthly cost and the expiry date.
+- A **model** is something a plan serves. It carries no credentials, and may only
+  *narrow* its plan's connection limit, never widen it.
+- **Lanes reference models**, written `plan/model` — never plans.
+
+Everything shared is shared because it belongs to the plan. Two models on one
+plan draw on the same slots, the same quota, the same cooldown and the same
+learned concurrency. That is not a special case; it is why `apex` (Claude's heavy
+model) and `judge` (Opus) cannot between them open two connections against a
+one-connection Claude Max plan:
+
+```
+apex took claude-max/fable; judge fell through to openai/sol rather than
+double-booking the plan's one connection
+```
+
+```yaml
+plans:
+  claude-max:
+    auth: cli_sidecar
+    max_parallel: 1              # the plan's limit — shared by both models
+    quotas: [5h constraint, weekly target]
+    api_base: http://claude-max-sidecar:8081/v1
+    models:
+      opus:  {model: openai/claude-opus-5}
+      fable: {model: openai/claude-fable-5-1, enabled: false}
+
+  local-box:
+    max_parallel: 2              # ONE machine, however many models
+    models:
+      qwen:      {model: openai/Qwen3.8-Flash-Next-oQ4e-mtp, context_window: 262144}
+      gemma:     {model: openai/gemma-4-26B-A4B-it-oQ4e-mtp, context_window: 262144}
+      glm-flash: {model: openai/GLM-5.3-Flash-oQ4e, context_window: 1048576, max_parallel: 1}
+```
+
 ## Lanes
 
 | Lane | Was | Ordered capacity | Tail |
 |---|---|---|---|
-| `apex` | Judgement — Heavy | Claude Max heavy tier* → Astra 6 (GPT 6 on the seat)* → Fable 5.1 (metered)* | Claude Max |
-| `judge` | Judgement — Regular | Claude Max → OpenAI → Grok | Qwen local |
-| `forge` | Coding Workhorse | Minimax Ultra → Minimax Max → Grok → GLM → OpenCode Go → OpenRouter | Qwen local |
+| `apex` | Judgement — Heavy | `openai/astra` → `claude-max/fable`* → `anthropic-api/fable`* | `claude-max/opus` |
+| `judge` | Judgement — Regular | `claude-max/opus` → `openai/sol` → `grok/grok-4.6` | `local-box/qwen` |
+| `forge` | Coding Workhorse | Minimax Ultra → Minimax Max → Grok → GLM → OpenCode Go → OpenRouter | `local-box/qwen` |
+| `local` | Local Only | `local-box/qwen` → `local-box/gemma` | *(none, on purpose)* |
+| `bulk` | Basic | `local-box/gemma` → `local-box/qwen` | `minimax-max/m2` |
 
-| `local` | Local Only | Qwen 3.8 Flash Next → Gemma 4 26B | *(none, on purpose)* |
-| `bulk` | Basic | Gemma 4 26B → Qwen 3.8 Flash Next | Minimax Max |
+\* Disabled until confirmed — see *No API key? Then apex is just Opus*.
 
-The local models share `subscription: local-box` — one machine, one pool of 2
-slots, however many plans point at it. `glm-local` (GLM 5.3 Flash, 1M context)
-sits outside every lane order as the context-window fallback target: a prompt too
-large for the chosen plan goes there instead of erroring. Only plans that declare
-`context_window` take part in that, so an undeclared window never becomes a wrong
-routing decision.
+A **tail** member is last-resort capacity: it keeps a lane from hard-failing but
+never carries normal traffic, and is excluded from the lane's advertised slots.
+The `local` lane has no tail and no cloud members deliberately — when the box is
+busy you get a 429 and back off rather than silently spending money.
 
-\* All three are disabled out of the box — see *No API key? Then apex is just
-Opus* below. `apex` currently resolves to Claude Max.
-
-A **tail** plan is last-resort capacity: it keeps the lane from hard-failing but
-never carries normal traffic, and it is excluded from the lane's advertised slot
-count. The `local` lane has no tail and no cloud members deliberately — when the
-box is busy you get a 429 and back off rather than silently spending money.
+`local-box/glm-flash` sits outside every lane order: it exists as the target for
+context-window fallbacks, so a prompt too large for the chosen model lands
+somewhere that can hold it. Only models that declare `context_window` take part,
+so an undeclared window never becomes a wrong routing decision.
 
 ## The three behaviours
 
@@ -227,26 +263,25 @@ does not grant API access.** `console.anthropic.com` keys are metered billing,
 separate from a Max plan. So Fable 5.1 via the API is only available if you
 choose to add API credits, and it ships `enabled: false`.
 
-Astra 6 is not a separate provider either — it is GPT 6 on the OpenAI/Codex
-seat. It is configured as a plan with `subscription: openai`, so it shares that
-seat's two connections, its quota windows, its cooldowns and its 2026-10-04
-expiry. Enable it once you confirm the alias the Codex CLI accepts.
+Astra 6 is not a separate provider either — it is `gpt-6-astra`, a model on the
+OpenAI/Codex seat, so it lives under that plan as `openai/astra` and shares the
+seat's two connections, quota windows, cooldowns and 2026-10-04 expiry.
 
 That leaves these options for a tier above Opus:
 
-1. **A heavier alias on the subscription itself**, if your plan exposes one. The
-   `claude-max-heavy` plan is wired for exactly this — same sidecar, same
-   connection, different `--model`. Find the aliases your plan accepts with:
+1. **A heavier model on the Claude Max plan itself**, if your plan exposes one.
+   `claude-max/fable` is wired for exactly this — same sidecar, same connection,
+   different `--model`. Find the aliases your plan accepts with:
 
    ```bash
    docker compose exec claude-max-sidecar claude --model bogus 2>&1 | head
    ```
 
-   Then set the alias in `deployments:`, add it to `CLAUDE_MODEL_ALLOW` in
-   `.env`, and flip `enabled: true`.
+   Then set it as that model's `model:` and flip `enabled: true`. The sidecar
+   derives its allowlist from this config, so no `.env` change is needed.
 
-2. **Astra 6 / GPT 6 on the Codex seat** — already wired, `enabled: false` until
-   you confirm its alias. Expires with the seat on 2026-10-04.
+2. **Astra 6 / GPT 6 on the Codex seat** — `openai/astra`, confirmed working and
+   enabled. Expires with the seat on 2026-10-04.
 3. **Accept that there is no tier above Opus** and let `apex` resolve to
    `claude-max`, the same place `judge` lands. That is the current default. It
    is not a broken lane — it means escalation gets the best model you have, and
@@ -255,22 +290,6 @@ That leaves these options for a tier above Opus:
 The sidecar will not run an alias that is not in `MODEL_ALLOW`; it falls back to
 the default and logs loudly, because an `apex` escalation silently served by the
 `judge` model is the kind of bug you would never notice.
-
-### One subscription, several tiers, one connection
-
-`claude-max-heavy` declares `subscription: claude-max`. That makes the two plans
-share **one** set of connection slots, one quota, one cooldown, and one learned
-concurrency figure — so `apex` and `judge` cannot between them open two
-connections against a one-connection plan:
-
-```
-apex took claude-max-heavy; judge fell through to openai rather than
-double-booking; after release judge could reach the subscription again
-```
-
-Use `subscription:` for any plan that is really a second view of an existing one.
-Without it, each plan gets its own slot counter and you would quietly exceed the
-real limit.
 
 ## CLI-backed lanes cannot serve tool calls
 
