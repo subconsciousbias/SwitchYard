@@ -224,11 +224,11 @@ tell you — it only reports configuration:
 ```bash
 docker compose exec -T claude-max-sidecar  claude -p "Reply with exactly: OK" --model opus --max-turns 1
 docker compose exec -T grok-sidecar        opencode auth list | grep -E "xAI|credentials"
-docker compose exec -T opencode-go-sidecar opencode auth list | grep -E "OpenCode Zen|credentials"
+docker compose exec -T opencode-go-sidecar opencode auth list | grep -E "OpenCode Go|credentials"
 ```
 
 **Expect** a reply from Claude, and the relevant provider listed for each
-OpenCode sidecar. `0 credentials` means the login did not persist — check that
+OpenCode sidecar (`xAI oauth`, `OpenCode Go api`). `0 credentials` means the login did not persist — check that
 `$HOME` inside the container matches where the credential directory is mounted
 (`docker compose exec grok-sidecar sh -c 'echo $HOME; opencode auth list'`).
 

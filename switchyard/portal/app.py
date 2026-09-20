@@ -112,16 +112,29 @@ async def collect_plans() -> list[dict]:
     for plan in reg.plans.values():
         hr = await headroom(ledger, plan)
         burn = await ledger.burn_rate(plan)
-        series = await ledger.daily_series(plan.subscription, days=31)
+        series = await ledger.daily_series(plan.key, days=31)
         month_tokens = sum(
             d["prompt_tokens"] + d["completion_tokens"] for d in series if d["day"].startswith(month)
         )
         month_cost = sum(d["cost"] for d in series if d["day"].startswith(month))
-        cooled, ttl, reason = await slots.cooldown_state(plan.subscription)
-        in_flight = await slots.in_flight(plan.subscription)
-        facts = await ledger.quota_facts(plan.subscription)
+        cooled, ttl, reason = await slots.cooldown_state(plan.key)
+        in_flight = await slots.in_flight(plan.key)
+        facts = await ledger.quota_facts(plan.key)
         capacity = await policy.effective(plan)
-        probe = await state["prober"].status(plan.subscription) if plan.probe else None
+        probe = await state["prober"].status(plan.key) if plan.probe else None
+        # Models are what lanes name; the plan is what owns the limits. Named
+        # `model_rows` rather than `models`, which is the imported module.
+        model_rows = [{
+            "key": m.key,
+            "ref": m.ref,
+            "label": m.display,
+            "provider_model": m.model,
+            "enabled": m.enabled,
+            "cap": plan.cap_for(m),
+            "narrowed": m.max_parallel is not None,
+            "context_window": m.context_window,
+            "lanes": reg.lanes_using(m),
+        } for m in plan.models.values()]
         pace = await policy.pace_state(plan) if await policy.plan_is_paced(plan) else None
 
         alerting = []
@@ -177,7 +190,7 @@ async def collect_plans() -> list[dict]:
             "pace": pace,
             "probe": probe,
             "windows": windows_remaining(plan.quota.period, plan.expires),
-            "models": models,
+            "models": model_rows,
             "cli_backed": plan.is_cli_backed,
         })
     return rows
