@@ -27,6 +27,21 @@ commands below work unchanged. Before the stack is up, read it from `.env` with
 
 ---
 
+## Run it, do not type it
+
+Everything below that a machine can check is in `scripts/smoke.py`. Prefer it:
+
+```bash
+python3 scripts/smoke.py           # free: local and bulk lanes, all behaviour checks
+python3 scripts/smoke.py --paid    # also the lanes that spend subscription quota
+python3 scripts/smoke.py --slow    # also the CLI harness overhead (minutes)
+```
+
+It exits non-zero if anything fails, and every check prints its evidence — the
+member that served the request, the slot counts before and after, the tool call
+that came back. The prose below explains what each check means and how to
+diagnose a failure; it is not a list of commands to retype.
+
 ## 0. Offline checks (no credentials needed, ~30 seconds)
 
 ```bash

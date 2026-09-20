@@ -571,6 +571,16 @@ ledger estimates plus observed-allowance learning.
 ## Tests
 
 ```bash
+python3 scripts/smoke.py         # the live stack: lanes, affinity, cooldown, tools
+```
+
+That is the mechanical suite against a running deployment — 14 checks by default,
+none of which spend subscription quota. `--paid` adds the lanes that do, `--slow`
+measures CLI harness overhead.
+
+Offline, needing nothing running:
+
+```bash
 python3 tests/test_routing.py    # ordered fill, affinity, vanishing capacity
 python3 tests/test_classify.py   # real MiniMax and Z.AI error payloads
 python3 tests/test_policy.py     # concurrency learning and pacing control

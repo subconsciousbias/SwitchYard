@@ -103,17 +103,41 @@ def test_absolute_reset_time_beats_the_default_cooldown():
 
     Without parsing the stated time, the lane would retry a dead plan every hour
     for thirty more hours.
+
+    The timestamp is generated rather than hard-coded: an earlier version pinned
+    the real message's "Sep 22nd, 2026 4:37 AM", and the assertion drifted out of
+    range as actual time passed — eventually it would parse to the past and return
+    None, failing for a reason unrelated to the parser.
     """
-    secs = server.seconds_until(CODEX_QUOTA)
-    assert secs is not None and 29 * 3600 < secs < 32 * 3600, secs
-    print(f"  '{CODEX_QUOTA[-28:]}' -> {secs / 3600:.1f}h")
+    from datetime import datetime, timedelta, timezone
+    target = datetime.now(timezone.utc) + timedelta(hours=30)
+    message = ("You've hit your usage limit. Visit x to purchase more credits or "
+               f"try again at {target.strftime('%b %d, %Y %I:%M %p')}.")
+    secs = server.seconds_until(message)
+    assert secs is not None and 29 * 3600 < secs < 31 * 3600, secs
+    print(f"  a stated reset 30h out -> {secs / 3600:.1f}h cooldown")
+
+
+def test_the_real_codex_wording_parses():
+    """Separately, the verbatim message format must still be recognised — only
+    the format, not the magnitude, so real time passing cannot break it."""
+    assert server._TRY_AGAIN_AT.search(server.normalise(CODEX_QUOTA)), CODEX_QUOTA
+    assert server._LIMIT.search(server.normalise(CODEX_QUOTA))
+    print(f"  verbatim wording recognised: ...{CODEX_QUOTA[-34:]}")
 
 
 def test_quota_message_becomes_429_with_that_retry_after():
-    exc = server._limit_error(CODEX_QUOTA)
+    """Generated timestamp, for the same reason as above: a hard-coded future
+    date silently drifts out of range as real time passes."""
+    from datetime import datetime, timedelta, timezone
+    target = datetime.now(timezone.utc) + timedelta(hours=30)
+    message = ("You've hit your usage limit. Visit x or try again at "
+               f"{target.strftime('%b %d, %Y %I:%M %p')}.")
+    exc = server._limit_error(message)
     assert exc.status_code == 429, exc.status_code
-    assert int(exc.headers["Retry-After"]) > 29 * 3600, exc.headers
-    print(f"  HTTP 429, Retry-After {exc.headers['Retry-After']}s")
+    retry = int(exc.headers["Retry-After"])
+    assert 29 * 3600 < retry < 31 * 3600, retry
+    print(f"  HTTP 429, Retry-After {retry}s ({retry / 3600:.1f}h)")
 
 
 def test_implausible_reset_times_are_discarded():
