@@ -341,9 +341,17 @@ One image, four services, selected by `PROVIDER`:
 | Grok $300 (SuperGrok) | `opencode` | `opencode run` | 8083 | `opencode auth login` |
 | OpenCode Go | `opencode` | `opencode run` | 8084 | `opencode auth login` |
 
-Run the login inside the container (`docker compose exec grok-sidecar
-opencode auth login`) or mount host credential directories that are already
-logged in — the compose file does the latter by default.
+Log in once per sidecar. Each has its own credential store under `./secrets/`,
+isolated from your host CLIs — deliberately, for two reasons:
+
+- **Claude on macOS keeps its token in the login Keychain**, so mounting
+  `~/.claude` gives a Linux container settings and history but no credentials.
+- OAuth refresh needs write access, so sharing means a containerised CLI writing
+  into the config directory your interactive CLI is using, mid-session.
+
+Two logins on one account are independent; one refresh-token chain copied into
+two places can rotate out from under the other. `secrets/README.md` covers
+sharing host directories anyway, which does work for the file-based CLIs.
 
 **Connection limits are not set in the compose file.** Each sidecar reads
 `config/plans.yaml` itself, takes the tightest `max_parallel` among the plans

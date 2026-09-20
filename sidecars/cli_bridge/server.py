@@ -473,6 +473,7 @@ def to_openai(payload: dict, model: str) -> dict:
 async def health() -> dict:
     cfg = config()
     return {"ok": True, "provider": PROVIDER, "supports_tools": False,
+            "home": os.environ.get("HOME", ""),
             "system_mode": SYSTEM_MODE, "bare": BARE,
             "subscription": SUBSCRIPTION or PROVIDER, "model": cfg.model,
             "models": sorted(cfg.models), "concurrency": cfg.concurrency,

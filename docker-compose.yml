@@ -88,9 +88,13 @@ services:
       redis: {condition: service_healthy}
 
   # Claude Max's quota is OAuth-only, so the CLI owns the credential and this
-  # service just exposes it as HTTP on the internal network. Log in once with
-  # `docker compose exec claude-max-sidecar claude login`, or mount a host
-  # ~/.claude that is already logged in.
+  # service just exposes it as HTTP on the internal network.
+  #
+  # Credentials live in ./secrets/claude, NOT your host ~/.claude — on macOS the
+  # host token is in the Keychain and unreadable here anyway, and mounting your
+  # live config directory read-write lets a containerised CLI rewrite the config
+  # of the CLI you are using interactively. See secrets/README.md.
+  #   docker compose exec claude-max-sidecar claude login
   # The four sidecars are the SAME image; only their environment differs. Only
   # this service declares `build`, and the rest reference the tag it produces —
   # otherwise compose builds the identical image four times and writes four tags,
@@ -117,7 +121,7 @@ services:
       SYSTEM_MODE: replace
     volumes:
       - ./config:/app/config:ro
-      - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude
+      - ${CLAUDE_CONFIG_DIR:-./secrets/claude}:/home/node/.claude
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8081/health')\""]
       interval: 30s
@@ -142,7 +146,7 @@ services:
       CLI_EXTRA_ARGS: ${CODEX_EXTRA_ARGS:-}
     volumes:
       - ./config:/app/config:ro
-      - ${CODEX_CONFIG_DIR:-~/.codex}:/home/node/.codex
+      - ${CODEX_CONFIG_DIR:-./secrets/codex}:/home/node/.codex
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8082/health')\""]
       interval: 30s
@@ -166,8 +170,8 @@ services:
       CLI_EXTRA_ARGS: ${OPENCODE_EXTRA_ARGS:-}
     volumes:
       - ./config:/app/config:ro
-      - ${OPENCODE_DATA_DIR:-~/.local/share/opencode}:/home/node/.local/share/opencode
-      - ${OPENCODE_CONFIG_DIR:-~/.config/opencode}:/home/node/.config/opencode
+      - ${OPENCODE_DATA_DIR:-./secrets/opencode/data}:/home/node/.local/share/opencode
+      - ${OPENCODE_CONFIG_DIR:-./secrets/opencode/config}:/home/node/.config/opencode
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8083/health')\""]
       interval: 30s
@@ -191,8 +195,8 @@ services:
       CLI_EXTRA_ARGS: ${OPENCODE_EXTRA_ARGS:-}
     volumes:
       - ./config:/app/config:ro
-      - ${OPENCODE_DATA_DIR:-~/.local/share/opencode}:/home/node/.local/share/opencode
-      - ${OPENCODE_CONFIG_DIR:-~/.config/opencode}:/home/node/.config/opencode
+      - ${OPENCODE_DATA_DIR:-./secrets/opencode/data}:/home/node/.local/share/opencode
+      - ${OPENCODE_CONFIG_DIR:-./secrets/opencode/config}:/home/node/.config/opencode
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8084/health')\""]
       interval: 30s

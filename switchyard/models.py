@@ -119,7 +119,11 @@ class Plan:
         """
         if self.supports_tools is not None:
             return self.supports_tools
-        return self.auth != "oauth_sidecar"
+        # `oauth_sidecar` is the historical name; `cli_sidecar` is the accurate
+        # one, since some of these credentials are API keys that only the CLI
+        # knows how to use (OpenCode Zen, for one). Either means "a CLI harness
+        # is in the way", which is what actually decides this.
+        return self.auth not in ("oauth_sidecar", "cli_sidecar")
 
     @property
     def subscription(self) -> str:

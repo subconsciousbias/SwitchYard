@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 config/litellm.generated.yaml
 .pytest_cache/
+
+# Sidecar credential stores — OAuth tokens live here
+secrets/*
+!secrets/README.md

@@ -168,15 +168,27 @@ behave correctly** — check for an import error above it.
 These have no API key. Claude Max and the ChatGPT seat both authenticate through
 their own CLI.
 
-Four of your plans have no API key at all. Each authenticates through its own
-CLI, and if you mounted an already-logged-in credential directory the login step
-is unnecessary — run the health checks regardless.
+Four of your plans have no API key at all; each authenticates through its own
+CLI, using a credential store under `./secrets/` that is isolated from your host
+CLIs. **Log in once per sidecar** — this is not optional, and mounting your host
+directories is not a substitute:
+
+- **Claude on macOS keeps its OAuth token in the login Keychain**, not in a
+  file, so there is nothing in `~/.claude` for a Linux container to read.
+  Mounting it yields settings and history but zero credentials.
+- Sharing a host directory read-write lets a containerised CLI rewrite the config
+  of the CLI you are using interactively, and OAuth refresh *requires* write
+  access. See `secrets/README.md`.
+
+If your `.env` pins `CLAUDE_CONFIG_DIR` / `CODEX_CONFIG_DIR` /
+`OPENCODE_DATA_DIR` / `OPENCODE_CONFIG_DIR` to host paths, comment those four
+lines out to use the isolated stores, then `docker compose up -d` to recreate.
 
 ```bash
 docker compose exec claude-max-sidecar   claude login          # follow the URL
 docker compose exec codex-sidecar        codex login
 docker compose exec grok-sidecar         opencode auth login   # choose xAI
-docker compose exec opencode-go-sidecar  opencode auth login   # choose OpenCode
+docker compose exec opencode-go-sidecar  opencode auth login   # choose OpenCode Zen
 
 for p in 8081 8082 8083 8084; do
   docker compose exec gateway python -c "
@@ -197,6 +209,20 @@ done
 {"ok":true,"provider":"opencode","subscription":"grok","model":"xai/grok-4",
  "models":["xai/grok-4"],"concurrency":4,"in_flight":0}
 ```
+
+Then prove each CLI can really authenticate, which the health endpoint cannot
+tell you — it only reports configuration:
+
+```bash
+docker compose exec -T claude-max-sidecar  claude -p "Reply with exactly: OK" --model opus --max-turns 1
+docker compose exec -T grok-sidecar        opencode auth list | grep -E "xAI|credentials"
+docker compose exec -T opencode-go-sidecar opencode auth list | grep -E "OpenCode Zen|credentials"
+```
+
+**Expect** a reply from Claude, and the relevant provider listed for each
+OpenCode sidecar. `0 credentials` means the login did not persist — check that
+`$HOME` inside the container matches where the credential directory is mounted
+(`docker compose exec grok-sidecar sh -c 'echo $HOME; opencode auth list'`).
 
 **This is the check that matters most.** `concurrency` comes from
 `config/plans.yaml`, not from the compose file — if it does not match the
