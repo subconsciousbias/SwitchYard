@@ -97,11 +97,20 @@ def test_probing_up_requires_unmet_demand_and_quiet():
 
 
 def test_auto_plans_start_at_the_seed():
+    """`max_parallel: auto` means "learn it", starting from the seed.
+
+    Built here rather than read from the config, so the test survives every plan
+    being given an explicit cap — it is about the feature, not today's numbers.
+    """
+    from dataclasses import replace
     reg = models.load()
-    for key in ("glm", "opencode-go"):
-        assert reg.plans[key].configured_parallel is None
-        assert reg.plans[key].max_parallel == reg.settings.concurrency_learning.seed_cap
-    print(f"  `max_parallel: auto` plans start at {reg.settings.concurrency_learning.seed_cap}")
+    seed = reg.settings.concurrency_learning.seed_cap
+    learned = replace(reg.plans["glm"], configured_parallel=None)
+    assert learned.max_parallel == seed, learned.max_parallel
+    # An explicit cap is used as-is.
+    fixed = replace(reg.plans["glm"], configured_parallel=3)
+    assert fixed.max_parallel == 3
+    print(f"  auto -> seed {seed}; explicit -> that number")
 
 
 # ----------------------------------------------------------------- pacing ----
@@ -198,7 +207,7 @@ def test_metered_and_local_plans_are_never_paced():
     async def go():
         reg, _, _, policy, _ = build(pacing=True)
         # Metered plans and the unmetered local box have no allowance to land on.
-        for key in ("openrouter", "anthropic-api", "local-box"):
+        for key in ("openrouter", "local-box"):
             assert not await policy.plan_is_paced(reg.plans[key]), key
         for key in ("minimax-ultra", "grok", "claude-max", "glm"):
             assert await policy.plan_is_paced(reg.plans[key]), key

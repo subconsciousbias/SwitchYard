@@ -35,8 +35,10 @@ The structure mirrors what you actually buy:
 
 - A **plan** is a thing you pay for. It owns the credentials, the quota windows,
   the connection limit, the monthly cost and the expiry date.
-- A **model** is something a plan serves. It carries no credentials, and may only
-  *narrow* its plan's connection limit, never widen it.
+- A **model** is something a plan serves. It carries no credentials, and has its
+  own optional concurrency limit — **a separate ceiling, not a narrowing of the
+  plan's.** The plan's limit caps total concurrency across its models; a model's
+  caps how much of that one model may take.
 - **Lanes reference models**, written `plan/model` — never plans.
 
 Everything shared is shared because it belongs to the plan. Two models on one
@@ -52,22 +54,29 @@ double-booking the plan's one connection
 
 ```yaml
 plans:
-  claude-max:
-    auth: cli_sidecar
-    max_parallel: 1              # the plan's limit — shared by both models
-    quotas: [5h constraint, weekly target]
-    api_base: http://claude-max-sidecar:8081/v1
-    models:
-      opus:  {model: openai/claude-opus-5}
-      fable: {model: openai/claude-fable-5-1, enabled: false}
-
   local-box:
-    max_parallel: 2              # ONE machine, however many models
+    max_parallel: 2              # total across every model on this machine
     models:
-      qwen:      {model: openai/Qwen3.8-Flash-Next-oQ4e-mtp, context_window: 262144}
-      gemma:     {model: openai/gemma-4-26B-A4B-it-oQ4e-mtp, context_window: 262144}
-      glm-flash: {model: openai/GLM-5.3-Flash-oQ4e, context_window: 1048576, max_parallel: 1}
+      qwen:  {model: openai/Qwen3.8-Flash-Next-oQ4e-mtp, max_parallel: 1}
+      gemma: {model: openai/gemma-4-26B-A4B-it-oQ4e-mtp, max_parallel: 1}
 ```
+
+Those are two independent counters, so one qwen and one gemma run together, a
+*second* qwen does not, and a third request anywhere on the plan does not either.
+The refusal says which limit bit:
+
+```
+req -> local-box/qwen
+req -> local-box/gemma   skipped=local-box/qwen(model full at 1)
+req -> 429: local-box/qwen(model full at 1), local-box/gemma(plan full at 2)
+```
+
+Checking a model's limit against the plan's counter — the obvious single-counter
+shortcut — would let a plan of 2 with two models at 1 each run only one request.
+
+A lane's advertised capacity accounts for both: per plan, the lesser of the plan's
+limit and what its members in that lane can actually reach. `forge` offers 16, not
+the 20 its plans' limits sum to, because several members cap themselves lower.
 
 ## Lanes
 

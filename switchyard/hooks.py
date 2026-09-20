@@ -182,7 +182,7 @@ class SwitchyardHandler(CustomLogger):
         if not ctx:
             return
         plan = self.registry.plans.get(ctx["plan"])
-        await self.picker.release(ctx["plan"], ctx["request_id"])
+        await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
         if not plan:
             return
 
@@ -230,7 +230,7 @@ class SwitchyardHandler(CustomLogger):
         ctx = self._ctx(kwargs)
         if not ctx:
             return
-        await self.picker.release(ctx["plan"], ctx["request_id"])
+        await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
         plan = self.registry.plans.get(ctx["plan"])
         if plan:
             await self.ledger.record(plan, failed=True)
@@ -242,7 +242,7 @@ class SwitchyardHandler(CustomLogger):
         meta = (request_data or {}).get("metadata") or {}
         ctx = meta.get(META_KEY)
         if isinstance(ctx, dict):
-            await self.picker.release(ctx["plan"], ctx["request_id"])
+            await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
             await self._handle_failure(ctx, original_exception)
 
     async def _handle_failure(self, ctx: dict, exc: Exception | None) -> None:

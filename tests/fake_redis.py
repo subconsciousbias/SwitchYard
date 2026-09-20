@@ -112,14 +112,20 @@ class FakeRedis:
     # -- the claim script --------------------------------------------------
     def register_script(self, _src):
         async def claim(keys, args):
-            inflight_key, cool_key = keys
-            rid, now, cap, stale_before, _ttl = args
+            inflight_key, cool_key, model_key = keys
+            rid, now, plan_cap, stale_before, _ttl, model_cap = args
             if await self.get(cool_key) is not None:
                 return -1
             await self.zremrangebyscore(inflight_key, "-inf", stale_before)
-            z = self.zsets.setdefault(inflight_key, {})
-            if len(z) >= int(cap):
+            await self.zremrangebyscore(model_key, "-inf", stale_before)
+            plan_z = self.zsets.setdefault(inflight_key, {})
+            if len(plan_z) >= int(plan_cap):
                 return 0
-            z[rid] = float(now)
+            mcap = int(model_cap)
+            model_z = self.zsets.setdefault(model_key, {})
+            if mcap >= 0 and len(model_z) >= mcap:
+                return -2
+            plan_z[rid] = float(now)
+            model_z[rid] = float(now)
             return 1
         return claim

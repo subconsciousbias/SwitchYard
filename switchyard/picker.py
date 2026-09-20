@@ -37,6 +37,15 @@ class Pick:
         return self.model.ref
 
 
+def _why(result: int, plan_cap: int, model_cap: int | None) -> str:
+    """Why a member was skipped, distinguishing the two limits."""
+    if result == -1:
+        return "cooled"
+    if result == -2:
+        return f"model full at {model_cap}"
+    return f"plan full at {plan_cap}"
+
+
 class Picker:
     def __init__(self, registry: Registry, slots: SlotTable,
                  policy: CapacityPolicy | None = None):
@@ -49,11 +58,16 @@ class Picker:
     # how `apex` and `judge` cannot between them open two connections against a
     # one-connection Claude Max plan.
     async def _cap(self, model: Model) -> tuple[int, str]:
-        """The cap to claim against: the plan's, narrowed by the model's own."""
+        """The PLAN's effective cap — the ceiling on total concurrency.
+
+        A model's own `max_parallel` is a separate, narrower limit on that model
+        alone, enforced by its own counter; it must not be conflated with this
+        one or a plan of 2 with two models at 1 each could only run one request.
+        """
         plan = self.registry.plan_of(model)
         if self.policy is None:
-            return plan.cap_for(model), "configured"
-        cap = await self.policy.effective_for(plan, model)
+            return plan.max_parallel, "configured"
+        cap = await self.policy.effective(plan)
         return cap.cap, cap.reason
 
     async def _members(self, lane: str, needs_tools: bool = False) -> list[Model]:
@@ -90,7 +104,8 @@ class Picker:
                 model = by_ref[held]
                 plan = self.registry.plan_of(model)
                 cap, reason = await self._cap(model)
-                if cap > 0 and await self.slots.try_claim(plan.key, cap, rid) == 1:
+                if cap > 0 and await self.slots.try_claim(
+                        plan.key, cap, rid, model.ref, model.max_parallel) == 1:
                     await self.slots.touch_lease(session, self.registry.settings.lease_ttl_seconds)
                     return Pick(lane, model, plan, rid, session, True, [], cap, reason)
                 # Its slots are full or it just got cooled down; fall through
@@ -109,7 +124,8 @@ class Picker:
                 # allowance is spent). Not an error, just no capacity.
                 skipped.append(f"{model.ref}(paced to 0)")
                 continue
-            result = await self.slots.try_claim(plan.key, cap, rid)
+            result = await self.slots.try_claim(
+                plan.key, cap, rid, model.ref, model.max_parallel)
             if result == 1:
                 if session:
                     await self.slots.set_lease(
@@ -117,15 +133,16 @@ class Picker:
                     )
                 return Pick(lane, model, plan, rid, session, False, skipped, cap, reason)
             if result == 0 and self.policy is not None:
-                # Demand the cap refused. That is the signal the learner needs
-                # before it will probe the limit upward.
+                # Demand the PLAN's cap refused. That is the signal the learner
+                # needs before it will probe the limit upward. A model-level
+                # refusal says nothing about the plan, so it is not pressure.
                 await self.policy.learner.note_pressure(plan.key)
-            skipped.append(f"{model.ref}({'cooled' if result == -1 else f'full at {cap}'})")
+            skipped.append(f"{model.ref}({_why(result, cap, model.max_parallel)})")
 
         raise LaneSaturated(lane, ", ".join(skipped))
 
-    async def release(self, plan_key: str, request_id: str) -> None:
-        await self.slots.release(plan_key, request_id)
+    async def release(self, plan_key: str, request_id: str, model_ref: str) -> None:
+        await self.slots.release(plan_key, request_id, model_ref)
 
     async def capacity(self, lane: str) -> dict:
         """Live picture of a lane, for the portal's capacity board.
@@ -135,12 +152,16 @@ class Picker:
         not be counted twice.
         """
         rows = []
-        total = live = used = 0
+        used = 0
         tail_on = self.policy is None or await self.policy.tail_enabled()
-        counted_live: set[str] = set()
-        counted_total: set[str] = set()
         counted_used: set[str] = set()
         live_members = 0
+        # Per plan: how much of its limit this lane can actually reach. A plan of
+        # 4 whose only member here caps itself at 2 offers 2, not 4 — summing plan
+        # limits overstates a lane whose members are narrower than their plans.
+        plan_caps: dict[str, int] = {}
+        plan_reach: dict[str, int] = {}
+        plan_total: dict[str, int] = {}
 
         for model in self.registry.lane_members(lane):
             plan = self.registry.plan_of(model)
@@ -148,6 +169,7 @@ class Picker:
             inflight = await self.slots.in_flight(plan.key)
             tail = self.registry.is_tail(lane, model.ref)
             cap, cap_reason = await self._cap(model)
+            model_inflight = await self.slots.in_flight_model(model.ref)
             if tail and not tail_on:
                 cap = 0
                 cap_reason = "tail disabled (pacing)"
@@ -159,9 +181,11 @@ class Picker:
                 "plan": plan.key,
                 "plan_label": plan.label,
                 "cap": cap,
-                "cap_configured": plan.cap_for(model),
+                "cap_configured": plan.max_parallel,
                 "cap_reason": cap_reason,
                 "in_flight": inflight,
+                "model_in_flight": model_inflight,
+                "model_cap": model.max_parallel,
                 "cooled": cooled,
                 "cooldown_remaining": ttl,
                 "cooldown_reason": reason,
@@ -171,17 +195,18 @@ class Picker:
                 "cli_backed": plan.is_cli_backed,
             })
 
-            if plan.key not in counted_total:
-                counted_total.add(plan.key)
-                total += plan.max_parallel
+            plan_total[plan.key] = plan.max_parallel
             if plan.key not in counted_used:
                 counted_used.add(plan.key)
                 used += inflight
-            if not cooled and not tail:
+            if not cooled and not tail and cap > 0:
                 live_members += 1
-                if plan.key not in counted_live:
-                    counted_live.add(plan.key)
-                    live += cap
+                plan_caps[plan.key] = cap
+                reach = model.max_parallel if model.max_parallel is not None else cap
+                plan_reach[plan.key] = plan_reach.get(plan.key, 0) + reach
+
+        total = sum(plan_total.values())
+        live = sum(min(plan_caps[k], plan_reach[k]) for k in plan_caps)
 
         return {
             "lane": lane,

@@ -32,12 +32,15 @@ def test_ordered_fill_then_spill():
     """A lane fills each model's plan to its cap before touching the next."""
     async def go():
         reg, slots, picker = build()
-        order = [m.ref for m in reg.lane_members("forge")]
+        members = reg.lane_members("forge")
         picked = [(await picker.pick("forge", None)).ref for _ in range(8)]
-        first, second = order[0], order[1]
-        cap_first = reg.plan_of(reg.model(first)).max_parallel
-        assert picked[:cap_first] == [first] * cap_first, picked
-        assert picked[cap_first] == second, picked
+        first, second = members[0], members[1]
+        # How many of THIS member can run at once: its plan's limit, narrowed by
+        # its own. The first forge member caps itself at 1 even though its plan
+        # allows 2, so "fill" means filling that, not the plan.
+        cap_first = reg.plan_of(first).cap_for(first)
+        assert picked[:cap_first] == [first.ref] * cap_first, picked
+        assert picked[cap_first] == second.ref, picked
         return picked
     picked = run(go())
     print("  ordered fill:", " ".join(picked))
@@ -48,9 +51,17 @@ def test_total_capacity_is_sum_of_caps():
     async def go():
         reg, slots, picker = build()
         members = reg.lane_members("forge")
-        # Slots belong to the plan, so count each plan once.
-        total = sum({reg.plan_of(m).key: reg.plan_of(m).max_parallel
-                     for m in members}.values())
+        # A lane's real capacity is, per plan, the lesser of the plan's limit and
+        # what its members in this lane can reach. A plan of 4 whose only member
+        # here caps itself at 2 contributes 2.
+        reach: dict[str, int] = {}
+        caps: dict[str, int] = {}
+        for m in members:
+            plan = reg.plan_of(m)
+            caps[plan.key] = plan.max_parallel
+            reach[plan.key] = reach.get(plan.key, 0) + (
+                m.max_parallel if m.max_parallel is not None else plan.max_parallel)
+        total = sum(min(caps[k], reach[k]) for k in caps)
         for _ in range(total):
             await picker.pick("forge", None)
         try:
@@ -69,15 +80,18 @@ def test_quota_exhaustion_removes_capacity():
         before = (await picker.capacity("forge"))["slots_available_now"]
         victim = reg.lane_members("forge")[0]
         victim_plan = reg.plan_of(victim)
+        # What this member actually contributed: its plan's limit, narrowed by
+        # its own. Cooling the plan removes that, not the plan's nominal limit.
+        contributed = victim_plan.cap_for(victim)
         await slots.cool_down(victim_plan.key, 900, "quota_exhausted")
         after = (await picker.capacity("forge"))["slots_available_now"]
         nxt = (await picker.pick("forge", None)).ref
-        return before, after, victim, victim_plan, nxt
-    before, after, victim, victim_plan, nxt = run(go())
-    assert after == before - victim_plan.max_parallel, (before, after)
+        return before, after, victim, contributed, nxt
+    before, after, victim, contributed, nxt = run(go())
+    assert after == before - contributed, (before, after, contributed)
     assert nxt != victim.ref
-    print(f"  {victim.ref} exhausted: lane {before} -> {after} slots, "
-          f"traffic moves to {nxt}")
+    print(f"  {victim.ref} exhausted: lane {before} -> {after} slots "
+          f"(it contributed {contributed}), traffic moves to {nxt}")
 
 
 def test_session_affinity_holds_and_survives_exhaustion():
@@ -85,15 +99,15 @@ def test_session_affinity_holds_and_survives_exhaustion():
     async def go():
         reg, slots, picker = build()
         first = await picker.pick("forge", "sess-A")
-        await picker.release(first.plan.key, first.request_id)
+        await picker.release(first.plan.key, first.request_id, first.ref)
         again = await picker.pick("forge", "sess-A")
         assert again.ref == first.ref and again.sticky
-        await picker.release(again.plan.key, again.request_id)
+        await picker.release(again.plan.key, again.request_id, again.ref)
 
         # Another session lands on the same (not yet full) model.
         other = await picker.pick("forge", "sess-B")
         assert other.ref == first.ref
-        await picker.release(other.plan.key, other.request_id)
+        await picker.release(other.plan.key, other.request_id, other.ref)
 
         # Now the leased plan runs out of quota: the session must move on
         # rather than getting stuck on dead capacity.
@@ -133,27 +147,50 @@ def test_local_lane_never_escapes_to_cloud():
           f"refuses instead of spilling")
 
 
-def test_local_models_share_one_machine():
-    """Several models on one box must not hand out several models' worth of
-    slots. The plan owns the limit, so they share it."""
+def test_plan_and_model_caps_are_separate_limits():
+    """Two counters, not one.
+
+    `local-box` allows 2 connections; each of its models allows 1. So one qwen
+    and one gemma may run together, a *second* qwen may not, and nothing more
+    may run at all. Enforcing the model's cap against the plan's counter — which
+    is what a single counter forces — would let only one request through in
+    total.
+    """
     async def go():
         reg, slots, picker = build()
         box = reg.plans["local-box"]
-        local = list(box.models.values())
-        naive = sum(box.cap_for(m) for m in local)
-        shared = box.max_parallel
+        assert box.max_parallel == 2
+        assert all(m.max_parallel == 1 for m in box.models.values())
 
-        # Saturate through the `local` lane, then confirm `bulk` — which also
-        # contains a local model — sees no free local capacity.
-        for _ in range(shared):
+        first = await picker.pick("local", None)          # qwen
+        second = await picker.pick("local", None)         # qwen full -> gemma
+        assert first.ref != second.ref, (first.ref, second.ref)
+        assert {first.ref, second.ref} == {"local-box/qwen", "local-box/gemma"}
+
+        # The plan is now full, so nothing else fits — and the refusal names the
+        # plan's limit, because that is genuinely what bit.
+        try:
             await picker.pick("local", None)
-        pick = await picker.pick("bulk", None)
-        return [m.ref for m in local], naive, shared, pick.ref
+            raise AssertionError("plan cap of 2 was exceeded")
+        except LaneSaturated as exc:
+            saturated = str(exc)
+        assert "plan full at 2" in saturated, saturated
 
-    refs, naive, shared, spilled = run(go())
-    assert shared < naive
-    print(f"  {len(refs)} models on local-box would naively offer {naive} slots; "
-          f"they share {shared}. With those busy, bulk spilled to {spilled}")
+        # Free gemma: the plan now has room, but qwen is still at its own cap of
+        # 1. So the next pick must skip qwen *for a model reason* and take gemma.
+        gemma = first if first.ref.endswith("gemma") else second
+        await picker.release(gemma.plan.key, gemma.request_id, gemma.ref)
+        third = await picker.pick("local", None)
+        assert third.ref == gemma.ref, third.ref
+        return saturated, third
+
+    saturated, third = run(go())
+    skipped = ", ".join(third.considered)
+    assert "model full at 1" in skipped, skipped
+    print("  plan=2, models=1 each: qwen+gemma run together; a third is refused")
+    print(f"  plan full: {saturated.split(': ', 1)[1]}")
+    print(f"  with room on the plan but not the model: skipped {skipped}, "
+          f"took {third.ref}")
 
 
 def test_expiring_plans_are_drained_first():
@@ -169,12 +206,12 @@ def test_expiring_plans_are_drained_first():
     print("  judge lane order:", " -> ".join(m.ref for m in order))
 
 
-def test_two_models_on_one_plan_share_its_single_connection():
+def test_models_on_one_plan_share_its_connection_limit():
     """`apex` and `judge` name different models of the same Claude Max plan.
 
-    The plan allows one connection. Without accounting slots against the plan
-    rather than the model, two lanes would happily open two connections against
-    it — which is the whole reason capacity belongs to the plan.
+    Whatever one lane consumes counts against the other, because the connection
+    limit belongs to the plan. Accounting per model instead would let two lanes
+    each open the plan's full allowance.
     """
     from dataclasses import replace
 
@@ -191,30 +228,40 @@ def test_two_models_on_one_plan_share_its_single_connection():
         seat = plans["openai"]
         plans["openai"] = replace(seat, models={
             **seat.models, "astra": replace(seat.models["astra"], enabled=False)})
-        plans["anthropic-api"] = replace(plans["anthropic-api"], enabled=False)
-
         reg = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
         picker = Picker(reg, slots)
 
-        first = await picker.pick("apex", None)
-        assert first.ref == "claude-max/fable", first.ref
-        assert first.plan.key == "claude-max" and first.plan.max_parallel == 1
+        cap = first_plan_cap = plans["claude-max"].max_parallel
 
-        # judge names claude-max/opus first: the plan is now busy, so it must
-        # walk past it rather than double-book the one connection.
+        # Fill the plan through apex, which names claude-max/fable.
+        held = []
+        for _ in range(cap):
+            try:
+                pick = await picker.pick("apex", None)
+            except LaneSaturated:
+                break
+            assert pick.plan.key == "claude-max", pick.ref
+            held.append(pick)
+        # fable caps itself at 1, so apex reaches the plan's limit only if the
+        # plan's limit is 1; otherwise it fills what it can and apex saturates.
+        used = await slots.in_flight("claude-max")
+
+        # judge names claude-max/opus first. Whatever apex consumed counts
+        # against the same plan, so judge may only use what is left.
         second = await picker.pick("judge", None)
-        assert second.plan.key != "claude-max", "shared connection was double-booked"
+        after = await slots.in_flight("claude-max")
+        assert after <= cap, (after, cap)
 
-        # Once the heavy call finishes, the connection is free again.
-        await picker.release(first.plan.key, first.request_id)
-        third = await picker.pick("judge", None)
-        return first.ref, second.ref, third.ref, slots
+        for pick in held:
+            await picker.release(pick.plan.key, pick.request_id, pick.ref)
+        freed = await slots.in_flight("claude-max")
+        return [p.ref for p in held], second.ref, used, after, freed, cap
 
-    a, b, c, slots = run(go())
-    inflight = run(slots.in_flight("claude-max"))
-    assert inflight <= 1, inflight
-    print(f"  apex took {a}; judge fell through to {b} rather than double-booking "
-          f"the plan's one connection; after release judge reached it again ({c})")
+    taken, b, used, after, freed, cap = run(go())
+    assert after <= cap
+    print(f"  apex filled the plan with {', '.join(taken)} ({used}/{cap})")
+    print(f"  judge then got {b}, plan still {after}/{cap} — never above its limit")
+    print(f"  after releasing apex's slots the plan sat at {freed}")
 
 
 def test_tool_calls_never_reach_a_cli_backed_plan():

@@ -105,8 +105,15 @@ plans:
         reset_at: [data.reset_at, data.next_reset_time, data.expire_time]
     notes: "Original workhorse. Good at coding with explicit instructions."
     models:
-      m2:
-        model: openai/MiniMax-M2
+      m3:
+        # NB: `minimax-m3-highspeed` does not exist. The catalogue offers
+        # MiniMax-M3 plus highspeed builds of M2.1 / M2.5 / M2.7, so this is the
+        # plain M3.
+        model: openai/MiniMax-M3
+      m2.7-highspeed:
+        # Cheaper and less capable. Deliberately in no lane — reachable only by
+        # naming it directly.
+        model: openai/MiniMax-M2.7-highspeed
 
   minimax-max:
     label: "Minimax Max Token Plan"
@@ -137,15 +144,18 @@ plans:
         reset_at: [data.reset_at, data.next_reset_time, data.expire_time]
     notes: "Second workhorse, added 2026-09-20 to stop the OpenRouter burn."
     models:
-      m2:
-        model: openai/MiniMax-M2
+      m3:
+        model: openai/MiniMax-M3
+      m2.7-highspeed:
+        # Direct-only, as above.
+        model: openai/MiniMax-M2.7-highspeed
 
   glm:
     label: "GLM Coding Plan (Z.AI)"
     auth: api_key
     provider_family: zai
     monthly_cost: 0
-    max_parallel: auto            # "severely limited" is not a number
+    max_parallel: 2
     expires: "2026-10-13"
     # A Coding Plan key works ONLY on the coding endpoint. Verified by direct
     # call: coding returns 200, while api.z.ai/api/paas/v4 and
@@ -169,15 +179,19 @@ plans:
         source: estimate
     notes: "Cancelled. Severely limited — drain whatever is left."
     models:
-      glm-4.6:
-        model: openai/glm-4.6
+      glm-4.7:
+        model: openai/glm-4.7
+        max_parallel: 2
+      glm-5.3-flash:
+        model: openai/glm-5.3-flash
+        max_parallel: 2
 
   openrouter:
     label: "OpenRouter"
     auth: api_key
     monthly_cost: 0
     metered: true                 # pay-per-token, not a subscription
-    max_parallel: 2
+    max_parallel: 4
     api_key: os.environ/OPENROUTER_API_KEY
     quotas:
       - name: monthly
@@ -192,7 +206,10 @@ plans:
       they all share the one dollar budget and the one connection limit.
     models:
       mimo:
-        model: openrouter/xiaomi/mimo-2.5     # TODO: confirm slug
+        # Slug confirmed against OpenRouter's catalogue (mimo-v2.5, not 2.5;
+        # xiaomi/mimo-v2.5-pro also exists).
+        model: openrouter/xiaomi/mimo-v2.5
+        max_parallel: 2
 
   opencode-go:
     label: "OpenCode Go Plan"
@@ -201,7 +218,7 @@ plans:
     # from the Grok plan's, even though both use the same CLI.
     auth: cli_sidecar
     monthly_cost: 0
-    max_parallel: auto
+    max_parallel: 2
     expires: "2026-09-27"
     api_base: http://opencode-go-sidecar:8084/v1
     api_key: sidecar
@@ -220,14 +237,15 @@ plans:
       # DIFFERENT providers there (free/community versus this paid plan).
       glm-5.3-flash:
         model: openai/opencode-go/glm-5.3-flash
+        max_parallel: 1
 
   # ------------------------------------------------------------ judgement ----
   claude-max:
     label: "Claude Max $200"
     auth: cli_sidecar             # OAuth; the Claude CLI holds the credential
     monthly_cost: 200
-    max_parallel: 1               # hard: one connection, shared by both models
-    max_parallel_ceiling: 1       # never probe above it
+    max_parallel: 2
+    max_parallel_ceiling: 2       # never probe above it
     api_base: http://claude-max-sidecar:8081/v1
     api_key: sidecar
     quotas:
@@ -244,17 +262,21 @@ plans:
         allowance: null           # TODO
         source: sidecar
     notes: >
-      Critical logic only. Both models below share the single connection and the
-      quota windows, so apex and judge can never open two connections here.
+      Critical logic only. All three models share the plan's 2 connections and
+      its quota windows, so apex and judge can never exceed them between them.
     models:
       opus:
         model: openai/claude-opus-5
+        max_parallel: 2
       fable:
-        # Fable 5.1 as served by the subscription, not the metered API. Enable
-        # once you confirm the CLI accepts this alias:
-        #   docker compose exec claude-max-sidecar claude --model bogus 2>&1 | head
+        # Fable 5.1 as served by the subscription, not the metered API.
         model: openai/claude-fable-5-1
-        enabled: false
+        max_parallel: 1
+      sonnet:
+        # Direct-only: in no lane, so Claude quota stays reserved for the
+        # judgement lanes unless you ask for this model by name.
+        model: openai/claude-sonnet-5
+        max_parallel: 2
 
   openai:
     label: "OpenAI $100 Plan (ChatGPT seat)"
@@ -286,15 +308,17 @@ plans:
       # terra, luna weakest. Prompt overhead for a 5-token reply in brackets.
       # Note the scheme: gpt-5, gpt-5-codex and codex-1 are all rejected.
       sol:
-        model: openai/gpt-5.6-sol        # [13293]
+        model: openai/gpt-5.6-sol        # [13293] strongest of the 5.6 family
+        max_parallel: 1
       terra:
-        model: openai/gpt-5.6-terra      # [13293]
-        enabled: false
+        model: openai/gpt-5.6-terra      # [13293] direct-only
+        max_parallel: 1
       luna:
-        model: openai/gpt-5.6-luna       # [11728] — weakest; cheap work only
-        enabled: false
+        model: openai/gpt-5.6-luna       # [11728] weakest; direct-only
+        max_parallel: 2
       astra:
-        model: openai/gpt-6-astra        # [14154] — "Astra 6", the apex tier
+        model: openai/gpt-6-astra        # [14154] "Astra 6", the apex tier
+        max_parallel: 1
 
   grok:
     label: "Grok $300 Plan (SuperGrok)"
@@ -303,8 +327,8 @@ plans:
     auth: cli_sidecar
     provider_family: xai
     monthly_cost: 0
-    max_parallel: 4
-    max_parallel_ceiling: 6
+    max_parallel: 2
+    max_parallel_ceiling: 4
     expires: "2026-10-09"
     api_base: http://grok-sidecar:8083/v1
     api_key: sidecar
@@ -325,10 +349,7 @@ plans:
     models:
       grok-4.6:
         model: openai/xai/grok-4.6
-      grok-build:
-        # Grok Build's coding-agent model; may suit forge better than 4.6.
-        model: openai/xai/grok-build-0.1
-        enabled: false
+        max_parallel: 2
 
   # ---------------------------------------------------------------- local ----
   local-box:
@@ -352,40 +373,15 @@ plans:
         label: "Qwen 3.8 Flash Next"
         model: openai/Qwen3.8-Flash-Next-oQ4e-mtp
         context_window: 262144
+        max_parallel: 1
       gemma:
         label: "Gemma 4 26B"
         model: openai/gemma-4-26B-A4B-it-oQ4e-mtp
         context_window: 262144
-      glm-flash:
-        label: "GLM 5.3 Flash (1M context)"
-        model: openai/GLM-5.3-Flash-oQ4e
-        context_window: 1048576
-        max_parallel: 1           # narrows the plan's limit for this model
-        # Deliberately outside every lane order: it exists as the target for
-        # context-window fallbacks, so a prompt too large for the chosen model
-        # lands somewhere that can hold it.
-
-  # ------------------------------------------------- metered API (opt-in) ----
-  anthropic-api:
-    label: "Anthropic API (metered)"
-    # A Claude subscription grants no API access; this needs separate billing at
-    # console.anthropic.com. Disabled: enable only if you add credits.
-    auth: api_key
-    enabled: false
-    metered: true
-    monthly_cost: 0
-    max_parallel: 1
-    api_key: os.environ/ANTHROPIC_API_KEY
-    quotas:
-      - name: monthly
-        role: target
-        kind: dollars
-        period: month
-        allowance: 100
-        source: ledger
-    models:
-      fable:
-        model: anthropic/claude-fable-5-1
+        max_parallel: 1
+      # The local GLM 5.3 Flash build is deliberately absent while you are still
+      # testing it. Adding it back would also restore a 1M-context member, which
+      # is the only thing context-window fallbacks currently have to aim at.
 
 # ============================================================================
 # LANES — ordered capacity, written as `plan/model`. Requests fill each model's
@@ -402,7 +398,7 @@ lanes:
       Escalations where Opus-class judgement was not enough. Note that both
       members ride plans whose other models serve `judge`, so the connection
       limits are shared — by design.
-    order: [openai/astra, claude-max/fable, anthropic-api/fable]
+    order: [openai/astra, claude-max/fable]
     tail: [claude-max/opus]
 
   judge:
@@ -415,10 +411,10 @@ lanes:
     label: "Coding Workhorse"
     description: "Getting work done. Ordered fill across every workhorse plan."
     order:
-      - minimax-ultra/m2
-      - minimax-max/m2
+      - minimax-ultra/m3
+      - minimax-max/m3
       - grok/grok-4.6
-      - glm/glm-4.6
+      - glm/glm-4.7
       - opencode-go/glm-5.3-flash
       - openrouter/mimo
     tail: [local-box/qwen]
@@ -434,4 +430,4 @@ lanes:
     label: "Basic"
     description: "Mechanical work — summaries, extraction, commit messages."
     order: [local-box/gemma, local-box/qwen]
-    tail: [minimax-max/m2]
+    tail: [glm/glm-5.3-flash]
