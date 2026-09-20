@@ -242,6 +242,27 @@ class Gate:
 
 _gate = Gate()
 
+# Concurrency is N CLI subprocesses inside THIS one container, all reading the
+# same credential directory — not N containers, so one login covers every
+# concurrent run. But a cold start with a token due for refresh would have every
+# subprocess racing to refresh and rewrite that shared credential file at once.
+# So the first request runs alone; once one has succeeded, the token is fresh and
+# the rest can proceed at full concurrency.
+_warm = asyncio.Event()
+_warmup_lock = asyncio.Lock()
+
+
+async def invoke(prompt: str, system: str | None, model: str | None) -> dict:
+    if _warm.is_set():
+        return await run_cli(prompt, system, model)
+    async with _warmup_lock:
+        if _warm.is_set():                     # someone warmed it while we waited
+            return await run_cli(prompt, system, model)
+        payload = await run_cli(prompt, system, model)
+        _warm.set()
+        log.info("%s: first call succeeded, releasing full concurrency", PROVIDER)
+        return payload
+
 # The CLI reports exhaustion in prose; these are the shapes worth trusting.
 _LIMIT = re.compile(
     r"(usage limit reached|limit will reset|you've reached your|rate.?limit"
@@ -473,7 +494,7 @@ def to_openai(payload: dict, model: str) -> dict:
 async def health() -> dict:
     cfg = config()
     return {"ok": True, "provider": PROVIDER, "supports_tools": False,
-            "home": os.environ.get("HOME", ""),
+            "home": os.environ.get("HOME", ""), "warm": _warm.is_set(),
             "system_mode": SYSTEM_MODE, "bare": BARE,
             "subscription": SUBSCRIPTION or PROVIDER, "model": cfg.model,
             "models": sorted(cfg.models), "concurrency": cfg.concurrency,
@@ -520,7 +541,7 @@ async def chat(request: Request):
                             detail=f"sidecar at capacity ({limit})",
                             headers={"Retry-After": "5"})
     try:
-        payload = await run_cli(prompt, system, model)
+        payload = await invoke(prompt, system, model)
     finally:
         await _gate.release()
     result = to_openai(payload, model)

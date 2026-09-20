@@ -341,6 +341,22 @@ One image, four services, selected by `PROVIDER`:
 | Grok $300 (SuperGrok) | `opencode` | `opencode run` | 8083 | `opencode auth login` |
 | OpenCode Go | `opencode` | `opencode run` | 8084 | `opencode auth login` |
 
+### One container per subscription, not one per request
+
+Concurrency is N CLI **subprocesses inside one container**, not N containers. So:
+
+- **one login per sidecar covers every concurrent run** on that subscription;
+- the login persists in a host bind mount, surviving restarts, `compose down/up`
+  and image rebuilds — it is genuinely one-time;
+- the connection limit is enforced by a gate in that one process, which is also
+  what makes "refuse immediately when full" possible, so Switchyard can spill to
+  the next plan instead of holding a worker open.
+
+The one hazard of a shared credential store is a cold start where the token is
+due for refresh: every concurrent subprocess would race to refresh and rewrite
+the same file. The first request therefore runs alone, and full concurrency is
+released once it succeeds (`"warm": true` on `/health`).
+
 Log in once per sidecar. Each has its own credential store under `./secrets/`,
 isolated from your host CLIs — deliberately, for two reasons:
 
