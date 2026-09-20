@@ -111,7 +111,7 @@ services:
     environment:
       PROVIDER: claude
       SIDECAR_PORT: "8081"
-      SWITCHYARD_SUBSCRIPTION: claude-max
+      SWITCHYARD_PLAN: claude-max
       SWITCHYARD_PLANS: /app/config/plans.yaml
       CLAUDE_CONFIG_DIR: /home/node/.claude
       # Verified present on this CLI version: --system-prompt overrides the
@@ -140,7 +140,7 @@ services:
     environment:
       PROVIDER: codex
       SIDECAR_PORT: "8082"
-      SWITCHYARD_SUBSCRIPTION: openai
+      SWITCHYARD_PLAN: openai
       SWITCHYARD_PLANS: /app/config/plans.yaml
       CODEX_HOME: /home/node/.codex
       CLI_EXTRA_ARGS: ${CODEX_EXTRA_ARGS:-}
@@ -165,7 +165,7 @@ services:
     environment:
       PROVIDER: opencode
       SIDECAR_PORT: "8083"
-      SWITCHYARD_SUBSCRIPTION: grok
+      SWITCHYARD_PLAN: grok
       SWITCHYARD_PLANS: /app/config/plans.yaml
       CLI_EXTRA_ARGS: ${OPENCODE_EXTRA_ARGS:-}
     volumes:
@@ -190,7 +190,7 @@ services:
     environment:
       PROVIDER: opencode
       SIDECAR_PORT: "8084"
-      SWITCHYARD_SUBSCRIPTION: opencode-go
+      SWITCHYARD_PLAN: opencode-go
       SWITCHYARD_PLANS: /app/config/plans.yaml
       CLI_EXTRA_ARGS: ${OPENCODE_EXTRA_ARGS:-}
     volumes:

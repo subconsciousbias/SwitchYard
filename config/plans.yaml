@@ -154,7 +154,7 @@ plans:
     label: "GLM Coding Plan (Z.AI)"
     auth: api_key
     provider_family: zai
-    monthly_cost: 0
+    monthly_cost: 58
     max_parallel: 2
     expires: "2026-10-13"
     # A Coding Plan key works ONLY on the coding endpoint. Verified by direct
@@ -220,7 +220,7 @@ plans:
     # so no API key here. Its own sidecar process because its quota is separate
     # from the Grok plan's, even though both use the same CLI.
     auth: cli_sidecar
-    monthly_cost: 0
+    monthly_cost: 10
     max_parallel: 2
     expires: "2026-09-27"
     api_base: http://opencode-go-sidecar:8084/v1
@@ -286,7 +286,7 @@ plans:
     # A seat has no API key: the Codex CLI owns the OAuth login.
     auth: cli_sidecar
     provider_family: openai
-    monthly_cost: 0
+    monthly_cost: 100
     max_parallel: 2
     max_parallel_ceiling: 2       # the seat allows 2; do not probe past it
     expires: "2026-10-04"
@@ -329,7 +329,7 @@ plans:
     # subscription, on a quota entirely separate from metered api.x.ai credits.
     auth: cli_sidecar
     provider_family: xai
-    monthly_cost: 0
+    monthly_cost: 100
     max_parallel: 2
     max_parallel_ceiling: 4
     expires: "2026-10-09"

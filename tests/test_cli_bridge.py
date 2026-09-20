@@ -197,6 +197,65 @@ def test_limit_detection_survives_rewording_and_curly_quotes():
     print(f"  {sum(cases.values())} limit wordings matched, 1 unrelated error not")
 
 
+
+
+# ----------------------------------------------------------- config reading ---
+PLANS = os.path.join(os.path.dirname(HERE), "config", "plans.yaml")
+
+
+def _read_for(plan: str, provider: str):
+    """read_config() for one plan, without disturbing the module's globals."""
+    import importlib
+    old = dict(os.environ)
+    os.environ.update({"PROVIDER": provider, "SWITCHYARD_PLAN": plan,
+                       "SWITCHYARD_PLANS": PLANS})
+    for key in ("SIDECAR_CONCURRENCY", "CLAUDE_MODEL", "CODEX_MODEL", "OPENCODE_MODEL"):
+        os.environ.pop(key, None)
+    try:
+        mod = importlib.reload(server)
+        return mod.read_config()
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+        importlib.reload(server)
+
+
+def test_sidecar_reads_models_from_the_plan():
+    """Models are nested under their plan. An earlier version read a top-level
+    `deployments:` map, found nothing, and silently served the profile default —
+    so every sidecar reported a model nobody had configured."""
+    cfg = _read_for("claude-max", "claude")
+    assert cfg.source == "config", cfg
+    assert "claude-opus-5" in cfg.models and "claude-sonnet-5" in cfg.models, cfg.models
+    assert cfg.concurrency == 2, cfg.concurrency
+    print(f"  claude-max: concurrency={cfg.concurrency} models={sorted(cfg.models)}")
+
+
+def test_sidecar_model_aliases_keep_provider_prefixes_where_needed():
+    """`openai/claude-opus-5` is `claude-opus-5` to the CLI, but
+    `openai/opencode-go/glm-5.3-flash` must keep its provider/model shape."""
+    assert _read_for("grok", "opencode").model == "xai/grok-4.6"
+    assert _read_for("opencode-go", "opencode").model == "opencode-go/glm-5.3-flash"
+    assert _read_for("openai", "codex").model.startswith("gpt-5.6-")
+    print("  only the LiteLLM provider prefix is stripped")
+
+
+def test_a_missing_plan_is_reported_not_papered_over():
+    cfg = _read_for("no-such-plan", "claude")
+    assert cfg.source == "fallback", cfg
+    print(f"  unknown plan -> source={cfg.source!r}, /health reports ok=false")
+
+
+def test_disabled_models_are_not_offered():
+    cfg = _read_for("openai", "codex")
+    import yaml
+    plan = yaml.safe_load(open(PLANS))["plans"]["openai"]
+    disabled = {k for k, v in plan["models"].items() if (v or {}).get("enabled") is False}
+    for key in disabled:
+        alias = plan["models"][key]["model"].split("/", 1)[1]
+        assert alias not in cfg.models, alias
+    print(f"  {len(disabled)} disabled model(s) withheld from the allowlist")
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

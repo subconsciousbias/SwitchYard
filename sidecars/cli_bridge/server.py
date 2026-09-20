@@ -6,7 +6,7 @@ the respective CLI's credential store. So the CLI stays the client — it owns
 login and refresh — and this shim just speaks HTTP on one side and the CLI on
 the other. No OAuth token ever reaches LiteLLM.
 
-One process per subscription, selected with PROVIDER:
+One process per plan, selected with PROVIDER:
     PROVIDER=claude    -> `claude -p`       (Claude Max)
     PROVIDER=codex     -> `codex exec`      (ChatGPT seat)
     PROVIDER=opencode  -> `opencode run`    (SuperGrok via OpenCode; OpenCode Go)
@@ -71,7 +71,10 @@ from fastapi.responses import StreamingResponse
 app = FastAPI(title="switchyard-cli-bridge")
 
 PROVIDER = os.environ.get("PROVIDER", "claude").lower()
-SUBSCRIPTION = os.environ.get("SWITCHYARD_SUBSCRIPTION", "")
+# The plan this process fronts. SWITCHYARD_SUBSCRIPTION is the old name, kept so
+# an existing compose file keeps working.
+PLAN = (os.environ.get("SWITCHYARD_PLAN")
+        or os.environ.get("SWITCHYARD_SUBSCRIPTION", ""))
 PLANS_PATH = os.environ.get("SWITCHYARD_PLANS", "/app/config/plans.yaml")
 CONFIG_TTL = 30.0          # re-read plans.yaml this often, so edits land live
 TIMEOUT = int(os.environ.get("SIDECAR_TIMEOUT", "600"))
@@ -158,7 +161,8 @@ CLI = PROFILE["cli"]
 class Config:
     concurrency: int
     model: str
-    models: set  # aliases a request may ask for
+    models: set   # aliases a request may ask for
+    source: str = "config"   # config | fallback — reported by /health
 
 
 _config: Config | None = None
@@ -166,52 +170,65 @@ _config_at = 0.0
 
 
 def read_config() -> Config:
-    """Concurrency and model aliases for this subscription, from plans.yaml.
+    """Concurrency and model aliases for this plan, read from plans.yaml.
 
-    * concurrency = the tightest `max_parallel` among the plans sharing this
-      subscription, since they all share one connection;
-    * models = the deployment alias of each *enabled* plan on it, so flipping a
-      plan's `enabled:` is all it takes to allow its tier here;
-    * model = the alias of the plan named exactly like the subscription.
+    The config nests models under their plan, so this reads
+    `plans[<plan>].models` — a plan owns the connection limit, and each model
+    contributes the alias this CLI will accept. An earlier version read a
+    top-level `deployments:` map keyed by plan, which no longer exists; it found
+    no models and silently fell back to the profile defaults, so every sidecar
+    reported a model nobody had configured.
 
-    Env vars still win, as an escape hatch when the config is unavailable.
+    Env vars still win, as an escape hatch when the config is unreadable.
     """
     fallback_model = os.environ.get(f"{PROVIDER.upper()}_MODEL") or PROFILE["model"]
     env_conc = os.environ.get("SIDECAR_CONCURRENCY")
 
-    caps: list[int] = []
+    cap: int | None = None
     models: set[str] = set()
     default: str | None = None
+    target = PLAN or PROVIDER
 
     try:
         with open(PLANS_PATH) as fh:
             raw = yaml.safe_load(fh) or {}
-        plans = raw.get("plans") or {}
-        deployments = raw.get("deployments") or {}
         seed = int(((raw.get("settings") or {}).get("concurrency_learning")
                     or {}).get("seed_cap", 2))
-        target = SUBSCRIPTION or PROVIDER
-        for key, body in plans.items():
-            body = body or {}
-            if (body.get("subscription") or key) != target:
-                continue
-            if body.get("enabled") is False:
-                continue
-            raw_cap = body.get("max_parallel", 1)
-            caps.append(seed if str(raw_cap).lower() == "auto" else int(raw_cap))
-            model = (deployments.get(key) or {}).get("model")
-            if model:
-                alias = model.split("/", 1)[1] if "/" in model else model
+        plan = (raw.get("plans") or {}).get(target) or {}
+        if not plan:
+            log.warning("no plan %r in %s; falling back to env", target, PLANS_PATH)
+        else:
+            raw_cap = plan.get("max_parallel", 1)
+            cap = seed if str(raw_cap).lower() == "auto" else int(raw_cap)
+            for key, body in (plan.get("models") or {}).items():
+                body = body or {}
+                if body.get("enabled") is False:
+                    continue
+                spec = body.get("model")
+                if not spec:
+                    continue
+                # Strip the LiteLLM provider prefix: `openai/claude-opus-5` is
+                # `claude-opus-5` to the CLI, and `openai/opencode-go/glm-5.3-flash`
+                # keeps its provider/model shape.
+                alias = spec.split("/", 1)[1] if "/" in spec else spec
                 models.add(alias)
-                if key == target:
+                if default is None:
                     default = alias
     except (OSError, ValueError, TypeError) as exc:
         log.warning("could not read %s (%s); falling back to env", PLANS_PATH, exc)
 
-    concurrency = int(env_conc) if env_conc else (min(caps) if caps else 1)
-    model = default or (sorted(models)[0] if models else fallback_model)
+    concurrency = int(env_conc) if env_conc else (cap if cap else 1)
+    model = default or fallback_model
+    source = "config" if models else "fallback"
+    if source == "fallback":
+        # Loud, because this is how a sidecar ends up serving a model nobody
+        # configured: it reads no models, quietly uses the profile default, and
+        # looks healthy while doing it.
+        log.error("read no models for plan %r from %s — falling back to %r. "
+                  "Check SWITCHYARD_PLAN and the plan's `models:` block.",
+                  target, PLANS_PATH, model)
     return Config(concurrency=max(1, concurrency), model=model,
-                  models=models | {model})
+                  models=models | {model}, source=source)
 
 
 def config() -> Config:
@@ -721,13 +738,14 @@ def to_openai(payload: dict, model: str) -> dict:
 @app.get("/health")
 async def health() -> dict:
     cfg = config()
-    return {"ok": True, "provider": PROVIDER, "supports_tools": False,
+    return {"ok": cfg.source == "config", "provider": PROVIDER,
+            "config_source": cfg.source, "supports_tools": False,
             "home": os.environ.get("HOME", ""), "warm": _warm.is_set(),
             # The CLIs have no token cap, so max_tokens becomes a prompt
             # instruction: a real reduction, but not a guarantee.
             "enforces_max_tokens": False,
             "system_mode": SYSTEM_MODE, "bare": BARE,
-            "subscription": SUBSCRIPTION or PROVIDER, "model": cfg.model,
+            "plan": PLAN or PROVIDER, "model": cfg.model,
             "models": sorted(cfg.models), "concurrency": cfg.concurrency,
             "in_flight": _gate.in_flight, "config": PLANS_PATH}
 

@@ -35,6 +35,13 @@ secret's value.
 Also: macOS has no `timeout(1)`. Use `gtimeout` if coreutils is installed, or
 leave the command unbounded.
 
+## Appending to a test file
+
+`tests/*.py` end with an `if __name__ == "__main__":` runner that discovers tests
+from `globals()`. Anything appended *after* that block is defined too late to be
+collected, so it silently does not run — the suite still reports "N tests passed"
+with your new test absent. Insert before the runner, and check the count went up.
+
 ## Tests run without services
 
 `tests/*.py` are plain scripts, no pytest plugins, no Redis, no network:
