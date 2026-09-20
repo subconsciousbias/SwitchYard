@@ -203,7 +203,12 @@ class SwitchyardHandler(CustomLogger):
         get = (lambda k: usage.get(k, 0)) if isinstance(usage, dict) else (lambda k: getattr(usage, k, 0) or 0)
         prompt_tokens = int(get("prompt_tokens") or 0)
         completion_tokens = int(get("completion_tokens") or 0)
-        cost = float(kwargs.get("response_cost") or 0.0)
+        # Only metered providers have a per-request cost. On a subscription the
+        # fee is fixed and the marginal cost of a request is zero; recording
+        # LiteLLM's notional price would inflate month_cost and corrupt the
+        # effective $/Mtok figure, which is the number used to judge whether the
+        # subscription is worth renewing.
+        cost = float(kwargs.get("response_cost") or 0.0) if plan.metered else 0.0
         await self.ledger.record(
             plan, prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens, cost=cost,

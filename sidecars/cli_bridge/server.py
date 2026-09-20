@@ -342,6 +342,38 @@ def build_argv(prompt: str, system: str | None, model: str | None = None) -> lis
     return argv + EXTRA_ARGS
 
 
+def _int(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def iter_json_objects(blob: str):
+    """Yield every JSON object in a stream, whether JSONL or concatenated.
+
+    OpenCode emits one object per line, but pretty-printed or run-together output
+    would silently yield nothing under a line-based parser — and "no text found"
+    then falls back to returning the raw stream as the answer, which is exactly
+    the bug this replaces.
+    """
+    decoder = json.JSONDecoder()
+    index = 0
+    length = len(blob)
+    while index < length:
+        brace = blob.find("{", index)
+        if brace < 0:
+            return
+        try:
+            obj, end = decoder.raw_decode(blob, brace)
+        except ValueError:
+            index = brace + 1
+            continue
+        index = end
+        if isinstance(obj, dict):
+            yield obj
+
+
 def parse_output(stdout: str) -> dict:
     """Normalise a CLI's output into {result, usage}."""
     kind = PROFILE["parser"]
@@ -350,57 +382,62 @@ def parse_output(stdout: str) -> dict:
         return json.loads(stdout)
 
     if kind in ("events_json", "codex_jsonl"):
-        # A stream of JSON events (or one JSON envelope): the assistant text is
-        # the answer and a token-count event carries usage. Unknown event shapes
-        # are ignored rather than fatal, so a CLI update degrades instead of
-        # breaking. Handles both JSONL and a single pretty-printed object.
+        # Verified against real OpenCode output. Three events for a trivial call:
+        #   {"type":"step_start","part":{"type":"step-start"}}
+        #   {"type":"text","part":{"type":"text","text":"OK"}}
+        #   {"type":"step_finish","part":{"type":"step-finish","reason":"stop",
+        #      "tokens":{"total":7492,"input":6194,"output":18,"reasoning":0,
+        #                "cache":{"write":0,"read":1280}},"cost":0.0009765}}
+        # So the answer is part.text on text parts, and usage is part.tokens on
+        # the finish part. Reasoning parts are excluded from the answer but their
+        # tokens are counted, because they are billed.
         text_parts: list[str] = []
         usage: dict = {}
 
-        # A single JSON object (pretty-printed or not) rather than JSONL.
-        stripped = stdout.strip()
-        if stripped.startswith("{") and "\n{" not in stripped:
-            try:
-                doc = json.loads(stripped)
-            except json.JSONDecodeError:
-                doc = None
-            if isinstance(doc, dict):
-                if isinstance(doc.get("usage"), dict):
-                    usage.update(doc["usage"])
-                for key in ("result", "response", "output", "text", "content"):
-                    val = doc.get(key)
-                    if isinstance(val, str) and val.strip():
-                        return {"result": val, "usage": usage}
+        for evt in iter_json_objects(stdout):
+            part = evt.get("part") if isinstance(evt.get("part"), dict) else {}
+            ptype = part.get("type") or evt.get("type")
 
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                evt = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            for key in ("input_tokens", "output_tokens", "total_tokens"):
-                if key in evt:
-                    usage[key] = evt[key]
-            if isinstance(evt.get("usage"), dict):
-                usage.update(evt["usage"])
-            msg = evt.get("message") or evt.get("text") or evt.get("delta")
-            if isinstance(msg, dict):
-                msg = msg.get("content") or msg.get("text")
-            if isinstance(msg, list):
-                msg = "".join(
-                    str(b.get("text", "")) for b in msg if isinstance(b, dict)
-                )
-            if isinstance(msg, str) and msg.strip():
-                if evt.get("type") in (None, "message", "assistant", "item.completed",
-                                       "agent_message", "text", "part.text",
-                                       "response.output_text.delta"):
+            if ptype == "text" and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+
+            tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else None
+            if tokens:
+                cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+                usage["input_tokens"] = usage.get("input_tokens", 0) + _int(tokens.get("input"))
+                usage["output_tokens"] = (usage.get("output_tokens", 0)
+                                          + _int(tokens.get("output"))
+                                          + _int(tokens.get("reasoning")))
+                if cache.get("read"):
+                    usage["cache_read_tokens"] = (usage.get("cache_read_tokens", 0)
+                                                  + _int(cache.get("read")))
+            if isinstance(part.get("cost"), (int, float)):
+                # The provider's notional API cost. Recorded for visibility, but
+                # meaningless as *spend* on a prepaid subscription, where the
+                # marginal cost of a request is zero.
+                usage["provider_cost"] = usage.get("provider_cost", 0.0) + float(part["cost"])
+
+            # Codex and older shapes: text at the top level, usage as a dict.
+            if not part:
+                if isinstance(evt.get("usage"), dict):
+                    usage.update(evt["usage"])
+                for key in ("input_tokens", "output_tokens", "total_tokens"):
+                    if key in evt:
+                        usage[key] = _int(evt[key])
+                msg = evt.get("message") or evt.get("text") or evt.get("delta")
+                if isinstance(msg, dict):
+                    msg = msg.get("content") or msg.get("text")
+                if isinstance(msg, list):
+                    msg = "".join(str(b.get("text", "")) for b in msg
+                                  if isinstance(b, dict))
+                if isinstance(msg, str) and msg.strip() and evt.get("type") in (
+                        None, "message", "assistant", "item.completed",
+                        "agent_message", "response.output_text.delta"):
                     text_parts.append(msg)
+
         if not text_parts:
             raise json.JSONDecodeError("no assistant text in CLI output", stdout, 0)
-        return {"result": text_parts[-1] if len(text_parts) == 1 else "".join(text_parts),
-                "usage": usage}
+        return {"result": "".join(text_parts), "usage": usage}
 
     return {"result": stdout.strip()}
 
