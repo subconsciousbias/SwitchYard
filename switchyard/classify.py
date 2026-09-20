@@ -106,13 +106,20 @@ _EXHAUSTED = re.compile(
     r"(usage limit|quota exceeded|quota exhausted|insufficient (balance|quota|credit)"
     r"|out of credit|credit limit|monthly limit|weekly limit|plan limit"
     r"|limit reached|no remaining|exceeded your current quota"
-    r"|resource_exhausted|arrearage)",
+    r"|resource_exhausted|arrearage"
+    # xAI via OpenCode says this when a SuperGrok subscription's quota is spent:
+    # "personal-team-blocked:spending-limit: You have run out of credits or need a
+    # Grok subscription." It reads like a dead account but the plan refills, so it
+    # is a quota wall, not an expired subscription.
+    r"|spending.?limit|run out of credits)",
     re.I,
 )
 _CONTEXT = re.compile(r"(context (length|window)|too many tokens|maximum context|prompt is too long)", re.I)
 _AUTH = re.compile(r"(invalid api key|unauthorized|authentication|invalid token|expired token)", re.I)
 _CONCURRENCY = re.compile(r"(concurrenc|connection limit|too many connections|max_parallel)", re.I)
-_PLAN_DEAD = re.compile(r"(subscription (has )?(expired|ended)|plan expired|package expired|no access to model)", re.I)
+_PLAN_DEAD = re.compile(
+    r"(subscription (has )?(expired|ended)|plan expired|package expired"
+    r"|no access to model)", re.I)
 
 # A vendor code parenthesised in the message, e.g. "insufficient balance (1008)".
 _CODE_IN_TEXT = re.compile(r"\((\d{4,5})\)")

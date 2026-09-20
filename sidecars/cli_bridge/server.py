@@ -566,10 +566,25 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None) -> 
         if _AUTH.search(blob):
             raise HTTPException(status_code=401,
                                 detail=f"{PROVIDER} cli not authenticated: {stderr[:300]}")
+        up_status, up_message, up_retryable = upstream_error(stdout)
+
+        # A quota message wins over the upstream status, even a non-retryable 403.
+        # xAI answers an exhausted SuperGrok subscription with
+        # "personal-team-blocked:spending-limit: You have run out of credits or
+        # need a Grok subscription" / 403 / isRetryable:false — which reads
+        # terminal but is a plan that refills. Calling it a dead credential would
+        # sideline a healthy subscription.
         if _LIMIT.search(blob) or seconds_until(blob):
-            # A stated "try again at <time>" is a limit by definition, even if the
-            # surrounding prose is worded in a way no pattern anticipated.
-            raise _limit_error(blob)
+            raise _limit_error(f"{up_message}\n{blob}" if up_message else blob)
+
+        # Otherwise an explicit upstream client error is the truth: a bad model
+        # id, a blocked account, a rejected credential. Surface it as-is so the
+        # router does not cool a plan down over something waiting cannot fix.
+        if up_status in (401, 402, 403) and up_retryable is not True:
+            raise HTTPException(
+                status_code=up_status,
+                detail={"error": {"message": up_message or blob[:300],
+                                  "type": "entitlement_or_credentials"}})
         status, detail = error_from_events(stdout)
         if status and 400 <= status < 500 and status != 429:
             # A client error is our fault, not the provider's — surface it as-is
@@ -597,6 +612,33 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None) -> 
         raise _limit_error(str(payload.get("result")))
 
     return payload
+
+
+def upstream_error(stdout: str) -> tuple[int | None, str, bool | None]:
+    """(status, message, retryable) from an OpenCode APIError envelope.
+
+    OpenCode reports the provider's own answer:
+      {"type":"error","error":{"name":"APIError","data":{
+         "message":"personal-team-blocked:spending-limit: You have run out of
+                    credits or need a Grok subscription...",
+         "statusCode":403,"isRetryable":false}}}
+    That is far better signal than pattern-matching the prose: 403 with
+    isRetryable false means no amount of waiting will help, so it must not be
+    dressed up as a usage limit that resets in an hour.
+    """
+    for evt in iter_json_objects(stdout):
+        err = evt.get("error") if isinstance(evt.get("error"), dict) else {}
+        data = err.get("data") if isinstance(err.get("data"), dict) else {}
+        if not data:
+            continue
+        status = data.get("statusCode")
+        retryable = data.get("isRetryable")
+        message = data.get("message")
+        if isinstance(status, int) or isinstance(message, str):
+            return (status if isinstance(status, int) else None,
+                    str(message or "")[:500],
+                    retryable if isinstance(retryable, bool) else None)
+    return None, "", None
 
 
 def error_from_events(stdout: str) -> tuple[int | None, str]:
