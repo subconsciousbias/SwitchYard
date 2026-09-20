@@ -33,9 +33,10 @@ The model name you ask for is a **lane**, not a provider.
 
 | Lane | Was | Ordered capacity | Tail |
 |---|---|---|---|
-| `apex` | Judgement — Heavy | Claude Max heavy tier* → Fable 5.1 (metered)* → Astra 6* | Claude Max |
+| `apex` | Judgement — Heavy | Claude Max heavy tier* → Astra 6 (GPT 6 on the seat)* → Fable 5.1 (metered)* | Claude Max |
 | `judge` | Judgement — Regular | Claude Max → OpenAI → Grok | Qwen local |
 | `forge` | Coding Workhorse | Minimax Ultra → Minimax Max → Grok → GLM → OpenCode Go → OpenRouter | Qwen local |
+
 | `local` | Local Only | Qwen → Gemma | *(none, on purpose)* |
 | `bulk` | Basic | Gemma → Qwen | Minimax Max |
 
@@ -219,7 +220,12 @@ does not grant API access.** `console.anthropic.com` keys are metered billing,
 separate from a Max plan. So Fable 5.1 via the API is only available if you
 choose to add API credits, and it ships `enabled: false`.
 
-That leaves two honest options for a tier above Opus:
+Astra 6 is not a separate provider either — it is GPT 6 on the OpenAI/Codex
+seat. It is configured as a plan with `subscription: openai`, so it shares that
+seat's two connections, its quota windows, its cooldowns and its 2026-10-04
+expiry. Enable it once you confirm the alias the Codex CLI accepts.
+
+That leaves these options for a tier above Opus:
 
 1. **A heavier alias on the subscription itself**, if your plan exposes one. The
    `claude-max-heavy` plan is wired for exactly this — same sidecar, same
@@ -232,7 +238,9 @@ That leaves two honest options for a tier above Opus:
    Then set the alias in `deployments:`, add it to `CLAUDE_MODEL_ALLOW` in
    `.env`, and flip `enabled: true`.
 
-2. **Accept that there is no tier above Opus** and let `apex` resolve to
+2. **Astra 6 / GPT 6 on the Codex seat** — already wired, `enabled: false` until
+   you confirm its alias. Expires with the seat on 2026-10-04.
+3. **Accept that there is no tier above Opus** and let `apex` resolve to
    `claude-max`, the same place `judge` lands. That is the current default. It
    is not a broken lane — it means escalation gets the best model you have, and
    the lane is there for the day you add one.
@@ -257,7 +265,58 @@ Use `subscription:` for any plan that is really a second view of an existing one
 Without it, each plan gets its own slot counter and you would quietly exceed the
 real limit.
 
-## OAuth subscriptions (Claude Max and the OpenAI seat)
+## CLI-backed lanes cannot serve tool calls
+
+Worth understanding before you point an agent at one, because it is the sharpest
+limitation in the whole design.
+
+Every OAuth subscription here is reached through a CLI — `claude -p`,
+`codex exec`, `opencode run`. Each of those is **a whole agent harness**, not a
+model endpoint. It has its own system prompt, its own tools and its own loop. So
+when another harness (OpenCode, Cursor, Claude Code, Paperclip) calls a lane
+backed by one:
+
+- **the system prompts stack** — the caller's instructions land on top of the
+  CLI's built-in agent prompt, which wastes tokens and gives the model two sets
+  of possibly contradictory rules;
+- **the caller's tools have nowhere to run** — they are definitions the inner
+  harness never sees;
+- **the inner harness's own tools act on the sidecar's container**, not the
+  caller's workspace, and their results never reach the caller.
+
+So Switchyard **refuses to route a request containing `tools` to a CLI-backed
+plan**, and the sidecar rejects one with a 400 if it arrives anyway. Dropping the
+definitions silently would look like the model simply choosing not to call
+anything — the worst possible failure mode.
+
+What that means per lane:
+
+| Lane | Any request | Requests with `tools` |
+|---|---|---|
+| `forge` | 7 plans | 5 — drops Grok, OpenCode Go |
+| `judge` | 4 plans | 1 — drops the OpenAI seat, Grok, Claude Max |
+| `apex` | Claude Max | **none** — fails with an explanation |
+
+The practical rule: **point agent harnesses at API-keyed lanes** (`forge`,
+`bulk`, `local`), and use the subscription lanes for text-in/text-out reasoning
+where the caller is not running its own tool loop. Set `supports_tools: true` on
+a plan to override the inference if you have a backend that really does pass
+tools through.
+
+Two mitigations for the prompt stacking on the text-only path:
+
+- `SYSTEM_MODE=replace` passes the caller's system prompt with the CLI's
+  *override* flag rather than appending to the built-in one, so only one agent
+  prompt is in play. Check the flag exists on your version first
+  (`claude --help | grep system-prompt`) — a wrong flag is a hard error.
+- `BARE=1` (the default) strips the inner harness's tools and caps it at one
+  turn, which is as close to a plain completion as a CLI gets.
+
+Where a CLI has no system-prompt flag at all (OpenCode, Codex as configured),
+the caller's system text is folded into the top of the prompt rather than
+discarded.
+
+## OAuth subscriptions (Claude Max, the OpenAI seat, SuperGrok, OpenCode Go)
 
 LiteLLM authenticates with static API keys and has no OAuth flow at all, so
 neither a Claude Max subscription nor a ChatGPT seat can be a deployment.
@@ -266,16 +325,32 @@ stays the client and owns login and token refresh, and the sidecar exposes it as
 an OpenAI-compatible endpoint on the internal network. LiteLLM never sees a
 subscription credential.
 
-One image, two services, selected by `PROVIDER`:
+One image, four services, selected by `PROVIDER`:
 
-| Plan | `PROVIDER` | CLI | Port | Concurrency |
+| Subscription | `PROVIDER` | CLI | Port | Log in with |
 |---|---|---|---|---|
-| Claude Max $200 | `claude` | `claude -p` | 8081 | 1 |
-| OpenAI $100 seat | `codex` | `codex exec` | 8082 | 2 |
+| Claude Max $200 | `claude` | `claude -p` | 8081 | `claude login` |
+| OpenAI seat (+ Astra 6) | `codex` | `codex exec` | 8082 | `codex login` |
+| Grok $300 (SuperGrok) | `opencode` | `opencode run` | 8083 | `opencode auth login` |
+| OpenCode Go | `opencode` | `opencode run` | 8084 | `opencode auth login` |
 
-Log in once per sidecar — `docker compose exec claude-max-sidecar claude login`,
-`docker compose exec codex-sidecar codex login` — or mount host `~/.claude` and
-`~/.codex` that are already logged in.
+Run the login inside the container (`docker compose exec grok-sidecar
+opencode auth login`) or mount host credential directories that are already
+logged in — the compose file does the latter by default.
+
+**Connection limits are not set in the compose file.** Each sidecar reads
+`config/plans.yaml` itself, takes the tightest `max_parallel` among the plans
+sharing its `SWITCHYARD_SUBSCRIPTION`, and derives its allowed model aliases from
+those plans' deployments. Change a limit in one place and the sidecar picks it up
+within 30 seconds — no restart, no duplicated number to forget.
+
+Two notes on the OpenCode pair. Grok is reached through OpenCode logged in to
+xAI rather than through Grok Build, which requires SuperGrok *Heavy*
+specifically — and either way a SuperGrok subscription rides xAI's CLI proxy on
+a quota entirely separate from metered `api.x.ai` credits. And although both
+plans use the same CLI and the same credential directory, they run as **separate
+processes**, because their quotas are separate: one process would put two
+subscriptions behind a single connection gate.
 
 The sidecar's critical job is mapping "usage limit reached" to **HTTP 429 with
 Retry-After**, because that is the signal the cooldown logic keys off. It also

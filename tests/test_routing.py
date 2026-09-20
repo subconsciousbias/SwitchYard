@@ -169,6 +169,54 @@ def test_one_subscription_cannot_be_used_twice_at_once():
     assert inflight <= 1
 
 
+
+
+def test_tool_calls_never_reach_a_cli_backed_plan():
+    """A request carrying `tools` must skip every CLI-backed plan.
+
+    Those plans are whole agent harnesses behind a sidecar: the caller's tool
+    definitions have nowhere to run, the harness's own tools act on the
+    sidecar's container rather than the caller's workspace, and the two system
+    prompts stack. Silently dropping the tools would look like the model simply
+    choosing not to call any.
+    """
+    async def go():
+        reg, slots, picker = build()
+        out = {}
+        for lane in ("forge", "judge"):
+            plain = [p.key for p in await picker._members(lane)]
+            with_tools = [p.key for p in await picker._members(lane, needs_tools=True)]
+            out[lane] = (plain, with_tools)
+            assert all(reg.plans[k].can_use_tools for k in with_tools), with_tools
+            dropped = set(plain) - set(with_tools)
+            assert all(reg.plans[k].auth == "oauth_sidecar" for k in dropped), dropped
+
+        # A tool-using request is routed, not rejected, as long as one plan can.
+        pick = await picker.pick("forge", None, needs_tools=True)
+        assert pick.plan.can_use_tools
+        return out, pick.plan.key
+
+    out, picked = run(go())
+    for lane, (plain, with_tools) in out.items():
+        print(f"  {lane}: {len(plain)} plans, {len(with_tools)} can take tools "
+              f"(dropped {sorted(set(plain) - set(with_tools))})")
+    print(f"  a tool-using forge request landed on {picked}")
+
+
+def test_a_lane_with_no_tool_capable_plan_says_so():
+    """apex is entirely CLI-backed, so a tool-using apex request must fail
+    with an explanation rather than quietly losing the tools."""
+    async def go():
+        reg, slots, picker = build()
+        assert not [p for p in await picker._members("apex", needs_tools=True)]
+        try:
+            await picker.pick("apex", None, needs_tools=True)
+        except LaneSaturated as exc:
+            return str(exc)
+        raise AssertionError("expected apex to refuse a tool-using request")
+    print(f"  {run(go())}")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):

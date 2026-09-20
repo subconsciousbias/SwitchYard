@@ -40,13 +40,13 @@ down and the lane moves on, so you can start with one.
 | `MINIMAX_*_API_BASE` | `https://api.minimax.io/v1` (or the `api.minimaxi.com` host if that is what your account shows). |
 | `GLM_API_KEY` | z.ai → API keys. |
 | `GLM_API_BASE` | **`https://api.z.ai/api/coding/paas/v4`** — a Coding Plan key is rejected by the general endpoint. |
-| `XAI_API_KEY` | console.x.ai → API Keys. Only if your Grok plan includes API credits; if it is a chat-only seat it needs a sidecar instead. |
+| ~~`XAI_API_KEY`~~ | **Not needed.** Your SuperGrok subscription is OAuth and runs through OpenCode; metered `api.x.ai` credits are separate billing. |
 | `OPENROUTER_API_KEY` | openrouter.ai/keys. Set a spend limit on the key itself as a second line of defence. |
 | `ANTHROPIC_API_KEY` | **Not needed.** A Claude subscription does not grant API access, and the metered Fable plan ships disabled. Set this only if you deliberately add API credits. |
-| `OPENCODE_API_BASE`, `OPENCODE_API_KEY` | From your OpenCode Go account. Expires 2026-09-27 — skip if not worth it. |
+| `OPENCODE_DATA_DIR`, `OPENCODE_CONFIG_DIR` | Your existing OpenCode credential paths — default `~/.local/share/opencode` and `~/.config/opencode`. Used by both the Grok and OpenCode Go sidecars. |
 | `LOCAL_API_BASE` | Ollama: `http://host.docker.internal:11434/v1`. LM Studio: `...:1234/v1`. |
 | `CLAUDE_CONFIG_DIR` | `/Users/temporalis/.claude` — no API key; the sidecar uses your existing login. |
-| `CODEX_CONFIG_DIR` | `/Users/temporalis/.codex` — likewise for the ChatGPT seat. |
+| `CODEX_CONFIG_DIR` | `/Users/temporalis/.codex` — likewise for the ChatGPT seat (and Astra 6 / GPT 6 on it). |
 
 Then confirm the local models are actually reachable from your host:
 
@@ -93,19 +93,41 @@ behave correctly** — check for an import error above it.
 These have no API key. Claude Max and the ChatGPT seat both authenticate through
 their own CLI.
 
+Four of your plans have no API key at all. Each authenticates through its own
+CLI, and if you mounted an already-logged-in credential directory the login step
+is unnecessary — run the health checks regardless.
+
 ```bash
-docker compose exec claude-max-sidecar claude login     # follow the URL it prints
-docker compose exec codex-sidecar codex login
-curl -s http://localhost:4000/../ >/dev/null 2>&1 || true
-docker compose exec claude-max-sidecar curl -s localhost:8081/health
-docker compose exec codex-sidecar curl -s localhost:8082/health
+docker compose exec claude-max-sidecar   claude login          # follow the URL
+docker compose exec codex-sidecar        codex login
+docker compose exec grok-sidecar         opencode auth login   # choose xAI
+docker compose exec opencode-go-sidecar  opencode auth login   # choose OpenCode
+
+for p in 8081 8082 8083 8084; do
+  docker compose exec gateway python -c "
+import json,urllib.request
+print(json.load(urllib.request.urlopen('http://$(
+  case $p in 8081) echo claude-max-sidecar;; 8082) echo codex-sidecar;;
+             8083) echo grok-sidecar;; 8084) echo opencode-go-sidecar;; esac
+):$p/health')))" 2>/dev/null
+done
 ```
 
-**Expect:** `{"ok":true,"provider":"claude","model":"opus","concurrency":1,...}`
-and the same for `codex` on 8082.
+**Expect** each to report its subscription, the concurrency it read from
+`plans.yaml`, and the model aliases it will accept, e.g.:
 
-If you mounted an already-logged-in `~/.claude`, the login step is unnecessary —
-the health check is still worth running.
+```
+{"ok":true,"provider":"claude","subscription":"claude-max","model":"claude-opus-5",
+ "models":["claude-opus-5"],"concurrency":1,"in_flight":0}
+{"ok":true,"provider":"opencode","subscription":"grok","model":"xai/grok-4",
+ "models":["xai/grok-4"],"concurrency":4,"in_flight":0}
+```
+
+**This is the check that matters most.** `concurrency` comes from
+`config/plans.yaml`, not from the compose file — if it does not match the
+`max_parallel` you set, the sidecar could not read the config and is falling back
+to a default. And if `models` is missing an alias you expect, that plan is still
+`enabled: false`.
 
 ---
 
@@ -184,17 +206,23 @@ gives no API access, so `apex` ships resolving to `claude-max` — the same mode
 `judge` uses. Check what aliases your plan accepts:
 
 ```bash
+# A heavier tier on the Claude Max subscription, if your plan has one:
 docker compose exec claude-max-sidecar claude --model bogus 2>&1 | head -20
-docker compose exec claude-max-sidecar claude --help | grep -A3 -- --model
+
+# Or Astra 6 / GPT 6, which lives on the Codex seat you already pay for:
+docker compose exec codex-sidecar codex --help | grep -A3 -- --model
 ```
 
 **Expect:** an error listing the valid aliases. If one of them is a heavier tier
 than `opus`, wire it up:
 
-1. set `CLAUDE_MODEL_ALLOW=<alias>` in `.env`;
-2. set `model: openai/<alias>` under `claude-max-heavy` in `deployments:`;
-3. set `enabled: true` on the `claude-max-heavy` plan;
-4. `docker compose up -d claude-max-sidecar && curl -X POST $PORTAL/admin/reload`.
+1. set `model: openai/<alias>` under `claude-max-heavy` (or `astra`) in
+   `deployments:`;
+2. set `enabled: true` on that plan;
+3. `curl -X POST $PORTAL/admin/reload`.
+
+No `.env` change and no rebuild: the sidecar re-reads `plans.yaml` every 30
+seconds and adds the alias to its own allowlist.
 
 Verify the sidecar will actually run it:
 
@@ -202,8 +230,9 @@ Verify the sidecar will actually run it:
 docker compose exec claude-max-sidecar curl -s localhost:8081/health
 ```
 
-**Expect:** `"models":["<alias>","opus"]`. If your alias is missing from that
-list, the sidecar will silently run `opus` instead — and log a warning saying so.
+**Expect:** the alias to appear in `"models"`. If it is missing, the sidecar will
+run its default instead — and log a warning saying so, because an `apex`
+escalation quietly served by the `judge` model is a bug nobody notices.
 
 Then test the lane:
 
@@ -251,6 +280,48 @@ tool that speaks only Anthropic's API can use a lane whose provider is not
 Anthropic.
 
 ---
+
+## 4g. Tool calls must avoid the CLI-backed lanes
+
+This is the check most likely to matter for Paperclip, since an agent sends tool
+definitions on nearly every call.
+
+```bash
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "model":"judge",
+    "messages":[{"role":"user","content":"What is the weather in Oslo?"}],
+    "tools":[{"type":"function","function":{"name":"get_weather",
+      "description":"Get weather for a city",
+      "parameters":{"type":"object","properties":{"city":{"type":"string"}},
+      "required":["city"]}}}],
+    "max_tokens":120}' | python3 -m json.tool | head -30
+docker compose logs --tail=5 gateway | grep 'lane=judge'
+```
+
+**Expect:** the log line to include `tools` and to pick a plan that is *not*
+`claude-max`, `openai` or `grok` — for `judge` that means `qwen-local`, since
+every other plan in that lane is CLI-backed. The response should contain a
+proper `tool_calls` block.
+
+Then confirm the refusal path is explicit rather than silent:
+
+```bash
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "model":"apex","messages":[{"role":"user","content":"hi"}],
+    "tools":[{"type":"function","function":{"name":"noop","parameters":{"type":"object","properties":{}}}}]
+  }' | python3 -m json.tool | head -12
+```
+
+**Expect:** a 429 whose detail says no plan in the lane can serve tool calls
+because every candidate is CLI-backed. That is correct: `apex` is entirely
+subscription-backed. **A 200 with no `tool_calls` would be the bug** — it would
+mean the definitions were silently dropped.
+
+The practical consequence for Paperclip: send agentic, tool-using work to
+`forge`, `bulk` or `local`, and reserve `judge` / `apex` for reasoning calls that
+do not carry tools.
 
 ## 5. Behaviour tests
 

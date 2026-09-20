@@ -1,18 +1,23 @@
-# Owns the vendor CLIs and their OAuth credentials. One image, two services:
-# PROVIDER=claude for Claude Max, PROVIDER=codex for the ChatGPT seat. Mount the
-# host's credential directory so each CLI uses a login you already have; this
-# image never handles a token itself.
+# Owns the vendor CLIs and their OAuth credentials. One image, three services:
+#   PROVIDER=claude  -> Claude Max        (claude -p)
+#   PROVIDER=codex   -> ChatGPT seat      (codex exec)
+#   PROVIDER=opencode -> SuperGrok / OpenCode Go (opencode run)
+# Mount the host's credential directory so each CLI uses a login you already
+# have; this image never handles a token itself. Connection limits and model
+# aliases are read from config/plans.yaml at runtime, not baked in here.
 FROM node:22-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip git ca-certificates \
+      python3 python3-pip git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-RUN npm install -g @anthropic-ai/claude-code @openai/codex
+
+RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
 
 WORKDIR /app
 COPY sidecars/cli_bridge/server.py /app/server.py
-RUN pip install --no-cache-dir --break-system-packages fastapi "uvicorn[standard]"
+RUN pip install --no-cache-dir --break-system-packages \
+      fastapi "uvicorn[standard]" pyyaml
 
-ENV PROVIDER=claude SIDECAR_CONCURRENCY=1
-EXPOSE 8081
+ENV PROVIDER=claude SWITCHYARD_PLANS=/app/config/plans.yaml
+EXPOSE 8081 8082 8083 8084
 CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${SIDECAR_PORT:-8081}"]

@@ -160,7 +160,8 @@ class Ledger:
         return window
 
     @staticmethod
-    def attribute_window(plan: Plan, reset_at: float | None) -> Quota:
+    def attribute_window(plan: Plan, reset_at: float | None,
+                         at: datetime | None = None) -> Quota:
         """Which window did we just hit? Pick the one whose own rollover is
         closest to the reset time the provider gave us."""
         if len(plan.quotas) == 1 or not reset_at:
@@ -168,7 +169,7 @@ class Ledger:
             # far more often, rather than poisoning the weekly figure.
             order = {"rolling_5h": 0, "day": 1, "week": 2, "month": 3, None: 4}
             return min(plan.quotas, key=lambda q: order.get(q.period, 4))
-        now = _now()
+        now = at or _now()
         target_delta = reset_at - now.timestamp()
         best, best_gap = plan.quotas[0], None
         for q in plan.quotas:

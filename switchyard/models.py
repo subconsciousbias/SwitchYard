@@ -73,6 +73,7 @@ class Plan:
     configured_parallel: int | None = None   # None when `max_parallel: auto`
     max_parallel_ceiling: int | None = None  # hard upper bound for learning
     pacing: bool | None = None               # per-plan override of the global switch
+    supports_tools: bool | None = None       # None -> inferred from `auth`
     metered: bool = False
     enabled: bool = True
     expires: date | None = None
@@ -103,6 +104,21 @@ class Plan:
         if self.expires is None:
             return None
         return (self.expires - date.today()).days
+
+    @property
+    def can_use_tools(self) -> bool:
+        """Whether a request carrying `tools` may be routed here.
+
+        A CLI-backed plan cannot serve one. The sidecar drives a whole agent
+        harness — its own system prompt, its own tools, its own loop — so the
+        caller's tool definitions have nowhere to go, its tool results would
+        come from the sidecar's workspace rather than the caller's, and the two
+        system prompts stack. Text in, text out is the honest contract for
+        those; anything agentic belongs on an API-keyed plan.
+        """
+        if self.supports_tools is not None:
+            return self.supports_tools
+        return self.auth != "oauth_sidecar"
 
     @property
     def subscription(self) -> str:
@@ -310,6 +326,7 @@ def load(path: str | None = None) -> Registry:
             max_parallel_ceiling=(int(body["max_parallel_ceiling"])
                                   if body.get("max_parallel_ceiling") else None),
             pacing=body.get("pacing"),
+            supports_tools=body.get("supports_tools"),
             monthly_cost=float(body.get("monthly_cost", 0) or 0),
             auth=body.get("auth", "api_key"),
             provider_family=body.get("provider_family"),

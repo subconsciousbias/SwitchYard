@@ -111,8 +111,11 @@ class SwitchyardHandler(CustomLogger):
             key_hash = hashlib.sha256(str(token).encode()).hexdigest()[:8]
         session = derive_session(data, key_hash)
 
+        # A request carrying tool definitions cannot go to a CLI-backed plan.
+        needs_tools = bool(data.get("tools"))
+
         try:
-            pick = await self.picker.pick(lane, session)
+            pick = await self.picker.pick(lane, session, needs_tools)
         except LaneSaturated as exc:
             # Surfacing this as a 429 is what lets clients back off instead of
             # hammering a lane whose paid capacity is genuinely gone.
@@ -136,8 +139,9 @@ class SwitchyardHandler(CustomLogger):
             "cap": pick.cap,
         }
         log.info(
-            "lane=%s -> %s [%s]%s%s",
+            "lane=%s -> %s [%s]%s%s%s",
             lane, pick.plan.key, pick.cap_reason,
+            " tools" if needs_tools else "",
             " (sticky)" if pick.sticky else "",
             f" skipped={','.join(pick.considered)}" if pick.considered else "",
         )

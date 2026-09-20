@@ -49,18 +49,27 @@ class Picker:
         cap = await self.policy.effective(plan)
         return cap.cap, cap.reason
 
-    async def _members(self, lane: str) -> list[Plan]:
-        """Lane order, minus the tail when pacing has switched it off."""
+    async def _members(self, lane: str, needs_tools: bool = False) -> list[Plan]:
+        """Lane order, minus the tail when pacing is on and minus plans that
+        cannot serve this request at all."""
         members = self.registry.lane_members(lane)
         if self.policy is not None and not await self.policy.tail_enabled():
             members = [p for p in members if not self.registry.is_tail(lane, p.key)]
+        if needs_tools:
+            # A CLI-backed plan would silently drop the caller's tools, so it is
+            # not a candidate — better to fall through to a plan that can.
+            members = [p for p in members if p.can_use_tools]
         return members
 
-    async def pick(self, lane: str, session: str | None) -> Pick:
+    async def pick(self, lane: str, session: str | None,
+                   needs_tools: bool = False) -> Pick:
         rid = uuid.uuid4().hex
-        members = await self._members(lane)
+        members = await self._members(lane, needs_tools)
         if not members:
-            raise LaneSaturated(lane, "no live plans (all expired or disabled)")
+            detail = ("no plan in this lane can serve tool calls — every "
+                      "candidate is CLI-backed" if needs_tools
+                      else "no live plans (all expired or disabled)")
+            raise LaneSaturated(lane, detail)
 
         by_key = {p.key: p for p in members}
         skipped: list[str] = []

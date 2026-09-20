@@ -320,9 +320,13 @@ def test_exhaustion_is_attributed_to_the_right_window():
             Quota(name="5h", role="constraint", period="rolling_5h", kind="tokens"),
             Quota(name="weekly", role="target", period="week", kind="tokens"),
         ))
-        soon = ledger.attribute_window(plan, time.time() + 2 * 3600)
-        later = ledger.attribute_window(plan, time.time() + 3 * 86400)
-        blind = ledger.attribute_window(plan, None)
+        # Fixed clock: late on a Sunday the weekly rollover is genuinely nearer
+        # than the 5-hour one, so a wall-clock test here is not measuring the
+        # attribution logic.
+        base = NOW.timestamp()
+        soon = ledger.attribute_window(plan, base + 2 * 3600, NOW)
+        later = ledger.attribute_window(plan, base + 3 * 86400, NOW)
+        blind = ledger.attribute_window(plan, None, NOW)
         return soon.label, later.label, blind.label
     soon, later, blind = run(go())
     assert soon == "5h" and later == "weekly" and blind == "5h", (soon, later, blind)

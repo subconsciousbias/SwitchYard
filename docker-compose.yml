@@ -2,7 +2,14 @@
 #
 #   gateway  :4000  OpenAI- and Anthropic-compatible. Point every tool here.
 #   portal   :4001  capacity board, quota headroom, subscription economics.
-#   sidecar  :8081  Claude Max over the CLI's OAuth (internal only).
+#   sidecars :8081  Claude Max   (claude -p)      internal only
+#            :8082  OpenAI seat  (codex exec)     internal only
+#            :8083  SuperGrok    (opencode run)   internal only
+#            :8084  OpenCode Go  (opencode run)   internal only
+#
+# The sidecars exist because those three plans are OAuth subscriptions with no
+# API key. Each reads its own connection limit and model aliases from
+# config/plans.yaml, so limits are never duplicated here.
 #
 # Local models are expected on the host; LOCAL_API_BASE defaults to
 # host.docker.internal so Ollama/LM Studio work without extra config.
@@ -83,15 +90,17 @@ services:
     build: {context: ., dockerfile: Dockerfile.sidecar}
     <<: *common
     expose: ["8081"]
+    # Concurrency and model aliases come from config/plans.yaml — the plans
+    # sharing `subscription: claude-max`. Nothing about limits is set here, so
+    # there is only ever one number to change.
     environment:
       PROVIDER: claude
       SIDECAR_PORT: "8081"
-      CLAUDE_MODEL: ${CLAUDE_MODEL:-opus}
-      MODEL_ALLOW: ${CLAUDE_MODEL_ALLOW:-}
-      SIDECAR_CONCURRENCY: "1"          # your one Claude connection, shared by
-                                        # every tier on this subscription
+      SWITCHYARD_SUBSCRIPTION: claude-max
+      SWITCHYARD_PLANS: /app/config/plans.yaml
       CLAUDE_CONFIG_DIR: /home/node/.claude
     volumes:
+      - ./config:/app/config:ro
       - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8081/health')\""]
@@ -100,25 +109,76 @@ services:
       retries: 3
       start_period: 20s
 
-  # Same image, same reason: the OpenAI $100 plan is a seat, so the Codex CLI
-  # holds the OAuth login. Log in with
-  # `docker compose exec codex-sidecar codex login`.
-  # Expires 2026-10-04 — delete this service and the plan then.
   codex-sidecar:
     build: {context: ., dockerfile: Dockerfile.sidecar}
     <<: *common
     expose: ["8082"]
+    # Serves both the `openai` seat (gpt-5) and `astra` (GPT 6) — one seat, one
+    # set of connections. Limits come from plans.yaml.
+    # Log in with: docker compose exec codex-sidecar codex login
+    # Expires 2026-10-04 — delete this service and both plans then.
     environment:
       PROVIDER: codex
       SIDECAR_PORT: "8082"
-      CODEX_MODEL: ${CODEX_MODEL:-gpt-5}
-      SIDECAR_CONCURRENCY: "2"          # 2 connections allowed on this plan
+      SWITCHYARD_SUBSCRIPTION: openai
+      SWITCHYARD_PLANS: /app/config/plans.yaml
       CODEX_HOME: /home/node/.codex
       CLI_EXTRA_ARGS: ${CODEX_EXTRA_ARGS:-}
     volumes:
+      - ./config:/app/config:ro
       - ${CODEX_CONFIG_DIR:-~/.codex}:/home/node/.codex
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8082/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # SuperGrok is OAuth-only and rides xAI's CLI proxy on its own quota, separate
+  # from metered api.x.ai credits. Reached through OpenCode logged in to xAI.
+  # Log in with: docker compose exec grok-sidecar opencode auth login
+  # Expires 2026-10-09 — delete this service and the plan then.
+  grok-sidecar:
+    build: {context: ., dockerfile: Dockerfile.sidecar}
+    <<: *common
+    expose: ["8083"]
+    environment:
+      PROVIDER: opencode
+      SIDECAR_PORT: "8083"
+      SWITCHYARD_SUBSCRIPTION: grok
+      SWITCHYARD_PLANS: /app/config/plans.yaml
+      CLI_EXTRA_ARGS: ${OPENCODE_EXTRA_ARGS:-}
+    volumes:
+      - ./config:/app/config:ro
+      - ${OPENCODE_DATA_DIR:-~/.local/share/opencode}:/home/node/.local/share/opencode
+      - ${OPENCODE_CONFIG_DIR:-~/.config/opencode}:/home/node/.config/opencode
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8083/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # The OpenCode Go plan: same CLI, different login, SEPARATE quota — so it gets
+  # its own process. One process per subscription is what keeps the connection
+  # gates independent.
+  # Expires 2026-09-27 — delete this service and the plan then.
+  opencode-go-sidecar:
+    build: {context: ., dockerfile: Dockerfile.sidecar}
+    <<: *common
+    expose: ["8084"]
+    environment:
+      PROVIDER: opencode
+      SIDECAR_PORT: "8084"
+      SWITCHYARD_SUBSCRIPTION: opencode-go
+      SWITCHYARD_PLANS: /app/config/plans.yaml
+      CLI_EXTRA_ARGS: ${OPENCODE_EXTRA_ARGS:-}
+    volumes:
+      - ./config:/app/config:ro
+      - ${OPENCODE_DATA_DIR:-~/.local/share/opencode}:/home/node/.local/share/opencode
+      - ${OPENCODE_CONFIG_DIR:-~/.config/opencode}:/home/node/.config/opencode
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8084/health')\""]
       interval: 30s
       timeout: 5s
       retries: 3
