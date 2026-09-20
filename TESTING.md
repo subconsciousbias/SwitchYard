@@ -303,7 +303,7 @@ curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
 ```
 
 **Expect:** a one-sentence summary. **Expect in the log:**
-`lane=bulk -> gemma-local`.
+`lane=bulk -> local-box/gemma`.
 
 ### 4c. `forge` — the workhorse lane, and the important one
 
@@ -380,7 +380,7 @@ curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
 ```
 
 **Expect:** a completion, and `lane=apex -> claude-max` in the log — or
-`-> claude-max-heavy` if you enabled the heavy tier above.
+`-> claude-max/fable` if you enabled that model above.
 
 Then confirm the shared connection is respected. With the heavy tier enabled,
 run an `apex` call and a `judge` call at the same time:
@@ -515,7 +515,7 @@ curl -s -X POST "$PORTAL/admin/pacing?enabled=on" | python3 -m json.tool
 ```
 
 **Expect:** `{"pacing": true, ...}`, the portal banner switching to "Pacing mode
-on", and the tail (`qwen-local`) vanishing from the `forge` board.
+on", and the tail (`local-box/qwen`) vanishing from the `forge` board.
 
 **Important caveat:** with `allowance: null` on every plan, pacing has nothing to
 aim at and will report *"pacing idle: no allowance known"* per plan, leaving caps
