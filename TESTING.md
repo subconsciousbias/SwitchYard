@@ -1,0 +1,350 @@
+# Switchyard — first-run testing runbook
+
+Work through this in order. Each step has a command and **what you should see**.
+Stop at the first step that does not match, since later steps depend on it.
+
+Set these once in your shell:
+
+```bash
+cd ~/Documents/GitHub/switchyard
+export KEY=$(grep '^LITELLM_MASTER_KEY=' .env | cut -d= -f2)
+export GW=http://localhost:4000
+export PORTAL=http://localhost:4001
+```
+
+---
+
+## 0. Offline checks (no credentials needed, ~30 seconds)
+
+```bash
+python3 tests/test_routing.py && python3 tests/test_classify.py \
+  && python3 tests/test_policy.py && python3 tests/test_probes.py \
+  && python3 tests/render_preview.py
+```
+
+**Expect:** four "tests passed" lines and a rendered preview. Open
+`/tmp/switchyard-preview.html` in a browser to see the portal layout before
+anything is live.
+
+---
+
+## 1. Credentials in `.env`
+
+Fill only what you want to test first — a plan with a missing key simply cools
+down and the lane moves on, so you can start with one.
+
+| Variable | Where to get it |
+|---|---|
+| `LITELLM_MASTER_KEY` | Invent one, e.g. `sk-switchyard-` plus random hex. This is what your tools authenticate to Switchyard with. |
+| `MINIMAX_ULTRA_API_KEY`, `MINIMAX_MAX_API_KEY` | platform.minimax.io → API Keys. **Use a separate key per plan** so the two plans' quotas stay distinguishable. |
+| `MINIMAX_*_API_BASE` | `https://api.minimax.io/v1` (or the `api.minimaxi.com` host if that is what your account shows). |
+| `GLM_API_KEY` | z.ai → API keys. |
+| `GLM_API_BASE` | **`https://api.z.ai/api/coding/paas/v4`** — a Coding Plan key is rejected by the general endpoint. |
+| `XAI_API_KEY` | console.x.ai → API Keys. Only if your Grok plan includes API credits; if it is a chat-only seat it needs a sidecar instead. |
+| `OPENROUTER_API_KEY` | openrouter.ai/keys. Set a spend limit on the key itself as a second line of defence. |
+| `ANTHROPIC_API_KEY` | console.anthropic.com → API keys. For the `apex` lane (Fable), metered. |
+| `OPENCODE_API_BASE`, `OPENCODE_API_KEY` | From your OpenCode Go account. Expires 2026-09-27 — skip if not worth it. |
+| `LOCAL_API_BASE` | Ollama: `http://host.docker.internal:11434/v1`. LM Studio: `...:1234/v1`. |
+| `CLAUDE_CONFIG_DIR` | `/Users/temporalis/.claude` — no API key; the sidecar uses your existing login. |
+| `CODEX_CONFIG_DIR` | `/Users/temporalis/.codex` — likewise for the ChatGPT seat. |
+
+Then confirm the local models are actually reachable from your host:
+
+```bash
+curl -s $LOCAL_API_BASE/models | head -c 300
+```
+
+**Expect:** JSON listing your local models. Note the exact ids — if they are not
+`qwen-3.8-flash` and `gemma-4`, fix the `model:` lines under `deployments:` in
+`config/plans.yaml`.
+
+---
+
+## 2. Bring the stack up
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+**Expect:** `redis`, `postgres`, `gateway`, `portal`, `claude-max-sidecar`,
+`codex-sidecar` all `running`, with redis/postgres `healthy`.
+
+```bash
+curl -s $GW/health/liveliness
+curl -s $PORTAL/healthz
+```
+
+**Expect:** a liveness response from the gateway, and
+`{"ok":true,"plans":12}` from the portal.
+
+```bash
+docker compose logs gateway | grep -i switchyard | head
+```
+
+**Expect:** `switchyard: 12 plans, lanes=apex,judge,forge,local,bulk`. If this
+line is missing, the plugin did not load and **nothing else in this runbook will
+behave correctly** — check for an import error above it.
+
+---
+
+## 3. Log the two sidecars in (OAuth plans)
+
+These have no API key. Claude Max and the ChatGPT seat both authenticate through
+their own CLI.
+
+```bash
+docker compose exec claude-max-sidecar claude login     # follow the URL it prints
+docker compose exec codex-sidecar codex login
+curl -s http://localhost:4000/../ >/dev/null 2>&1 || true
+docker compose exec claude-max-sidecar curl -s localhost:8081/health
+docker compose exec codex-sidecar curl -s localhost:8082/health
+```
+
+**Expect:** `{"ok":true,"provider":"claude","model":"opus","concurrency":1,...}`
+and the same for `codex` on 8082.
+
+If you mounted an already-logged-in `~/.claude`, the login step is unnecessary —
+the health check is still worth running.
+
+---
+
+## 4. Lane-by-lane smoke tests
+
+Start with the cheapest lane and work up. Each call should return a normal
+OpenAI-shaped completion.
+
+### 4a. `local` — no cloud spend, proves the plumbing
+
+```bash
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "model":"local",
+    "messages":[{"role":"user","content":"Reply with exactly: LOCAL OK"}],
+    "max_tokens":16}' | python3 -m json.tool | head -20
+```
+
+**Expect:** a completion containing `LOCAL OK`. Then confirm Switchyard routed
+it rather than LiteLLM guessing:
+
+```bash
+docker compose logs --tail=20 gateway | grep 'lane='
+```
+
+**Expect:** `lane=local -> qwen-local [configured]`. The `[...]` is the cap
+reason — `configured`, `learned[h14]`, or a pacing decision.
+
+### 4b. `bulk` — mechanical work
+
+```bash
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "model":"bulk",
+    "messages":[{"role":"user","content":"Summarise in one sentence: Switchyard routes LLM requests across several subscription plans, filling each to its connection limit before spilling to the next."}],
+    "max_tokens":80}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
+```
+
+**Expect:** a one-sentence summary. **Expect in the log:**
+`lane=bulk -> gemma-local`.
+
+### 4c. `forge` — the workhorse lane, and the important one
+
+```bash
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "model":"forge",
+    "messages":[{"role":"user","content":"Write a Python function reverse_words(s) that reverses the order of words in a string. Code only."}],
+    "max_tokens":200}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
+```
+
+**Expect:** a working function. **Expect in the log:**
+`lane=forge -> opencode-go` **or** `-> grok` — *not* `minimax-ultra`. That is the
+drain rule working: expiring plans go first. If you skipped OpenCode Go's
+credentials, expect `opencode-go(cooled)` in the skipped list and the pick
+falling to `grok`.
+
+### 4d. `judge` — one connection, via the sidecar
+
+```bash
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "model":"judge",
+    "messages":[{"role":"user","content":"Two sentences: when is a message queue the wrong choice?"}],
+    "max_tokens":150}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
+```
+
+**Expect:** a considered answer. **Expect in the log:** `lane=judge -> openai`
+(the seat expires 2026-10-04, so it drains first), falling back to `grok` then
+`claude-max`.
+
+### 4e. `apex` — escalation only, metered
+
+```bash
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "model":"apex",
+    "messages":[{"role":"user","content":"One paragraph: the strongest argument against per-window quota pacing."}],
+    "max_tokens":200}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
+```
+
+**Expect:** a completion, and `lane=apex -> anthropic-fable` in the log. This one
+costs real money per call — one test is enough.
+
+### 4f. The Anthropic protocol (what Claude Code speaks)
+
+```bash
+curl -s $GW/v1/messages -H "x-api-key: $KEY" \
+  -H 'anthropic-version: 2023-06-01' -H 'Content-Type: application/json' -d '{
+    "model":"forge","max_tokens":32,
+    "messages":[{"role":"user","content":"Reply with exactly: MESSAGES OK"}]}' \
+  | python3 -m json.tool | head -20
+```
+
+**Expect:** an Anthropic-shaped response containing `MESSAGES OK`. This proves a
+tool that speaks only Anthropic's API can use a lane whose provider is not
+Anthropic.
+
+---
+
+## 5. Behaviour tests
+
+### 5a. Ordered fill and total capacity
+
+```bash
+for i in $(seq 1 12); do
+  curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: application/json' -d '{"model":"forge",
+    "messages":[{"role":"user","content":"count to 200 slowly"}],"max_tokens":400}' \
+    >/dev/null &
+done; wait
+docker compose logs --tail=40 gateway | grep 'lane=forge'
+```
+
+**Expect:** the first plan's slots filled to its cap, then the next plan, and so
+on — never round-robin. Watch it live on the portal's capacity board instead if
+you prefer.
+
+### 5b. Session affinity
+
+```bash
+for i in 1 2 3; do
+  curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+    -H 'X-Session-Id: affinity-test-1' -H 'Content-Type: application/json' \
+    -d '{"model":"forge","messages":[{"role":"user","content":"say hi"}],"max_tokens":10}' \
+    >/dev/null
+done
+docker compose logs --tail=10 gateway | grep 'lane=forge'
+```
+
+**Expect:** the first line picks a plan; the next two show the **same plan** with
+`(sticky)`. Then repeat without the header and with a different first message —
+expect a fresh lease, proving the conversation-prefix fingerprint separates
+sessions.
+
+### 5c. Capacity disappearing on exhaustion
+
+You do not need to burn a real quota. Cool a plan down by hand and watch the
+lane shrink:
+
+```bash
+curl -s $PORTAL/api/state | python3 -c 'import json,sys; d=json.load(sys.stdin); print("forge slots:", [l for l in d["capacity"]["lanes"] if l["lane"]=="forge"][0]["slots_available_now"])'
+docker compose exec redis redis-cli -n 1 SET "sy:cool:minimax-ultra" "quota_exhausted|0" EX 120
+curl -s $PORTAL/api/state | python3 -c 'import json,sys; d=json.load(sys.stdin); print("forge slots:", [l for l in d["capacity"]["lanes"] if l["lane"]=="forge"][0]["slots_available_now"])'
+```
+
+**Expect:** the second number is 4 lower than the first, and a `forge` request
+now skips `minimax-ultra(cooled)`. Undo it with the portal's **re-admit** button
+or `redis-cli -n 1 DEL sy:cool:minimax-ultra`.
+
+### 5d. Pacing mode
+
+```bash
+curl -s -X POST "$PORTAL/admin/pacing?enabled=on" | python3 -m json.tool
+```
+
+**Expect:** `{"pacing": true, ...}`, the portal banner switching to "Pacing mode
+on", and the tail (`qwen-local`) vanishing from the `forge` board.
+
+**Important caveat:** with `allowance: null` on every plan, pacing has nothing to
+aim at and will report *"pacing idle: no allowance known"* per plan, leaving caps
+alone. That is correct behaviour, not a bug. To see pacing actually bite, put a
+real number on one window — e.g. under `minimax-ultra`'s `monthly` window set
+`allowance: 200000000` — then `curl -X POST $PORTAL/admin/reload` and watch the
+Pacing column. Turn it back off with `?enabled=off` when you are done.
+
+---
+
+## 6. Real MiniMax usage (optional, needs a session cookie)
+
+1. Log in to platform.minimax.io in a browser.
+2. Open devtools → Network → any request to the platform → copy the whole
+   `Cookie:` request header value. (Or run `document.cookie` in the console,
+   which may be missing HttpOnly cookies — if the probe then fails, use the
+   Network tab value.)
+3. On the portal, **Real usage** panel → paste into the row for the Ultra plan →
+   **save & test**.
+
+**Expect one of:**
+- `active` with a real "N left" figure — done, the board now shows true headroom.
+- `could not find a remaining value` plus a **raw JSON response**. This is the
+  likely first outcome, because I could not verify the endpoint's field names.
+  Read the raw JSON, then correct the `fields:` paths under that plan's `probe:`
+  block in `plans.yaml`, `curl -X POST $PORTAL/admin/reload`, and test again.
+- `session rejected (401)` / `needs re-auth` — the cookie was incomplete; use the
+  full Network-tab header value.
+
+Remember this cookie is full account access, and logging out at MiniMax revokes
+it.
+
+---
+
+## 7. Point Paperclip at it
+
+Change one lane first, not all of them.
+
+```bash
+# Paperclip's LLM config, per lane:
+#   base_url: http://<switchyard-host>:4000/v1
+#   api_key:  $LITELLM_MASTER_KEY
+#   model:    forge        (or judge / apex / local / bulk)
+```
+
+Send **one** real task through the `forge` lane — something ordinary, like a
+small refactor or a status summary on a real issue.
+
+**Expect:**
+- the task completes as it did before;
+- `docker compose logs gateway | grep lane=forge` shows a single pick;
+- the portal's `forge` board shows one slot in use during the call;
+- the plan's `This month` token count increases afterwards.
+
+If Paperclip can pass a stable per-task or per-conversation id as
+`X-Session-Id`, set it. Affinity then becomes exact instead of inferred from the
+conversation prefix, which keeps long tasks on one provider and its prompt cache
+warm.
+
+Then move `judge`, then the rest.
+
+---
+
+## What I could not verify, and what to watch
+
+These are the parts built from documentation rather than a live call, so check
+them first if something misbehaves:
+
+1. **The MiniMax probe endpoint's host, path and field names.** Step 6 exists
+   specifically to discover them.
+2. **Codex CLI flags.** `codex exec --json --model ... <prompt>` is the assumed
+   invocation; flags move between releases. If the `judge` lane 502s on the
+   `openai` plan, run `docker compose exec codex-sidecar codex exec --help` and
+   set `CODEX_ARGS` in `.env` accordingly.
+3. **The two sidecars' limit wording.** The 429 mapping matches phrases like
+   "usage limit reached". If either vendor rewords it, an exhausted plan will
+   surface as a 502 instead of cooling down. Worth one deliberate exhaustion
+   test on each when convenient.
+4. **The OpenRouter Mimo 2.5 slug** — confirm at openrouter.ai/models.
+5. **Whether your Grok plan has API credits or is a chat seat.** If
+   `XAI_API_KEY` calls 401, it is a seat and needs a sidecar like the others.
+6. **Real token allowances.** Everything works without them, but pacing stays
+   idle and headroom stays estimated until either you set them or a plan hits a
+   wall once and the observed-allowance learning records it.
