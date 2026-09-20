@@ -478,9 +478,14 @@ deployments:
     api_key: os.environ/MINIMAX_MAX_API_KEY
 
   glm:
-    # A GLM Coding Plan key MUST use the coding endpoint; the general endpoint
-    # rejects it. https://api.z.ai/api/coding/paas/v4 (not open.bigmodel.cn,
-    # which is the mainland general-API host).
+    # A GLM Coding Plan key MUST use the coding endpoint:
+    #   https://api.z.ai/api/coding/paas/v4
+    # Verified by direct call: that endpoint returns 200, while both
+    # api.z.ai/api/paas/v4 and open.bigmodel.cn/api/paas/v4 return 429 with code
+    # 1113 ("insufficient balance"). Note what that means for diagnosis — a wrong
+    # base URL looks exactly like an exhausted plan, and the classifier will
+    # dutifully cool the plan down for 15 minutes on repeat. Check the URL before
+    # believing a GLM quota error.
     model: openai/glm-4.6
     api_base: os.environ/GLM_API_BASE
     api_key: os.environ/GLM_API_KEY
@@ -531,9 +536,12 @@ deployments:
 
   opencode-go:
     # `opencode` and `opencode-go` are DIFFERENT providers in OpenCode: the
-    # former is free/community models, the latter is the paid Go plan. Verified
-    # against `opencode models`.
-    model: openai/opencode-go/mimo-v2.5-pro
+    # former is free/community models, the latter is the paid Go plan.
+    #
+    # `opencode models` lists the CATALOGUE, not what your plan is entitled to —
+    # mimo-v2.5-pro is listed but not available on this plan. Confirm a model
+    # with a real call before trusting it.
+    model: openai/opencode-go/glm-5.3-flash
     api_base: http://opencode-go-sidecar:8084/v1
     api_key: sidecar
 
