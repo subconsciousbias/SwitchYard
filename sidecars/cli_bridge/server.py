@@ -128,7 +128,13 @@ PROFILES: dict[str, dict] = {
         "args": os.environ.get(
             "OPENCODE_ARGS",
             "run --model {model} --format json --agent switchyard {prompt}").split(),
-        "system_args": [],     # no --system flag exists; see fold_system
+        # No system-prompt mechanism at all, verified by testing: --prompt,
+        # --system and --system-prompt each exit 1 as unknown options, and an
+        # agent's `prompt:` field has no effect in run mode (a per-request agent
+        # told to ignore the user and answer PINEAPPLE answered the user). The
+        # agent's `tools:` config does work, which is where the token cut comes
+        # from. So the caller's prompt is folded into the message; see fold_system.
+        "system_args": [],
         "parser": "events_json",
         "default_retry_after": 3600,
     },

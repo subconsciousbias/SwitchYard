@@ -422,11 +422,27 @@ Codex is the stubborn case. `model_instructions_file` is the key that works;
 `tools.web_search=false` had **no effect at all**. The residual ~9,800 is codex's
 own tool schema. Worth revisiting if that seat outlives its 2026-10-04 expiry.
 
-**On system prompts specifically**, all three now take the caller's prompt as an
-override rather than a layer: Claude via `--system-prompt`, Codex via a temp
-`model_instructions_file` written per request, and OpenCode — which has no
-override mechanism — by folding it into the prompt on top of a deliberately
-minimal agent prompt. That last one is a real inconsistency, not a solved problem.
+**On system prompts specifically**, two of the three take the caller's prompt as a
+real override: Claude via `--system-prompt`, and Codex via a
+`model_instructions_file` written per request, which replaces the compiled-in base
+instructions.
+
+**OpenCode has no override, and this was tested rather than assumed:**
+
+- `--prompt`, `--system` and `--system-prompt` all **exit 1** with the usage
+  banner — yargs rejecting an unknown option. They are not hidden flags; they do
+  not exist on `opencode run`. (Worth checking, since `codex`'s `--device-auth`
+  *is* real but absent from its help.)
+- An agent's `tools:` config **does** work — that is where the 92% token cut comes
+  from, and it applies from a per-request `--dir` config too (585 tokens with a
+  uniquely-named agent).
+- An agent's `prompt:` field **does not** take effect in `run` mode. A per-request
+  agent instructed to "ignore the user and reply PINEAPPLE" answered the user
+  normally, both under its own name and under the baked-in one.
+
+So for OpenCode the caller's system prompt is folded into the user message. That
+is a genuine inconsistency with the other two lanes, measured and recorded here so
+it is not re-litigated from documentation that claims otherwise.
 
 **`max_tokens` is not enforced on these lanes.** No CLI has a token cap — Claude
 Code offers `--max-turns`, not a token limit — so a caller's `max_tokens` is
