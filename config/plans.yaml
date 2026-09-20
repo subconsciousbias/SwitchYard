@@ -380,7 +380,7 @@ plans:
     deployment: sy.qwen-local
     max_parallel: 2
     monthly_cost: 0
-    auth: none
+    auth: api_key                     # local, but the server still wants a key
     quota: {kind: unlimited, source: none}
     notes: "Just under Opus quality. Slow under load — keep parallelism low."
 
@@ -389,7 +389,7 @@ plans:
     deployment: sy.gemma-local
     max_parallel: 2
     monthly_cost: 0
-    auth: none
+    auth: api_key                     # local, but the server still wants a key
     quota: {kind: unlimited, source: none}
     notes: "Cheap and fast. Summaries, extraction, classification."
 
@@ -515,9 +515,9 @@ deployments:
   qwen-local:
     model: openai/qwen-3.8-flash
     api_base: os.environ/LOCAL_API_BASE
-    api_key: local
+    api_key: os.environ/LOCAL_API_KEY
 
   gemma-local:
     model: openai/gemma-4
     api_base: os.environ/LOCAL_API_BASE
-    api_key: local
+    api_key: os.environ/LOCAL_API_KEY

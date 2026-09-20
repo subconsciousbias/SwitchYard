@@ -45,18 +45,24 @@ down and the lane moves on, so you can start with one.
 | `ANTHROPIC_API_KEY` | **Not needed.** A Claude subscription does not grant API access, and the metered Fable plan ships disabled. Set this only if you deliberately add API credits. |
 | `OPENCODE_DATA_DIR`, `OPENCODE_CONFIG_DIR` | Your existing OpenCode credential paths — default `~/.local/share/opencode` and `~/.config/opencode`. Used by both the Grok and OpenCode Go sidecars. |
 | `LOCAL_API_BASE` | Ollama: `http://host.docker.internal:11434/v1`. LM Studio: `...:1234/v1`. |
+| `LOCAL_API_KEY` | Your local server's key. If it needs none, put any non-empty string — LiteLLM must send something. |
 | `CLAUDE_CONFIG_DIR` | `/Users/temporalis/.claude` — no API key; the sidecar uses your existing login. |
 | `CODEX_CONFIG_DIR` | `/Users/temporalis/.codex` — likewise for the ChatGPT seat (and Astra 6 / GPT 6 on it). |
 
 Then confirm the local models are actually reachable from your host:
 
 ```bash
-curl -s $LOCAL_API_BASE/models | head -c 300
+export LOCAL_API_KEY=$(grep '^LOCAL_API_KEY=' .env | cut -d= -f2)
+curl -s $LOCAL_API_BASE/models -H "Authorization: Bearer $LOCAL_API_KEY" | head -c 400
 ```
 
 **Expect:** JSON listing your local models. Note the exact ids — if they are not
 `qwen-3.8-flash` and `gemma-4`, fix the `model:` lines under `deployments:` in
 `config/plans.yaml`.
+
+`{"error":{"message":"API key required",...}}` means `LOCAL_API_KEY` is unset or
+wrong. Without the header it will fail the same way, so keep the `-H` on every
+direct call to the local server. (Calls through the gateway carry it for you.)
 
 ---
 

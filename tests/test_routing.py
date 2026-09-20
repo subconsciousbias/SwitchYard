@@ -108,7 +108,10 @@ def test_local_lane_never_escapes_to_cloud():
     async def go():
         reg, _, picker = build()
         members = [p.key for p in reg.lane_members("local")]
-        assert all(reg.plans[k].auth == "none" for k in members), members
+        # The marker for "local" is an unmetered, unlimited quota — not the auth
+        # mode, since a local server may well require a key.
+        assert all(reg.plans[k].quota.kind == "unlimited" for k in members), members
+        assert all(not reg.plans[k].metered for k in members), members
         total = sum(reg.plans[k].max_parallel for k in members)
         for _ in range(total):
             await picker.pick("local", None)
