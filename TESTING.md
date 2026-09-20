@@ -18,11 +18,12 @@ hand and you can end up sending the key *plus a comment* and getting a confusing
 401 from a stack that is working perfectly.
 
 ```bash
-export KEY=$(docker compose exec -T gateway printenv LITELLM_MASTER_KEY | tr -d '\r\n')
+export LITELLM_MASTER_KEY=$(docker compose exec -T gateway printenv LITELLM_MASTER_KEY | tr -d '\r\n')
 ```
 
-(Before the stack is up, read it from `.env` with
-`sed -n 's/^LITELLM_MASTER_KEY=//p' .env | sed 's/[[:space:]]*#.*//'`.)
+The name matches `.env`, so if you already export that file into your shell the
+commands below work unchanged. Before the stack is up, read it from `.env` with
+`sed -n 's/^LITELLM_MASTER_KEY=//p' .env | sed 's/[[:space:]]*#.*//'`.
 
 ---
 
@@ -248,17 +249,19 @@ OpenAI-shaped completion.
 ### 4a. `local` — no cloud spend, proves the plumbing
 
 ```bash
-curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H 'Content-Type: application/json' -d '{
     "model":"local",
     "messages":[{"role":"user","content":"Reply with exactly: LOCAL OK"}],
-    "max_tokens":16}' | python3 -m json.tool | head -20
+    "max_tokens":200}' | python3 -m json.tool | head -20
 ```
 
-**Expect:** a completion mentioning `LOCAL OK`. Note that the local Qwen is a
-*reasoning* model — at `max_tokens: 16` you will see its thinking truncated
-mid-sentence rather than the clean answer. That is the model, not the routing.
-Raise `max_tokens` to 200 if you want a tidy reply.
+**Expect:** a completion containing `LOCAL OK`.
+
+The local Qwen is a *reasoning* model, so a small `max_tokens` returns its
+thinking truncated mid-sentence with `finish_reason: "length"` — e.g. at 16
+tokens you get `We need respond to user: "Reply with exactly: LOCAL OK". Need
+final`. That is the model, not the routing. Hence the 200 above.
 
 Then confirm Switchyard routed it, rather than LiteLLM quietly using the lane
 alias's default deployment:
@@ -295,7 +298,7 @@ slot accounting, affinity and pacing — while still returning 200s.
 ### 4b. `bulk` — mechanical work
 
 ```bash
-curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H 'Content-Type: application/json' -d '{
     "model":"bulk",
     "messages":[{"role":"user","content":"Summarise in one sentence: Switchyard routes LLM requests across several subscription plans, filling each to its connection limit before spilling to the next."}],
@@ -308,7 +311,7 @@ curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
 ### 4c. `forge` — the workhorse lane, and the important one
 
 ```bash
-curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H 'Content-Type: application/json' -d '{
     "model":"forge",
     "messages":[{"role":"user","content":"Write a Python function reverse_words(s) that reverses the order of words in a string. Code only."}],
@@ -324,7 +327,7 @@ falling to `grok`.
 ### 4d. `judge` — one connection, via the sidecar
 
 ```bash
-curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H 'Content-Type: application/json' -d '{
     "model":"judge",
     "messages":[{"role":"user","content":"Two sentences: when is a message queue the wrong choice?"}],
@@ -372,7 +375,7 @@ escalation quietly served by the `judge` model is a bug nobody notices.
 Then test the lane:
 
 ```bash
-curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H 'Content-Type: application/json' -d '{
     "model":"apex",
     "messages":[{"role":"user","content":"One paragraph: the strongest argument against per-window quota pacing."}],
@@ -386,10 +389,10 @@ Then confirm the shared connection is respected. With the heavy tier enabled,
 run an `apex` call and a `judge` call at the same time:
 
 ```bash
-curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H 'Content-Type: application/json' \
   -d '{"model":"apex","messages":[{"role":"user","content":"count to 300 slowly"}],"max_tokens":500}' >/dev/null &
 sleep 1
-curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H 'Content-Type: application/json' \
   -d '{"model":"judge","messages":[{"role":"user","content":"say hi"}],"max_tokens":20}' >/dev/null
 wait
 docker compose logs --tail=10 gateway | grep -E 'lane=(apex|judge)'
@@ -403,7 +406,7 @@ worth reporting.
 ### 4f. The Anthropic protocol (what Claude Code speaks)
 
 ```bash
-curl -s $GW/v1/messages -H "x-api-key: $KEY" \
+curl -s $GW/v1/messages -H "x-api-key: $LITELLM_MASTER_KEY" \
   -H 'anthropic-version: 2023-06-01' -H 'Content-Type: application/json' -d '{
     "model":"forge","max_tokens":32,
     "messages":[{"role":"user","content":"Reply with exactly: MESSAGES OK"}]}' \
@@ -422,7 +425,7 @@ This is the check most likely to matter for Paperclip, since an agent sends tool
 definitions on nearly every call.
 
 ```bash
-curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H 'Content-Type: application/json' -d '{
     "model":"judge",
     "messages":[{"role":"user","content":"What is the weather in Oslo?"}],
@@ -442,7 +445,7 @@ proper `tool_calls` block.
 Then confirm the refusal path is explicit rather than silent:
 
 ```bash
-curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H 'Content-Type: application/json' -d '{
     "model":"apex","messages":[{"role":"user","content":"hi"}],
     "tools":[{"type":"function","function":{"name":"noop","parameters":{"type":"object","properties":{}}}}]
@@ -464,7 +467,7 @@ do not carry tools.
 
 ```bash
 for i in $(seq 1 12); do
-  curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
     -H 'Content-Type: application/json' -d '{"model":"forge",
     "messages":[{"role":"user","content":"count to 200 slowly"}],"max_tokens":400}' \
     >/dev/null &
@@ -480,7 +483,7 @@ you prefer.
 
 ```bash
 for i in 1 2 3; do
-  curl -s $GW/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
     -H 'X-Session-Id: affinity-test-1' -H 'Content-Type: application/json' \
     -d '{"model":"forge","messages":[{"role":"user","content":"say hi"}],"max_tokens":10}' \
     >/dev/null

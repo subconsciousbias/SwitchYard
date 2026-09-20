@@ -21,10 +21,10 @@ Then point anything at `http://<host>:4000` with `LITELLM_MASTER_KEY` as the key
 
 ```bash
 # Claude Code (Anthropic protocol)
-ANTHROPIC_BASE_URL=http://host:4000  ANTHROPIC_AUTH_TOKEN=$KEY  ANTHROPIC_MODEL=forge  claude
+ANTHROPIC_BASE_URL=http://host:4000  ANTHROPIC_AUTH_TOKEN=$LITELLM_MASTER_KEY  ANTHROPIC_MODEL=forge  claude
 
 # Codex / Cursor / Cline / aider / Zed (OpenAI protocol)
-OPENAI_BASE_URL=http://host:4000/v1  OPENAI_API_KEY=$KEY         # model: forge
+OPENAI_BASE_URL=http://host:4000/v1  OPENAI_API_KEY=$LITELLM_MASTER_KEY   # model: forge
 ```
 
 The model name you ask for is a **lane**, not a provider.
