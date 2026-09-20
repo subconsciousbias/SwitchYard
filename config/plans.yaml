@@ -523,13 +523,17 @@ deployments:
     # Served by OpenCode over its xAI login, not api.x.ai. Everything after the
     # first slash is passed to `opencode run --model`, which wants
     # provider/model — so this resolves to `--model xai/grok-4`.
-    model: openai/xai/grok-4              # TODO: confirm with `opencode models`
+    # Verified against `opencode models`: the provider id is `xai` and the model
+    # is `grok-4.6`. `xai/grok-4` does not exist.
+    model: openai/xai/grok-4.6
     api_base: http://grok-sidecar:8083/v1
     api_key: sidecar
 
   opencode-go:
-    # provider/model as OpenCode names it; check with `opencode models`.
-    model: openai/opencode/grok-code      # TODO: confirm the model id
+    # `opencode` and `opencode-go` are DIFFERENT providers in OpenCode: the
+    # former is free/community models, the latter is the paid Go plan. Verified
+    # against `opencode models`.
+    model: openai/opencode-go/mimo-v2.5-pro
     api_base: http://opencode-go-sidecar:8084/v1
     api_key: sidecar
 

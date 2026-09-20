@@ -339,7 +339,11 @@ One image, four services, selected by `PROVIDER`:
 | Claude Max $200 | `claude` | `claude -p` | 8081 | `claude login` |
 | OpenAI seat (+ Astra 6) | `codex` | `codex exec` | 8082 | `codex login --device-auth` |
 | Grok $300 (SuperGrok) | `opencode` | `opencode run` | 8083 | `opencode auth login --provider xai` |
-| OpenCode Go | `opencode` | `opencode run` | 8084 | `opencode auth login --provider opencode` |
+| OpenCode Go | `opencode` | `opencode run` | 8084 | `opencode auth login --provider opencode-go` |
+
+Note that `opencode` and `opencode-go` are *different* providers in OpenCode —
+free/community models versus your paid Go plan — so both the login provider id
+and the model string need the hyphenated form for that plan.
 
 Device-code flows, not browser callbacks: a callback listener started inside the
 container sends your host browser to a `localhost` port that resolves to your Mac,

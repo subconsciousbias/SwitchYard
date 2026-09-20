@@ -196,7 +196,7 @@ lines out to use the isolated stores, then `docker compose up -d` to recreate.
 docker compose exec claude-max-sidecar   claude login
 docker compose exec codex-sidecar        codex login --device-auth
 docker compose exec grok-sidecar         opencode auth login --provider xai
-docker compose exec opencode-go-sidecar  opencode auth login --provider opencode
+docker compose exec opencode-go-sidecar  opencode auth login --provider opencode-go
 
 for p in 8081 8082 8083 8084; do
   docker compose exec gateway python -c "

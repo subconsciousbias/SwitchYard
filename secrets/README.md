@@ -7,7 +7,7 @@ from your host CLIs. Log in once per sidecar:
 docker compose exec claude-max-sidecar   claude login
 docker compose exec codex-sidecar        codex login --device-auth
 docker compose exec grok-sidecar         opencode auth login --provider xai
-docker compose exec opencode-go-sidecar  opencode auth login --provider opencode
+docker compose exec opencode-go-sidecar  opencode auth login --provider opencode-go
 ```
 
 The logins persist here across restarts and rebuilds — the directory is a host
