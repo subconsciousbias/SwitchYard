@@ -892,6 +892,22 @@ def _limit_error(blob: str, default_retry_after: int | None = None) -> HTTPExcep
 
 def to_openai(payload: dict, model: str) -> dict:
     usage = payload.get("usage") or {}
+    input_tokens = int(usage.get("input_tokens", 0) or 0)
+    output_tokens = int(usage.get("output_tokens", 0) or 0)
+    # Anthropic counts cache tokens separately from input_tokens:
+    #   cache_read_input_tokens     -- served from the prompt cache
+    #   cache_creation_input_tokens -- written to the cache this turn
+    # Per OpenAI convention (and how the OpenCode/Codex parser above feeds
+    # cache reads into input_tokens already) cached tokens are a *subset*
+    # of prompt_tokens, so we only add them when the payload is clearly
+    # Anthropic-shaped. Otherwise the OpenCode/Codex cache_read_tokens would
+    # be double-counted into prompt_tokens.
+    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
+        prompt_tokens = (input_tokens
+                         + int(usage.get("cache_read_input_tokens", 0) or 0)
+                         + int(usage.get("cache_creation_input_tokens", 0) or 0))
+    else:
+        prompt_tokens = input_tokens
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
         "object": "chat.completion",
@@ -903,9 +919,9 @@ def to_openai(payload: dict, model: str) -> dict:
             "finish_reason": "stop",
         }],
         "usage": {
-            "prompt_tokens": int(usage.get("input_tokens", 0) or 0),
-            "completion_tokens": int(usage.get("output_tokens", 0) or 0),
-            "total_tokens": int(usage.get("input_tokens", 0) or 0) + int(usage.get("output_tokens", 0) or 0),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": prompt_tokens + output_tokens,
         },
     }
 

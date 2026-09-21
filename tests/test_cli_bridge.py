@@ -44,6 +44,49 @@ def test_openai_envelope_reports_real_token_counts():
     print(f"  openai usage: {u}")
 
 
+def test_anthropic_cache_tokens_are_counted_in_prompt_tokens():
+    """Anthropic counts cache reads and writes separately from input_tokens;
+    without adding them here, a heavily-cached session reports as nearly idle.
+
+    Repro from issue #25: a real bridged job that consumed ~64k tokens
+    reported 95 to the ledger because the cache fields were dropped at the
+    to_openai boundary. The fix has to add them to prompt_tokens, otherwise
+    the gateway's per-seat headroom calculation sees a cached seat as
+    almost empty and leans on it harder than the plan allows.
+    """
+    payload = {"result": "ok", "usage": {
+        "input_tokens": 95,
+        "cache_read_input_tokens": 63200,
+        "cache_creation_input_tokens": 800,
+        "output_tokens": 200,
+    }}
+    u = server.to_openai(payload, "claude-opus-5")["usage"]
+    expected_prompt = 95 + 63200 + 800
+    assert u["prompt_tokens"] == expected_prompt, u
+    assert u["completion_tokens"] == 200, u
+    assert u["total_tokens"] == expected_prompt + 200, u
+    print(f"  anthropic cached prompt folded into total: {u}")
+
+
+def test_openai_shape_cache_tokens_are_not_double_counted():
+    """OpenCode/Codex feed `cache_read_tokens` separately, but their
+    `input_tokens` already includes those reads per OpenAI convention.
+    Only Anthropic's cache_*_input_tokens are excluded from input_tokens,
+    so adding them here must be gated on the Anthropic field names —
+    otherwise this branch would inflate an OpenCode-style prompt by the
+    cached portion a second time.
+    """
+    payload = {"result": "ok", "usage": {
+        "input_tokens": 6194,
+        "output_tokens": 18,
+        "cache_read_tokens": 1280,
+    }}
+    u = server.to_openai(payload, "m")["usage"]
+    assert u["prompt_tokens"] == 6194, u
+    assert u["total_tokens"] == 6212, u
+    print(f"  openai-shape cache stays inside input_tokens: {u}")
+
+
 def test_reasoning_tokens_are_billed_but_not_shown():
     """Reasoning is excluded from the answer text and included in output tokens."""
     stream = "\n".join([
