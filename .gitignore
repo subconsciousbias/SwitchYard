@@ -12,6 +12,8 @@ __pycache__/
 *.pyc
 config/litellm.generated.yaml
 .pytest_cache/
+# scratch output from local benchmark runs
+.benchmarks/
 
 # Sidecar credential stores — OAuth tokens live here
 secrets/*
