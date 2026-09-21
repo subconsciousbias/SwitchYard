@@ -7,9 +7,15 @@
 # startup: restart it with a broken plans.yaml and it either fails to come up or
 # quietly falls back, which is a worse place to debug from than a refused edit.
 #
-# Then: restart the gateway (the only way its router picks up new models, an
-# api_base or a credential), refresh the portal's board in place, and leave the
-# sidecars alone — they re-read the file themselves within 30 seconds.
+# Then: ask the gateway whether its router can follow this edit. The handler
+# publishes a signature of everything the LiteLLM router bakes at startup
+# (model strings, api_base, credentials, lanes). If the edited file produces
+# the same signature the change is policy-only — caps, quotas, lane order,
+# settings — and the gateway hot-swaps its registry within ~5s, so no restart.
+# Only a differing signature forces `docker compose restart gateway`.
+#
+# Then refresh the portal's board in place, and leave the sidecars alone —
+# they re-read the file themselves within 30 seconds.
 #
 # Nothing is lost by the restart. Learned concurrency, pacing state, cooldowns,
 # session leases and usage all live in Redis.
@@ -43,7 +49,48 @@ for lane in reg.lanes:
               file=sys.stderr)
 PY
 
-echo "==> restarting the gateway (its router is built at startup)"
+echo "==> checking whether the router can follow this edit"
+# The signature is computed here from the edited file and compared with the one
+# the running gateway publishes (redis db 1, same as its other state). Equal
+# signatures means every change is policy-only: the gateway's own watcher swaps
+# it in within ~5s. Different, absent, or an unreachable redis all restart —
+# guessing "policy-only" and leaving a stale router is the worse failure.
+new_sig="$(python3 - "$plans" <<'PY'
+import sys
+sys.path.insert(0, ".")
+from switchyard import models
+print(models.router_signature(models.load(sys.argv[1])))
+PY
+)"
+live_sig="$(docker compose exec -T redis redis-cli -n 1 get switchyard:router_sig 2>/dev/null || true)"
+
+if [ -n "$live_sig" ] && [ "$new_sig" = "$live_sig" ]; then
+  echo "==> policy-only change — gateway hot-swaps within ~5s, no restart"
+  # Give the watcher a cycle plus margin, then confirm the gateway actually
+  # applied it; a gateway stuck on the OLD file (bad perms, broken yaml) would
+  # otherwise look done. The signature alone cannot prove the swap — the
+  # watcher re-publishes the running signature even when it refuses a
+  # router-shaped edit — so the gateway log is the tiebreaker.
+  sleep 8
+  # Captured, not piped: grep -q exits at the first match, docker compose logs
+  # then dies on SIGPIPE, and pipefail turns "found it" into "not found" —
+  # which would restart on every successful hot-swap.
+  gwlog="$(docker compose logs --since 30s gateway 2>/dev/null || true)"
+  if printf '%s' "$gwlog" | grep -q "reloaded in place"; then
+    echo "    gateway: hot-swapped"
+  elif printf '%s' "$gwlog" | grep -q "KEEPING the current"; then
+    echo "    gateway refused the swap (router-shaped) — restarting"
+    restart=1
+  else
+    echo "    gateway did not report a swap — restarting to be safe"
+    restart=1
+  fi
+else
+  echo "==> router-shaped change (or no live signature) — restarting the gateway"
+  restart=1
+fi
+
+if [ "${restart:-0}" -eq 1 ]; then
 docker compose restart gateway >/dev/null
 
 echo -n "==> waiting for the gateway "
@@ -63,6 +110,7 @@ if [ "$up" -ne 1 ]; then
   echo
   echo "gateway did not come back; check: docker compose logs --tail=40 gateway" >&2
   exit 1
+fi
 fi
 
 echo "==> refreshing the portal board"
