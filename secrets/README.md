@@ -6,12 +6,20 @@ from your host CLIs. Log in once per sidecar:
 ```bash
 docker compose exec claude-max-sidecar   claude login
 docker compose exec codex-sidecar        codex login --device-auth
-docker compose exec grok-sidecar         opencode auth login --provider xai
 docker compose exec opencode-go-sidecar  opencode auth login --provider opencode-go
+docker compose exec opencode-go2-sidecar opencode auth login --provider opencode-go
+python3 -m switchyard.oauth login xai    # SuperGrok: SwitchYard's own grant,
+                                         # stored as secrets/oauth.json — no CLI
 ```
 
+`scripts/auth_audit.py` audits all of the above (and whatever sidecars
+docker-compose.yml grows), and apply.sh runs the missing logins for you.
+
 The logins persist here across restarts and rebuilds — the directory is a host
-bind mount, so it is genuinely one-time.
+bind mount, so it is genuinely one-time. OpenCode keeps its login as
+`auth.json` under its **data** directory (`secrets/opencode{,2}/data`), which
+is also where `scripts/auth_audit.py` checks; the config directory holds only
+settings.
 
 **Device-code flows only.** A browser-callback login starts its listener inside
 the container and points your host browser at `localhost:<port>`, which resolves
