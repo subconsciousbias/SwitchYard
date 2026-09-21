@@ -20,6 +20,7 @@ import sys
 import time
 
 PROTOCOL_VERSION = "2024-11-05"
+PROGRESS_INTERVAL = 20.0
 
 TOOLS = [
     {
@@ -32,6 +33,10 @@ TOOLS = [
                 "text": {"type": "string", "description": "text to echo back"},
                 "delay": {"type": "number",
                           "description": "seconds to sleep before replying"},
+                "keepalive": {"type": "boolean",
+                              "description": ("send progress notifications while "
+                                              "parked; false measures the client's "
+                                              "raw timeout")},
             },
             "required": ["text", "delay"],
         },
@@ -77,12 +82,31 @@ def handle(message: dict) -> None:
         args = params.get("arguments") or {}
         delay = float(args.get("delay") or 0)
         text = str(args.get("text") or "")
-        log(f"tools/call parked for {delay}s")
+        meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        token = meta.get("progressToken")
+        keepalive = str(args.get("keepalive", "1")).lower() not in ("0", "false", "no")
+        log(f"tools/call parked for {delay}s (progressToken="
+            f"{'yes' if token is not None else 'no'}, keepalive={keepalive})")
         started = time.time()
         # The point of the probe: hold the call open. In the real bridge this is
         # where we would return the tool call to the originating HTTP caller and
         # await its result, rather than sleeping.
-        time.sleep(delay)
+        #
+        # While sleeping, emit notifications/progress the way tool_server.py
+        # does, so the probe measures the ceiling the bridge actually has. Pass
+        # keepalive=false to measure the raw ceiling without it -- that is how
+        # OpenCode's ~60s client timeout was found.
+        if token is not None and keepalive:
+            deadline = started + delay
+            progress = 0
+            while time.time() < deadline:
+                time.sleep(min(PROGRESS_INTERVAL, max(0.0, deadline - time.time())))
+                progress += 1
+                send({"jsonrpc": "2.0", "method": "notifications/progress",
+                      "params": {"progressToken": token, "progress": progress,
+                                 "message": "probe still parked"}})
+        else:
+            time.sleep(delay)
         held = time.time() - started
         log(f"answering after {held:.1f}s")
         reply(request_id, {

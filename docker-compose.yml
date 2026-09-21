@@ -196,6 +196,11 @@ services:
     expose: ["8084"]
     environment:
       PROVIDER: opencode
+      # Verified against a live `opencode run` (v1.18.31): --dir project config
+      # loads a local MCP server, its tools arrive as switchyard_<name>, no
+      # permission prompt blocks them, and a 90s parked call survives now that
+      # tool_server.py sends notifications/progress.
+      BRIDGE: mcp
       SIDECAR_PORT: "8084"
       SWITCHYARD_PLAN: opencode-go
       SWITCHYARD_PLANS: /app/config/plans.yaml

@@ -339,12 +339,20 @@ properly, rather than worked around:
   and handed back to the caller to run and answer, so the caller's tools do
   reach the model.
 
-Live today: `claude-max` runs the bridge (`BRIDGE: mcp`) and serves real
-`tool_calls` on the `apex` and `judge` lanes, tool results included. `grok`,
-`openai` and `opencode-go` are still marked `supports_tools: false` — grok and
-opencode-go until their MCP profile is verified against a live `opencode run`,
-openai because Codex has no MCP client and needs the direct OAuth path instead.
-Every lane still has tool-capable capacity without them.
+Live today: `claude-max` and `opencode-go` run the bridge (`BRIDGE: mcp`) and
+serve real `tool_calls`, tool results included, on `apex`, `judge` and `forge`.
+`grok` reaches the model through the token proxy instead, which needs no bridge
+at all. Only `openai` is still marked `supports_tools: false`: Codex has no MCP
+client, so it needs the direct OAuth path.
+
+One thing the OpenCode profile turned on. Its MCP client times a tool call out
+after about 60s — a 90s park died with `MCP error -32001: Request timed out` —
+which would have capped every tool call the bridge served through it. But
+OpenCode calls every tool with `resetTimeoutOnProgress: true`, so
+`tool_server.py` sends `notifications/progress` while a call is parked and each
+one restarts that timer. The same 90s park then completes. It is sent to any
+client that supplies a `progressToken`, so Claude Code benefits too without
+needing its own setting.
 
 ### A parked session holds a real connection
 
@@ -473,6 +481,20 @@ Concurrency is N CLI **subprocesses inside one container**, not N containers. So
 - the connection limit is enforced by a gate in that one process, which is also
   what makes "refuse immediately when full" possible, so Switchyard can spill to
   the next plan instead of holding a worker open.
+
+### The CLI versions are pinned
+
+`Dockerfile.sidecar` pins all three: `@anthropic-ai/claude-code@2.1.278`,
+`@openai/codex@0.155.1`, `opencode-ai@1.18.31` (OpenCode v1, which is current —
+there is no 2.x release, only a `tui-v2` snapshot tag).
+
+They are pinned because the bridge depends on the exact behaviour of each: the
+flags it accepts, the JSON event shape it emits, what its MCP client names a
+tool, and how long that client will hold a tool call open. An unpinned
+`npm install -g` re-resolves to whatever is newest at build time, so a rebuild
+for an unrelated reason could swap the CLI under a verified profile — which is
+precisely how a `starlette` bump silently broke the portal. Raise a pin
+deliberately, then re-run the sidecar checks in `TESTING.md`.
 
 ### Keeping the CLI's own prompt small
 

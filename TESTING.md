@@ -223,6 +223,28 @@ print(json.load(urllib.request.urlopen('http://$(
 done
 ```
 
+### The MCP bridge's parking ceiling
+
+`sidecars/mcp_bridge/probe_server.py` exists to measure the one property the
+whole bridge rests on: how long an MCP tool call can be held open before the
+CLI's own client gives up. Run it against a live CLI whenever you raise a
+pinned CLI version:
+
+```bash
+docker compose exec -T opencode-go-sidecar sh -lc 'mkdir -p /tmp/mcptest && cat > /tmp/mcptest/opencode.json <<JSON
+{"mcp":{"switchyard":{"type":"local","command":["python3","/app/mcp_bridge/probe_server.py"],"enabled":true}},
+ "agents":{}}
+JSON
+cd /tmp/mcptest && opencode run --dir /tmp/mcptest --format json \
+  --model opencode-go/glm-5.3-flash \
+  "Call slow_echo with text=parked and delay=90. Wait for it, then report what it returned."'
+```
+
+**Expect** `status=completed` and `parked (held 90.0s)`. A
+`MCP error -32001: Request timed out` means the progress keepalive is not
+reaching the client — pass `keepalive=false` in the tool arguments to measure
+the raw ceiling deliberately, which is how OpenCode's ~60s limit was found.
+
 SuperGrok is not in that list any more: the `grok` plan is served by
 `xai-token-proxy`, which holds Switchyard's own OAuth grant instead of shelling
 out to a CLI. Its grant is taken out **from the host**, because the device flow

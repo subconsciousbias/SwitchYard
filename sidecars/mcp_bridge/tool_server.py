@@ -34,6 +34,17 @@ CALLBACK_URL = os.environ["SWITCHYARD_CALLBACK_URL"].rstrip("/")
 # minutes into a build or a test suite when it finally answers.
 _raw_timeout = os.environ.get("SWITCHYARD_CALLBACK_TIMEOUT", "")
 CALLBACK_TIMEOUT = float(_raw_timeout) if _raw_timeout else None
+# How often to send notifications/progress for a parked call.
+#
+# This is not cosmetic: an MCP *client* times its own requests out, and the
+# bridge's whole premise is a call parked for as long as the caller needs. Every
+# OpenCode tool call is made with `resetTimeoutOnProgress: true`, so each
+# progress notification restarts its ~60s timer -- verified against the shipped
+# binary and against a live run, where a 90s park died with "MCP error -32001:
+# Request timed out" before this existed. Progress only reaches the client if it
+# supplied a progressToken, which OpenCode does; Claude Code's own ceiling is
+# generous enough not to need it, and sending it there is harmless.
+PROGRESS_INTERVAL = float(os.environ.get("SWITCHYARD_PROGRESS_INTERVAL", "20"))
 
 
 def log(message: str) -> None:
@@ -81,9 +92,37 @@ def call_back(name: str, arguments: dict) -> dict:
                 "isError": True}
 
 
-async def handle_call(request_id, name: str, arguments: dict, lock: asyncio.Lock) -> None:
-    log(f"tools/call {name!r} parked")
-    result = await asyncio.to_thread(call_back, name, arguments)
+async def keep_alive(token, lock: asyncio.Lock) -> None:
+    """Restart the client's request timer while a call is parked.
+
+    Cancelled as soon as the call resolves. `progress` only ever climbs, since
+    a client may treat a decreasing value as a protocol error, and `total` is
+    deliberately omitted: we do not know how long the caller will take, and
+    claiming a denominator would be a lie the client might render as a bar.
+    """
+    progress = 0
+    while True:
+        await asyncio.sleep(PROGRESS_INTERVAL)
+        progress += 1
+        await write_reply({"jsonrpc": "2.0", "method": "notifications/progress",
+                           "params": {"progressToken": token,
+                                      "progress": progress,
+                                      "message": "waiting for the caller's tool result"}},
+                          lock)
+
+
+async def handle_call(request_id, name: str, arguments: dict, lock: asyncio.Lock,
+                      progress_token=None) -> None:
+    log(f"tools/call {name!r} parked"
+        + ("" if progress_token is not None else " (no progressToken: client "
+                                                 "timeout cannot be reset)"))
+    beat = (asyncio.create_task(keep_alive(progress_token, lock))
+            if progress_token is not None else None)
+    try:
+        result = await asyncio.to_thread(call_back, name, arguments)
+    finally:
+        if beat is not None:
+            beat.cancel()
     log(f"tools/call {name!r} resolved isError={result.get('isError', False)}")
     await write_reply({"jsonrpc": "2.0", "id": request_id, "result": result}, lock)
 
@@ -114,9 +153,11 @@ async def handle(message: dict, lock: asyncio.Lock) -> None:
         # frames while this one parks on the HTTP call, which is what lets
         # several tools/call requests be in flight at once on one stdio
         # connection -- the mechanism parallel tool calls rely on.
+        meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
         asyncio.create_task(handle_call(
             request_id, str(params.get("name") or ""),
-            params.get("arguments") or {}, lock))
+            params.get("arguments") or {}, lock,
+            progress_token=meta.get("progressToken")))
         return
 
     if request_id is not None:

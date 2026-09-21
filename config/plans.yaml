@@ -241,9 +241,6 @@ plans:
     notes: >
       Cancelled, 7 days left as of 2026-09-20. The drain rule puts it at the
       front of the workhorse lane until it dies.
-    # Text-only until opencode-go-sidecar runs BRIDGE=mcp against a verified
-    # OpenCode MCP profile.
-    supports_tools: false
     models:
       # provider/model as OpenCode names it — `opencode` and `opencode-go` are
       # DIFFERENT providers there (free/community versus this paid plan).

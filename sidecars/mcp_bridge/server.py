@@ -145,12 +145,23 @@ MCP_PROFILES: dict[str, dict] = {
         "parser": "claude_json",
         "default_retry_after": 5 * 3600,
     },
-    # NOT exercised against a real OpenCode login while building this -- the
-    # `mcp:`/`agent.tools` shape below is OpenCode's documented local-server
-    # config (the same family cli_bridge/harness/opencode.json already uses
-    # to gate the built-in tools of its `switchyard` agent), but confirm it
-    # against `opencode run --help` and a live SuperGrok/OpenCode Go login
-    # before trusting it in production. See the report for what to check.
+    # Verified against a live `opencode run` on OpenCode **v1** (1.18.31, pinned
+    # in Dockerfile.sidecar): the --dir project config below loads the local MCP
+    # server, its tools arrive named switchyard_<name>, nothing prompts for
+    # permission, and a 90s parked call completes.
+    #
+    # That last one only holds because tool_server.py sends
+    # notifications/progress: OpenCode calls every tool with
+    # `resetTimeoutOnProgress: true`, and without those notifications a 90s park
+    # died with "MCP error -32001: Request timed out" at about 60s.
+    #
+    # OpenCode v2 renames all of this, so a version bump is not a drop-in:
+    # `mcp` -> `mcp.servers`, `enabled: true` -> `disabled: false`,
+    # `agent` -> `agents`, `prompt` -> `system`, `disable` -> `disabled`, and
+    # `timeout` becomes `{catalog, execution}` -- which would replace the
+    # progress keepalive with a plain execution timeout. v2 is not on npm as
+    # `opencode-ai` (still 1.18.31 there; only @opencode/client is 2.x), so it
+    # arrives by its own installer. Re-run the checks above before moving.
     "opencode": {
         "cli": os.environ.get("OPENCODE_CLI", "opencode"),
         "argv": ["run", "--model", "{model}", "--format", "json",
@@ -325,8 +336,8 @@ def write_opencode_dir(workdir: Path, session_id: str, tools_path: Path) -> None
     """`opencode run --dir <workdir>` reads project config from that
     directory. This adds one local MCP server and an agent that exposes
     only its tools -- the same pattern cli_bridge/harness/opencode.json uses
-    to gate the built-in ones. UNVERIFIED against a real login; see the
-    module docstring."""
+    to gate the built-in ones. Verified against a live run on OpenCode v1; the
+    keys are all renamed in v2 -- see MCP_PROFILES for the mapping."""
     cfg = {
         "mcp": {
             "switchyard": {
