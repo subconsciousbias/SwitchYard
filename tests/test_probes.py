@@ -59,9 +59,18 @@ def test_cookie_is_never_readable_through_status():
         blob = repr(st)
         assert secret not in blob and "abcdefgh" not in blob, blob
         assert st["has_cookie"]
-        # Only a length and the last four characters — enough to tell two
-        # cookies apart, not enough to use one.
-        assert st["fingerprint"].startswith(f"{len(secret)} chars ending ")
+        # A length and a truncated digest — enough to tell two cookies apart,
+        # and carrying no part of one. It used to end with the cookie's last
+        # four characters, which is real session material on a page that
+        # promises the cookie is never returned.
+        fp = st["fingerprint"]
+        assert fp.startswith(f"{len(secret)} chars, #"), fp
+        for n in (4, 6, 8):
+            assert secret[-n:] not in fp, f"fingerprint leaks the last {n} chars: {fp}"
+        # Two different cookies must not collide.
+        await prober.set_cookie("minimax-max", secret + "x")
+        other = (await prober.status("minimax-max"))["fingerprint"]
+        assert other != fp, (fp, other)
         return st
     st = run(go())
     print(f"  status exposes only a fingerprint: {st['fingerprint']!r}")

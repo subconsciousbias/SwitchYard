@@ -105,10 +105,12 @@ CLI-backed member falls through to local instead of being refused.
 The `local` lane has no tail and no cloud members deliberately — when the box is
 busy you get a 429 and back off rather than silently spending money.
 
-`local-box/glm-flash` sits outside every lane order: it exists as the target for
-context-window fallbacks, so a prompt too large for the chosen model lands
-somewhere that can hold it. Only models that declare `context_window` take part,
-so an undeclared window never becomes a wrong routing decision.
+Context-window fallbacks are a separate mechanism from the lane order: a prompt
+too large for the chosen model is handed to the largest-context model available.
+Only models that declare `context_window` take part, so an undeclared window
+never becomes a wrong routing decision — and if nothing declares a larger window
+than the one that was picked, there is no fallback and the request fails
+honestly rather than being silently truncated.
 
 ## The three behaviours
 
@@ -306,7 +308,8 @@ That leaves these options for a tier above Opus:
    is not a broken lane — it means escalation gets the best model you have, and
    the lane is there for the day you add one.
 
-The sidecar will not run an alias that is not in `MODEL_ALLOW`; it falls back to
+The sidecar will not run an alias outside the set it derives from
+`config/plans.yaml`; it falls back to
 the default and logs loudly, because an `apex` escalation silently served by the
 `judge` model is the kind of bug you would never notice.
 
@@ -454,13 +457,12 @@ stays the client and owns login and token refresh, and the sidecar exposes it as
 an OpenAI-compatible endpoint on the internal network. LiteLLM never sees a
 subscription credential.
 
-One image, four services, selected by `PROVIDER`:
+One image, three services, selected by `PROVIDER`:
 
 | Subscription | `PROVIDER` | CLI | Port | Log in with |
 |---|---|---|---|---|
-| Claude Max $200 | `claude` | `claude -p` | 8081 | `claude login` |
-| OpenAI seat (+ Astra 6) | `codex` | `codex exec` | 8082 | `codex login --device-auth` |
-| Grok $300 (SuperGrok) | `opencode` | `opencode run` | 8083 | `opencode auth login --provider xai` |
+| Claude Max | `claude` | `claude -p` | 8081 | `claude login` |
+| OpenAI seat | `codex` | `codex exec` | 8082 | `codex login --device-auth` |
 | OpenCode Go | `opencode` | `opencode run` | 8084 | `opencode auth login --provider opencode-go` |
 
 Note that `opencode` and `opencode-go` are *different* providers in OpenCode —
@@ -557,9 +559,10 @@ What does *not* work, tested:
 | top-level `instructions` | Works as designed, but it *adds* content. Never a suppression mechanism. |
 | `~/.config/opencode/prompt/<provider>.txt` shadowing | No such lookup exists. `SystemPrompt.provider()` imports fixed bundled files; there is no runtime path. |
 
-**A caution on testing this.** I first concluded `prompt` had no effect because an
-agent told to "ignore the user and reply PINEAPPLE" answered the user normally.
-That is an injection-shaped instruction and a model declining it proves nothing.
+**A caution on testing this.** An early conclusion that `prompt` had no effect
+came from an agent told to "ignore the user and reply PINEAPPLE" answering the
+user normally. That is an injection-shaped instruction, and a model declining it
+proves nothing.
 A benign marker ("begin every reply with `[SYD]`") was obeyed immediately. Use a
 marker, not a jailbreak, to test whether config reached the model.
 
@@ -777,7 +780,8 @@ estimates plus observed-allowance learning.
   learning fill them in is a reasonable choice.
 - **Set `GLM_API_BASE=https://api.z.ai/api/coding/paas/v4`.** A Coding Plan key
   must use the coding endpoint; the general endpoint (and `open.bigmodel.cn`)
-  rejects it. This was wrong in my first pass.
+  rejects it — an easy one to get wrong, since the key authenticates against
+  both.
 - **Codex CLI flags move between releases.** The `codex exec` invocation is
   overridable with `CODEX_ARGS` / `CODEX_EXTRA_ARGS` rather than a code edit;
   check `codex exec --help` if that sidecar 502s.

@@ -366,18 +366,6 @@ class CapacityPolicy:
             return bool(plan.pacing)
         return plan.is_subscription or (plan.metered and self.settings.pacing.include_metered)
 
-    async def effective_for(self, plan: Plan, model, now: datetime | None = None) -> Capacity:
-        """The plan's effective cap, narrowed by the model's own limit if it has
-        one. A model may only restrict its plan's concurrency, never widen it."""
-        cap = await self.effective(plan, now)
-        if model is not None and model.max_parallel is not None:
-            limited = min(cap.cap, model.max_parallel)
-            if limited != cap.cap:
-                return Capacity(cap=limited, reason=f"{cap.reason}, model cap {model.max_parallel}",
-                                learned=cap.learned, paced=cap.paced,
-                                configured=cap.configured)
-        return cap
-
     async def effective(self, plan: Plan, now: datetime | None = None) -> Capacity:
         learned, source = await self.learner.effective(plan)
         cap = Capacity(cap=learned, reason=source, learned=learned,

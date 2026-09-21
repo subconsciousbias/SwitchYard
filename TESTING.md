@@ -6,7 +6,7 @@ Stop at the first step that does not match, since later steps depend on it.
 Set these once in your shell:
 
 ```bash
-cd ~/Documents/GitHub/switchyard
+cd /path/to/switchyard
 export GW=http://localhost:4000
 export PORTAL=http://localhost:4001
 ```
@@ -90,7 +90,6 @@ curl -s $LOCAL_API_BASE/models -H "Authorization: Bearer $LOCAL_API_KEY" | head 
 |---|---|---|
 | `local-box/qwen` | `Qwen3.8-Flash-Next-oQ4e-mtp` | 262144 |
 | `local-box/gemma` | `gemma-4-26B-A4B-it-oQ4e-mtp` | 262144 |
-| `local-box/glm-flash` | `GLM-5.3-Flash-oQ4e` | 1048576 |
 
 If your ids differ, fix the `model:` line for that model under its plan in
 `config/plans.yaml`. To see the full list with context sizes:
@@ -100,9 +99,10 @@ curl -s $LOCAL_API_BASE/models -H "Authorization: Bearer $LOCAL_API_KEY" \
   | python3 -c 'import json,sys; [print(m["id"], m.get("max_model_len")) for m in json.load(sys.stdin)["data"]]'
 ```
 
-`local-box/glm-flash` is deliberately **not** in any lane order — it is the target for
-context-window fallbacks, so a prompt too large for the chosen plan lands
-somewhere that can hold it rather than erroring.
+Context-window fallbacks use whichever configured model declares the largest
+`context_window`, so if you run a long-context local model, add it to
+`local-box` with its real window and oversized prompts will land there. With
+only the two above — both 262144 — there is nothing larger to fall back to.
 
 All three are models of the **one** `local-box` plan, so they draw on its single
 pool of 2 slots. They run on the same machine; three models at 2 each would put
@@ -127,7 +127,8 @@ broken credentials. A stale or placeholder `ghcr.io` login makes Docker send the
 instead of falling back to anonymous, and GHCR refuses. Check what it holds:
 
 ```bash
-echo ghcr.io | docker-credential-osxkeychain get   # macOS; prints the secret
+echo ghcr.io | docker-credential-osxkeychain get | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["Username"])'   # macOS
 ```
 
 A username like `USERNAME` means a copy-pasted `docker login` placeholder. Clear
@@ -167,13 +168,13 @@ curl -s $PORTAL/healthz
 ```
 
 **Expect:** a liveness response from the gateway, and
-`{"ok":true,"plans":12}` from the portal.
+`{"ok":true,"plans":9}` from the portal.
 
 ```bash
 docker compose logs gateway | grep -i switchyard | head
 ```
 
-**Expect:** `switchyard: 12 plans, lanes=apex,judge,forge,local,bulk`. If this
+**Expect:** `switchyard: 9 plans, lanes=apex,judge,forge,local,bulk`. If this
 line is missing, the plugin did not load and **nothing else in this runbook will
 behave correctly** — check for an import error above it.
 
@@ -516,27 +517,15 @@ proper `tool_calls` block. Check which member it picked and cross-reference
 `config/plans.yaml`: the log line names a `plan/model` ref, and that plan
 should not have `supports_tools: false` set.
 
-**Interim caveat:** as of this writing no plan sets `supports_tools: false`, so
-every member of every lane is a legal pick for a tool-using request — but the
-CLI-backed sidecars (`claude-max`, `openai`, `grok`, `opencode-go`) still
-hard-reject any request carrying `tools` with a 400
-(`sidecars/cli_bridge/server.py`), because the direct-API and MCP-bridge
-workstreams that let them actually serve tools land separately from this
-change. So a tool-using `judge` or `apex` call may currently surface that 400
-through the gateway if the picker lands on one of those plans first — that is
-a real gap in the sidecar, not a routing bug, and it closes as each provider's
-workstream ships. If you hit it before then, and there is genuinely no way for
-that plan to serve tools, add `supports_tools: false` to it in
-`config/plans.yaml` so the picker routes around it until the fix lands.
+Every plan serves tool calls. The CLI-backed ones do it through the MCP bridge
+(`BRIDGE: mcp` on the three sidecars), which hands the caller's tools to the
+vendor's own client and parks its tool call until the caller answers; Grok goes
+direct through the token proxy. `supports_tools: false` remains available in
+`config/plans.yaml` for a plan that genuinely cannot, and the picker then routes
+tool-carrying requests around it — but no plan sets it today.
 
-**A 200 with no `tool_calls` would be the bug** regardless of which plan is
-picked — it would mean the definitions were silently dropped rather than
-either served or refused.
-
-The practical consequence for Paperclip: `forge`, `bulk` and `local` are the
-lanes with local-box in easy reach, so tool-using work routed there is least
-likely to hit the interim gap above; `judge` / `apex` may or may not, depending
-on where each subscription's workstream stands.
+**A 200 with no `tool_calls` would be the bug**: it would mean the definitions
+were silently dropped rather than either served or refused.
 
 ## 5. Behaviour tests
 
@@ -726,7 +715,7 @@ Two related notes:
   business code 1113 really does arrive wrapped in an HTTP 429, which is why the
   classifier reads the body rather than trusting the status.
 
-## What I could not verify, and what to watch
+## Not verified here, and what to watch
 
 These are the parts built from documentation rather than a live call, so check
 them first if something misbehaves:

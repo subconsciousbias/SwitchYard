@@ -106,10 +106,6 @@ class Ledger:
             plan.key, K_PERIOD.format(plan=plan.key, period=period_key(quota.period, at))
         )
 
-    async def current_period(self, plan: Plan) -> dict[str, float]:
-        """Consumption in the target window (the one pacing aims to fill)."""
-        return await self.window_usage(plan, plan.quota)
-
     async def burn_rate(self, plan: Plan, hours: int = 3) -> dict[str, float]:
         """Cost and tokens per hour over the last `hours` completed buckets."""
         now = _now()

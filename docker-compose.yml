@@ -4,12 +4,14 @@
 #   portal   :4001  capacity board, quota headroom, subscription economics.
 #   sidecars :8081  Claude Max   (claude -p)      internal only
 #            :8082  OpenAI seat  (codex exec)     internal only
-#            :8083  SuperGrok    (opencode run)   internal only
 #            :8084  OpenCode Go  (opencode run)   internal only
+#   proxy    :8090  SuperGrok    (own OAuth grant) internal only
 #
-# The sidecars exist because those three plans are OAuth subscriptions with no
-# API key. Each reads its own connection limit and model aliases from
-# config/plans.yaml, so limits are never duplicated here.
+# The sidecars exist because those plans are OAuth subscriptions with no API
+# key. Each reads its own connection limit and model aliases from
+# config/plans.yaml, so limits are never duplicated here. SuperGrok needs no
+# CLI: api.x.ai is OpenAI-compatible, so the token proxy attaches our own
+# OAuth bearer and forwards the caller's request untouched.
 #
 # Local models are expected on the host; LOCAL_API_BASE defaults to
 # host.docker.internal so Ollama/LM Studio work without extra config.

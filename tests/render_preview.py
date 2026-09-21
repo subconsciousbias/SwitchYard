@@ -127,13 +127,21 @@ def fixture(reg):
 
 
 def probe_fixture(reg):
-    """Probe-capable plans, one healthy and one needing re-auth."""
+    """Cookie-needing plans, one healthy and one needing re-auth.
+
+    Mirrors collect_probes(): only `kind: cookie` probes appear on this panel,
+    because it exists to collect a credential someone has to go and fetch. A
+    preview listing every probe would not be a preview of the real page.
+    """
     out = []
-    for i, plan in enumerate(p for p in reg.plans.values() if p.probe):
+    cookie_plans = [p for p in reg.plans.values()
+                    if p.probe and p.probe.kind == "cookie"]
+    for i, plan in enumerate(cookie_plans):
         healthy = i == 0
         out.append({
             "plan": plan,
-            "status": {"has_cookie": True, "fingerprint": "412 chars ending 9f2a",
+            "status": {"has_cookie": True, "fingerprint": "412 chars, #9f2a1c3d",
+                       "windows": "weekly=12% used,5h=37% used" if healthy else "",
                        "added_at": time.time() - 3600,
                        "last_ok_at": time.time() - 120 if healthy else None,
                        "last_attempt_at": time.time() - 120,
@@ -170,6 +178,12 @@ def main() -> int:
     reg = models.load()
     capacity, rows = fixture(reg)
     env = Environment(loader=FileSystemLoader(TPL), undefined=StrictUndefined)
+    # Take the filters from the app rather than redefining them: a template
+    # using a filter the preview does not know is exactly the regression this
+    # is meant to catch, and duplicating them here would hide it.
+    from switchyard.portal.app import _ago, _interval
+    env.filters["ago"] = _ago
+    env.filters["interval"] = _interval
     ctx = {"capacity": capacity, "plans": rows, "settings": reg.settings,
            "probes": probe_fixture(reg), "request": None}
     html = env.get_template("index.html").render(**ctx)

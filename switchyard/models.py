@@ -253,10 +253,6 @@ class Plan:
     def constraints(self) -> tuple[Quota, ...]:
         return tuple(q for q in self.quotas if not q.is_target)
 
-    @property
-    def known_allowances(self) -> int:
-        return sum(1 for q in self.quotas if q.allowance)
-
     # -- models ------------------------------------------------------------
     @property
     def live_models(self) -> list[Model]:

@@ -133,12 +133,21 @@ PROFILES: dict[str, dict] = {
         "args": os.environ.get(
             "OPENCODE_ARGS",
             "run --model {model} --format json --agent switchyard {prompt}").split(),
-        # No system-prompt mechanism at all, verified by testing: --prompt,
-        # --system and --system-prompt each exit 1 as unknown options, and an
-        # agent's `prompt:` field has no effect in run mode (a per-request agent
-        # told to ignore the user and answer PINEAPPLE answered the user). The
-        # agent's `tools:` config does work, which is where the token cut comes
-        # from. So the caller's prompt is folded into the message; see fold_system.
+        # No system-prompt FLAG at all, verified by testing: --prompt, --system
+        # and --system-prompt each exit 1 as unknown options.
+        #
+        # An agent's `prompt:` field does work — it replaces the base prompt
+        # rather than adding to it. An earlier note here said it had no effect,
+        # on the strength of an agent told to ignore the user and answer a fixed
+        # token; the model answered the user instead. That proved nothing: an
+        # instruction to disregard the user is injection-shaped, and refusing it
+        # is correct behaviour, not evidence the field was ignored. A neutral
+        # marker in the same field was obeyed immediately.
+        #
+        # It is still omitted, for a different reason: no base prompt file
+        # matches `xai/grok-*`, so there is nothing to replace and the field is
+        # pure cost. The agent's `tools:` config is where the token cut comes
+        # from. The caller's prompt is folded into the message; see fold_system.
         "system_args": [],
         "parser": "events_json",
         "default_retry_after": 3600,

@@ -119,9 +119,13 @@ def check_sidecar_health() -> None:
         except ValueError:
             check(f"{svc} health", False, raw[:120])
             continue
+        # `plan` is cli_bridge-only; mcp_bridge reports `provider`. Assert on
+        # what both return, or this passes for the wrong reason on a bridged
+        # sidecar and prints "plan=None" while claiming success.
         ok = d.get("ok") and d.get("config_source") == "config"
         check(f"{svc} reads its plan from config", ok,
-              f"plan={d.get('plan')} models={d.get('models')} conc={d.get('concurrency')}")
+              f"plan={d.get('plan') or d.get('provider')} "
+              f"models={d.get('models')} conc={d.get('concurrency')}")
 
 
 def check_token_proxy_health() -> None:
