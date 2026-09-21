@@ -430,7 +430,8 @@ than `opus`, wire it up:
 
 1. set `model: openai/<alias>` on that model under its plan;
 2. set `enabled: true` on the model;
-3. `curl -X POST $PORTAL/admin/reload`.
+3. `scripts/reload.sh` — a new model string is router-shaped, so this is the
+   one case where the gateway actually restarts.
 
 No `.env` change and no rebuild: the sidecar re-reads `plans.yaml` every 30
 seconds and adds the alias to its own allowlist.
