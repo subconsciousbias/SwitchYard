@@ -110,16 +110,12 @@ class SwitchyardHandler(CustomLogger):
             self._ledger = Ledger(self.redis)
         return self._ledger
 
-    def reload(self) -> None:
-        """Pick up edits to plans.yaml without restarting the proxy.
-
-        Learned concurrency and pacing state live in Redis, so toggling pacing
-        or changing an allowance takes effect on the next request without
-        losing what the learner already knows.
-        """
-        self.registry = models.load()
-        self._policy = CapacityPolicy(self.redis, self.registry.settings, self.ledger)
-        self._picker = Picker(self.registry, self.slots, self._policy)
+    # No reload() here on purpose. LiteLLM builds its router from the config
+    # generated at container start, so a change to models, api_base or
+    # credentials cannot take effect without a restart — and a method that
+    # refreshed only the routing policy would look like a live reload while
+    # leaving the router stale. `docker compose restart gateway` is the whole
+    # answer; the portal's /admin/reload refreshes the board it owns.
 
     # -- inbound: choose a provider ---------------------------------------
     async def async_pre_call_hook(

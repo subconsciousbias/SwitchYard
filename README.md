@@ -662,6 +662,30 @@ Caps, cost, expiry, quota model, lane order, and credentials are all in that one
 file; the LiteLLM config is generated from it at container start
 (`python -m switchyard.gen_litellm`). There is no second file to keep in sync.
 
+### Reloading after you edit `config/plans.yaml`
+
+Three things read that file, and they pick up changes differently:
+
+```bash
+docker compose restart gateway          # routing: required for most edits
+curl -X POST http://localhost:4001/admin/reload   # the portal's board
+# sidecars re-read it themselves, within 30s
+```
+
+**The gateway needs a restart, and there is no way around it.** LiteLLM builds
+its router from a config generated at container start, so a new model, a changed
+`api_base` or a different credential cannot take effect in a running process.
+Lane order, caps and quota windows would be enough to refresh in place, but a
+half-reload that leaves the router stale is worse than a restart that takes
+seconds — a plan you thought you had removed would keep serving.
+
+The portal is a separate process with its own copy, so `/admin/reload` keeps its
+board honest without touching traffic. The sidecars re-read `plans.yaml` on a
+30-second cache, so a concurrency or model-alias change lands on its own.
+
+Nothing is lost by restarting: learned concurrency, pacing state, cooldowns,
+session leases and usage all live in Redis.
+
 ## Quota windows: a 5-hour limit *and* a weekly allowance
 
 Most subscriptions enforce several limits at once — a short burst window

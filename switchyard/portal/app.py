@@ -419,10 +419,23 @@ async def frag_plans(request: Request):
 
 @app.post("/admin/reload")
 async def reload_config() -> dict:
+    """Re-read plans.yaml for THIS process: the board, not the router.
+
+    The gateway is a separate container with its own copy of the registry, and
+    its LiteLLM model list is generated at startup — so a change to models,
+    api_base or credentials needs `docker compose restart gateway` regardless.
+    This makes the board agree with the file in the meantime.
+    """
     registry = models.load()
+    policy = CapacityPolicy(state["redis"], registry.settings, state["ledger"])
     state["registry"] = registry
-    state["picker"] = Picker(registry, state["slots"])
-    return {"reloaded": True, "plans": len(registry.plans), "lanes": list(registry.lanes)}
+    state["policy"] = policy
+    # The policy has to be passed on, or the board silently loses pacing,
+    # learned caps and the spent-quota gate the moment anyone hits reload.
+    state["picker"] = Picker(registry, state["slots"], policy)
+    return {"reloaded": True, "plans": len(registry.plans),
+            "lanes": list(registry.lanes),
+            "note": "portal only — restart the gateway for routing changes"}
 
 
 @app.post("/admin/pacing")
