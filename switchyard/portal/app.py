@@ -280,11 +280,17 @@ def _probe_window(w) -> dict:
 
 
 async def collect_probes() -> list[dict]:
-    """Plans whose real headroom comes from a console endpoint."""
+    """Plans that need a pasted browser cookie, and only those.
+
+    This panel exists to collect a credential the operator has to go and get.
+    A probe reading an API key, a CLI's own records or the OAuth proxy needs
+    nothing from anyone, so listing it here is a row that can never be acted
+    on — its numbers already appear in the subscription table like any other.
+    """
     reg, prober = state["registry"], state["prober"]
     out = []
     for plan in reg.plans.values():
-        if plan.probe is None:
+        if plan.probe is None or plan.probe.kind != "cookie":
             continue
         out.append({"plan": plan, "status": await prober.status(plan.key),
                     "last_test": state.get("probe_tests", {}).get(plan.key)})
