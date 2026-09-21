@@ -717,7 +717,7 @@ async def register_tool_call(session_id: str, name: str, arguments: dict) -> dic
     if session is None or session.dead:
         raise HTTPException(status_code=404, detail="unknown or reaped mcp_bridge session")
     call = ParkedCall(id=session.mint_call_id(), name=name, arguments=arguments,
-                       future=asyncio.get_event_loop().create_future())
+                       future=asyncio.get_running_loop().create_future())
     session.touch()
     session.enqueue(call)
     # Never log arguments or results at info level -- they can carry

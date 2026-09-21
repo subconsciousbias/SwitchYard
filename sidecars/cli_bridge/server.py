@@ -1052,7 +1052,7 @@ async def usage_report() -> dict:
     proc = await asyncio.create_subprocess_exec(
         PROFILE["cli"], "-p", "/usage",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        cwd="/tmp")
+        cwd=tempfile.gettempdir())
     try:
         _, err = await asyncio.wait_for(proc.communicate(), USAGE_TIMEOUT)
     except asyncio.TimeoutError:

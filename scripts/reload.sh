@@ -66,15 +66,17 @@ if [ "$up" -ne 1 ]; then
 fi
 
 echo "==> refreshing the portal board"
+reload_json="$(mktemp -t switchyard-reload.XXXXXX.json)"
 if curl -fsS -m 10 -X POST "http://localhost:${portal_port}/admin/reload" \
-     -o /tmp/switchyard-reload.json 2>/dev/null; then
+     -o "$reload_json" 2>/dev/null; then
   python3 -c "
 import json
-d = json.load(open('/tmp/switchyard-reload.json'))
+d = json.load(open('$reload_json'))
 print(f\"    portal: {d['plans']} plans, lanes {', '.join(d['lanes'])}\")"
 else
   echo "    portal not reachable on :${portal_port} (skipped — it reloads on restart too)"
 fi
+rm -f "$reload_json"
 
 echo "==> sidecars re-read $plans themselves within 30s"
 echo "done."

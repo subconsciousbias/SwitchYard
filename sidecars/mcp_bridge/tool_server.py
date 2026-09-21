@@ -167,7 +167,7 @@ async def handle(message: dict, lock: asyncio.Lock) -> None:
 
 
 async def stdin_lines(queue: "asyncio.Queue[str | None]") -> None:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     while True:
         line = await loop.run_in_executor(None, sys.stdin.readline)
         if not line:
