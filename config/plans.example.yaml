@@ -116,7 +116,7 @@ plans:
       url: https://platform.minimax.io/backend/account/token_plan/remains_percent
       method: GET
       window: weekly                # which window the flat numbers describe
-      interval_seconds: 600
+      interval_seconds: 120
       referer: https://platform.minimax.io/console/usage
       # It reports PERCENTAGES and nothing else: every *_count field comes back
       # -1, so used_percent is the only real measurement. One response carries
@@ -178,7 +178,7 @@ plans:
       url: https://platform.minimax.io/backend/account/token_plan/remains_percent
       method: GET
       window: weekly                # which window the flat numbers describe
-      interval_seconds: 600
+      interval_seconds: 120
       referer: https://platform.minimax.io/console/usage
       # It reports PERCENTAGES and nothing else: every *_count field comes back
       # -1, so used_percent is the only real measurement. One response carries
@@ -253,7 +253,7 @@ plans:
       url: https://api.z.ai/api/monitor/usage/quota/limit
       method: GET
       window: weekly
-      interval_seconds: 600
+      interval_seconds: 120
       headers:
         Authorization: os.environ/GLM_API_KEY
       windows:
@@ -364,7 +364,7 @@ plans:
       url: https://opencode.ai/console/api/go/status
       method: GET
       window: monthly
-      interval_seconds: 600
+      interval_seconds: 120
       referer: https://opencode.ai/console
       headers:
         # Required: the route answers {"code":"org_required"} without it. Not a
@@ -508,7 +508,7 @@ plans:
       url: http://codex-sidecar:8082/usage
       method: GET
       window: weekly
-      interval_seconds: 600
+      interval_seconds: 120
       windows:
         weekly:
           used_percent: [rate_limits.primary.used_percent]
@@ -577,7 +577,7 @@ plans:
       url: http://xai-token-proxy:8090/usage
       method: GET
       window: weekly
-      interval_seconds: 600
+      interval_seconds: 120
       windows:
         weekly:
           used_percent: [config.creditUsagePercent,

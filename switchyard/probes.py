@@ -342,8 +342,12 @@ class Prober:
         if record:
             for r in found:
                 if r.remaining is not None:
+                    # Pass the provider's own total. Without it window_headroom
+                    # rebuilds one as remaining + OUR tally, which understates
+                    # it by everything spent outside SwitchYard: a $12 cap read
+                    # back as $11.87.
                     await self.ledger.note_reported(plan.key, r.remaining, r.reset_at,
-                                                    window=r.window)
+                                                    window=r.window, limit=r.total)
                 else:
                     # Percent-only: there is no count to reconcile against our
                     # own tally, so store the percentage the provider states.
