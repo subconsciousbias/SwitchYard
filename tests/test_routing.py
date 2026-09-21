@@ -606,6 +606,42 @@ def test_a_lane_board_separates_its_own_traffic_from_a_sibling_lanes():
     print(f"  {ref}: 1 slot reads as 'here' on local and 'elsewhere' on bulk")
 
 
+def test_a_row_draws_its_own_model_cap_not_the_plans():
+    """The lane board's per-row strip must mirror what the model can actually
+    claim, not the plan's nominal ceiling.
+
+    `local-box` allows 2 connections; each of its models allows 1. Gemma's row
+    used to draw two slot squares because the picker reported the plan's cap
+    for the row, and the second one could never serve gemma — only its sibling
+    qwen on the same plan. The fix narrows the row the same way the aggregate
+    below it already did: each row caps itself at `model.max_parallel`.
+    """
+    async def go():
+        reg, _, picker = build()
+        cap = await picker.capacity("local")
+
+        def row(ref):
+            return next(r for r in cap["plans"] if r["ref"] == ref)
+
+        gemma, qwen = row("local-box/gemma"), row("local-box/qwen")
+        # Each model may claim 1 of the plan's 2 slots. The row is what this
+        # model can hold, the configured is the plan's ceiling.
+        assert gemma["cap"] == 1, gemma
+        assert qwen["cap"] == 1, qwen
+        assert gemma["cap_configured"] == 2, gemma
+        assert qwen["cap_configured"] == 2, qwen
+        assert gemma["model_cap"] == 1 and qwen["model_cap"] == 1
+        # The reason names the binding constraint, not the plan's "configured".
+        assert gemma["cap_reason"] == "model limit 1", gemma["cap_reason"]
+        # Aggregate still counts the plan's reach: 1 (gemma) + 1 (qwen) = 2.
+        assert cap["slots_available_now"] == 2, cap
+        return gemma["cap"], cap["slots_available_now"]
+
+    cap, total = run(go())
+    print(f"  local-box/gemma row: cap={cap}, lane total still {total} "
+          "(1 gemma + 1 qwen = plan's 2)")
+
+
 def test_a_spent_plan_is_skipped_unless_it_may_use_extra_quota():
     """100% of the target window means no capacity — and breaks affinity.
 
