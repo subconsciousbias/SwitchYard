@@ -582,12 +582,21 @@ def _stub_start_session(recorder: list):
 
     The real one spawns the vendor CLI; here we only need to observe what the
     rebuild path would have fed it. Returns the restore callable.
+
+    Releases the concurrency slot too: resume_gone_session acquired one before
+    calling start_session, and the real start_session keeps it (it is
+    released when end_session is later called on the rebuilt session). The
+    stub does no work and creates no session, so leaving the slot taken would
+    leak it across tests; with the example plan at concurrency 2, two
+    rebuild-path tests back-to-back exhaust the gate and the next acquire
+    stalls.
     """
     real = server.start_session
 
     async def fake(body, mcp_tools, prompt, system, model, request):
         recorder.append({"tools": mcp_tools, "prompt": prompt,
                          "system": system, "model": model})
+        await server.cli_bridge._gate.release()
         return {"stubbed": True}
 
     server.start_session = fake
@@ -767,10 +776,17 @@ def test_multi_session_ids_pick_live_and_drop_the_rest():
     the new code picks the first live session, ignores the others, and lets
     the caller's request complete.
 
+    The unpicked session is then superseded (issue #13, defect 2): its tool
+    results were dropped from this batch, so its parked calls can never be
+    answered and its CLI subprocess is blocked on tool_server.py requests
+    that will never reply. Leaving it live breaks the invariant "one caller
+    tool loop <-> at most one live mcp_bridge session", so it is torn down
+    now rather than waiting for the idle reaper.
+
     Stubs `_continue_followup` so the routing decision is observable without
     a CLI process. The CLI completion path is exercised by an earlier test
     (`test_followup_correlates_by_tool_call_id_and_resumes_the_model`) -- we
-    only need to prove the multi-live routing here.
+    only need to prove the multi-live routing and the cleanup here.
     """
     captured: list = []
     real = server._continue_followup
@@ -798,6 +814,15 @@ def test_multi_session_ids_pick_live_and_drop_the_rest():
                 parked = server.ParkedCall(
                     id=f"call_{s.id}_1", name="echo", arguments={},
                     future=asyncio.get_event_loop().create_future())
+                # In production a parked call has tool_server.py's HTTP
+                # request as its consumer and a parked session has its
+                # turn_future already resolved (the CLI finished a
+                # tool_calls turn). This test inlines both, so add
+                # callbacks to swallow whatever supersede_session leaves
+                # behind -- otherwise asyncio logs "Future exception was
+                # never retrieved" for the dropped session.
+                parked.future.add_done_callback(lambda f: f.exception())
+                s.turn_future.add_done_callback(lambda f: f.exception())
                 s.pending[parked.id] = parked
                 server.SESSIONS[s.id] = s
 
@@ -816,12 +841,15 @@ def test_multi_session_ids_pick_live_and_drop_the_rest():
         # Only the chosen session's tool message survived the filter.
         assert captured[0]["kept"] == 1, captured
         assert result["kept_tool_msgs"] == 1, result
-        # The unpicked session is still around (the GUI's other conversation
-        # is not lost just because this batch was bundled).
-        survivors = server.SESSIONS
-        assert s_a.id in survivors or s_b.id in survivors, survivors
+        # Both sessions are gone: the chosen one because the stub ended it
+        # after the routing decision, and the dropped one because
+        # handle_followup superseded it before calling _continue_followup.
+        # That upholds the invariant that one tool loop has at most one live
+        # mcp_bridge session (issue #13, defect 2).
+        assert s_a.id not in server.SESSIONS, server.SESSIONS
+        assert s_b.id not in server.SESSIONS, server.SESSIONS
         print(f"  multi-live follow-up chose session {chosen[:8]}... and "
-              "dropped the other's tool result")
+              "superseded the other's session so neither is live")
     finally:
         server._continue_followup = real
 
@@ -984,6 +1012,235 @@ def test_run_session_fails_502_when_structured_parser_finds_no_answer():
     assert "no parsed answer" in result.get("detail", ""), result
     print(f"  MCP session: structured-parser failure -> {result['status']} "
           f"({result['detail'][:60]}...)")
+
+
+# ------------------------------------------ issue #13: rebuild churn ----------
+def test_duplicate_delivery_returns_cached_response_without_rebuilding():
+    """Regression for issue #13, defect 1.
+
+    The same tool results delivered twice used to look identical to a lost
+    session: nothing parked in the live session matched, so the code
+    rebuilt. That wasted a turn of narration and could leave the caller in
+    a worse state than before -- and on the gateway it spawned the second
+    live session of defect 2. After the fix, the duplicate is recognised via
+    the resolved-recently record, the cached tool_calls response is returned
+    verbatim, and no rebuild fires.
+
+    Drives _continue_followup directly: the duplicate short-circuit only
+    applies while the session is still parked, so the test pins that state
+    (last_response set, awaiting_followup=True, resolved_recently populated)
+    and verifies a second follow-up with the same tool_call_ids returns the
+    cached response without calling start_session.
+    """
+    captured: list = []
+    restore = _stub_start_session(captured)
+    try:
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            parked = asyncio.create_task(
+                server.register_tool_call(session.id, "get_weather",
+                                          {"city": "Oslo"}))
+            await asyncio.sleep(0)
+            turn = await session.turn_future
+            assert turn["type"] == "tool_calls", turn
+            call = turn["calls"][0]
+
+            # Simulate the prior delivery that consumed the tool result: pop
+            # the parked call, mark it resolved, render a tool_calls response,
+            # and leave the session parked -- exactly the state a duplicate
+            # delivery would land in. Resolve the parked future too, so the
+            # register_tool_call coroutine returns instead of hanging the test.
+            session.pending.pop(call.id, None)
+            session.mark_resolved(call.id)
+            cached = server.render_turn(session, turn, None)
+            session.last_response = cached
+            session.awaiting_followup = True
+            call.future.set_result(
+                {"content": [{"type": "text", "text": '{"temp_c":-3}'}],
+                 "isError": False})
+            with contextlib.suppress(Exception):
+                await parked
+
+            # Same tool result delivered again -- a client retry because the
+            # network dropped the response. Before the fix this rebuilt; now
+            # it must return the cached response and leave exactly one live
+            # session.
+            assert session.id in server.SESSIONS
+            body = {"model": "m", "messages": [
+                {"role": "tool", "tool_call_id": call.id,
+                 "content": '{"temp_c":-3}'},
+            ]}
+            second = await server._continue_followup(body, session.id,
+                                                     body["messages"], None)
+            return cached, second, session, call.id
+
+        cached, second, session, call_id = asyncio.run(scenario())
+        assert cached is second, "duplicate delivery must echo the cached response"
+        assert cached["choices"][0]["finish_reason"] == "tool_calls", cached
+        # No rebuild fired -- start_session was never called.
+        assert captured == [], captured
+        # The session is still in SESSIONS (and live): a duplicate delivery
+        # does not consume the session, because the tool results were
+        # already consumed by the first delivery.
+        assert session.id in server.SESSIONS
+        assert not session.dead
+        assert call_id in session.resolved_recently
+        print(f"  duplicate delivery returned the cached response; "
+              f"{len(captured)} rebuild(s); one live session")
+    finally:
+        restore()
+
+
+def test_rebuild_supersedes_the_old_session_so_two_live_sessions_never_coexist():
+    """Regression for issue #13, defect 2.
+
+    Before this fix, a follow-up whose delivered tool_call_ids did not match
+    anything parked in the live session rebuilt by calling
+    `resume_gone_session` -> `start_session`. That minted a fresh session id
+    and inserted it into SESSIONS, but the old one was still in SESSIONS
+    too -- parked, alive, and forever waiting for tool results that will
+    never come. Two live sessions of one tool loop is the bug the issue is
+    named after.
+
+    Drives the rebuild path directly: a live session with a parked call
+    whose id the follow-up does NOT name, so the resolve loop resolves zero
+    calls and the rebuild branch in _continue_followup runs. Without the fix
+    the old session stays live alongside the rebuilt one; with it, the old
+    session is superseded and removed.
+    """
+    captured: list = []
+    restore = _stub_start_session(captured)
+    try:
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            # Parked with a tool call whose id the follow-up will NOT name --
+            # so the rebuild path (not the resolve path) is taken.
+            parked = asyncio.create_task(
+                server.register_tool_call(session.id, "get_weather",
+                                          {"city": "Oslo"}))
+            await asyncio.sleep(0)
+            await session.turn_future
+            session.awaiting_followup = True
+
+            # A follow-up whose tool_call_id does not match anything parked
+            # in this session AND is not in resolved_recently. The
+            # duplicate-delivery short-circuit must not fire (no resolved
+            # ids), so the rebuild path runs.
+            foreign_id = f"call_{uuid.uuid4().hex}_1"
+            body = {"model": "m",
+                    "tools": [{"type": "function", "function": {
+                        "name": "get_weather", "description": "",
+                        "parameters": {"type": "object", "properties": {}}}}],
+                    "messages": [
+                        {"role": "user", "content": "weather in Oslo?"},
+                        {"role": "assistant", "content": None, "tool_calls": [
+                            {"id": foreign_id, "type": "function",
+                             "function": {"name": "get_weather",
+                                          "arguments": '{"city":"Oslo"}'}}]},
+                        {"role": "tool", "tool_call_id": foreign_id,
+                         "content": '{"temp_c":-3}'},
+                    ]}
+            tool_msgs = body["messages"][2:]
+            result = await server._continue_followup(body, session.id,
+                                                     tool_msgs, None)
+            # The parked call's future was failed by supersede_session; the
+            # register_tool_call task raised 504. Consume it here so asyncio
+            # does not log "future exception was never retrieved".
+            with contextlib.suppress(Exception):
+                await parked
+            return result, session
+
+        result, session = asyncio.run(scenario())
+        assert result == {"stubbed": True}, result
+        # Rebuild fired exactly once -- the old session was rebuilt against.
+        assert len(captured) == 1, captured
+        # The old session is gone: not in SESSIONS, marked dead. The invariant
+        # holds: one tool loop, at most one live session.
+        assert session.id not in server.SESSIONS, dict(server.SESSIONS)
+        assert session.dead, session
+        print(f"  rebuild superseded the old session: SESSIONS has "
+              f"{len(server.SESSIONS)} unrelated entry/entries")
+    finally:
+        restore()
+
+
+def test_span2_follow_up_supersedes_dropped_sessions_so_the_invariant_holds():
+    """Regression for issue #13, defect 2 (second half).
+
+    When a follow-up's tool results span more than one live session, the
+    others' tool results are dropped by design (the request can only resolve
+    against one session). The dropped sessions' CLIs are blocked on
+    tool_server.py requests that will never be answered, so they are now
+    superseded -- exactly like the rebuild path -- so the invariant "one
+    caller tool loop <-> at most one live mcp_bridge session" holds for the
+    span-N case too.
+
+    The test asserts both halves of the invariant in one go: only the chosen
+    session is routed to _continue_followup, and all the others are gone
+    from SESSIONS by the time handle_followup returns.
+    """
+    captured: list = []
+    real = server._continue_followup
+
+    async def stub(body, wanted, tool_msgs, request):
+        captured.append({"wanted": wanted})
+        return {"stubbed": wanted}
+
+    server._continue_followup = stub
+    try:
+        async def go():
+            s_a = _new_session()
+            s_b = _new_session()
+            s_c = _new_session()
+            sessions = [s_a, s_b, s_c]
+            for s in sessions:
+                s.new_turn()
+                s.awaiting_followup = True
+                parked = server.ParkedCall(
+                    id=f"call_{s.id}_1", name="echo", arguments={},
+                    future=asyncio.get_event_loop().create_future())
+                # In production a parked call has tool_server.py's HTTP
+                # request as its consumer and a parked session has its
+                # turn_future already resolved (the CLI finished a
+                # tool_calls turn). This test inlines both, so add
+                # callbacks to swallow whatever supersede_session leaves
+                # behind -- otherwise asyncio logs "Future exception was
+                # never retrieved" for the dropped sessions.
+                parked.future.add_done_callback(lambda f: f.exception())
+                s.turn_future.add_done_callback(lambda f: f.exception())
+                s.pending[parked.id] = parked
+                server.SESSIONS[s.id] = s
+
+            body = {"model": "m", "messages": [
+                {"role": "tool", "tool_call_id": f"call_{s_a.id}_1",
+                 "content": "a"},
+                {"role": "tool", "tool_call_id": f"call_{s_b.id}_1",
+                 "content": "b"},
+                {"role": "tool", "tool_call_id": f"call_{s_c.id}_1",
+                 "content": "c"},
+            ]}
+            return await server.handle_followup(body, body["messages"]), sessions
+
+        result, sessions = asyncio.run(go())
+        # Only one routing decision; the other tool results were filtered.
+        assert len(captured) == 1, captured
+        chosen_id = captured[0]["wanted"]
+        # The chosen session survives -- _continue_followup is a stub here,
+        # so it does not end it. The dropped sessions are gone.
+        survivors = [s for s in sessions if s.id in server.SESSIONS]
+        assert len(survivors) == 1, survivors
+        assert survivors[0].id == chosen_id, (survivors, chosen_id)
+        # The dropped sessions are dead.
+        for s in sessions:
+            if s.id != chosen_id:
+                assert s.dead, s
+        assert result == {"stubbed": chosen_id}, result
+        print(f"  span-3 follow-up chose {chosen_id[:8]}... and superseded "
+              "the other two sessions; invariant upheld")
+    finally:
+        server._continue_followup = real
 
 
 if __name__ == "__main__":
