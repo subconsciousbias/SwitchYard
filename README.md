@@ -727,6 +727,40 @@ board honest without touching traffic. The sidecars re-read `plans.yaml` on a
 Nothing is lost by restarting: learned concurrency, pacing state, cooldowns,
 session leases and usage all live in Redis.
 
+### Adding a plan, end to end
+
+Edit `config/plans.yaml`, then run one command:
+
+```bash
+scripts/apply.sh
+```
+
+It does what `reload.sh` does, plus everything a brand-new plan needs:
+
+1. propagates new `.env.example` keys into `.env` (append-only, always),
+   recreating the app containers on the way up if anything was added, because
+   `.env` is read when a container is created, not on restart;
+2. validates the config before Docker touches anything;
+3. rebuilds the baked images **only where they are stale** — it compares the
+   mtimes of `switchyard/`, `sidecars/` and the Dockerfiles against each
+   image's creation time. A pure `plans.yaml` edit rebuilds nothing, because
+   `./config` is mounted, not baked;
+4. `docker compose up -d` — brings up any service a new plan added;
+5. runs `reload.sh` (gateway restart, portal board refresh, health wait);
+6. audits auth per plan and prints the exact sign-in command for each plan
+   that is missing one — env keys for `api_key` plans, the credential file
+   under `./secrets/` for `cli_sidecar` plans, the OAuth grant for
+   `oauth_proxy` plans. It never runs a login itself: those are your
+   keychain and browser session. Run it, then `scripts/apply.sh` again.
+
+Useful variants:
+
+```bash
+scripts/apply.sh --dry-run      # validate + audit + report, change nothing
+scripts/apply.sh --build        # force a rebuild even if nothing looks stale
+scripts/apply.sh --skip-reload  # run the reload steps separately
+```
+
 ## Quota windows: a 5-hour limit *and* a weekly allowance
 
 Most subscriptions enforce several limits at once — a short burst window
