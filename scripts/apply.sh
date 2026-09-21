@@ -16,9 +16,9 @@
 #
 # And ending up running is not enough: a plan without its credential serves 401s
 # out of its lane. So the script ends with an auth audit — env keys, CLI login
-# files, OAuth grants — printing the exact command for each one that is
-# missing. It never runs a login itself: those are your keychain and browser
-# session. It prints them; you run them.
+# files, OAuth grants — and runs every missing CLI login and OAuth grant INLINE
+# (scripts/auth_audit.py --run), re-auditing afterwards. Only .env gaps are
+# left to you: keys typed by hand stay typed by hand.
 #
 # Order matters and is deliberate:
 #   1. sync-env       -- append new .env.example keys BEFORE anything recreates
@@ -26,7 +26,7 @@
 #   3. build (stale)  -- the only slow step, and usually skipped
 #   4. compose up -d  -- creates new services, recreates what compose changed
 #   5. reload.sh      -- restart the gateway, refresh the portal, wait for health
-#   6. auth audit     -- what still needs YOU, with the exact command
+#   6. auth audit     -- run missing CLI logins inline, re-audit, report rest
 #
 # set -euo pipefail: a silent partial apply is the one outcome this must not
 # produce — failing loudly mid-way beats reporting "done" while the gateway
@@ -190,112 +190,23 @@ else
 fi
 
 # ------------------------------------------------------------ 6. auth audit
-# Reads credentials only as EXISTENCE: file present, key non-empty, grant
-# authorisation. Never prints a value. Prints the command for each one it must
-# not run itself.
+# See scripts/auth_audit.py: reports every plan's credential state (existence
+# only, never values), runs the missing CLI logins and OAuth grants inline, and
+# re-audits; only .env gaps still need you by hand.
+#
+# --run exits 1 when credentials are STILL missing after the inline logins —
+# report that, but do not fail the apply for it: the config is live either way,
+# and a fresh clone always has .env gaps only the operator can fill. Any other
+# nonzero status is an audit crash and propagates.
 echo "==> auth audit"
-python3 - <<'PY'
-import os, sys
-from pathlib import Path
-
-sys.path.insert(0, ".")
-import yaml
-from switchyard import models
-
-reg = models.load("config/plans.yaml")
-missing: list[str] = []
-
-def env_file() -> dict:
-    out = {}
-    for line in Path(".env").read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        out[k.strip()] = v.strip()
-    return out
-
-def env_refs(value):
-    """The os.environ/KEY references a plan field makes, if any."""
-    if not value or not value.startswith("os.environ/"):
-        return []
-    return [value.split("/", 1)[1]]
-
-dotenv = env_file()
-
-api_plans = [p for p in reg.plans.values() if p.auth == "api_key"]
-for p in api_plans:
-    needed = sorted(set(env_refs(p.api_base) + env_refs(p.api_key)))
-    if not needed:
-        print(f"  {p.key:<14} api_key: no os.environ references to check")
-        continue
-    absent = [k for k in needed if not dotenv.get(k)]
-    if absent:
-        print(f"  {p.key:<14} MISSING env keys: {', '.join(absent)}")
-        missing.append(f"  {p.key}: fill {', '.join(absent)} in .env, then re-run scripts/apply.sh")
-    else:
-        print(f"  {p.key:<14} env keys present: {', '.join(needed)}")
-
-cli_cred = {
-    "claude-max-sidecar": (
-        os.environ.get("CLAUDE_CONFIG_DIR", "secrets/claude"),
-        ".credentials.json"),
-    "codex-sidecar": (
-        os.environ.get("CODEX_CONFIG_DIR", "secrets/codex"),
-        "auth.json"),
-    "opencode-go-sidecar": (
-        os.environ.get("OPENCODE_CONFIG_DIR", "secrets/opencode/config"),
-        "auth.json"),
-}
-login_cmd = {
-    "claude-max-sidecar": "docker compose exec claude-max-sidecar claude login",
-    "codex-sidecar": "docker compose exec codex-sidecar codex login --device-auth",
-    "opencode-go-sidecar": "docker compose exec opencode-go-sidecar opencode auth login --provider opencode-go",
-}
-
-compose = yaml.safe_load(Path("docker-compose.yml").read_text())
-for p in reg.plans.values():
-    if not p.is_cli_backed:
-        continue
-    svc = next((name for name, body in (compose.get("services") or {}).items()
-                if isinstance(body.get("environment"), dict)
-                and body["environment"].get("SWITCHYARD_PLAN") == p.key), None)
-    if not svc:
-        print(f"  {p.key:<14} cli_sidecar: no compose service sets SWITCHYARD_PLAN: {p.key}")
-        continue
-    if svc not in cli_cred:
-        print(f"  {p.key:<14} cli_sidecar: no credential known for service {svc!r}")
-        continue
-    d, fname = cli_cred[svc]
-    cred = Path(d) / fname
-    if cred.exists() and cred.stat().st_size > 0:
-        print(f"  {p.key:<14} cli login present ({d}/{fname})")
-    else:
-        print(f"  {p.key:<14} NOT signed in — {d}/{fname} absent")
-        missing.append(f"  {p.key}: run {login_cmd[svc]}")
-
-for p in reg.plans.values():
-    if p.auth != "oauth_proxy":
-        continue
-    from switchyard import oauth
-    provider = p.provider_family or "xai"
-    if provider not in set(oauth.FLOWS) | set(oauth.HEADLESS_FLOWS):
-        print(f"  {p.key:<14} oauth_proxy: no flow registered for {provider!r}")
-        continue
-    st = oauth.status(provider)
-    if st.get("authorised"):
-        print(f"  {p.key:<14} oauth grant present ({provider})")
-    else:
-        print(f"  {p.key:<14} oauth grant MISSING ({provider})")
-        missing.append(f"  {p.key}: run python3 -m switchyard.oauth login {provider}")
-
-if missing:
-    print()
-    print("ACTION REQUIRED — these need you, then run scripts/apply.sh again:")
-    for line in missing:
-        print(line)
-else:
-    print("  every plan's credential is in place")
-PY
+if [ "$dry_run" -eq 1 ]; then
+  python3 scripts/auth_audit.py
+elif python3 scripts/auth_audit.py --run; then
+  :
+else
+  rc=$?
+  if [ "$rc" -ne 1 ]; then exit "$rc"; fi
+  echo "==> apply finished — the credentials listed above are still missing"
+fi
 
 echo "==> done. Verify live when ready: python3 scripts/smoke.py"
