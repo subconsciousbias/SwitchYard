@@ -215,11 +215,20 @@ class Ledger:
         await self.redis.hset(key, mapping=mapping)
 
     async def note_reported(self, plan_key: str, remaining: float | None,
-                            reset_at: float | None, window: str | None = None) -> None:
-        """Record limits a provider actually told us about (headers/sidecar)."""
+                            reset_at: float | None, window: str | None = None,
+                            limit: float | None = None) -> None:
+        """Record limits a provider actually told us about (headers/sidecar).
+
+        `limit` matters when the provider states both sides: xAI answers with
+        x-ratelimit-limit-tokens next to the remaining count, and deriving the
+        total from our own tally instead would understate it by everything the
+        account spent outside SwitchYard.
+        """
         mapping = {}
         if remaining is not None:
             mapping["reported_remaining"] = remaining
+        if limit is not None:
+            mapping["reported_limit"] = limit
         if reset_at is not None:
             mapping["reset_at"] = reset_at
         if not mapping:
@@ -299,9 +308,12 @@ async def window_headroom(ledger: Ledger, plan: Plan, q: Quota) -> dict:
     if facts.get("reported_remaining") is not None and isinstance(facts.get("reported_remaining"), float):
         # A number the provider gave us always beats our own estimate.
         rem = float(facts["reported_remaining"])
-        total = rem + consumed
-        return {**meta, "kind": q.kind, "pct_used": _pct(consumed, total), "limit": total,
-                "consumed": consumed, "basis": "reported by provider",
+        # A stated limit beats reconstructing one from our own consumption.
+        total = (float(facts["reported_limit"])
+                 if isinstance(facts.get("reported_limit"), float) else rem + consumed)
+        return {**meta, "kind": q.kind, "pct_used": _pct(max(0.0, total - rem), total),
+                "limit": total,
+                "consumed": max(0.0, total - rem), "basis": "reported by provider",
                 "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
 
     if limit is None and isinstance(facts.get("observed_allowance_tokens"), float):

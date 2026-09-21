@@ -33,9 +33,12 @@ from switchyard import oauth  # noqa: E402
 
 class _FakeResponse:
     """Just enough of httpx.Response for server.py's non-streaming path."""
-    def __init__(self, status_code=200, payload=None):
+    def __init__(self, status_code=200, payload=None, headers=None):
         self.status_code = status_code
         self._payload = payload if payload is not None else {"ok": True}
+        # Real responses carry headers, and the proxy forwards the quota ones —
+        # xAI's x-ratelimit-* are the only headroom this plan has.
+        self.headers = headers if headers is not None else {}
 
     def json(self):
         return self._payload
@@ -44,12 +47,16 @@ class _FakeResponse:
 class _FakeAsyncClient:
     """Records the single call server.py makes, instead of hitting a socket."""
     last: dict = {}
+    # Set to a _FakeResponse to control what comes back (headers, status).
+    response = None
 
     def __init__(self, timeout=None):
         pass
 
     async def post(self, url, content=None, headers=None):
         _FakeAsyncClient.last = {"url": url, "content": content, "headers": headers}
+        if _FakeAsyncClient.response is not None:
+            return _FakeAsyncClient.response
         return _FakeResponse(200, {"id": "chatcmpl-fake",
                                    "choices": [{"message": {"role": "assistant",
                                                              "content": "ok"}}]})
@@ -220,6 +227,46 @@ def test_health_never_includes_a_token_or_authorization_header():
         print("  /health payload contains no token and no Authorization header")
     finally:
         _restore_oauth(originals)
+
+
+def test_quota_headers_are_forwarded_but_framing_headers_are_not():
+    """xAI states this plan's headroom in response headers and nowhere else.
+
+    The proxy re-serialises the body, so relaying content-length or
+    content-encoding from upstream would describe the wrong bytes and truncate
+    or break decoding of the response. Only the quota headers come back.
+    """
+    upstream = {
+        "x-ratelimit-limit-tokens": "53000000",
+        "x-ratelimit-remaining-tokens": "51750000",
+        "x-ratelimit-limit-requests": "8300",
+        "retry-after": "12",
+        "content-length": "999999",
+        "content-encoding": "gzip",
+        "server": "cloudflare",
+    }
+    server.PROVIDER = "xai"
+    originals = _install_fake_oauth(token="secret-xai-token")
+    client_original = _install_fake_client()
+    _FakeAsyncClient.response = _FakeResponse(payload={"ok": True}, headers=upstream)
+    try:
+        resp = TestClient(server.app).post(
+            "/v1/chat/completions",
+            content=json.dumps({"model": "grok-4.6", "messages": []}))
+    finally:
+        _FakeAsyncClient.response = None
+        _restore_client(client_original)
+        _restore_oauth(originals)
+    assert resp.status_code == 200, resp.text
+    got = {k.lower() for k in resp.headers}
+    assert "x-ratelimit-remaining-tokens" in got, sorted(got)
+    assert resp.headers["x-ratelimit-limit-tokens"] == "53000000"
+    assert "retry-after" in got, sorted(got)
+    # Framing and provenance headers describe the upstream body, not ours.
+    assert resp.headers.get("content-encoding") != "gzip", "would break decoding"
+    assert resp.headers.get("content-length") != "999999", "would truncate the body"
+    assert "server" not in got or resp.headers["server"] != "cloudflare"
+    print("  forwarded the x-ratelimit-* and retry-after headers, dropped the framing ones")
 
 
 if __name__ == "__main__":

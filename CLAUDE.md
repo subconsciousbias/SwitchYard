@@ -25,6 +25,30 @@ duplicate any of them — the sidecars read `plans.yaml` themselves. If you find
 yourself setting the same number in two places, the config is the source of
 truth and the other place is a bug.
 
+## `switchyard/` is baked into three images, not mounted
+
+Only `./config` is mounted. `switchyard/*.py` is COPYed into the gateway, the
+portal and the sidecar images, so after editing it:
+
+```bash
+docker compose build gateway portal claude-max-sidecar xai-token-proxy
+docker compose up -d
+```
+
+`docker compose restart` re-runs the OLD code and looks like the change did
+nothing — or worse, half the stack picks it up and the other half does not, which
+reads as an inconsistent bug. This has already cost three debugging detours: a
+`hooks.py` change that "had no effect", a `models.py` schema addition that
+crashed the portal on a config only it had, and a headroom calculation that was
+right in the gateway and wrong on the board.
+
+Two related traps in the same family:
+
+- `.env` is read when a container is **created**. A value added afterwards needs
+  `up -d --force-recreate <service>`, not `restart`.
+- `config/litellm.generated.yaml` in the repo is a stale artifact. The gateway
+  generates its own at `/tmp/litellm.generated.yaml` on startup; read that one.
+
 ## Don't touch credential stores
 
 Same reasoning as `.env`: never run `docker login`/`docker logout`, never write to

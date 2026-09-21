@@ -213,13 +213,33 @@ async def _forward(request: Request, path_attr: str, path_name: str) -> Streamin
                         return
                     async for chunk in upstream.aiter_raw():
                         yield chunk
+        # A streamed response cannot carry the upstream's headers, because they
+        # are not known until the request is made; the caller gets none, and the
+        # quota board falls back to whatever the last non-streamed call
+        # reported. Worth knowing rather than silently assuming coverage.
         return StreamingResponse(relay(), media_type="text/event-stream")
 
     try:
         resp = await client.post(url, content=body, headers=headers)
     finally:
         await client.aclose()
-    return JSONResponse(status_code=resp.status_code, content=_safe_json(resp))
+    return JSONResponse(status_code=resp.status_code, content=_safe_json(resp),
+                        headers=_quota_headers(resp))
+
+
+# Headers worth passing back. Not a blanket relay: content-length and
+# content-encoding describe the upstream body, not the one this process just
+# re-serialised, and forwarding them produces a truncated or undecodable
+# response. These are the ones that carry the provider's own headroom, which is
+# otherwise lost here — xAI answers with x-ratelimit-remaining-tokens against
+# x-ratelimit-limit-tokens, and Switchyard's quota board has no other source for
+# this plan.
+_QUOTA_HEADER_PREFIXES = ("x-ratelimit-", "ratelimit-", "x-quota-", "retry-after")
+
+
+def _quota_headers(resp: httpx.Response) -> dict[str, str]:
+    return {k: v for k, v in resp.headers.items()
+            if k.lower().startswith(_QUOTA_HEADER_PREFIXES)}
 
 
 def _safe_json(resp: httpx.Response):

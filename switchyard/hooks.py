@@ -417,9 +417,10 @@ class SwitchyardHandler(CustomLogger):
                 continue
             remaining = _as_float(headers.get((q.headers.get("remaining") or "").lower()))
             reset = _as_float(headers.get((q.headers.get("reset") or "").lower()))
-            if remaining is not None or reset is not None:
+            limit = _as_float(headers.get((q.headers.get("limit") or "").lower()))
+            if remaining is not None or reset is not None or limit is not None:
                 await self.ledger.note_reported(plan.key, remaining, reset,
-                                                window=q.label)
+                                                window=q.label, limit=limit)
 
 
 def _payload_of(response_obj: Any) -> Any:

@@ -462,8 +462,15 @@ plans:
         role: target
         kind: tokens
         period: week
-        allowance: null           # TODO: set once a full week has been observed
-        source: estimate
+        allowance: null           # comes from the headers below
+        source: headers
+        # api.x.ai reports headroom on every non-streamed response, so this plan
+        # needs no probe and no cookie: x-ratelimit-remaining-tokens against
+        # x-ratelimit-limit-tokens (53,000,000 when last read). The token proxy
+        # forwards these specific headers for exactly this reason.
+        headers:
+          remaining: x-ratelimit-remaining-tokens
+          limit: x-ratelimit-limit-tokens
     notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
     models:
       grok-4.6:
