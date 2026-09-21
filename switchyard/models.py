@@ -134,6 +134,9 @@ class Pacing:
 class Settings:
     drain_within_days: int = 21
     lease_ttl_seconds: int = 1800
+    # Move inline <think>...</think> out of streamed content and into
+    # reasoning_content, the way a buffered response already does.
+    split_reasoning_tags: bool = True
     inflight_max_age_seconds: int = 120
     heartbeat_seconds: int = 30
     default_cooldown_seconds: int = 900

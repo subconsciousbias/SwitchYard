@@ -27,6 +27,7 @@ from . import models
 from .classify import Outcome, classify, inspect_success_payload
 from .picker import LaneSaturated, Picker
 from .policy import CapacityPolicy
+from .reasoning import ReasoningSplitter
 from .session import derive as derive_session
 from .slots import SlotTable
 from .usage import Ledger
@@ -329,6 +330,48 @@ class SwitchyardHandler(CustomLogger):
         except Exception:                 # never fail a served request over a label
             log.debug("could not stamp response with switchyard routing info")
         return response
+
+    async def async_post_call_streaming_iterator_hook(
+        self, user_api_key_dict: UserAPIKeyAuth, response: Any, request_data: dict
+    ):
+        """Lift inline `<think>` reasoning out of a STREAMED response.
+
+        LiteLLM already does this for a buffered response, so the same model
+        answers cleanly when buffered and leaks raw tags when streamed. A client
+        that renders content verbatim then shows the model thinking out loud.
+        Normalising it here means one behaviour whatever the provider and
+        whatever the transport.
+
+        Reasoning is moved, never dropped: it arrives as `reasoning_content`
+        deltas, which is where the non-streamed path puts it.
+        """
+        if not self.registry.settings.split_reasoning_tags:
+            async for chunk in response:
+                yield chunk
+            return
+
+        splitter = ReasoningSplitter()
+        async for chunk in response:
+            try:
+                choices = getattr(chunk, "choices", None) or []
+                delta = getattr(choices[0], "delta", None) if choices else None
+                text = getattr(delta, "content", None) if delta is not None else None
+                if text:
+                    content, reasoning = splitter.feed(text)
+                    delta.content = content
+                    if reasoning:
+                        # The field may not exist on the model; set it either way
+                        # so the caller sees the same shape as a buffered reply.
+                        prior = getattr(delta, "reasoning_content", None) or ""
+                        delta.reasoning_content = prior + reasoning
+            except Exception:                 # never break a stream over this
+                log.debug("reasoning split skipped for one chunk", exc_info=True)
+            yield chunk
+
+        trailing_content, trailing_reasoning = splitter.flush()
+        if trailing_content or trailing_reasoning:
+            log.debug("stream ended mid-tag; flushed %d content, %d reasoning chars",
+                      len(trailing_content), len(trailing_reasoning))
 
     async def async_post_call_failure_hook(
         self, request_data: dict, original_exception: Exception, user_api_key_dict: UserAPIKeyAuth, **_: Any

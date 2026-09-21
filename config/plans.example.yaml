@@ -24,6 +24,10 @@ settings:
   # How long a session keeps its model. Refreshed on every request, so an
   # active session never migrates; an idle one lets its slot go.
   lease_ttl_seconds: 1800
+  # Providers that wrap chain-of-thought in <think>...</think> leak it into
+  # streamed content — LiteLLM lifts it into reasoning_content only for a
+  # buffered reply. Set false to pass the tags through untouched.
+  split_reasoning_tags: true
   # A slot whose heartbeat has stopped for this long is assumed dead and pruned.
   # Slots are heartbeaten while their request is alive, so this can be short
   # without cutting off legitimately long calls — an OpenCode request runs for
