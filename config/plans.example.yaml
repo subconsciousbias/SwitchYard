@@ -24,6 +24,14 @@ settings:
   # How long a session keeps its model. Refreshed on every request, so an
   # active session never migrates; an idle one lets its slot go.
   lease_ttl_seconds: 1800
+  # How long a mid-tool-loop follow-up waits for a slot on its pinned plan
+  # before the 429. Zero restores the old fail-fast. 10s rides out the moment
+  # when every slot of the pinned plan is momentarily busy, so a running loop
+  # stays on the plan holding the provider's prompt cache instead of bouncing
+  # a retry the caller then re-fires anyway. Note the wait happens in the
+  # gateway with the request parked, NOT on a slot: other sessions keep being
+  # placed while one waits.
+  pin_wait_seconds: 10
   # Providers that wrap chain-of-thought in <think>...</think> leak it into
   # streamed content — LiteLLM lifts it into reasoning_content only for a
   # buffered reply. Set false to pass the tags through untouched.
@@ -311,7 +319,7 @@ plans:
     expires: null            # set a date to have the drain rule prefer it
     api_base: http://opencode-go-sidecar:8084/v1
     api_key: sidecar
-    # `source: ledger`, not a probe, and that was checked rather than assumed.
+    # The quotas are `source: probe`, and that was checked rather than assumed.
     # The console at opencode.ai/console does have a usage API —
     # `GET /console/api/usage/summary?range=7d` with an `x-org-id: wrk_...`
     # header and the session cookie answers with real totals — but it is the Zen
@@ -325,8 +333,8 @@ plans:
     #
     # A probe against that summary route would therefore show a permanent 0,
     # which reads as verified headroom and is worse than admitting there is no
-    # number. So the only usage figure is the one SwitchYard books itself from
-    # each response's token counts — a floor on consumption, labelled as such.
+    # number. The go/status route below is the real source; SwitchYard's own
+    # tally from response token counts stays a labelled floor on consumption.
     # Three windows, all in DOLLARS of model spend, not tokens: the Go plan is
     # $10/month that buys metered model usage, and the console meters it as
     # microcents against a limit. Monthly is the allowance worth filling; the
@@ -390,11 +398,76 @@ plans:
           reset_at: [access.endsAt]
     notes: >
       A short-lived plan. Give it an `expires:` date and the drain rule
-      moves it to the front of its lane as that date approaches. Usage is SwitchYard's own
-      tally: no provider endpoint reports this plan's consumption.
+      moves it to the front of its lane as that date approaches. All three
+      meters are probed from the console route above.
     models:
       # provider/model as OpenCode names it — `opencode` and `opencode-go` are
       # DIFFERENT providers there (free/community versus this paid plan).
+      glm-5.3-flash:
+        model: openai/opencode-go/glm-5.3-flash
+        max_parallel: 1
+
+  # A SECOND subscription on the same CLI product is a SECOND sidecar process,
+  # not a second plan on the first plan's api_base: a sidecar serves exactly one
+  # plan (SWITCHYARD_PLAN) with exactly one CLI login, so sharing a process
+  # would spend the first account's quota under the second plan's name. Copy the
+  # compose service, bump the port, and give each plan its own org id in .env.
+  opencode-go2:
+    label: "OpenCode Go Plan #2"
+    auth: cli_sidecar
+    monthly_cost: 10
+    max_parallel: 2
+    expires: null            # set a date to have the drain rule prefer it
+    api_base: http://opencode-go2-sidecar:8085/v1
+    api_key: sidecar
+    # Same three DOLLAR windows as the first Go plan — see that block for how
+    # the allowances were derived and why the Zen summary route is a decoy.
+    quotas:
+      - name: 5h
+        role: constraint
+        kind: dollars
+        period: rolling_5h
+        allowance: 12.0           # limitMicroCents 1200000000
+        source: probe
+      - name: weekly
+        role: constraint
+        kind: dollars
+        period: week
+        allowance: 30.0           # limitMicroCents 3000000000
+        source: probe
+      - name: monthly
+        role: target
+        kind: dollars
+        period: month
+        allowance: 60.0           # limitMicroCents 6000000000
+        source: probe
+    probe:
+      kind: cookie
+      url: https://opencode.ai/console/api/go/status
+      method: GET
+      window: monthly
+      interval_seconds: 120
+      referer: https://opencode.ai/console
+      headers:
+        # One org id per Go subscription — OPENCODE_ORG_ID2 for this plan.
+        x-org-id: os.environ/OPENCODE_ORG_ID2
+      scale: 0.00000001
+      windows:
+        5h:
+          used: [access.meters.fiveHour.usedMicroCents]
+          total: [access.meters.fiveHour.limitMicroCents]
+          reset_at: [access.meters.fiveHour.resetsAt]
+        weekly:
+          used: [access.meters.week.usedMicroCents]
+          total: [access.meters.week.limitMicroCents]
+          reset_at: [access.meters.week.resetsAt]
+        monthly:
+          used: [access.meters.month.usedMicroCents]
+          total: [access.meters.month.limitMicroCents]
+          reset_at: [access.endsAt]
+    notes: >
+      Second Go subscription: own sidecar process, own CLI login, own org id.
+    models:
       glm-5.3-flash:
         model: openai/opencode-go/glm-5.3-flash
         max_parallel: 1

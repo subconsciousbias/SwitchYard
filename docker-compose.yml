@@ -5,6 +5,7 @@
 #   sidecars :8081  Claude Max   (claude -p)      internal only
 #            :8082  OpenAI seat  (codex exec)     internal only
 #            :8084  OpenCode Go  (opencode run)   internal only
+#            :8085  OpenCode Go 2 (opencode run)  internal only
 #   proxy    :8090  SuperGrok    (own OAuth grant) internal only
 #
 # The sidecars exist because those plans are OAuth subscriptions with no API
@@ -100,7 +101,7 @@ services:
   # sits in Windows Credential Manager (DPAPI-encrypted) — none of those are
   # reachable from the container. See secrets/README.md.
   #   docker compose exec claude-max-sidecar claude login
-  # The four sidecars are the SAME image; only their environment differs. Only
+  # The sidecars are the SAME image; only their environment differs. Only
   # this service declares `build`, and the rest reference the tag it produces —
   # otherwise compose builds the identical image four times and writes four tags,
   # which wastes build time and (with concurrent exports) can fail with
@@ -221,6 +222,33 @@ services:
       - ${OPENCODE_CONFIG_DIR:-./secrets/opencode/config}:/home/node/.config/opencode
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8084/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Second OpenCode Go subscription: same CLI, ANOTHER login, separate quota —
+  # so its own process, like every other subscription. Two plans must never
+  # share a sidecar: the process serves exactly one plan (SWITCHYARD_PLAN) with
+  # exactly one CLI login, and pointing the second plan at the first's process
+  # would spend the first account's quota under the second plan's name.
+  opencode-go2-sidecar:
+    image: switchyard-sidecar:latest     # built by claude-max-sidecar
+    <<: *common
+    expose: ["8085"]
+    environment:
+      PROVIDER: opencode
+      BRIDGE: mcp
+      SIDECAR_PORT: "8085"
+      SWITCHYARD_PLAN: opencode-go2
+      SWITCHYARD_PLANS: /app/config/plans.yaml
+      CLI_EXTRA_ARGS: ${OPENCODE_EXTRA_ARGS:-}
+    volumes:
+      - ./config:/app/config:ro
+      - ${OPENCODE2_DATA_DIR:-./secrets/opencode2/data}:/home/node/.local/share/opencode
+      - ${OPENCODE2_CONFIG_DIR:-./secrets/opencode2/config}:/home/node/.config/opencode
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8085/health')\""]
       interval: 30s
       timeout: 5s
       retries: 3

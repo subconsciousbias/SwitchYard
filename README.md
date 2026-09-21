@@ -422,10 +422,13 @@ follow-up does arrive it is **resumed on the same plan**:
 - SwitchYard pins it there — but the pin is the session lease, and the lease
   has a TTL (`lease_ttl_seconds`, 1800s). Inside the window the plan still
   holds the provider's prompt cache for this conversation and the loop's quota
-  story, so a mid-loop follow-up finishes where it started, spent or not. Past
-  the window — by which point no provider's cache is warm anyway — the lease
-  is gone and the follow-up places fresh, spilling down the lane like any new
-  request.
+  story, so a mid-loop follow-up finishes where it started, spent or not. If
+  the pinned plan's slots are all busy, the follow-up waits up to
+  `pin_wait_seconds` (10s) for one to free before refusing — the wait holds no
+  slot, so other sessions keep being placed while it does; a plan under an
+  active cooldown is refused immediately. Past the lease window — by which
+  point no provider's cache is warm anyway — the lease is gone and the
+  follow-up places fresh, spilling down the lane like any new request.
 - The sidecar rebuilds the session from the caller's own request, which carries
   the whole history, tool results and all.
 - This is the **only** path allowed to queue. A new request still fails fast so
@@ -663,6 +666,10 @@ isolated from your host CLIs — deliberately, for two reasons:
 
 - **Claude on macOS keeps its token in the login Keychain**, so mounting
   `~/.claude` gives a Linux container settings and history but no credentials.
+  On Linux the token sits in the user's keyring (GNOME Keyring / KWallet, read
+  by the CLI via `secret-tool`); on Windows it lives in Windows Credential
+  Manager, encrypted with DPAPI. None of those stores are reachable from
+  inside the container.
 - OAuth refresh needs write access, so sharing means a containerised CLI writing
   into the config directory your interactive CLI is using, mid-session.
 

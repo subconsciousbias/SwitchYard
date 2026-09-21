@@ -134,6 +134,12 @@ class Pacing:
 class Settings:
     drain_within_days: int = 21
     lease_ttl_seconds: int = 1800
+    # How long a mid-tool-loop follow-up waits for a slot on its pinned plan
+    # before 429ing. Zero restores fail-fast. The wait keeps a loop on the plan
+    # holding the provider's prompt cache during the short bursts when every
+    # slot is momentarily busy; waiting longer than roughly one turn (10-20s)
+    # just moves the caller's own retry delay into the gateway.
+    pin_wait_seconds: float = 10.0
     # Move inline <think>...</think> out of streamed content and into
     # reasoning_content, the way a buffered response already does.
     split_reasoning_tags: bool = True

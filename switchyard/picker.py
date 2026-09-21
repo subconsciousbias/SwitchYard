@@ -1,7 +1,9 @@
 """Lane -> plan selection: session affinity first, then ordered fill."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -115,6 +117,8 @@ class Picker:
 
         by_ref = {m.ref: m for m in members}
         skipped: list[str] = []
+        wait = (self.registry.settings.pin_wait_seconds
+                if pinned and session else 0.0)
 
         # 1. Affinity. A session that already has a provider stays on it as
         #    long as that provider is still in the lane and has a free slot.
@@ -129,25 +133,41 @@ class Picker:
                 # quota story stays on one plan. New requests still skip the
                 # plan, so it drains rather than being hammered.
                 cap, reason = await self._cap(model, allow_spent=pinned)
-                if cap > 0 and await self.slots.try_claim(
-                        plan.key, cap, rid, model.ref, model.max_parallel,
-                        lane=lane) == 1:
-                    await self.slots.touch_lease(session, self.registry.settings.lease_ttl_seconds)
-                    return Pick(lane, model, plan, rid, session, True, [], cap, reason)
-                if pinned:
-                    # The pin outranks a spill only inside the lease window,
-                    # where the cached prefix is still plausibly warm. It is
-                    # not forever: when the lease lapses this branch no longer
-                    # runs, the follow-up places fresh below, and that is safe
-                    # -- every bridge now rebuilds a lost session from the
-                    # caller's own request (mcp_bridge resume_gone_session),
-                    # and native plans take foreign tool_call_ids as the
-                    # opaque strings they are.
-                    raise LaneSaturated(
-                        lane, f"pinned to {held} mid-tool-loop; it has no free slot")
-                # Its slots are full or it just got cooled down; fall through
-                # and re-lease. Sessions follow capacity rather than blocking.
-                skipped.append(f"{held}(lease unusable)")
+                # When the plan's slots are all busy, a pinned follow-up waits
+                # briefly for one rather than 429ing. The wait holds no slot —
+                # this loop parks in the gateway, and other sessions keep
+                # being placed while it does — so a burst of concurrent turns
+                # on the pinned plan serialises here instead of bouncing
+                # retries that would all come back anyway. Past the deadline
+                # the caller gets the 429 and its own backoff takes over.
+                # No wait when there is nothing to wait FOR: a cap of 0 or an
+                # active cooldown will not lift inside 10s, so fail (or spill)
+                # straight away.
+                cooled, _, _ = await self.slots.cooldown_state(plan.key)
+                deadline = time.monotonic() + (wait if cap > 0 and not cooled else 0.0)
+                while True:
+                    if cap > 0 and await self.slots.try_claim(
+                            plan.key, cap, rid, model.ref, model.max_parallel,
+                            lane=lane) == 1:
+                        await self.slots.touch_lease(
+                            session, self.registry.settings.lease_ttl_seconds)
+                        return Pick(lane, model, plan, rid, session, True,
+                                    [], cap, reason)
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(0.5)
+                # The pin is a preference with a deadline, not a guarantee.
+                # The wait rides out a burst so the loop stays on the plan
+                # holding the provider's prompt cache; past it the follow-up
+                # places fresh down the lane, which is safe -- every bridge
+                # now rebuilds a lost session from the caller's own request
+                # (mcp_bridge resume_gone_session), and native plans take
+                # foreign tool_call_ids as the opaque strings they are. Its
+                # slots are full or it just got cooled down; re-lease wherever
+                # there is room. Sessions follow capacity rather than
+                # blocking, and the lane only 429s when ALL of it is full.
+                skipped.append(f"{held}(pinned, no free slot after {wait:g}s)"
+                               if pinned else f"{held}(lease unusable)")
             elif held:
                 await self.slots.drop_lease(session)
 

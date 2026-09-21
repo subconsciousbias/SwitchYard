@@ -403,9 +403,15 @@ def test_a_mid_tool_loop_followup_pins_to_its_plan_instead_of_spilling():
     Past the lease TTL the pin is gone with the cache, and the same follow-up
     places fresh — safe now that any bridge rebuilds a lost session from the
     caller's own request.
+
+    Runs with `pin_wait_seconds: 0` so the fail-fast contract is exercised
+    directly; the waiting behaviour has its own test below.
     """
     async def go():
         reg, slots, picker = build()
+        from dataclasses import replace
+        picker.registry = replace(
+            reg, settings=replace(reg.settings, pin_wait_seconds=0))
         lane = "forge"
         session = "sess-pinned"
 
@@ -757,6 +763,95 @@ def test_naming_a_deployment_still_claims_a_slot_and_honours_limits():
     ref, cap, refused = run(go())
     assert ref in refused, refused
     print(f"  {ref}: {cap} concurrent, then refused ({refused.split(':')[-1].strip()})")
+
+
+def test_a_pinned_followup_waits_for_a_slot_before_refusing():
+    """The pin waits out a short burst instead of 429ing immediately.
+
+    The old behaviour 429'd the instant the pinned plan had no free slot, and
+    since nearly every agentic turn carries tool results, a busy plan turned
+    its sessions' next turns into retry storms while the peer plans sat idle.
+    Now the follow-up parks in the gateway for `pin_wait_seconds` — holding
+    no slot, so other sessions keep being placed — and claims the first slot
+    that frees. The refusal comes only after the wait.
+    """
+    import time as _time
+
+    async def go():
+        reg, slots, picker = build()
+        from dataclasses import replace
+        reg = replace(reg, settings=replace(reg.settings, pin_wait_seconds=3.0))
+        picker.registry = reg
+        lane = "forge"
+        session = "sess-pinned-wait"
+
+        first = await picker.pick(lane, session)
+        plan = reg.plan_of(first.model)
+
+        # Fill every remaining slot of the pinned plan, so its next claim
+        # must fail — the way a burst of concurrent turns does.
+        filler = None
+        for n in range(plan.max_parallel * 2):
+            rid = f"wait-filler-{n}"
+            if await slots.try_claim(plan.key, plan.max_parallel, rid,
+                                     first.ref, first.model.max_parallel) != 1:
+                break
+            filler = rid
+        assert filler is not None, "could not fill the pinned plan"
+
+        # The pinned follow-up waits and gets the slot the moment it frees.
+        async def free_soon():
+            await asyncio.sleep(0.3)
+            await picker.release(plan.key, first.request_id, first.ref)
+
+        freer = asyncio.create_task(free_soon())
+        started = _time.monotonic()
+        resumed = await picker.pick(lane, session, pinned=True)
+        elapsed = _time.monotonic() - started
+        await freer
+        assert resumed.ref == first.ref, (resumed.ref, first.ref)
+        assert resumed.sticky
+        assert 0.3 <= elapsed < 2.5, elapsed
+        await picker.release(resumed.plan.key, resumed.request_id, resumed.ref)
+
+        # With no slot ever freeing, the wait ends in the same refusal — and
+        # the wait happens only when the plan might free up: a cooled plan is
+        # refused immediately.
+        refilled = []
+        for n in range(plan.max_parallel * 2):
+            rid = f"wait-filler-b-{n}"
+            if await slots.try_claim(plan.key, plan.max_parallel, rid,
+                                     first.ref, first.model.max_parallel) != 1:
+                break
+            refilled.append(rid)
+        started = _time.monotonic()
+        try:
+            await picker.pick(lane, session, pinned=True)
+        except LaneSaturated as exc:
+            detail = str(exc)
+        else:
+            raise AssertionError("a full pinned plan must still refuse eventually")
+        elapsed = _time.monotonic() - started
+        assert first.ref in detail, detail
+        assert elapsed >= 2.5, elapsed
+
+        await slots.cool_down(plan.key, 900, "quota_exhausted")
+        started = _time.monotonic()
+        try:
+            await picker.pick(lane, session, pinned=True)
+        except LaneSaturated:
+            pass
+        else:
+            raise AssertionError("a cooled pinned plan must refuse, not wait")
+        assert _time.monotonic() - started < 0.5, "cooled plan must fail fast"
+
+        for rid in refilled:
+            await picker.release(plan.key, rid, first.ref)
+        return first.ref, detail
+
+    ref, detail = run(go())
+    print(f"  pinned to {ref}: waited out the burst, refused only after the "
+          f"deadline ({detail[:70]}...)")
 
 
 if __name__ == "__main__":
