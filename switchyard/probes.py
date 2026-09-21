@@ -122,6 +122,12 @@ def dig(doc: Any, path: str) -> Any:
     list whose `key` equals `value`. MiniMax returns one entry per model family
     (`model_remains[].model_name` of "general", "video", ...), and depending on
     array order would break the moment they add a family.
+
+    Several conditions can be joined with `&`, because one field is not always
+    enough to identify a row: z.ai returns two entries of
+    `type=TOKENS_LIMIT` that differ only by `unit` (3 for the 5-hour window, 6
+    for the weekly one), so `limits.type=TOKENS_LIMIT&unit=6.percentage` is the
+    only way to name the right one.
     """
     cur = doc
     for part in path.split("."):
@@ -131,9 +137,10 @@ def dig(doc: Any, path: str) -> Any:
             cur = cur[part]
         elif isinstance(cur, list):
             if "=" in part:
-                key, _, want = part.partition("=")
+                wanted = [c.partition("=") for c in part.split("&")]
                 cur = next((item for item in cur
-                            if isinstance(item, dict) and str(item.get(key)) == want), None)
+                            if isinstance(item, dict)
+                            and all(str(item.get(k)) == v for k, _, v in wanted)), None)
                 if cur is None:
                     return None
             else:

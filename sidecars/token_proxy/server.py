@@ -252,6 +252,47 @@ def _safe_json(resp: httpx.Response):
         return {"error": resp.text[:2000]}
 
 
+# The subscription's real headroom, which nothing else exposes. api.x.ai's
+# x-ratelimit-* headers are an advertised ceiling, not live usage — measured:
+# three calls consuming ~3,000 tokens left remaining-tokens at exactly
+# 53,000,000 — and /v1/usage, /v1/subscription and /v1/quota are all 404. The
+# Grok CLI reads this instead, with the same bearer it uses for chat:
+#
+#   {"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY",
+#              "start":"...","end":"2026-09-24T18:29:42+00:00"},
+#              "creditUsagePercent":100.0,
+#              "productUsage":[{"product":"GrokBuild","usagePercent":100.0}],
+#              "prepaidBalance":{"val":995}}}
+USAGE_URLS = {
+    "xai": "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+}
+
+
+@app.get("/usage")
+async def usage() -> JSONResponse:
+    """The provider's own usage report, fetched with this process's grant.
+
+    Kept here rather than in the prober because this is where the token lives:
+    the portal never sees a credential, it just reads the JSON.
+    """
+    url = USAGE_URLS.get(PROVIDER)
+    if url is None:
+        raise HTTPException(status_code=501,
+                            detail=f"no usage endpoint known for {PROVIDER!r}")
+    try:
+        token = oauth.access_token(PROVIDER)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {token}"},
+                                follow_redirects=True)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502,
+                            detail=f"usage endpoint returned {resp.status_code}")
+    return JSONResponse(content=_safe_json(resp))
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     return await _forward(request, "chat_completions_path", "chat/completions")

@@ -928,6 +928,13 @@ async def health() -> dict:
             "session_ttl_seconds": SESSION_TTL}
 
 
+@app.get("/usage")
+async def usage() -> dict:
+    """Same report as the text bridge: the CLI's own /usage, via its transcript.
+    Registered on both apps because a plan on BRIDGE=mcp serves from this one."""
+    return await cli_bridge.usage_report()
+
+
 @app.get("/v1/models")
 async def models() -> dict:
     return await cli_bridge.models()

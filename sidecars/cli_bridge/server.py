@@ -59,6 +59,7 @@ import os
 import re
 import tempfile
 import time
+from pathlib import Path
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -842,6 +843,156 @@ def to_openai(payload: dict, model: str) -> dict:
             "total_tokens": int(usage.get("input_tokens", 0) or 0) + int(usage.get("output_tokens", 0) or 0),
         },
     }
+
+
+# --------------------------------------------------------------- plan usage ---
+# Where the CLI writes its session transcripts. `claude -p "/usage"` runs the
+# same slash command the TUI does and records the report it fetched, which is
+# the only way to read plan headroom without calling Anthropic's API with the
+# subscription's own token -- the thing a subscription's terms do not allow.
+CLAUDE_PROJECTS = Path(os.environ.get(
+    "CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude" / "projects")))
+USAGE_TIMEOUT = float(os.environ.get("USAGE_TIMEOUT_SECONDS", "120"))
+
+
+def _find_usage_report(since: float) -> dict | None:
+    """The newest `usageReport` written to a transcript after `since`.
+
+    Transcripts are JSONL, one object per line, and the report is nested
+    somewhere inside the record for the command that produced it — the exact
+    depth has moved between versions, so it is searched for by key rather than
+    by a fixed path.
+    """
+    newest: tuple[float, dict] | None = None
+    if not CLAUDE_PROJECTS.is_dir():
+        return None
+    for path in CLAUDE_PROJECTS.rglob("*.jsonl"):
+        try:
+            if path.stat().st_mtime < since - 5:
+                continue
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        if "usageReport" not in text:
+            continue
+        for line in text.splitlines():
+            if "usageReport" not in line:
+                continue
+            try:
+                found = _dig_key(json.loads(line), "usageReport")
+            except ValueError:
+                continue
+            if isinstance(found, dict) and found.get("rate_limits"):
+                stamp = path.stat().st_mtime
+                if newest is None or stamp > newest[0]:
+                    newest = (stamp, found)
+    return newest[1] if newest else None
+
+
+def _dig_key(node, key: str):
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+        for value in node.values():
+            found = _dig_key(value, key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _dig_key(value, key)
+            if found is not None:
+                return found
+    return None
+
+
+CODEX_SESSIONS = Path(os.environ.get(
+    "CODEX_SESSIONS_DIR", str(Path.home() / ".codex" / "sessions")))
+
+
+def _codex_rate_limits() -> dict | None:
+    """The newest `rate_limits` block Codex wrote to a session rollout.
+
+    Codex records it on ordinary calls, so unlike Claude nothing has to be run
+    to produce it — the cost is that it is only as fresh as the last request
+    this sidecar made. `resets_at` says which window it describes, so a stale
+    reading is still interpretable rather than silently wrong.
+    """
+    if not CODEX_SESSIONS.is_dir():
+        return None
+    files = sorted((p for p in CODEX_SESSIONS.rglob("*.jsonl")),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in files[:25]:
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        if "rate_limits" not in text:
+            continue
+        for line in reversed(text.splitlines()):
+            if "rate_limits" not in line:
+                continue
+            try:
+                found = _dig_key(json.loads(line), "rate_limits")
+            except ValueError:
+                continue
+            if isinstance(found, dict) and found.get("primary"):
+                return {"rate_limits": found,
+                        "observed_at": path.stat().st_mtime}
+    return None
+
+
+async def usage_report() -> dict:
+    """What the vendor's own client last reported about this plan's headroom.
+
+    Deliberately never a direct call to the vendor's usage API — Anthropic's
+    api/oauth/usage or ChatGPT's backend-api/codex/usage — because reaching
+    those from here means using the subscription's own OAuth token, which is
+    what its terms do not allow. The CLI is asked instead, or its own records
+    are read.
+    """
+    if PROVIDER == "codex":
+        report = _codex_rate_limits()
+        if report is None:
+            raise HTTPException(
+                status_code=503,
+                detail="no rate_limits recorded yet — codex writes them on a "
+                       "real request, so send one through this plan first")
+        return report
+    if PROVIDER != "claude":
+        raise HTTPException(status_code=501,
+                            detail=f"no usage report implemented for {PROVIDER!r}")
+    started = time.time()
+    proc = await asyncio.create_subprocess_exec(
+        PROFILE["cli"], "-p", "/usage",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd="/tmp")
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), USAGE_TIMEOUT)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        raise HTTPException(status_code=504,
+                            detail=f"/usage did not finish within {USAGE_TIMEOUT:.0f}s")
+    if proc.returncode != 0:
+        raise HTTPException(
+            status_code=502,
+            detail=f"/usage exited {proc.returncode}: {err.decode(errors='replace')[:300]}")
+
+    report = _find_usage_report(started)
+    if report is None:
+        # The command ran but wrote nothing we recognise — a version change in
+        # the transcript shape is the likely cause, and saying so beats
+        # returning an empty report that reads as "no usage".
+        raise HTTPException(
+            status_code=502,
+            detail="/usage produced no usageReport in the CLI's transcripts; the "
+                   "transcript shape may have changed in this CLI version")
+    return report
+
+
+@app.get("/usage")
+async def usage() -> dict:
+    return await usage_report()
 
 
 @app.get("/health")

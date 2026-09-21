@@ -221,14 +221,45 @@ plans:
         kind: tokens
         period: rolling_5h
         allowance: null           # TODO: confirm on the Z.AI plan page
-        source: estimate
+        source: probe
       - name: weekly
         role: target
         kind: tokens
         period: week
         allowance: null           # TODO: confirm; may be monthly instead
-        source: estimate
+        source: probe
     notes: "Cancelled. Severely limited — drain whatever is left."
+    probe:
+      # z.ai publishes the Coding Plan's own quota here. The key goes in
+      # Authorization RAW — a `Bearer ` prefix is rejected — which is why this
+      # is a header mapping rather than probe kind `bearer`.
+      #
+      #   {"data":{"level":"pro","limits":[
+      #     {"type":"TIME_LIMIT","unit":5,"number":1,"usage":1000,
+      #      "remaining":1000,"percentage":0,"nextResetTime":...},
+      #     {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":0},
+      #     {"type":"TOKENS_LIMIT","unit":6,"number":1,"percentage":1,
+      #      "nextResetTime":1790542882984}]}}
+      #
+      # Two TOKENS_LIMIT rows differ only by `unit` — 3 carries `number: 5` for
+      # the 5-hour window, 6 carries `number: 1` for the weekly one — so both
+      # fields are matched. Matching on type alone would read whichever came
+      # first in the array.
+      kind: none
+      url: https://api.z.ai/api/monitor/usage/quota/limit
+      method: GET
+      window: weekly
+      interval_seconds: 600
+      headers:
+        Authorization: os.environ/GLM_API_KEY
+      windows:
+        5h:
+          used_percent: [data.limits.type=TOKENS_LIMIT&unit=3.percentage]
+          reset_at: [data.limits.type=TOKENS_LIMIT&unit=3.nextResetTime]
+        weekly:
+          used_percent: [data.limits.type=TOKENS_LIMIT&unit=6.percentage]
+          reset_at: [data.limits.type=TOKENS_LIMIT&unit=6.nextResetTime]
+
     models:
       glm-5.3:
         # Judgement-regular tier. Ids confirmed against the coding endpoint's
@@ -378,14 +409,43 @@ plans:
         role: constraint          # do not blow the burst window
         kind: tokens
         period: rolling_5h
-        allowance: null           # TODO: fill after a cycle of observation
-        source: sidecar
+        allowance: null           # percent only; see the probe below
+        source: probe
       - name: weekly
         role: target              # this is the allowance worth filling
         kind: tokens
         period: week
-        allowance: null           # TODO
-        source: sidecar
+        allowance: null           # percent only; see the probe below
+        source: probe
+    probe:
+      # Not a console endpoint: the sidecar runs the CLI's own `/usage` and
+      # returns the report it wrote to its transcript. Anthropic does publish
+      # this at api.anthropic.com/api/oauth/usage, but reaching it from here
+      # would mean using the subscription's OAuth token directly, which its
+      # terms do not allow — so the vendor's own client is asked instead.
+      #
+      #   {"rate_limits":{"limits":[
+      #      {"kind":"session","percent":2,"resets_at":"2026-09-21T09:10:00+00:00"},
+      #      {"kind":"weekly_all","percent":98,"resets_at":"2026-09-23T03:00:00+00:00",
+      #       "severity":"critical"},
+      #      {"kind":"weekly_scoped","percent":12,"scope":{"model":{...}}}]}}
+      #
+      # `weekly_scoped` is deliberately not mapped: it is one model's share of
+      # the same week, so showing it as the weekly window would understate what
+      # is left. `weekly_all` is the one that stops you.
+      kind: none              # no cookie: the sidecar holds the credential
+      url: http://claude-max-sidecar:8081/usage
+      method: GET
+      window: weekly
+      interval_seconds: 900
+      timeout_seconds: 180    # it shells out to the CLI
+      windows:
+        5h:
+          used_percent: [rate_limits.limits.kind=session.percent]
+          reset_at: [rate_limits.limits.kind=session.resets_at]
+        weekly:
+          used_percent: [rate_limits.limits.kind=weekly_all.percent]
+          reset_at: [rate_limits.limits.kind=weekly_all.resets_at]
     notes: >
       Critical logic only. All three models share the plan's 2 connections and
       its quota windows, so apex and judge can never exceed them between them.
@@ -420,8 +480,31 @@ plans:
         role: target
         kind: tokens
         period: week
-        allowance: null
-        source: estimate
+        allowance: null           # percent only; see the probe below
+        source: probe
+    probe:
+      # Codex records its own rate limits in every session rollout, so the
+      # sidecar reads them from disk — no call to
+      # chatgpt.com/backend-api/codex/usage, which would mean using the seat's
+      # OAuth token directly. It is therefore as fresh as the last request this
+      # plan served; `resets_at` says which window it describes.
+      #
+      #   {"rate_limits":{"limit_id":"codex","plan_type":"prolite",
+      #     "primary":{"used_percent":100.0,"window_minutes":10080,
+      #                "resets_at":1790051828},
+      #     "secondary":null,
+      #     "credits":{"has_credits":true,"balance":"218.70"}}}
+      #
+      # window_minutes 10080 is seven days, which is the weekly window here.
+      kind: none
+      url: http://codex-sidecar:8082/usage
+      method: GET
+      window: weekly
+      interval_seconds: 600
+      windows:
+        weekly:
+          used_percent: [rate_limits.primary.used_percent]
+          reset_at: [rate_limits.primary.resets_at]
     notes: "Cancelled. Both models share the seat's 2 connections and its quota."
     models:
       # Verified ids on a ChatGPT seat, in capability order — sol strongest, then
@@ -462,15 +545,36 @@ plans:
         role: target
         kind: tokens
         period: week
-        allowance: null           # comes from the headers below
-        source: headers
-        # api.x.ai reports headroom on every non-streamed response, so this plan
-        # needs no probe and no cookie: x-ratelimit-remaining-tokens against
-        # x-ratelimit-limit-tokens (53,000,000 when last read). The token proxy
-        # forwards these specific headers for exactly this reason.
-        headers:
-          remaining: x-ratelimit-remaining-tokens
-          limit: x-ratelimit-limit-tokens
+        allowance: null           # percent only; see the probe below
+        source: probe
+        # NOT wired to x-ratelimit-*, though api.x.ai does send them. Measured:
+        # three calls consuming ~3,000 tokens left x-ratelimit-remaining-tokens
+        # at exactly 53,000,000 and remaining-requests at 8,300 — they are the
+        # advertised ceiling, not live headroom, so mapping them would put a
+        # number on the board that never moves and reads as "plenty left".
+        #
+        # There is no machine-readable alternative: /v1/usage, /v1/subscription,
+        # /v1/rate-limits and /v1/quota are all 404, and console.x.ai covers the
+        # metered API credits (balance $0.00) rather than this subscription. So
+        # this plan is ledger-estimated until xAI publishes something real.
+        # The proxy still forwards those headers — retry-after among them — and
+        # a `headers:` mapping here is all it would take if they ever go live.
+    probe:
+      # What the Grok CLI itself reads: the billing endpoint on its chat proxy,
+      # with the same bearer. The token proxy fetches it, so no credential
+      # reaches the portal. `creditUsagePercent` is the subscription's weekly
+      # figure — 100.0 while the x-ratelimit headers still claimed 53,000,000
+      # tokens remaining, which is exactly why those are not used.
+      kind: none
+      url: http://xai-token-proxy:8090/usage
+      method: GET
+      window: weekly
+      interval_seconds: 600
+      windows:
+        weekly:
+          used_percent: [config.creditUsagePercent,
+                         config.productUsage.product=GrokBuild.usagePercent]
+          reset_at: [config.currentPeriod.end, config.billingPeriodEnd]
     notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
     models:
       grok-4.6:
