@@ -423,20 +423,29 @@ def effective_cost_per_mtok(plan: Plan, tokens_this_month: float, metered_cost: 
 def model_effective_cost_per_mtok(
     plan: Plan, model_tokens: float, model_cost: float, plan_tokens: float
 ) -> float | None:
-    """Per-model effective $/Mtok, allocating the subscription fee pro-rata by token share.
+    """Per-model effective $/Mtok.
 
-    Rules:
-    - below 1M tokens on the model -> None (same threshold as plan version);
-    - metered plan: spend = model_cost (actual spend);
-    - subscription plan: allocate monthly fee pro-rata by token share;
-    - spend <= 0 -> 0.0; else round to 4 decimals.
+    The threshold differs by plan kind, because the number's meaning does:
+
+    - metered plan: the rate is the model's own spend over its own tokens, so
+      it needs 1M model tokens before it means anything;
+    - subscription plan: the fee is allocated by token share, and the share
+      CANCELS — spend_m = fee·m/t, so $/Mtok = fee/(t/1M), the plan's own
+      rate. Every model that carried any traffic shows it as soon as the
+      PLAN crosses 1M tokens; gating on the model's own share would hide a
+      real number from a small slice of a subscription that is being used.
+
+    Returns None when the model saw no traffic, or the meaningful threshold
+    is not met yet; spend <= 0 -> 0.0; else rounded to 4 decimals.
     """
-    if model_tokens < 1_000_000:
+    if model_tokens <= 0:
         return None
     if plan.metered:
+        if model_tokens < 1_000_000:
+            return None
         spend = model_cost
     else:
-        if plan_tokens == 0:
+        if plan_tokens < 1_000_000:
             return None
         spend = (plan.monthly_cost or 0.0) * model_tokens / plan_tokens
     if spend <= 0:

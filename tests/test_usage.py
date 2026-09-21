@@ -229,10 +229,31 @@ def test_model_eff_cost_subscription():
     assert result == 13.20
 
 
-def test_model_eff_cost_below_1m_tokens():
-    """Below 1M tokens on the model -> None, same as plan version."""
-    plan = fake_plan(monthly_cost=100.0)
-    assert model_effective_cost_per_mtok(plan, 500_000, 5.0, 1_000_000) is None
+def test_model_eff_cost_subscription_small_slice():
+    """A small slice of a used subscription still shows the plan's rate.
+
+    The pro-rata share cancels out of the division, so the number is the
+    plan's own $/Mtok the moment the PLAN crosses 1M tokens — gating on the
+    model's own 1M hid a real number from glm-5.3-flash at 878K.
+    """
+    plan = fake_plan(monthly_cost=10.0)
+    # 878K of 5M plan tokens: spend = $10 * 878440/5M, rate = spend / 0.8784M
+    result = model_effective_cost_per_mtok(plan, 878_440, 0.0, 5_000_000)
+    assert result == round(10.0 / 5.0, 4)  # == the plan's $/Mtok
+
+
+def test_model_eff_cost_subscription_plan_under_1m():
+    """Subscription whose PLAN total is under 1M -> None, same as before."""
+    plan = fake_plan(monthly_cost=10.0)
+    assert model_effective_cost_per_mtok(plan, 400_000, 0.0, 900_000) is None
+
+
+def test_model_eff_cost_no_traffic():
+    """A model that saw no traffic gets no rate, on any plan kind."""
+    plan = fake_plan(monthly_cost=10.0)
+    assert model_effective_cost_per_mtok(plan, 0, 0.0, 5_000_000) is None
+    metered = fake_plan(monthly_cost=0.0, metered=True)
+    assert model_effective_cost_per_mtok(metered, 0, 0.0, 5_000_000) is None
 
 
 def test_model_eff_cost_plan_tokens_zero():
@@ -276,6 +297,32 @@ def test_effective_cost_per_mtok_metered():
     # spend = 20.0 (metered_cost), since monthly_cost is 0/falsy
     # $20 / 40Mtok = $0.50/Mtok
     assert result == 0.50
+
+
+# ---------------------------------------------------------------------------
+# Tests: compact count formatting (the portal's `compact` filter)
+# ---------------------------------------------------------------------------
+
+def test_compact_counts():
+    """K/M/B/T scaling with one decimal, trailing zeros trimmed."""
+    from switchyard.portal.app import _compact
+    assert _compact(4_723_058) == "4.7M"
+    assert _compact(500_000) == "500K"
+    assert _compact(1_230_000_000) == "1.2B"
+    assert _compact(3.1e12) == "3.1T"
+    assert _compact(312) == "312"
+    assert _compact(0) == "0"
+    assert _compact(41_090_604) == "41.1M"
+
+
+def test_compact_boundary_and_trimming():
+    """999,999 rounds up to 1M rather than the false-precision 1000K;
+    whole values carry no trailing .0."""
+    from switchyard.portal.app import _compact
+    assert _compact(999_999) == "1M"
+    assert _compact(1_000_000) == "1M"
+    assert _compact(12_000_000) == "12M"
+    assert _compact(999_499) == "999.5K"
 
 
 # ---------------------------------------------------------------------------

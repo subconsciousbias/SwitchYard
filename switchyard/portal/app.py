@@ -71,8 +71,25 @@ def _interval(seconds) -> str:
     return f"{seconds}s" if seconds < 60 else f"{seconds // 60}m"
 
 
+def _compact(n) -> str:
+    """Token counts that scale: 4.7M beats 4,723,058, and keeps beating it at
+    1.2B or 3.1T. K covers the small end; bare numbers below a thousand. The
+    K->M boundary is nudged so 999,999 reads 1M, not the false-precision 1000K."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    for div, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if n >= div * 0.9995:
+            return sign + f"{n / div:.1f}".rstrip("0").rstrip(".") + suffix
+    return sign + f"{n:.0f}"
+
+
 templates.env.filters["ago"] = _ago
 templates.env.filters["interval"] = _interval
+templates.env.filters["compact"] = _compact
 
 state: dict = {}
 

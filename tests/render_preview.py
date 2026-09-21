@@ -195,9 +195,10 @@ def main() -> int:
     # Take the filters from the app rather than redefining them: a template
     # using a filter the preview does not know is exactly the regression this
     # is meant to catch, and duplicating them here would hide it.
-    from switchyard.portal.app import _ago, _interval
+    from switchyard.portal.app import _ago, _interval, _compact
     env.filters["ago"] = _ago
     env.filters["interval"] = _interval
+    env.filters["compact"] = _compact
     ctx = {"connect": {"base_url": "http://switchyard.local:4000/v1",
                        "anthropic_url": "http://switchyard.local:4000",
                        "lanes": list(reg.lanes)},

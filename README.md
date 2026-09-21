@@ -309,9 +309,11 @@ opening eight vendor dashboards.
   per-plan alert threshold. This is what catches a $20/hour overflow early.
   (Subscriptions allocate the plan's spend pro-rata by token share; metered
   plans show their own spend.)
-- **Effective $/Mtok** — per model on each plan row. For subscriptions: the
-  monthly fee allocated by token share. For metered plans: actual spend.
-  An em-dash means under 1M tokens so far this month.
+- **Effective $/Mtok** — per model on each plan row. For metered plans: the
+  model's own spend, shown once it has 1M tokens of its own. For
+  subscriptions: the plan's fee ÷ tokens delivered (the token-share
+  allocation cancels out, so every model on the plan shows the plan's rate
+  once the plan crosses 1M). An em-dash means that threshold is not met yet.
 
 `GET /api/state` returns all of it as JSON for your own client. Burn rate,
 monthly tokens/cost, and effective $/Mtok live on each entry of `models[]`

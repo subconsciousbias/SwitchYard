@@ -26,7 +26,12 @@
   h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
      margin:32px 0 10px;font-weight:600}
   .sub{color:var(--muted);margin:0 0 4px}
-  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  /* overflow-x, not `width` tricks: the plans table is full of nowrap mono
+     numbers whose combined minimum is wider than any fixed max-width, and a
+     table that cannot shrink pushes PAST the window. Scrolling inside the
+     panel keeps every column intact and the page honest. */
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+         padding:14px 16px;overflow-x:auto}
   .grid{display:grid;gap:12px}
   @media(min-width:780px){.grid.lanes{grid-template-columns:repeat(2,1fr)}}
   table{width:100%;border-collapse:collapse}
