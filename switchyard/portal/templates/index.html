@@ -3,6 +3,32 @@
 <h1>SwitchYard</h1>
 <p class="sub">Every lane's live capacity, and how close each subscription is to running dry.</p>
 
+{# The first question a new reader has is "how do I point something at this?".
+   The key is named, never shown: this page is screenshot-prone. #}
+<div class="panel" style="margin-bottom:14px">
+  <strong>Point your tools here</strong>
+  <table style="margin-top:6px">
+    <tr>
+      <td style="width:150px"><span class="muted">OpenAI-compatible</span></td>
+      <td class="mono">{{ connect.base_url }}</td>
+    </tr>
+    <tr>
+      <td><span class="muted">Anthropic-compatible</span></td>
+      <td class="mono">{{ connect.anthropic_url }}</td>
+    </tr>
+    <tr>
+      <td><span class="muted">API key</span></td>
+      <td class="mono">LITELLM_MASTER_KEY<span class="muted"> — the value in your
+        <span class="mono">.env</span>, not shown here</span></td>
+    </tr>
+    <tr>
+      <td><span class="muted">Model</span></td>
+      <td class="mono">{{ connect.lanes | join(' · ') }}<span class="muted">
+        — use a lane name, not a model id</span></td>
+    </tr>
+  </table>
+</div>
+
 <div class="panel row" style="margin-bottom:14px">
   <div>
     <strong>Pacing mode {{ 'on' if capacity.pacing else 'off' }}</strong>

@@ -191,7 +191,10 @@ def main() -> int:
     from switchyard.portal.app import _ago, _interval
     env.filters["ago"] = _ago
     env.filters["interval"] = _interval
-    ctx = {"capacity": capacity, "plans": rows, "settings": reg.settings,
+    ctx = {"connect": {"base_url": "http://switchyard.local:4000/v1",
+                       "anthropic_url": "http://switchyard.local:4000",
+                       "lanes": list(reg.lanes)},
+           "capacity": capacity, "plans": rows, "settings": reg.settings,
            "probes": probe_fixture(reg), "request": None}
     html = env.get_template("index.html").render(**ctx)
     out = "/tmp/switchyard-preview.html"

@@ -289,7 +289,7 @@ opening eight vendor dashboards.
 - **Burn rate** — $/hr and tokens/hr over the last 3 hours, with a per-plan
   alert threshold. This is what catches a $20/hour overflow early.
 - **Effective $/Mtok** — monthly fee ÷ tokens actually delivered. The number that
-  answers whether the $132 Ultra plan or the $55 Max plan is the better buy.
+  answers which of two plans on the same provider is the better buy.
 
 `GET /api/state` returns all of it as JSON for your own client. `POST /admin/reload`
 picks up `plans.yaml` edits without a restart.
@@ -303,7 +303,7 @@ choose to add API credits, and it ships `enabled: false`.
 
 Astra 6 is not a separate provider either — it is `gpt-6-astra`, a model on the
 OpenAI/Codex seat, so it lives under that plan as `openai/astra` and shares the
-seat's two connections, quota windows, cooldowns and 2026-10-04 expiry.
+seat's two connections, quota windows, cooldowns and expiry date.
 
 That leaves these options for a tier above Opus:
 
@@ -319,7 +319,7 @@ That leaves these options for a tier above Opus:
    derives its allowlist from this config, so no `.env` change is needed.
 
 2. **Astra 6 / GPT 6 on the Codex seat** — `openai/astra`, confirmed working and
-   enabled. Expires with the seat on 2026-10-04.
+   enabled. Expires with the seat.
 3. **Accept that there is no tier above Opus** and let `apex` resolve to
    `claude-max`, the same place `judge` lands. That is the current default. It
    is not a broken lane — it means escalation gets the best model you have, and
@@ -537,7 +537,7 @@ Codex is the stubborn case. `model_instructions_file` is the key that works;
 `experimental_instructions_file` barely moves it (14,154), and
 `include_plan_tool=false`, `include_apply_patch_tool=false` and
 `tools.web_search=false` had **no effect at all**. The residual ~9,800 is codex's
-own tool schema. Worth revisiting if that seat outlives its 2026-10-04 expiry.
+own tool schema. Worth revisiting if that seat is renewed.
 
 **On system prompts specifically**, two of the three take the caller's prompt as a
 real override: Claude via `--system-prompt`, and Codex via a
@@ -791,10 +791,9 @@ estimates plus observed-allowance learning.
 
 ## Before this is live — worth checking
 
-- **TODOs in `plans.yaml`:** the Mimo 2.5 OpenRouter slug, the OpenCode Go base
-  URL and model id, the Astra 6 endpoint (shipped disabled), and token
-  allowances for the Minimax plans — leaving those null and letting the observed
-  learning fill them in is a reasonable choice.
+- **Token allowances in `config/plans.yaml`** are left `null` in the example.
+  You can fill in a real number per window, or leave them and let the observed
+  allowance — where the plan actually ran out last cycle — fill in for you.
 - **Set `GLM_API_BASE=https://api.z.ai/api/coding/paas/v4`.** A Coding Plan key
   must use the coding endpoint; the general endpoint (and `open.bigmodel.cn`)
   rejects it — an easy one to get wrong, since the key authenticates against
@@ -814,21 +813,59 @@ estimates plus observed-allowance learning.
 python3 scripts/smoke.py         # the live stack: lanes, affinity, cooldown, tools
 ```
 
-That is the mechanical suite against a running deployment — 14 checks by default,
+That is the mechanical suite against a running deployment — 15 checks by default,
 none of which spend subscription quota. `--paid` adds the lanes that do, `--slow`
 measures CLI harness overhead.
 
 Offline, needing nothing running:
 
 ```bash
-python3 tests/test_routing.py    # ordered fill, affinity, vanishing capacity
-python3 tests/test_classify.py   # real MiniMax and Z.AI error payloads
-python3 tests/test_policy.py     # concurrency learning and pacing control
-python3 tests/test_probes.py     # quota probe field mapping and re-auth
-python3 tests/render_preview.py  # every portal template, against a fixture
+python3 -m pytest -q             # the whole suite: routing, classification,
+                                 # pacing, probes, both bridges, the token proxy
 ```
 
-Neither needs Redis or a running stack.
+No Redis, no Docker, no network, and no credentials: the fake Redis in
+`tests/fake_redis.py` stands in for the real one, and every test loads
+`config/plans.example.yaml` rather than your own plans, so the result does not
+depend on which subscriptions you happen to have.
+
+`python3 tests/render_preview.py` renders every portal template against a
+fixture and writes an HTML file you can open. It is a preview tool rather than a
+test — it catches a template that no longer renders, but it does not assert
+anything, and `pytest` does not collect it.
+
+## Provenance, and the vendor surfaces this touches
+
+Some of what SwitchYard reads is not in any vendor's public API docs. Where
+that is true, here is exactly what it does and how it was established, so you
+can judge it rather than take it on trust.
+
+**It never calls a vendor's API with a subscription credential it was not
+given.** That is the line, and it is why two obvious shortcuts were rejected.
+Anthropic publishes usage at `api.anthropic.com/api/oauth/usage` and the
+ChatGPT backend at `chatgpt.com/backend-api/codex/usage`; reaching either from
+here would mean presenting a subscription's own OAuth token to an API that
+subscription's terms do not cover. Instead:
+
+| What | How it is read | Why that is different |
+|---|---|---|
+| Claude Max usage | the sidecar runs `claude -p "/usage"` and reads the report the CLI writes to its own transcript | the vendor's client makes its own call, as it does when you type `/usage` |
+| OpenAI seat usage | the sidecar reads the `rate_limits` Codex already records in its session rollouts | nothing is called at all; the file is already on disk |
+| SuperGrok usage | the token proxy fetches `cli-chat-proxy.grok.com/v1/billing`, the endpoint the Grok CLI reads, with our own OAuth grant | the grant is SwitchYard's, obtained by its own device-code login |
+| GLM usage | `api.z.ai/api/monitor/usage/quota/limit` with your API key | an ordinary API-key call |
+| MiniMax and OpenCode Go usage | a session cookie you paste, against the same console endpoint your browser calls | you supply the credential, and can revoke it by logging out |
+
+Two further notes on method. The ChatGPT Responses request shape documented in
+`sidecars/token_proxy/server.py` was captured by pointing Codex CLI at a local
+recorder: nothing was forwarded upstream and no credential was read. It is kept
+as the reason that route was **not** taken. And the OpenCode internals described
+below come from reading the published `opencode-ai` package, which is
+MIT-licensed; the behaviours quoted were confirmed against a live `opencode run`
+rather than inferred.
+
+A session cookie is as powerful as being logged in. If pasting one is not a
+trade you want to make, delete that plan's `probe:` block and its headroom falls
+back to ledger estimates.
 
 ## Sources for the error-code behaviour
 

@@ -10,11 +10,6 @@
       <div class="mono nowrap">
         <span class="big" title="in use by this lane">{{ lane.slots_in_use_here }}</span
         ><span class="muted">/{{ lane.slots_available_now }}</span>
-        {% if lane.slots_in_use_elsewhere %}
-          <span class="tag" style="color:var(--elsewhere);border-color:currentColor"
-                title="busy on a model this lane shares with another lane — it costs capacity here, but it is not this lane's traffic">
-            +{{ lane.slots_in_use_elsewhere }} elsewhere</span>
-        {% endif %}
         {% if lane.tail_only %}
           <span class="tag warn" title="only the emergency tail is live in this lane">tail only</span>
         {% endif %}

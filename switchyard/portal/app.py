@@ -31,6 +31,22 @@ app = FastAPI(title="SwitchYard")
 templates = Jinja2Templates(directory=os.path.join(BASE, "templates"))
 
 
+def _connect_info(request) -> dict:
+    """How to point a client at the gateway, from the portal you are looking at.
+
+    The host comes from this request, so it is right whether you opened the
+    portal on localhost or across the network. The key is deliberately NOT read
+    or displayed — the page names the variable instead, because a dashboard that
+    prints its own master key is one screenshot away from giving it away.
+    """
+    host = request.url.hostname or "localhost"
+    port = os.environ.get("GATEWAY_PORT", "4000")
+    reg = state.get("registry")
+    return {"base_url": f"http://{host}:{port}/v1",
+            "anthropic_url": f"http://{host}:{port}",
+            "lanes": list(reg.lanes) if reg else []}
+
+
 def _ago(ts: float | None) -> str:
     """"2m ago" for a timestamp. A reading with no age is indistinguishable from
     a fresh one, which matters most for a cookie that expires silently."""
@@ -285,7 +301,8 @@ async def api_state() -> dict:
 async def index(request: Request):
     return templates.TemplateResponse(
         request, "index.html",
-        {"capacity": await collect_capacity(),
+        {"connect": _connect_info(request),
+         "capacity": await collect_capacity(),
          "plans": await collect_plans(), "probes": await collect_probes(),
          "settings": state["registry"].settings},
     )
