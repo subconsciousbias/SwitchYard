@@ -586,6 +586,58 @@ def test_only_a_resumption_is_allowed_to_queue():
     print("  new requests refused immediately; resumptions queue with a deadline")
 
 
+def test_a_streamed_reply_is_framed_as_sse_with_its_tool_calls():
+    """`stream: true` must produce SSE, including when the answer is tool calls.
+
+    The MCP bridge returned a JSON body whatever the caller asked for. An
+    OpenAI client that requested SSE does not error on that — it waits for
+    events that never arrive — so the caller hung with no error logged
+    anywhere, and every hung attempt left a session parked holding one of the
+    plan's connections until it reported itself at capacity. Observed exactly
+    that against the judge lane.
+    """
+    async def collect(result, model):
+        out = []
+        async for frame in server.cli_bridge.sse_from_completion(result, model):
+            out.append(frame)
+        return out
+
+    tool_result = {
+        "id": "chatcmpl-x", "created": 1, "model": "claude-opus-5",
+        "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                "name": "get_weather", "arguments": '{"city": "Oslo"}'}}]}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+    }
+    frames = asyncio.run(collect(tool_result, "claude-opus-5"))
+    assert frames[-1] == "data: [DONE]\n\n", frames[-1]
+    assert all(f.startswith("data: ") for f in frames), frames
+
+    first = json.loads(frames[0][6:])
+    delta = first["choices"][0]["delta"]
+    assert delta["role"] == "assistant"
+    calls = delta["tool_calls"]
+    assert calls[0]["index"] == 0 and calls[0]["id"] == "call_1", calls
+    assert calls[0]["function"]["name"] == "get_weather", calls
+    # The terminal frame carries the finish_reason the caller keys on.
+    last = json.loads(frames[-2][6:])
+    assert last["choices"][0]["finish_reason"] == "tool_calls", last
+    assert last["usage"]["total_tokens"] == 3, last
+
+    # A plain text answer streams too, and says "stop".
+    text_result = {
+        "id": "chatcmpl-y", "created": 2, "model": "claude-opus-5",
+        "choices": [{"index": 0, "finish_reason": "stop",
+                      "message": {"role": "assistant", "content": "OK"}}],
+        "usage": {"total_tokens": 1},
+    }
+    frames = asyncio.run(collect(text_result, "claude-opus-5"))
+    assert json.loads(frames[0][6:])["choices"][0]["delta"]["content"] == "OK"
+    assert json.loads(frames[-2][6:])["choices"][0]["finish_reason"] == "stop"
+    print("  tool calls and text both framed as SSE, with usage and finish_reason")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

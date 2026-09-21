@@ -950,6 +950,41 @@ def _codex_rate_limits() -> dict | None:
     return None
 
 
+async def sse_from_completion(result: dict, model: str):
+    """Re-emit a finished completion as a one-shot SSE stream.
+
+    Neither CLI streams, so there is nothing to relay incrementally: the answer
+    is complete before the first byte goes out. A caller that asked for
+    `stream: true` still needs SSE framing, though — given a JSON body instead,
+    an OpenAI client waits for events that never arrive and simply hangs.
+
+    Tool calls are carried too. Without them a tool-using client streaming
+    against a bridged plan sees an empty message and no finish_reason it
+    recognises.
+    """
+    choice = (result.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    base = {"id": result.get("id"), "object": "chat.completion.chunk",
+            "created": result.get("created"), "model": model}
+
+    first = {"role": "assistant"}
+    if message.get("content"):
+        first["content"] = message["content"]
+    if message.get("tool_calls"):
+        first["tool_calls"] = [
+            {"index": i, "id": call.get("id"), "type": call.get("type", "function"),
+             "function": call.get("function", {})}
+            for i, call in enumerate(message["tool_calls"])]
+    yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': first, 'finish_reason': None}]})}\n\n"
+
+    done = {**base,
+            "choices": [{"index": 0, "delta": {},
+                          "finish_reason": choice.get("finish_reason") or "stop"}],
+            "usage": result.get("usage")}
+    yield f"data: {json.dumps(done)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 async def usage_report() -> dict:
     """What the vendor's own client last reported about this plan's headroom.
 
@@ -1072,22 +1107,8 @@ async def _handle_chat(body: dict):
 
     if not body.get("stream"):
         return result
-
-    async def one_shot():
-        chunk = {
-            "id": result["id"], "object": "chat.completion.chunk",
-            "created": result["created"], "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant",
-                         "content": result["choices"][0]["message"]["content"]},
-                         "finish_reason": None}],
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
-        done = {**chunk, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": result["usage"]}
-        yield f"data: {json.dumps(done)}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(one_shot(), media_type="text/event-stream")
+    return StreamingResponse(sse_from_completion(result, model),
+                             media_type="text/event-stream")
 
 
 @app.post("/v1/chat/completions")

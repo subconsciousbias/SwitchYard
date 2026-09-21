@@ -65,6 +65,7 @@ from pathlib import Path
 log = logging.getLogger("mcp_bridge")
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="switchyard-mcp-bridge")
 
@@ -947,5 +948,16 @@ async def chat(request: Request):
     if not tools:
         # Identical to the plain CLI shim: this literally calls its function,
         # not a re-implementation of it, so there is nothing here to regress.
+        # That path already frames a streamed reply.
         return await cli_bridge._handle_chat(body)
-    return await handle_tool_request(body, tools, request)
+
+    result = await handle_tool_request(body, tools, request)
+    if not body.get("stream"):
+        return result
+    # A caller that asked for SSE and got a JSON body does not error -- it waits
+    # for events that never arrive. That is a client hanging with no log line
+    # anywhere, and each hung attempt parks a session holding a connection until
+    # the plan reports itself full.
+    return StreamingResponse(
+        cli_bridge.sse_from_completion(result, result.get("model") or ""),
+        media_type="text/event-stream")
