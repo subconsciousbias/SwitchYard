@@ -272,15 +272,29 @@ class Picker:
                 cap = 0
                 cap_reason = "tail disabled (pacing)"
 
+            # Narrow the row by the model's own `max_parallel`, the same way the
+            # aggregate counts this model toward its plan's reach a few lines
+            # down. Without it, a model of 1 on a plan of 2 drew two slot squares
+            # — the second of which it could never serve, and which the template
+            # filled from the plan's in_flight counter, reading as busy capacity
+            # that no traffic here could account for. The slots above this model's
+            # own limit remain reachable by sibling models on the same plan, not
+            # withheld from this one; the template paints them with `cap_reason`
+            # so the row still says "I can use 1, the plan has 2".
+            row_cap, row_cap_reason = cap, cap_reason
+            if model.max_parallel is not None and model.max_parallel < cap:
+                row_cap = model.max_parallel
+                row_cap_reason = f"model limit {model.max_parallel}"
+
             rows.append({
                 "ref": model.ref,
                 "model": model.key,
                 "model_label": model.display,
                 "plan": plan.key,
                 "plan_label": plan.label,
-                "cap": cap,
+                "cap": row_cap,
                 "cap_configured": plan.max_parallel,
-                "cap_reason": cap_reason,
+                "cap_reason": row_cap_reason,
                 "in_flight": inflight,
                 "model_in_flight": model_inflight,
                 "model_in_flight_here": model_here,

@@ -57,10 +57,14 @@ def fixture(reg):
         for i, model in enumerate(reg.lane_members(key)):
             plan = reg.plan_of(model)
             cap = 0 if i == 2 else plan.cap_for(model)
+            # cap_configured is the PLAN's max_parallel, not the model-narrowed
+            # one — same as picker.capacity() reports. Without the gap, no row
+            # exercises the model-limit withheld square that a model of 1 on a
+            # plan of 2 (e.g. local-box) draws.
             rows.append({
                 "ref": model.ref, "model": model.key, "model_label": model.display,
                 "plan": plan.key, "plan_label": plan.label,
-                "cap": cap, "cap_configured": plan.cap_for(model),
+                "cap": cap, "cap_configured": plan.max_parallel,
                 "cap_reason": "ahead of pace on weekly, holding" if cap == 0
                               else f"paced {cap} of {plan.max_parallel}",
                 "in_flight": min(cap, 1), "cooled": i == 1,
