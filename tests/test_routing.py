@@ -475,6 +475,44 @@ def test_a_mid_tool_loop_followup_pins_to_its_plan_instead_of_spilling():
     print(f"  pinned to {ref}: full -> {detail!r}, free -> same plan")
 
 
+def test_a_heartbeat_keeps_a_long_request_past_the_staleness_sweep():
+    """touch() must report whether the slot is still there, and keep it alive.
+
+    ZADD XX counts only members *added*, which under XX is always zero, so the
+    liveness check read every successful refresh as "the sweep already took it"
+    and each heartbeat stopped after one beat. A request outliving
+    inflight_max_age then lost its slot while still running, and a CLI call
+    legitimately runs for minutes. Verified against real Redis: `ZADD k XX 200 a`
+    returns 0 while `ZADD k XX CH 200 a` returns 1.
+    """
+    async def go():
+        reg, slots, picker = build()
+        slots.inflight_max_age = 2          # a sweep we can outlive in a test
+        pick = await picker.pick("forge", None)
+        plan, ref, rid = pick.plan.key, pick.ref, pick.request_id
+
+        assert await slots.touch(plan, rid, ref) is True, \
+            "a live claim must report alive, or its heartbeat gives up"
+
+        # Beat past the sweep horizon; the slot survives because it stays fresh.
+        for _ in range(3):
+            await asyncio.sleep(1)
+            assert await slots.touch(plan, rid, ref) is True
+        assert await slots.in_flight(plan) >= 1, "sweep took a heartbeating slot"
+        assert await slots.in_flight_model(ref) >= 1
+
+        # Once released, the same call reports gone -- which is what tells the
+        # heartbeat to stop rather than resurrect a finished request.
+        await picker.release(plan, rid, ref)
+        assert await slots.touch(plan, rid, ref) is False
+        assert await slots.in_flight_model(ref) == 0, "model counter leaked"
+        return plan, ref
+
+    plan, ref = run(go())
+    print(f"  {plan}/{ref.split('/')[-1]}: heartbeat held the slot past the sweep, "
+          f"release freed both counters")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):

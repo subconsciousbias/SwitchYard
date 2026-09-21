@@ -20,22 +20,37 @@ class FakePipeline:
     def hset(self, key, mapping=None, **_):
         self.ops.append(("hset", key, mapping or {})); return self
 
+    def zadd(self, key, mapping, xx=False, ch=False, **_):
+        self.ops.append(("zadd", key, mapping, xx, ch)); return self
+
     def expire(self, key, ttl):
         return self
 
     async def execute(self):
+        """Returns one result per queued command, in order, like a real pipeline.
+
+        It used to return [], so a caller reading `results[0]` silently got
+        nothing — which is exactly how a heartbeat whose liveness check never
+        worked passed its tests.
+        """
+        results = []
         for op in self.ops:
             if op[0] == "hincrbyfloat":
                 _, key, field, amount = op
                 h = self.store.hashes.setdefault(key, {})
                 h[field] = float(h.get(field, 0)) + float(amount)
+                results.append(h[field])
             elif op[0] == "hset":
                 _, key, mapping = op
                 self.store.hashes.setdefault(key, {}).update(
                     {k: str(v) for k, v in mapping.items()}
                 )
+                results.append(len(mapping))
+            elif op[0] == "zadd":
+                _, key, mapping, xx, ch = op
+                results.append(await self.store.zadd(key, mapping, xx=xx, ch=ch))
         self.ops.clear()
-        return []
+        return results
 
 
 class FakeRedis:
@@ -72,16 +87,21 @@ class FakeRedis:
             self.strings[key] = (self.strings[key][0], time.time() + ttl)
 
     # -- zsets -------------------------------------------------------------
-    async def zadd(self, key, mapping, xx=False, **_):
+    async def zadd(self, key, mapping, xx=False, ch=False, **_):
+        """Real ZADD counts members *added*; with CH it counts added OR updated.
+        The difference is the whole liveness signal behind touch(), so the fake
+        has to model it or a broken heartbeat looks fine in tests."""
         z = self.zsets.setdefault(key, {})
-        added = 0
+        changed = 0
         for member, score in mapping.items():
             if xx and member not in z:
                 continue
             if member not in z:
-                added += 1
+                changed += 1
+            elif ch and z[member] != float(score):
+                changed += 1
             z[member] = float(score)
-        return added
+        return changed
 
     async def zrem(self, key, member):
         self.zsets.get(key, {}).pop(member, None)

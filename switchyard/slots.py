@@ -95,8 +95,14 @@ class SlotTable:
         """
         now = time.time()
         pipe = self.redis.pipeline()
-        pipe.zadd(K_INFLIGHT.format(plan=plan), {request_id: now}, xx=True)
-        pipe.zadd(K_INFLIGHT_MODEL.format(ref=model_ref), {request_id: now}, xx=True)
+        # CH is not optional: ZADD XX without it counts only members *added*,
+        # which under XX is always zero. Reading that as "the slot is gone" made
+        # every heartbeat stop after its first beat, so a request outliving
+        # inflight_max_age lost its slot to the sweep while still running — and
+        # a CLI call legitimately runs for minutes.
+        pipe.zadd(K_INFLIGHT.format(plan=plan), {request_id: now}, xx=True, ch=True)
+        pipe.zadd(K_INFLIGHT_MODEL.format(ref=model_ref), {request_id: now},
+                  xx=True, ch=True)
         updated = await pipe.execute()
         return bool(updated and updated[0])
 
