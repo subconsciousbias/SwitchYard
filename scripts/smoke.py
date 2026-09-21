@@ -24,6 +24,9 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# The LIVE config on purpose, unlike the unit tests, which always use
+# config/plans.example.yaml: smoke checks the stack that is actually running,
+# so it has to read the plans that stack was started with.
 os.environ.setdefault("SWITCHYARD_PLANS", str(
     Path(__file__).resolve().parent.parent / "config" / "plans.yaml"))
 from switchyard import models  # noqa: E402  # read-only: which plan a member belongs to

@@ -41,7 +41,9 @@ os.environ.setdefault("SWITCHYARD_PLAN", "claude-max")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from plans_path import plans_path  # noqa: E402
 
-os.environ.setdefault("SWITCHYARD_PLANS", plans_path())
+# Assigned, not setdefault: an exported SWITCHYARD_PLANS pointing at
+# someone's real config would otherwise silently become the fixture.
+os.environ["SWITCHYARD_PLANS"] = plans_path()
 os.environ.setdefault("SIDECAR_PORT", "8081")
 
 from _modules import load  # noqa: E402
