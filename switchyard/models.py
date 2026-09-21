@@ -122,7 +122,8 @@ class Pacing:
 class Settings:
     drain_within_days: int = 21
     lease_ttl_seconds: int = 1800
-    inflight_max_age_seconds: int = 900
+    inflight_max_age_seconds: int = 120
+    heartbeat_seconds: int = 30
     default_cooldown_seconds: int = 900
     concurrency_learning: ConcurrencyLearning = field(default_factory=ConcurrencyLearning)
     pacing: Pacing = field(default_factory=Pacing)

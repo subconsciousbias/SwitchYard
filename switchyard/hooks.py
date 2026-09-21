@@ -11,6 +11,7 @@ names exactly one provider and it never has to make a routing decision.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -64,6 +65,9 @@ class SwitchyardHandler(CustomLogger):
         self._picker: Picker | None = None
         self._ledger: Ledger | None = None
         self._policy: CapacityPolicy | None = None
+        # request_id -> heartbeat task, so a live request keeps its slot and a
+        # dead one loses it within inflight_max_age_seconds.
+        self._beats: dict[str, asyncio.Task] = {}
         log.info(
             "%d plans, lanes=%s, tool-capable=%d",
             len(self.registry.plans), ",".join(self.registry.lanes),
@@ -150,6 +154,7 @@ class SwitchyardHandler(CustomLogger):
                 headers={"Retry-After": "20"},
             ) from exc
 
+        self._start_heartbeat(pick.plan.key, pick.model.ref, pick.request_id)
         data["model"] = pick.model.deployment
         meta = data.setdefault("metadata", {})
         meta[META_KEY] = {
@@ -171,6 +176,31 @@ class SwitchyardHandler(CustomLogger):
         )
         return data
 
+    # -- keeping a live claim alive ----------------------------------------
+    def _start_heartbeat(self, plan_key: str, model_ref: str, request_id: str) -> None:
+        interval = max(5, self.registry.settings.heartbeat_seconds)
+
+        async def beat() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(interval)
+                    alive = await self.slots.touch(plan_key, request_id, model_ref)
+                    if not alive:
+                        # The sweep already removed it; nothing to keep alive.
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("heartbeat for %s stopped", request_id, exc_info=True)
+
+        task = asyncio.create_task(beat())
+        self._beats[request_id] = task
+
+    def _stop_heartbeat(self, request_id: str) -> None:
+        task = self._beats.pop(request_id, None)
+        if task:
+            task.cancel()
+
     # -- outbound: release the slot, record usage --------------------------
     def _ctx(self, kwargs: dict) -> dict | None:
         meta = (kwargs.get("litellm_params", {}) or {}).get("metadata") or kwargs.get("metadata") or {}
@@ -182,6 +212,7 @@ class SwitchyardHandler(CustomLogger):
         if not ctx:
             return
         plan = self.registry.plans.get(ctx["plan"])
+        self._stop_heartbeat(ctx["request_id"])
         await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
         if not plan:
             return
@@ -230,6 +261,7 @@ class SwitchyardHandler(CustomLogger):
         ctx = self._ctx(kwargs)
         if not ctx:
             return
+        self._stop_heartbeat(ctx["request_id"])
         await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
         plan = self.registry.plans.get(ctx["plan"])
         if plan:
@@ -242,6 +274,7 @@ class SwitchyardHandler(CustomLogger):
         meta = (request_data or {}).get("metadata") or {}
         ctx = meta.get(META_KEY)
         if isinstance(ctx, dict):
+            self._stop_heartbeat(ctx["request_id"])
             await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
             await self._handle_failure(ctx, original_exception)
 

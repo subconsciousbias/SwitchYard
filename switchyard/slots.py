@@ -80,6 +80,26 @@ class SlotTable:
         await self.redis.zrem(K_INFLIGHT.format(plan=plan), request_id)
         await self.redis.zrem(K_INFLIGHT_MODEL.format(ref=model_ref), request_id)
 
+    async def touch(self, plan: str, request_id: str, model_ref: str) -> bool:
+        """Refresh a live claim's timestamp.
+
+        A slot is only released by the completion hook, which never runs if the
+        worker is killed or the client vanishes — so a dead request used to hold
+        its slot until the staleness sweep, 15 minutes later. A 2-slot plan then
+        looks full with nothing running.
+
+        Heartbeating while the request is alive separates "slow" from "dead",
+        which lets the sweep be aggressive without cutting off long calls (an
+        OpenCode request legitimately runs for minutes). GT/XX: only update an
+        existing member, never resurrect one the sweep already removed.
+        """
+        now = time.time()
+        pipe = self.redis.pipeline()
+        pipe.zadd(K_INFLIGHT.format(plan=plan), {request_id: now}, xx=True)
+        pipe.zadd(K_INFLIGHT_MODEL.format(ref=model_ref), {request_id: now}, xx=True)
+        updated = await pipe.execute()
+        return bool(updated and updated[0])
+
     async def in_flight_model(self, ref: str) -> int:
         key = K_INFLIGHT_MODEL.format(ref=ref)
         await self.redis.zremrangebyscore(key, "-inf", time.time() - self.inflight_max_age)

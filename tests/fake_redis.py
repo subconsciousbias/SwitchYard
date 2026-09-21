@@ -72,6 +72,17 @@ class FakeRedis:
             self.strings[key] = (self.strings[key][0], time.time() + ttl)
 
     # -- zsets -------------------------------------------------------------
+    async def zadd(self, key, mapping, xx=False, **_):
+        z = self.zsets.setdefault(key, {})
+        added = 0
+        for member, score in mapping.items():
+            if xx and member not in z:
+                continue
+            if member not in z:
+                added += 1
+            z[member] = float(score)
+        return added
+
     async def zrem(self, key, member):
         self.zsets.get(key, {}).pop(member, None)
 

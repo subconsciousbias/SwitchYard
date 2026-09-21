@@ -410,7 +410,7 @@ Each CLI offers a different lever, all now applied:
 | CLI | Mechanism | Prompt tokens, trivial call |
 |---|---|---|
 | `claude -p` | `--system-prompt` (true replace), `--disallowed-tools`, `--exclude-dynamic-system-prompt-sections` | **2** |
-| `opencode run` | `--agent switchyard` — a custom agent (`harness/opencode.json`) with every tool disabled and no prompt of its own | 7,239 → **423** |
+| `opencode run` | `--agent switchyard` — a custom agent (`harness/opencode.json`) with every tool disabled and no prompt of its own | 7,239 → **445** |
 | `codex exec` | `-c model_instructions_file=<path>` replaces the compiled-in base instructions | 14,255 → **9,768** |
 
 Measured through the bridge, not inferred. OpenCode's 92% cut is the important
@@ -427,32 +427,54 @@ real override: Claude via `--system-prompt`, and Codex via a
 `model_instructions_file` written per request, which replaces the compiled-in base
 instructions.
 
-**OpenCode has no override.** Six mechanisms were tested, all negative — recorded
-here because the documentation and search results confidently describe several of
-them as working:
+**OpenCode's `agent.prompt` does replace the base prompt** — and whether you want
+that depends on the provider, which took three attempts and a read of the source to
+establish.
+
+`packages/opencode/src/session/llm/request.ts` makes it a binary switch:
+
+```ts
+...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+```
+
+`SystemPrompt.provider()` picks a base prompt file *by model id* —
+`prompt/anthropic.txt`, `gpt.txt`, `default.txt` and so on, each 1,700–2,000
+tokens. For a model it matches, setting `prompt` replaces that file and saves most
+of it: measured 2,351 tokens without a prompt against 589 with one, in a harness
+where a base file applied.
+
+**For `xai/grok-*` no base file matches**, so there is nothing to replace and the
+prompt is pure cost. In the real deployment path: 445 tokens with no prompt, 604
+with one. So the agent deliberately has **no `prompt` field**. Revisit that if you
+ever route an Anthropic- or GPT-family model through OpenCode, where the saving
+would invert.
+
+What does *not* work, tested:
 
 | Attempted | Result |
 |---|---|
-| `--prompt`, `--system`, `--system-prompt` flags | **exit 1**, unknown option. Not hidden — absent. (Worth testing either way: `codex`'s `--device-auth` is real yet missing from its help.) |
-| `agent.<name>.prompt` | Parses, no behavioural effect. Costs 159 tokens. |
-| `agent.<name>.system` | No effect, and **adds ~1,800 tokens** |
-| `agent.<name>.instructions` | No effect |
-| top-level `instructions` | No effect, and **adds ~1,900 tokens** |
-| `~/.config/opencode/prompt/<provider>.txt` shadowing | No such strings exist in the binary; the only `prompt/` references are MCP endpoints |
+| `--prompt`, `--system`, `--system-prompt` flags | **exit 1**, unknown option. `run.ts`'s `builder()` defines no such flag. |
+| `agent.<name>.system` | Not a schema key. Unknown keys are absorbed into `agent.options` and passed to the provider as opaque options — hence "adds ~1,800 tokens, changes nothing". |
+| `agent.<name>.instructions` | Same; a known upstream gap. |
+| top-level `instructions` | Works as designed, but it *adds* content. Never a suppression mechanism. |
+| `~/.config/opencode/prompt/<provider>.txt` shadowing | No such lookup exists. `SystemPrompt.provider()` imports fixed bundled files; there is no runtime path. |
 
-The test was discriminating: an agent instructed to "ignore the user entirely and
-reply with exactly PINEAPPLE" answered the user normally every time, while the
-`tools:` config alongside it demonstrably applied. So these keys are accepted and
-ignored, and two of them are actively expensive.
+**A caution on testing this.** I first concluded `prompt` had no effect because an
+agent told to "ignore the user and reply PINEAPPLE" answered the user normally.
+That is an injection-shaped instruction and a model declining it proves nothing.
+A benign marker ("begin every reply with `[SYD]`") was obeyed immediately. Use a
+marker, not a jailbreak, to test whether config reached the model.
 
-What *does* work is `tools:` — the whole 94% saving — including from a per-request
-`--dir` config. And the agent carries **no prompt of its own**: one line cost 582
-tokens against 423 without it, for identical answers, and it was redundant since
-the caller's prompt is folded into the message and governs anyway.
+**Per-request system prompts.** `--dir <tmpdir>` with a generated `opencode.json`
+would give a true per-request override, since `--dir` config is read. Not used: it
+measured no token benefit for our providers and adds a temp directory per request.
+The caller's prompt is folded into the message instead, which is a role difference
+(user rather than system) and the one real inconsistency left against Claude and
+Codex.
 
-So for OpenCode the caller's system prompt goes into the user message. A genuine
-inconsistency with the other two lanes, and not one that can be closed from
-outside the CLI.
+Nothing in config can suppress the `<env>` block (cwd, git state, platform, date)
+or a discovered `AGENTS.md` / `~/.claude/CLAUDE.md`. The OpenCode sidecars do not
+mount `~/.claude`, so that file is not picked up here — worth knowing it would be.
 
 **`max_tokens` is not enforced on these lanes.** No CLI has a token cap — Claude
 Code offers `--max-turns`, not a token limit — so a caller's `max_tokens` is

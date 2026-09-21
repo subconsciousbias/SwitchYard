@@ -24,8 +24,14 @@ settings:
   # How long a session keeps its model. Refreshed on every request, so an
   # active session never migrates; an idle one lets its slot go.
   lease_ttl_seconds: 1800
-  # Safety net: an in-flight slot older than this is assumed leaked and pruned.
-  inflight_max_age_seconds: 900
+  # A slot whose heartbeat has stopped for this long is assumed dead and pruned.
+  # Slots are heartbeaten while their request is alive, so this can be short
+  # without cutting off legitimately long calls — an OpenCode request runs for
+  # minutes. Without heartbeats this had to exceed the longest possible request,
+  # which meant a killed worker parked its slot for 15 minutes and a 2-slot plan
+  # looked full with nothing running.
+  inflight_max_age_seconds: 120
+  heartbeat_seconds: 30
   # Default sit-out after a hard quota rejection, when the provider gives us
   # no Retry-After to go on.
   default_cooldown_seconds: 900
