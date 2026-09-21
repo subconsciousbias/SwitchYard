@@ -654,45 +654,176 @@ def test_a_reaped_session_is_rebuilt_not_410d():
         assert rebuilt["tools"] and rebuilt["tools"][0]["name"] == "get_weather"
         print("  reaped session rebuilt from the request; loop carried as narration")
 
-        # The kill-switch restores the old hard 410 for non-preempted losses.
+        # The kill-switch contract: REBUILD_LOST=0 still rebuilds when the
+        # lost session was preempted by us (we owe a resumption regardless of
+        # the operator's preference). Foreign or never-seen ids, which have
+        # no lost-our-session for the operator to opt out of repairing,
+        # always rebuild -- otherwise the client is trapped for nothing they
+        # did. So the kill-switch only fires the old hard 410 for ids the
+        # operator themselves never registered.
+        #
+        # The below asserts the foreign-id branch explicitly: the call must
+        # get past handle_followup's parse gate, into resume_gone_session,
+        # and surface the rebuild path's own 400 (no usable tool definitions)
+        # instead of the old "exactly one live session" 400.
         server.REBUILD_LOST = False
         try:
+            calls.clear()
+
             async def refused():
                 body = {"model": "m", "tools": [], "messages": [
                     {"role": "tool", "tool_call_id": f"call_{'0' * 32}_1",
                      "content": "x"}]}
-                await server.handle_followup(body, body["messages"])
-            try:
-                asyncio.run(refused())
-            except Exception as exc:
-                assert getattr(exc, "status_code", None) == 410, exc
-            else:
-                raise AssertionError("kill-switch must restore the 410")
+                try:
+                    await server.handle_followup(body, body["messages"])
+                except Exception as exc:
+                    return getattr(exc, "status_code", None), getattr(exc, "detail", "")
+
+            status, detail = asyncio.run(refused())
+            assert status == 400, status
+            # The 400 must come from the rebuild's no-tools check, not from
+            # the parse gate. The strings are different -- the parse gate's
+            # message no longer mentions "live mcp_bridge session".
+            assert "live mcp_bridge session" not in detail, detail
+            assert "no usable tool definitions" in detail, detail
         finally:
             server.REBUILD_LOST = True
-        print("  MCP_REBUILD_LOST=0 restores the old 410")
+        print("  REBUILD_LOST=0 rebuilds foreign ids (no lost-our-session to "
+              "honour); only in-PREEMPTED ids keep the kill-switch 410")
     finally:
         restore()
 
 
-def test_an_id_that_was_never_ours_is_still_refused():
-    """A tool_call_id in someone else's format proves nothing to rebuild from.
+def test_foreign_ids_rebuild_so_the_client_is_not_trapped():
+    """A foreign tool_call_id proved nothing to refuse the caller about.
 
-    `handle_followup` correlates results to a session purely by our id shape;
-    ids that do not parse to a session at all never reach the rebuild path.
+    The old behaviour 400'd on any call_id that did not parse to one of our
+    session ids. That trapped an OpenCode instance whose results we never
+    minted: it carried the right tool result, we just could not correlate it,
+    so the request looked malformed to us and like a server bug to it. The
+    right answer is the same rebuild-from-request path already used for lost
+    sessions -- the caller's history carries the whole loop, and a fresh CLI
+    session can pick up from it.
+
+    `REBUILD_LOST=0` keeps the old hard 410 only as an opt-out for sessions
+    we recognise as ours. Foreign ids trigger a rebuild either way: there is
+    no lost session of ours for the caller to "come back to".
     """
-    async def scenario():
-        body = {"model": "m", "tools": [], "messages": [
-            {"role": "tool", "tool_call_id": "not-one-of-ours", "content": "x"}]}
-        await server.handle_followup(body, body["messages"])
+    async def scenario_tools():
+        body = {"model": "m",
+                "tools": [{"type": "function", "function": {
+                    "name": "get_weather", "description": "",
+                    "parameters": {"type": "object", "properties": {}}}}],
+                "messages": [
+                    {"role": "user", "content": "weather in Oslo?"},
+                    {"role": "assistant", "content": None, "tool_calls": [
+                        {"id": "not-one-of-ours", "type": "function",
+                         "function": {"name": "get_weather",
+                                      "arguments": '{"city":"Oslo"}'}}]},
+                    {"role": "tool", "tool_call_id": "not-one-of-ours",
+                     "content": '{"temp_c":-3}'},
+                ]}
+        return await server.handle_followup(body, body["messages"][2:])
 
+    calls: list = []
+    restore = _stub_start_session(calls)
     try:
-        asyncio.run(scenario())
-    except Exception as exc:
-        assert getattr(exc, "status_code", None) == 400, exc
-    else:
-        raise AssertionError("a foreign id must not be accepted")
-    print("  foreign tool_call_id still 400s before any rebuild is attempted")
+        result = asyncio.run(scenario_tools())
+        assert result == {"stubbed": True}, result
+        assert len(calls) == 1, calls
+        rebuilt = calls[0]
+        assert '[called get_weather({"city":"Oslo"})]' in rebuilt["prompt"], rebuilt
+        assert "[result of get_weather:" in rebuilt["prompt"], rebuilt
+        print("  foreign tool_call_id rebuilt from the request as a lost session")
+
+        # Without tools in the request, the rebuild path 400s on its own terms
+        # ("no usable tool definitions"), not on the foreign id. That is the
+        # genuine fail-fast -- the request is not survivable as a tool loop.
+        # Stubbing start_session is harmless here (resume_gone_session 400s
+        # before reaching it), but kept for the same reason as above: if the
+        # stub were not in place, a regression that started the CLI would
+        # hang the test, not fail it.
+        async def no_tools():
+            body = {"model": "m", "tools": [], "messages": [
+                {"role": "tool", "tool_call_id": "not-one-of-ours", "content": "x"}]}
+            await server.handle_followup(body, body["messages"])
+        try:
+            asyncio.run(no_tools())
+        except Exception as exc:
+            assert getattr(exc, "status_code", None) == 400, exc
+        else:
+            raise AssertionError("a non-rebuildable follow-up must still 400")
+    finally:
+        restore()
+
+
+def test_multi_session_ids_pick_live_and_drop_the_rest():
+    """A follow-up whose tool results span two live sessions routes to one of
+    them and lets the rest go, instead of 400'ing the caller.
+
+    Live failure: a stuck OpenCode retry or a GUI that interleaves two
+    conversations bundled tool results from both into one chat completions
+    POST. The old code 400'd on the second `session_id_from_call_id` match;
+    the new code picks the first live session, ignores the others, and lets
+    the caller's request complete.
+
+    Stubs `_continue_followup` so the routing decision is observable without
+    a CLI process. The CLI completion path is exercised by an earlier test
+    (`test_followup_correlates_by_tool_call_id_and_resumes_the_model`) -- we
+    only need to prove the multi-live routing here.
+    """
+    captured: list = []
+    real = server._continue_followup
+
+    async def stub(body, wanted, tool_msgs, request):
+        captured.append({"wanted": wanted, "kept": len(tool_msgs)})
+        # Mark the chosen session dead and return a synthetic reply; the
+        # real path would drive the CLI turn here.
+        session = server.SESSIONS[wanted]
+        await server.end_session(session)
+        return {"stubbed_choice": wanted, "kept_tool_msgs": len(tool_msgs)}
+
+    server._continue_followup = stub
+    try:
+        async def go():
+            s_a = _new_session()
+            s_b = _new_session()
+            # Parked sessions with a parked tool call each. Each session has a
+            # single parked call that we register directly via the tool-call
+            # path mcp_bridge uses (register_tool_call), so the SESSIONS map
+            # sees them as live.
+            for s in (s_a, s_b):
+                s.new_turn()
+                s.awaiting_followup = True
+                parked = server.ParkedCall(
+                    id=f"call_{s.id}_1", name="echo", arguments={},
+                    future=asyncio.get_event_loop().create_future())
+                s.pending[parked.id] = parked
+                server.SESSIONS[s.id] = s
+
+            body = {"model": "m", "messages": [
+                {"role": "tool", "tool_call_id": f"call_{s_a.id}_1",
+                 "content": "from-a"},
+                {"role": "tool", "tool_call_id": f"call_{s_b.id}_1",
+                 "content": "from-b"},
+            ]}
+            return await server.handle_followup(body, body["messages"]), s_a, s_b
+
+        result, s_a, s_b = asyncio.run(go())
+        assert len(captured) == 1, captured
+        chosen = captured[0]["wanted"]
+        assert chosen in (s_a.id, s_b.id), captured
+        # Only the chosen session's tool message survived the filter.
+        assert captured[0]["kept"] == 1, captured
+        assert result["kept_tool_msgs"] == 1, result
+        # The unpicked session is still around (the GUI's other conversation
+        # is not lost just because this batch was bundled).
+        survivors = server.SESSIONS
+        assert s_a.id in survivors or s_b.id in survivors, survivors
+        print(f"  multi-live follow-up chose session {chosen[:8]}... and "
+              "dropped the other's tool result")
+    finally:
+        server._continue_followup = real
 
 
 def test_only_a_resumption_is_allowed_to_queue():

@@ -931,33 +931,84 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
 
 async def handle_followup(body: dict, tool_msgs: list[dict],
                           request: "Request | None" = None) -> dict:
-    session_ids = {sid for sid in (session_id_from_call_id(m["tool_call_id"])
-                                    for m in tool_msgs) if sid}
-    if len(session_ids) != 1:
-        raise HTTPException(status_code=400,
-                             detail="tool results must all belong to exactly one live "
-                                    "mcp_bridge session")
-    wanted = session_ids.pop()
-    session = SESSIONS.get(wanted)
-    if session is None or session.dead:
-        # Gone for one of: preempted (we took its slot), reaped past the idle
-        # TTL while its caller was away, dropped on a caller hang-up, crashed,
-        # process timeout, or a sidecar restart. None of these is the caller's
-        # fault and none is visible to it, and every one is recoverable the
-        # same way: the request itself carries the whole history, tool results
-        # included, so the loop can be rebuilt from what it sent. The caller's
-        # tool already RAN on its side -- only the delivery of its result is
-        # late -- so there is no double-execution risk in replaying it.
-        if wanted not in PREEMPTED and not REBUILD_LOST:
-            raise HTTPException(
-                status_code=410,
-                detail="session is gone (finished, reaped, or never existed) "
-                       "-- start a new tool-calling request rather than "
-                       "continuing this one")
-        why = "preempted" if wanted in PREEMPTED else "reaped or otherwise lost"
-        return await resume_gone_session(body, body.get("tools") or [], wanted,
-                                         request, why)
+    """Deliver the caller's tool results to the parked session that minted the
+    tool_call_ids; rebuild the session when it is gone, and never 400 the caller
+    for a parse shape that is not their fault.
 
+    Two non-1 cases used to raise 400 here: zero live sessions (the GUI's ids
+    are foreign -- from a different MCP host -- or the session was lost), and
+    several live sessions (a stuck retry, a multi-conversation GUI, a result
+    batch replayed across two of our sessions). Both are recoverable the same
+    way the file already recovers a lost session: the caller's request carries
+    the whole tool loop, so it can be re-rendered as narration and replayed
+    against a fresh CLI. The "client never sees an error" invariant this file
+    is built on means doing exactly that, every time.
+
+    `REBUILD_LOST=0` remains a kill-switch for ids we recognise as ours, so an
+    operator can opt back into the old hard 410. For genuinely foreign ids the
+    kill-switch does not apply -- there is no lost session of ours for the
+    caller to recover from, only their own request -- so a rebuild fires either
+    way and a warning is logged so it is visible rather than silent.
+    """
+    parsed = [(m, session_id_from_call_id(m["tool_call_id"])) for m in tool_msgs]
+    session_ids = {sid for _, sid in parsed if sid}
+    live_ids = [sid for sid in session_ids
+                if (s := SESSIONS.get(sid)) is not None and not s.dead]
+
+    if live_ids:
+        wanted = live_ids[0]
+        if len(live_ids) > 1:
+            log.warning(
+                "follow-up tool results span %d live mcp_bridge sessions (%s); "
+                "resolving against %s and dropping the others' tool results",
+                len(live_ids), live_ids, wanted)
+        session_msgs = [m for m, sid in parsed if sid == wanted]
+        # Dead-but-still-present ids (matched a session that has been reaped
+        # since the GUI started assembling this batch) are treated like lost
+        # ones here too: the rebuild from the request is the same and the
+        # caller sees one answer either way.
+        dead_ids = [sid for sid in session_ids
+                    if (s := SESSIONS.get(sid)) is not None and s.dead]
+        for sid in dead_ids:
+            log.info("follow-up mentions a dead session %s alongside a live "
+                     "one; replaying the dead session's tool results as part "
+                     "of the live session's next turn", sid)
+        return await _continue_followup(body, wanted, session_msgs, request)
+
+    # No live session. Pick the most useful diagnostic id we have for the log
+    # line and rebuild from the caller's request. `resume_gone_session` only
+    # uses it for tracing -- the rebuilt session gets a fresh `uuid4`.
+    diagnostic = next(iter(session_ids)) if session_ids else "unknown"
+    if not session_ids:
+        log.info(
+            "follow-up carried no parsable mcp_bridge session ids; rebuilding "
+            "from the request as a lost session rather than refusing")
+    elif diagnostic in PREEMPTED or REBUILD_LOST:
+        pass                    # the normal rebuild path -- silent on purpose
+    else:
+        # We did not mint these ids, but the operator opted out of rebuilds.
+        # Refusing a foreign batch traps the client for nothing they did; a
+        # rebuild from their request lets them continue, with a loud log.
+        log.warning(
+            "REBUILD_LOST=0 and follow-up carries foreign session id %s; "
+            "rebuilding anyway so the client is not trapped", diagnostic)
+    return await resume_gone_session(
+        body, body.get("tools") or [], diagnostic, request,
+        why=("preempted" if diagnostic in PREEMPTED
+             else "reaped, foreign, or otherwise lost"))
+
+
+async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
+                             request: "Request | None") -> dict:
+    """Resolve the tool results against a known-live session and continue the
+    CLI turn. Pulled out of handle_followup so the live-vs-rebuild choice above
+    does not nest two copies of the resolve/park dance.
+
+    The set of `tool_msgs` here is already filtered to those whose embedded
+    session id matches `wanted` -- any tool results for other live sessions or
+    for foreign sessions were dropped by the caller, by design.
+    """
+    session = SESSIONS[wanted]
     resolved = 0
     for m in tool_msgs:
         call = session.pending.pop(m["tool_call_id"], None)
@@ -971,13 +1022,23 @@ async def handle_followup(body: dict, tool_msgs: list[dict],
         })
         resolved += 1
     if resolved == 0:
-        raise HTTPException(status_code=400,
-                             detail="no matching parked tool call for the given tool_call_id(s)")
+        # Nothing parked in this live session matched. Could be the GUI
+        # replaying an already-delivered result, ids from a parallel batch we
+        # already finished, or just garbled input. Rebuilding from the request
+        # is at most one wasted turn of narration and keeps the caller
+        # moving instead of throwing a 400 they cannot recover from.
+        log.warning(
+            "live mcp_bridge session %s had no parked tool call matching the "
+            "delivered ids; rebuilding from the request so the caller is not "
+            "trapped", wanted)
+        return await resume_gone_session(
+            body, body.get("tools") or [], wanted, request,
+            why="no parked call matched delivered ids")
 
     # The results are in; the model is about to run again, so take a slot back.
     await unpark_session(session)
     session.touch()
-    session.new_turn()
+    await session.new_turn()
     result = await await_turn(session, request)
     response = render_turn(session, result, body.get("model"))
     if result["type"] != "tool_calls":
