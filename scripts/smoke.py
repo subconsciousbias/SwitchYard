@@ -31,7 +31,11 @@ from switchyard import models  # noqa: E402  # read-only: which plan a member be
 GW = "http://localhost:4000"
 PORTAL = "http://localhost:4001"
 SIDECARS = {"claude-max-sidecar": 8081, "codex-sidecar": 8082,
-            "grok-sidecar": 8083, "opencode-go-sidecar": 8084}
+            "opencode-go-sidecar": 8084}
+# Not a CLI sidecar: it forwards the caller's body to api.x.ai under our own
+# OAuth grant, so it has no harness prompt to measure and no vendor CLI to log
+# in. Checked for a live grant instead.
+TOKEN_PROXIES = {"xai-token-proxy": 8090}
 
 results: list[tuple[str, bool, str]] = []
 
@@ -89,7 +93,8 @@ def routed_to(lane: str, since: int = 25) -> str:
 def check_services() -> None:
     out = compose("ps", "--format", "{{.Service}} {{.Status}}")
     running = [l for l in out.splitlines() if " Up " in l or l.endswith("Up")]
-    expected = {"gateway", "portal", "redis", "postgres"} | set(SIDECARS)
+    expected = ({"gateway", "portal", "redis", "postgres"}
+                | set(SIDECARS) | set(TOKEN_PROXIES))
     names = {l.split()[0] for l in running}
     check("all services up", expected <= names,
           f"missing: {sorted(expected - names)}" if expected - names else
@@ -117,6 +122,35 @@ def check_sidecar_health() -> None:
         ok = d.get("ok") and d.get("config_source") == "config"
         check(f"{svc} reads its plan from config", ok,
               f"plan={d.get('plan')} models={d.get('models')} conc={d.get('concurrency')}")
+
+
+def check_token_proxy_health() -> None:
+    """A proxy without a grant serves nothing, and says so rather than 500ing.
+
+    The grant is taken out from the host (`python3 -m switchyard.oauth login
+    xai`) because it needs a human at a browser, so an unauthorised proxy is a
+    normal state to find and worth naming precisely — the plan it fronts will
+    otherwise fail every request in its lane.
+    """
+    for svc, port in TOKEN_PROXIES.items():
+        raw = compose("exec", "-T", svc, "python3", "-c",
+                      f"import json,urllib.request;"
+                      f"print(json.dumps(json.load(urllib.request.urlopen("
+                      f"'http://localhost:{port}/health'))))")
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            check(f"{svc} health", False, raw[:120])
+            continue
+        if not d.get("authorised"):
+            check(f"{svc} has a live grant", False,
+                  f"no grant on file — run: python3 -m switchyard.oauth "
+                  f"login {d.get('provider')}")
+            continue
+        left = d.get("expires_in")
+        check(f"{svc} has a live grant", bool(d.get("ok")),
+              f"{d.get('provider')} -> {d.get('upstream_base')}, "
+              f"{left}s left, refresh={'yes' if d.get('has_refresh') else 'NO'}")
 
 
 def check_lane(lane: str, api_key: str, expect_text: str | None = None) -> None:
@@ -258,8 +292,7 @@ def check_harness_overhead() -> None:
     """The CLI's own prompt, which is quota spent on instructions you did not
     write. Slow: one real call per sidecar."""
     for svc, port, model in (("claude-max-sidecar", 8081, "claude-opus-5"),
-                             ("codex-sidecar", 8082, "gpt-5.6-sol"),
-                             ("grok-sidecar", 8083, "xai/grok-4.6")):
+                             ("codex-sidecar", 8082, "gpt-5.6-sol")):
         script = (
             "import json,urllib.request;"
             f"body=json.dumps({{'model':'{model}','max_tokens':60,"
@@ -274,10 +307,9 @@ def check_harness_overhead() -> None:
         except (ValueError, IndexError):
             check(f"{svc} harness overhead", False, raw[:120])
             continue
-        # Budgets sit a little above the measured figures (2 / 423 / 9,768), so a
+        # Budgets sit a little above the measured figures (2 / 9,768), so a
         # regression that reintroduces the CLI's own prompt trips this.
-        budget = {"claude-max-sidecar": 100, "grok-sidecar": 900,
-                  "codex-sidecar": 11000}[svc]
+        budget = {"claude-max-sidecar": 100, "codex-sidecar": 11000}[svc]
         check(f"{svc} harness overhead within budget", tokens <= budget,
               f"{tokens} prompt tokens (budget {budget})")
 
@@ -294,6 +326,7 @@ def main() -> int:
     check_services()
     check_plugin_loaded()
     check_sidecar_health()
+    check_token_proxy_health()
 
     api_key = key()
     if not api_key:

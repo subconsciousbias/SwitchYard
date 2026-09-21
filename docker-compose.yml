@@ -159,35 +159,6 @@ services:
       retries: 3
       start_period: 20s
 
-  # SuperGrok is OAuth-only and rides xAI's CLI proxy on its own quota, separate
-  # from metered api.x.ai credits. Reached through OpenCode logged in to xAI.
-  # Log in with: docker compose exec grok-sidecar opencode auth login
-  # Expires 2026-10-09 — delete this service and the plan then.
-  # No longer referenced by any plan: the grok plan moved to xai-token-proxy
-  # above, which is the path that can serve tool calls. Kept until the proxy has
-  # served real traffic, as the fallback if that grant turns out not to work —
-  # delete this service once it has.
-  grok-sidecar:
-    image: switchyard-sidecar:latest     # built by claude-max-sidecar
-    <<: *common
-    expose: ["8083"]
-    environment:
-      PROVIDER: opencode
-      SIDECAR_PORT: "8083"
-      SWITCHYARD_PLAN: grok
-      SWITCHYARD_PLANS: /app/config/plans.yaml
-      CLI_EXTRA_ARGS: ${OPENCODE_EXTRA_ARGS:-}
-    volumes:
-      - ./config:/app/config:ro
-      - ${OPENCODE_DATA_DIR:-./secrets/opencode/data}:/home/node/.local/share/opencode
-      - ${OPENCODE_CONFIG_DIR:-./secrets/opencode/config}:/home/node/.config/opencode
-    healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8083/health')\""]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
-
   # SuperGrok via Switchyard's own OAuth grant, not the OpenCode CLI. This is
   # the path that lets a caller's `tools` reach the model untouched, because
   # there is no agent harness in the way — see sidecars/token_proxy/server.py.

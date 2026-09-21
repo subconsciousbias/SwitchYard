@@ -97,8 +97,9 @@ class HeadlessFlow:
     Reverse-engineered from OpenCode's `chatgpt-headless` integration: the
     strings and the surrounding logic are both present verbatim in the binary
     at `/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe` inside the
-    grok-sidecar container (`grep -a` for the literals below finds them; the
-    file has no `strings` in that image). Traced with:
+    opencode-go-sidecar container (`grep -a` for the literals below finds them;
+    the file has no `strings` in that image; this was traced in the since-removed
+    grok-sidecar, which ran the same image). Traced with:
 
         grep -a -o "id:an,.\\{0,1500\\}" opencode.exe   # the headless method
         grep -a -o "function tt(o,e,i){.\\{0,200\\}" opencode.exe   # the code exchange

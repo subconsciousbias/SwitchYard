@@ -211,18 +211,36 @@ lines out to use the isolated stores, then `docker compose up -d` to recreate.
 ```bash
 docker compose exec claude-max-sidecar   claude login
 docker compose exec codex-sidecar        codex login --device-auth
-docker compose exec grok-sidecar         opencode auth login --provider xai
 docker compose exec opencode-go-sidecar  opencode auth login --provider opencode-go
 
-for p in 8081 8082 8083 8084; do
+for p in 8081 8082 8084; do
   docker compose exec gateway python -c "
 import json,urllib.request
 print(json.load(urllib.request.urlopen('http://$(
   case $p in 8081) echo claude-max-sidecar;; 8082) echo codex-sidecar;;
-             8083) echo grok-sidecar;; 8084) echo opencode-go-sidecar;; esac
+             8084) echo opencode-go-sidecar;; esac
 ):$p/health')))" 2>/dev/null
 done
 ```
+
+SuperGrok is not in that list any more: the `grok` plan is served by
+`xai-token-proxy`, which holds Switchyard's own OAuth grant instead of shelling
+out to a CLI. Its grant is taken out **from the host**, because the device flow
+needs a human at a browser:
+
+```bash
+python3 -m switchyard.oauth login xai          # prints a URL and a code
+python3 -m switchyard.oauth status xai         # never prints the token itself
+docker compose exec -T xai-token-proxy python3 -c \
+  "import json,urllib.request;print(json.load(urllib.request.urlopen(
+   'http://localhost:8090/health')))"
+```
+
+**Expect** `authorised: true`, `ok: true`, `has_refresh: true`, and
+`upstream_base: https://api.x.ai/v1`. The tokens land in `./secrets/oauth.json`
+(mode 0600, gitignored), which the container mounts at `/app/secrets` — so the
+host CLI and the proxy share one grant and one refresh. `ok: false` with
+`authorised: false` is the normal state before the login, not a crash.
 
 **Expect** each to report its subscription, the concurrency it read from
 `plans.yaml`, and the model aliases it will accept, e.g.:
@@ -230,8 +248,8 @@ done
 ```
 {"ok":true,"provider":"claude","subscription":"claude-max","model":"claude-opus-5",
  "models":["claude-opus-5"],"concurrency":1,"in_flight":0}
-{"ok":true,"provider":"opencode","subscription":"grok","model":"xai/grok-4",
- "models":["xai/grok-4"],"concurrency":4,"in_flight":0}
+{"ok":true,"provider":"opencode","subscription":"opencode-go",
+ "model":"opencode-go/glm-5.3-flash","concurrency":2,"in_flight":0}
 ```
 
 Then prove each CLI can really authenticate, which the health endpoint cannot
@@ -239,21 +257,20 @@ tell you — it only reports configuration:
 
 ```bash
 docker compose exec -T claude-max-sidecar  claude -p "Reply with exactly: OK" --model opus --max-turns 1
-docker compose exec -T grok-sidecar        opencode auth list | grep -E "xAI|credentials"
 docker compose exec -T opencode-go-sidecar opencode auth list | grep -E "OpenCode Go|credentials"
 ```
 
-**Expect** a reply from Claude, and the relevant provider listed for each
-OpenCode sidecar (`xAI oauth`, `OpenCode Go api`). `0 credentials` means the login did not persist — check that
-`$HOME` inside the container matches where the credential directory is mounted
-(`docker compose exec grok-sidecar sh -c 'echo $HOME; opencode auth list'`).
+**Expect** a reply from Claude, and `OpenCode Go api` listed. `0 credentials`
+means the login did not persist — check that `$HOME` inside the container
+matches where the credential directory is mounted
+(`docker compose exec opencode-go-sidecar sh -c 'echo $HOME; opencode auth list'`).
 
 You can also check the harness overhead, which is quota you spend on the CLI's own
 prompt rather than your work:
 
 ```bash
-docker compose exec -T grok-sidecar sh -c \
-  'opencode run --model xai/grok-4.6 --format json --agent switchyard "Say OK"' \
+docker compose exec -T opencode-go-sidecar sh -c \
+  'opencode run --model opencode-go/glm-5.3-flash --format json --agent switchyard "Say OK"' \
   | python3 -c 'import json,sys
 for l in sys.stdin:
     e=json.loads(l) if l.strip().startswith("{") else {}
