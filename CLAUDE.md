@@ -73,6 +73,15 @@ from `globals()`. Anything appended *after* that block is defined too late to be
 collected, so it silently does not run — the suite still reports "N tests passed"
 with your new test absent. Insert before the runner, and check the count went up.
 
+## Tests never call a real provider
+
+`tests/conftest.py` blocks every socket to a non-loopback address, so a test
+that reaches api.x.ai, api.z.ai or a local Ollama fails instead of spending
+capacity. Loopback is allowed on purpose: stub servers and subprocess bridges
+run on 127.0.0.1, which is how the real protocol gets exercised against a fake
+peer. Anything that genuinely needs a provider belongs in `scripts/smoke.py`,
+which checks a running deployment and says so.
+
 ## Tests run without services
 
 `tests/*.py` are plain scripts, no pytest plugins, no Redis, no network:

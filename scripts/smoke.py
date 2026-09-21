@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Run SwitchYard's mechanical checks against the running stack.
+"""Check a RUNNING SwitchYard deployment. This is not the test suite.
 
-Everything in TESTING.md that a machine can verify lives here, so it is run and
-not hand-typed. Exits non-zero if any check fails.
+It sends real requests to real providers, so it needs the stack up, your
+credentials present, and it consumes capacity — local models by default, and
+paid subscription quota with --paid. Nothing here is mocked; that is the point,
+and it is why it lives in scripts/ rather than tests/.
 
-    python3 scripts/smoke.py              # free: local and bulk lanes only
+The offline suite is `python3 -m pytest -q`: no network, no credentials, no
+Docker, and it refuses to reach anything but loopback (see tests/conftest.py).
+Run that constantly; run this when you have changed the deployment.
+
+    python3 scripts/smoke.py              # local models only, no paid quota
     python3 scripts/smoke.py --paid       # also the lanes that spend quota
     python3 scripts/smoke.py --slow       # also the CLI harness overhead (minutes)
 
-A check either passes with evidence or fails with the reason. Nothing is reported
-as "probably fine".
+A check either passes with evidence or fails with the reason. Nothing is
+reported as "probably fine". Exits non-zero if any check fails.
 """
 from __future__ import annotations
 
@@ -32,6 +38,8 @@ os.environ.setdefault("SWITCHYARD_PLANS", str(
 from switchyard import models  # noqa: E402  # read-only: which plan a member belongs to
 
 GW = "http://localhost:4000"
+# How long to wait before retrying a lane that answered "no capacity".
+SATURATED_RETRY_SECONDS = 8
 PORTAL = "http://localhost:4001"
 SIDECARS = {"claude-max-sidecar": 8081, "codex-sidecar": 8082,
             "opencode-go-sidecar": 8084}
@@ -70,12 +78,24 @@ def post(path: str, payload: dict, api_key: str, timeout: int = 600,
         headers["anthropic-version"] = "2023-06-01"
     else:
         headers["Authorization"] = f"Bearer {api_key}"
-    req = urllib.request.Request(GW + path, json.dumps(payload).encode(), headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as exc:
-        return {"__http__": exc.code, "__body__": exc.read().decode()[:300]}
+    # A saturated lane is retried, once, after a pause. Several checks here
+    # aim at the same 2-slot local plan back to back, and a slot is released by
+    # the completion callback slightly AFTER the response reaches us — so a
+    # sequential caller can genuinely race itself into "no capacity". That is
+    # the lane working as designed, not a failure, and reporting it as one made
+    # three checks flap. A second refusal is still reported.
+    for attempt in (1, 2):
+        req = urllib.request.Request(GW + path, json.dumps(payload).encode(), headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode()[:300]
+            saturated = exc.code == 429 and "no capacity" in body
+            if saturated and attempt == 1:
+                time.sleep(SATURATED_RETRY_SECONDS)
+                continue
+            return {"__http__": exc.code, "__body__": body}
 
 
 def state() -> dict:

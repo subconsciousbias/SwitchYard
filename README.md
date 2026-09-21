@@ -810,24 +810,27 @@ estimates plus observed-allowance learning.
 ## Tests
 
 ```bash
+python3 -m pytest -q             # routing, classification, pacing, probes,
+                                 # both bridges, the token proxy
+```
+
+No Redis, no Docker, no credentials, and **no provider calls**: `tests/conftest.py`
+blocks any socket to a non-loopback address, so a test that reaches for a real
+API fails rather than quietly spending your quota. The fake Redis in
+`tests/fake_redis.py` stands in for the real one, several tests run stub servers
+and real subprocesses on `127.0.0.1`, and every test loads
+`config/plans.example.yaml` rather than your own plans — so the result is the
+same on any machine, whatever you subscribe to.
+
+Separately, to check a deployment you are actually running:
+
+```bash
 python3 scripts/smoke.py         # the live stack: lanes, affinity, cooldown, tools
 ```
 
-That is the mechanical suite against a running deployment — 15 checks by default,
-none of which spend subscription quota. `--paid` adds the lanes that do, `--slow`
-measures CLI harness overhead.
-
-Offline, needing nothing running:
-
-```bash
-python3 -m pytest -q             # the whole suite: routing, classification,
-                                 # pacing, probes, both bridges, the token proxy
-```
-
-No Redis, no Docker, no network, and no credentials: the fake Redis in
-`tests/fake_redis.py` stands in for the real one, and every test loads
-`config/plans.example.yaml` rather than your own plans, so the result does not
-depend on which subscriptions you happen to have.
+That one is not mocked. It needs the stack up and your credentials present, and
+it spends capacity: local models by default, paid quota with `--paid`. 15 checks,
+`--slow` adds CLI harness overhead measurement.
 
 `python3 tests/render_preview.py` renders every portal template against a
 fixture and writes an HTML file you can open. It is a preview tool rather than a
