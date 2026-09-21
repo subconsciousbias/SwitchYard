@@ -18,6 +18,7 @@ logging out of MiniMax, which invalidates the session.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
@@ -234,6 +235,11 @@ class Prober:
             "needs_reauth": probe.get("needs_reauth") in ("1", "1.0", "True"),
             "remaining": _num(probe.get("remaining")),
             "total": _num(probe.get("total")),
+            # A per-window summary, already rendered by run(): "weekly=12% used"
+            # or "monthly=59 left". Without it the panel can only show an
+            # absolute remaining count, which is blank for every provider that
+            # publishes percentages — i.e. the ones the panel exists to serve.
+            "windows": probe.get("windows", ""),
         }
 
     # -- the probe itself --------------------------------------------------
@@ -383,8 +389,18 @@ class Prober:
 
 
 def _fingerprint(cookie: str) -> str:
-    """Enough to tell two cookies apart, not enough to use one."""
-    return f"{len(cookie)} chars ending {cookie[-4:]}" if len(cookie) > 8 else "short"
+    """Enough to tell two cookies apart, not enough to use one.
+
+    Deliberately no substring of the cookie. This used to end with its last four
+    characters, which is real session material on a page that promises the
+    cookie is never returned — and the panel is exactly what someone screenshots
+    when a probe fails. A truncated digest distinguishes two cookies without
+    carrying any of one.
+    """
+    if len(cookie) <= 8:
+        return "short"
+    digest = hashlib.sha256(cookie.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"{len(cookie)} chars, #{digest}"
 
 
 def _s(v: Any) -> str:

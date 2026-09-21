@@ -30,6 +30,34 @@ BASE = os.path.dirname(__file__)
 app = FastAPI(title="SwitchYard")
 templates = Jinja2Templates(directory=os.path.join(BASE, "templates"))
 
+
+def _ago(ts: float | None) -> str:
+    """"2m ago" for a timestamp. A reading with no age is indistinguishable from
+    a fresh one, which matters most for a cookie that expires silently."""
+    if not ts:
+        return "never"
+    delta = max(0.0, datetime.now(timezone.utc).timestamp() - float(ts))
+    if delta < 90:
+        return f"{int(delta)}s ago"
+    if delta < 5400:
+        return f"{int(delta // 60)}m ago"
+    if delta < 172800:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
+def _interval(seconds) -> str:
+    """Poll intervals under a minute rendered as "every 0m" before this."""
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    return f"{seconds}s" if seconds < 60 else f"{seconds // 60}m"
+
+
+templates.env.filters["ago"] = _ago
+templates.env.filters["interval"] = _interval
+
 state: dict = {}
 
 

@@ -19,8 +19,9 @@
         <td>
           <strong>{{ p.plan.label }}</strong>
           <div class="muted mono" style="font-size:12px">
-            {{ p.plan.probe.window or 'target' }} window · every
-            {{ p.plan.probe.interval_seconds // 60 }}m</div>
+            {{ p.plan.probe.windows | join(', ') if p.plan.probe.windows
+               else p.plan.probe.window }} · every
+            {{ p.plan.probe.interval_seconds | interval }}</div>
         </td>
         <td class="nowrap">
           {% if st.needs_reauth %}
@@ -35,7 +36,16 @@
           {% endif %}
         </td>
         <td class="mono nowrap">
-          {% if st.remaining is not none %}
+          {# The per-window summary, not an absolute count: MiniMax publishes
+             percentages only, so `remaining` is blank for exactly the providers
+             this panel exists to serve. With the age of the reading, because a
+             cookie expires silently and a stale number is the failure mode. #}
+          {% if st.windows %}
+            {{ st.windows.replace(',', ' · ') }}
+            {% if st.last_ok_at %}
+              <div class="muted" style="font-size:12px">read {{ st.last_ok_at | ago }}</div>
+            {% endif %}
+          {% elif st.remaining is not none %}
             {{ '{:,.0f}'.format(st.remaining) }} left
             {% if st.total %}<span class="muted">/ {{ '{:,.0f}'.format(st.total) }}</span>{% endif %}
           {% else %}
@@ -88,7 +98,8 @@
           {% endif %}
           {% if p.last_test.raw %}
             <details style="margin-top:6px">
-              <summary class="muted" style="font-size:11px;cursor:pointer">raw response</summary>
+              <summary class="muted" style="font-size:11px;cursor:pointer"
+                       title="a provider's own payload — it may carry account ids, plan ids or an email">raw response (may contain account identifiers)</summary>
               <pre class="mono" style="font-size:11px;white-space:pre-wrap;word-break:break-all;
                    background:var(--track);padding:8px;border-radius:6px;margin:6px 0 0;
                    max-height:140px;overflow:auto">{{ p.last_test.raw }}</pre>
