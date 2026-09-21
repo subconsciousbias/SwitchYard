@@ -381,6 +381,11 @@ plans:
     # Three models at 2 each would put six concurrent requests on hardware that
     # handles one or two.
     max_parallel: 2
+    # No concurrency learning here: a local server queues requests rather than
+    # refusing them, so the learner never sees pressure, reads that as headroom
+    # and keeps probing upward — while the real effect is a longer queue and
+    # worse latency on hardware that handles one or two at a time. 2 means 2.
+    learning: false
     api_base: os.environ/LOCAL_API_BASE
     api_key: os.environ/LOCAL_API_KEY
     quotas:

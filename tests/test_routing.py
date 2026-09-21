@@ -546,6 +546,49 @@ def test_the_generated_config_declares_no_general_fallbacks():
           f"context-window entries, all naming real deployments")
 
 
+def test_a_lane_board_separates_its_own_traffic_from_a_sibling_lanes():
+    """A model in several lanes is busy for all of them, but the traffic belongs
+    to whichever lane claimed it.
+
+    local-box/qwen is in `local` and `bulk`. One request on `local` must read as
+    `local`'s own slot there, and as somebody else's on `bulk` — otherwise a
+    quiet lane looks busy and there is no way to tell which lane to throttle.
+    The slot still costs real capacity in both, so slots_available_now counts it
+    either way.
+    """
+    async def go():
+        reg, slots, picker = build()
+        pick = await picker.pick("local", "sess-attribution")
+        assert pick.plan.key == "local-box", pick.ref
+
+        here = await picker.capacity("local")
+        there = await picker.capacity("bulk")
+
+        assert here["slots_in_use_here"] == 1, here
+        assert here["slots_in_use_elsewhere"] == 0, here
+        assert there["slots_in_use_here"] == 0, there
+        assert there["slots_in_use_elsewhere"] == 1, there
+
+        def row(cap, ref):
+            return next(r for r in cap["plans"] if r["ref"] == ref)
+
+        mine, theirs = row(here, pick.ref), row(there, pick.ref)
+        assert mine["model_in_flight_here"] == 1 and mine["model_in_flight_elsewhere"] == 0
+        assert theirs["model_in_flight_here"] == 0 and theirs["model_in_flight_elsewhere"] == 1
+        assert "local" in theirs["lanes_sharing"], theirs["lanes_sharing"]
+        # The busy slot is real capacity in both views, not conjured away.
+        assert mine["model_in_flight"] == theirs["model_in_flight"] == 1
+
+        # A caller naming a deployment directly has no lane; it must not be
+        # silently credited to one.
+        direct = await picker.pick("bulk", None)
+        await slots.release(direct.plan.key, direct.request_id, direct.ref)
+        return pick.ref
+
+    ref = run(go())
+    print(f"  {ref}: 1 slot reads as 'here' on local and 'elsewhere' on bulk")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):

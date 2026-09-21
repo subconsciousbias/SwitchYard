@@ -147,6 +147,9 @@ class Plan:
     configured_parallel: int | None = None   # None when `max_parallel: auto`
     max_parallel_ceiling: int | None = None
     pacing: bool | None = None
+    # None means "follow the global setting". Set `learning: false` on a plan
+    # whose concurrency must stay exactly as configured.
+    learning: bool | None = None
     supports_tools: bool | None = None
     quotas: tuple[Quota, ...] = field(default_factory=lambda: (Quota(),))
     probe: Probe | None = None
@@ -213,6 +216,18 @@ class Plan:
         if not settings.pacing.enabled:
             return False
         return self.is_subscription or (self.metered and settings.pacing.include_metered)
+
+    def learns(self, settings: Settings) -> bool:
+        """Whether the concurrency learner may move this plan's cap at all.
+
+        Opt out per plan with `learning: false`. Worth doing wherever "no refusal"
+        is not evidence of headroom: a local server queues requests instead of
+        rejecting them, so the learner sees nothing but success and keeps
+        probing, while the real effect is a growing queue and worse latency.
+        """
+        if not settings.concurrency_learning.enabled:
+            return False
+        return True if self.learning is None else bool(self.learning)
 
     # -- quota -------------------------------------------------------------
     @property
@@ -416,6 +431,7 @@ def load(path: str | None = None) -> Registry:
             max_parallel_ceiling=(int(body["max_parallel_ceiling"])
                                   if body.get("max_parallel_ceiling") else None),
             pacing=body.get("pacing"),
+            learning=body.get("learning"),
             supports_tools=body.get("supports_tools"),
             quotas=quotas,
             probe=probe,

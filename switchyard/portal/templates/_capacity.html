@@ -8,8 +8,13 @@
         <span class="muted mono">&nbsp;{{ lane.lane }}</span>
       </div>
       <div class="mono nowrap">
-        <span class="big">{{ lane.slots_in_use }}</span
+        <span class="big" title="in use by this lane">{{ lane.slots_in_use_here }}</span
         ><span class="muted">/{{ lane.slots_available_now }}</span>
+        {% if lane.slots_in_use_elsewhere %}
+          <span class="tag" style="color:var(--elsewhere);border-color:currentColor"
+                title="busy on a model this lane shares with another lane — it costs capacity here, but it is not this lane's traffic">
+            +{{ lane.slots_in_use_elsewhere }} elsewhere</span>
+        {% endif %}
         {% if lane.tail_only %}
           <span class="tag warn" title="only the emergency tail is live in this lane">tail only</span>
         {% elif lane.slots_configured != lane.slots_available_now %}
@@ -34,8 +39,34 @@
         <td>
           <div class="slots">
             {# Slots the effective cap allows, then the ones it has withheld. #}
+            {#
+              Busy slots, in attribution order: this lane's own requests first,
+              then the same model busy on *another* lane, then a sibling model
+              on the same plan. All three cost real capacity — which is why they
+              fill the same row — but only the first is this lane's traffic, and
+              conflating them made a quiet lane look busy.
+            #}
+            {% set here = p.model_in_flight_here %}
+            {% set elsewhere = p.model_in_flight_elsewhere + p.model_in_flight_direct %}
             {% for i in range(p.cap) %}
-              <span class="slot {% if p.cooled %}gone{% elif i < p.in_flight %}used{% endif %}"></span>
+              {# Past cap_configured means the learner probed above plans.yaml,
+                 which max_parallel_ceiling had to permit. Marked so an extra
+                 slot can never read as ordinary configured capacity. #}
+              {% set probed = ' probed' if i >= p.cap_configured else '' %}
+              {% if p.cooled %}
+                <span class="slot gone"></span>
+              {% elif i < here %}
+                <span class="slot used{{ probed }}" title="in use by this lane{{ ' (learner probed above the configured ' ~ p.cap_configured ~ ')' if probed }}"></span>
+              {% elif i < here + elsewhere %}
+                <span class="slot elsewhere"
+                      title="{{ p.model }} in use by {{ p.lanes_sharing|join(', ') or 'another lane' }} — occupied, but not this lane's traffic"></span>
+              {% elif i < p.in_flight %}
+                <span class="slot sibling"
+                      title="another model on {{ p.plan }} is using this connection"></span>
+              {% else %}
+                <span class="slot{{ probed }}"
+                      {% if probed %}title="learner probed above the configured {{ p.cap_configured }}, allowed by max_parallel_ceiling"{% endif %}></span>
+              {% endif %}
             {% endfor %}
             {% for i in range(p.cap, p.cap_configured) %}
               <span class="slot gone" title="withheld: {{ p.cap_reason }}"></span>

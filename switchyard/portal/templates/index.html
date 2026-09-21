@@ -27,6 +27,15 @@
 </div>
 
 <h2>Lanes — ordered capacity</h2>
+{# One legend for the whole board: it is the same key for every lane, and
+   repeating it per panel crowded out the panels themselves. #}
+<div class="legend" style="margin:-4px 0 10px">
+  <span class="k"><span class="slot used"></span>this lane</span>
+  <span class="k"><span class="slot elsewhere"></span>same model, another lane</span>
+  <span class="k"><span class="slot sibling"></span>sibling model, same plan</span>
+  <span class="k"><span class="slot gone"></span>withheld</span>
+  <span class="k"><span class="slot probed"></span>learner probed above config</span>
+</div>
 {% include "_capacity.html" %}
 
 {% if probes %}

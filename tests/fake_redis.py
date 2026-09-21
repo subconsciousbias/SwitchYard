@@ -109,6 +109,14 @@ class FakeRedis:
     async def zcard(self, key):
         return len(self.zsets.get(key, {}))
 
+    async def zrange(self, key, start, stop):
+        members = sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])
+        if stop == -1:
+            stop = len(members)
+        else:
+            stop += 1
+        return [m for m, _ in members[start:stop]]
+
     async def zremrangebyscore(self, key, lo, hi):
         z = self.zsets.get(key, {})
         for m in [m for m, s in z.items() if s <= float(hi)]:
@@ -123,6 +131,9 @@ class FakeRedis:
 
     async def hget(self, key, field):
         return self.hashes.get(key, {}).get(field)
+
+    async def hdel(self, key, field):
+        return 1 if self.hashes.get(key, {}).pop(field, None) is not None else 0
 
     async def incr(self, key):
         val = int(float((await self.get(key)) or 0)) + 1
@@ -143,8 +154,8 @@ class FakeRedis:
     # -- the claim script --------------------------------------------------
     def register_script(self, _src):
         async def claim(keys, args):
-            inflight_key, cool_key, model_key = keys
-            rid, now, plan_cap, stale_before, _ttl, model_cap = args
+            inflight_key, cool_key, model_key, lane_key = keys
+            rid, now, plan_cap, stale_before, _ttl, model_cap, lane = args
             if await self.get(cool_key) is not None:
                 return -1
             await self.zremrangebyscore(inflight_key, "-inf", stale_before)
@@ -158,5 +169,7 @@ class FakeRedis:
                 return -2
             plan_z[rid] = float(now)
             model_z[rid] = float(now)
+            if lane:
+                self.hashes.setdefault(lane_key, {})[rid] = str(lane)
             return 1
         return claim

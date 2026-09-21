@@ -123,10 +123,27 @@ class ConcurrencyLearner:
     async def effective(self, plan: Plan) -> tuple[int, str]:
         """Learned cap for right now, probing upward when it is safe to."""
         cfg = self.settings.concurrency_learning
-        ceiling = plan.max_parallel_ceiling or max(plan.configured_parallel or 1, 1) * 4
+        # Absent an explicit ceiling, never probe above the number the config
+        # states. This used to default to 4x it, which meant a plan configured
+        # at 2 silently climbed to 8: the board then drew more slots than
+        # plans.yaml declared, with nothing saying why. Probing *past* a stated
+        # limit is a decision only the operator can make, so it needs
+        # `max_parallel_ceiling`. Learning still does the valuable half by
+        # itself -- backing off below the limit under pressure.
+        #
+        # `max_parallel: auto` is the case with nothing stated, so there the
+        # seed is a guess and the ceiling has to come from cfg instead.
+        if plan.max_parallel_ceiling:
+            ceiling = plan.max_parallel_ceiling
+        elif plan.configured_parallel is not None:
+            ceiling = plan.configured_parallel
+        else:
+            ceiling = max(cfg.seed_cap, 1) * 4
         seed = plan.configured_parallel or cfg.seed_cap
 
-        if not cfg.enabled:
+        if not plan.learns(self.settings):
+            # Either learning is off globally, or this plan opted out with
+            # `learning: false`. Its cap is exactly what the config says.
             return max(1, seed), "configured"
 
         bucket = _bucket(self.settings)

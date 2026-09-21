@@ -366,6 +366,80 @@ def test_partial_knowledge_still_protects_the_known_window():
     print(f"  weekly unknown, 5h at 95% -> still capped to {cap.cap} by {st['binding']}")
 
 
+def test_learning_never_probes_above_the_configured_limit_without_a_ceiling():
+    """A stated max_parallel is a stated limit, not a starting suggestion.
+
+    The default ceiling used to be 4x the configured value, so a plan set to 2
+    silently climbed to 8: the capacity board then drew more slots than
+    plans.yaml declared, with nothing on it saying why. Probing past a stated
+    limit needs `max_parallel_ceiling` to say how far. Backing off below it
+    still happens on its own, which is the half worth having automatic.
+    """
+    async def go():
+        reg, redis, _, policy, _ = build()
+        # No ceiling declared: the configured value is the hard stop.
+        plan = replace(reg.plans["glm"], max_parallel_ceiling=None)
+        assert plan.configured_parallel == 2, plan.configured_parallel
+
+        async def probe_hard(p):
+            for bucket in ("global", f"h{datetime.now(timezone.utc).hour:02d}"):
+                await redis.hset(f"sy:learn:{p.key}:{bucket}",
+                                 mapping={"changed_at": time.time() - 10_000,
+                                          "last_rejection_at": time.time() - 10_000})
+            for _ in range(5):
+                await policy.learner.note_pressure(p.key)
+            return (await policy.effective(p)).cap
+
+        capped = plan.configured_parallel
+        for _ in range(4):                      # sustained unmet demand
+            assert await probe_hard(plan) <= capped, "probed past the configured limit"
+
+        # Declaring a ceiling is what permits it, and it stops exactly there.
+        roomy = replace(plan, max_parallel_ceiling=3)
+        seen = {await probe_hard(roomy) for _ in range(4)}
+        assert max(seen) == 3, seen
+        return capped, sorted(seen)
+
+    capped, seen = run(go())
+    print(f"  no ceiling: stays at {capped}; ceiling 3: reaches {seen[-1]}")
+
+
+def test_a_plan_can_opt_out_of_learning_entirely():
+    """`learning: false` pins a plan's cap to its configured value.
+
+    local-box is the case it exists for: a local server queues requests instead
+    of refusing them, so the learner sees only success, reads that as headroom,
+    and probes upward while the real effect is a longer queue and worse latency.
+    """
+    async def go():
+        reg, redis, _, policy, _ = build()
+        plan = reg.plans["local-box"]
+        assert plan.learning is False, "local-box should opt out in plans.yaml"
+        assert not plan.learns(reg.settings)
+
+        # Neither a refusal nor sustained demand may move it.
+        await policy.learner.note_rejection(plan, at_concurrency=2)
+        for _ in range(5):
+            await policy.learner.note_pressure(plan.key)
+        for bucket in ("global", f"h{datetime.now(timezone.utc).hour:02d}"):
+            await redis.hset(f"sy:learn:{plan.key}:{bucket}",
+                             mapping={"cap": 7, "changed_at": time.time() - 10_000})
+        eff = await policy.effective(plan)
+
+        # A plan that has not opted out still learns, so this is an opt-out and
+        # not an accidental global off-switch.
+        other = reg.plans["minimax-ultra"]
+        await policy.learner.note_rejection(other, at_concurrency=4)
+        moved = (await policy.effective(other)).cap
+        return eff.cap, eff.reason, plan.configured_parallel, moved, other.configured_parallel
+
+    cap, reason, configured, moved, other_configured = run(go())
+    assert cap == configured, (cap, configured)
+    assert reason == "configured", reason
+    assert moved < other_configured, (moved, other_configured)
+    print(f"  local-box pinned at {cap} ({reason}); minimax-ultra still moved to {moved}")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

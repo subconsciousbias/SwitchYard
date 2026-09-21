@@ -54,6 +54,15 @@ def fixture(reg):
                 "tail": reg.is_tail(key, model.ref), "days_left": plan.days_left,
                 "shares_plan_with": [m.key for m in reg.siblings(model)],
                 "cli_backed": plan.is_cli_backed,
+                # Exercise all three slot colours: the first member's busy slot
+                # is this lane's, a later one's belongs to a sibling lane, so
+                # the preview shows the attribution rather than only "used".
+                "model_in_flight": min(cap, 1),
+                "model_in_flight_here": min(cap, 1) if i == 0 else 0,
+                "model_in_flight_elsewhere": min(cap, 1) if i == 3 else 0,
+                "model_in_flight_direct": 0,
+                "model_cap": model.max_parallel,
+                "lanes_sharing": ["judge"] if i == 3 else [],
             })
         lanes.append({
             "lane": key, "label": reg.lanes[key].label,
@@ -61,6 +70,8 @@ def fixture(reg):
             "slots_available_now": sum(r["cap"] for r in rows
                                        if not r["cooled"] and not r["tail"]),
             "slots_in_use": sum(r["in_flight"] for r in rows),
+            "slots_in_use_here": sum(r["model_in_flight_here"] for r in rows),
+            "slots_in_use_elsewhere": sum(r["model_in_flight_elsewhere"] for r in rows),
             "tail_only": False, "plans": rows,
         })
 

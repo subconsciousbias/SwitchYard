@@ -106,7 +106,8 @@ class Picker:
                 plan = self.registry.plan_of(model)
                 cap, reason = await self._cap(model)
                 if cap > 0 and await self.slots.try_claim(
-                        plan.key, cap, rid, model.ref, model.max_parallel) == 1:
+                        plan.key, cap, rid, model.ref, model.max_parallel,
+                        lane=lane) == 1:
                     await self.slots.touch_lease(session, self.registry.settings.lease_ttl_seconds)
                     return Pick(lane, model, plan, rid, session, True, [], cap, reason)
                 if pinned:
@@ -135,7 +136,7 @@ class Picker:
                 skipped.append(f"{model.ref}(paced to 0)")
                 continue
             result = await self.slots.try_claim(
-                plan.key, cap, rid, model.ref, model.max_parallel)
+                plan.key, cap, rid, model.ref, model.max_parallel, lane=lane)
             if result == 1:
                 if session:
                     await self.slots.set_lease(
@@ -163,6 +164,7 @@ class Picker:
         """
         rows = []
         used = 0
+        used_elsewhere = 0
         tail_on = self.policy is None or await self.policy.tail_enabled()
         counted_used: set[str] = set()
         live_members = 0
@@ -180,6 +182,13 @@ class Picker:
             tail = self.registry.is_tail(lane, model.ref)
             cap, cap_reason = await self._cap(model)
             model_inflight = await self.slots.in_flight_model(model.ref)
+            # A model in several lanes is busy for all of them, but the traffic
+            # belongs to whichever lane claimed it. Splitting the two is what
+            # stops a sibling lane's work reading as this lane's consumption.
+            by_lane = await self.slots.in_flight_by_lane(plan.key, model.ref)
+            model_here = by_lane.get(lane, 0)
+            model_elsewhere = sum(n for k, n in by_lane.items() if k and k != lane)
+            model_direct = by_lane.get("", 0)
             if tail and not tail_on:
                 cap = 0
                 cap_reason = "tail disabled (pacing)"
@@ -195,6 +204,10 @@ class Picker:
                 "cap_reason": cap_reason,
                 "in_flight": inflight,
                 "model_in_flight": model_inflight,
+                "model_in_flight_here": model_here,
+                "model_in_flight_elsewhere": model_elsewhere,
+                "model_in_flight_direct": model_direct,
+                "lanes_sharing": [k or "direct" for k in sorted(by_lane) if k != lane],
                 "model_cap": model.max_parallel,
                 "cooled": cooled,
                 "cooldown_remaining": ttl,
@@ -209,6 +222,9 @@ class Picker:
             if plan.key not in counted_used:
                 counted_used.add(plan.key)
                 used += inflight
+                plan_lanes = await self.slots.in_flight_by_lane(plan.key)
+                used_elsewhere += sum(n for k, n in plan_lanes.items()
+                                      if k and k != lane)
             if not cooled and not tail and cap > 0:
                 live_members += 1
                 plan_caps[plan.key] = cap
@@ -224,6 +240,11 @@ class Picker:
             "slots_configured": total,
             "slots_available_now": live,   # excludes cooled plans and the tail
             "slots_in_use": used,
+            # Of the busy slots this lane can reach, how many are its own work
+            # versus a sibling lane's. They still cost real capacity either way,
+            # which is why slots_available_now counts both.
+            "slots_in_use_here": max(0, used - used_elsewhere),
+            "slots_in_use_elsewhere": used_elsewhere,
             "tail_only": live_members == 0 and bool(rows),
             "plans": rows,
         }
