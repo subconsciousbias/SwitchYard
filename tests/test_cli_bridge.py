@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -77,6 +78,55 @@ def test_no_text_raises_rather_than_returning_the_raw_stream():
         print("  a stream with no answer raises instead of echoing itself")
         return
     raise AssertionError("expected a parse failure, not a silent fallback")
+
+
+def test_structured_parser_failure_is_a_502_not_a_raw_passthrough():
+    """An OpenCode/Codex stream with no answer must surface as a real error.
+
+    The previous fallback returned the raw JSONL (step_start/step_finish lines
+    and all) as the assistant content -- issue #3 had OpenCode clients see
+    those raw events in place of a parsed answer. The fix: any structured
+    parser that fails to find text now raises HTTP 502, so the gateway can
+    retry on another lane rather than ship the raw stream to the caller.
+
+    Drive the failure path with a fake CLI binary that prints the bad stream
+    and exits 0: same contract as a real opencode run that produces only
+    step_start / step_finish events with no text part.
+    """
+    import asyncio
+    from fastapi import HTTPException
+
+    bad_stream = ('{"type":"step_start","part":{"type":"step-start"}}\n'
+                  '{"type":"step_finish","part":{"type":"step-finish",'
+                  '"tokens":{"input":1,"output":1}}}')
+
+    fake = tempfile.NamedTemporaryFile(
+        "w", suffix=".py", prefix="clib-bad-", delete=False)
+    fake.write("import sys\n"
+               f"sys.stdout.write({bad_stream!r})\n")
+    fake.close()
+    real_cli = server.CLI
+    real_bare = server.BARE
+    real_args = server.PROFILE["args"]
+    try:
+        server.CLI = sys.executable
+        server.BARE = False
+        server.PROFILE["args"] = [fake.name]
+        async def invoke():
+            return await server._run_cli("hi", None, "xai/grok-4.6", [])
+        try:
+            asyncio.run(invoke())
+        except HTTPException as exc:
+            assert exc.status_code == 502, exc.status_code
+            assert "no parsed answer" in str(exc.detail), exc.detail
+            print(f"  structured-parser failure -> 502 ({exc.detail[:60]}...)")
+            return
+        raise AssertionError("expected a 502, not a raw passthrough")
+    finally:
+        server.CLI = real_cli
+        server.BARE = real_bare
+        server.PROFILE["args"] = real_args
+        os.unlink(fake.name)
 
 
 def test_max_tokens_becomes_an_instruction():

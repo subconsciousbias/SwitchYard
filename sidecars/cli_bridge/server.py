@@ -637,6 +637,11 @@ def parse_output(stdout: str, kind: str | None = None) -> dict:
     return {"result": stdout.strip()}
 
 
+# Parser kinds whose output format is fully specified above; for them the
+# raw-output fallback at the _run_cli call site must never fire.
+STRUCTURED_PARSERS = {"claude_json", "events_json", "codex_jsonl"}
+
+
 def fold_max_tokens(system: str | None, max_tokens: int | None) -> str | None:
     """Turn the caller's max_tokens into an instruction, since no CLI has a flag.
 
@@ -775,7 +780,15 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
 
     try:
         payload = parse_output(stdout)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as exc:
+        # A structured parser knowing the output shape has nothing left to
+        # guess: echoing the raw stream here is how step_start / step_finish
+        # JSONL leaked through to clients as the "answer" (issue #3). Surface
+        # the failure as a real error so the gateway retries instead.
+        if PROFILE["parser"] in STRUCTURED_PARSERS:
+            raise HTTPException(
+                status_code=502,
+                detail=f"{PROVIDER} cli yielded no parsed answer: {exc}") from exc
         payload = {"result": stdout.strip()}
 
     # The CLI can exit 0 while reporting a limit inside the JSON envelope.

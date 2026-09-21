@@ -955,6 +955,37 @@ def test_a_prompt_over_the_argv_limit_travels_on_stdin():
     print(f"  {len(huge)}-char prompt stayed off argv and arrived whole on stdin")
 
 
+def test_run_session_fails_502_when_structured_parser_finds_no_answer():
+    """The MCP-bridge path used to echo the raw event stream too.
+
+    cli_bridge's parser raised on a stream with no text part; the mcp_bridge
+    session driver's except swallowed it and returned
+    {"result": "<step_start>...<step_finish>..."} as the assistant's payload.
+    That JSONL passed through the tool loop and out to the client -- issue
+    #3, observed against an OpenCode lane. Now the same failure surfaces as
+    a 502 so the gateway can retry on a healthy lane.
+    """
+    bad_stream = ('{"type":"step_start","part":{"type":"step-start"}}\n'
+                  '{"type":"step_finish","part":{"type":"step-finish",'
+                  '"tokens":{"input":1,"output":1}}}')
+    fake_cli = _write_fake_cli(
+        "import sys\n"
+        f"sys.stdout.write({bad_stream!r})\n")
+
+    async def scenario():
+        session = _new_session()
+        session.new_turn()
+        await server.run_session(session, [sys.executable, fake_cli])
+        return session.turn_future.result()
+
+    result = asyncio.run(scenario())
+    assert result["type"] == "error", result
+    assert result["status"] == 502, result
+    assert "no parsed answer" in result.get("detail", ""), result
+    print(f"  MCP session: structured-parser failure -> {result['status']} "
+          f"({result['detail'][:60]}...)")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

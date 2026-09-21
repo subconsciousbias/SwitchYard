@@ -557,7 +557,15 @@ async def run_session(session: Session, argv: list[str],
 
         try:
             payload = cli_bridge.parse_output(stdout, PROFILE["parser"])
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError) as exc:
+            # Same contract as cli_bridge._run_cli: a structured parser that
+            # cannot find the answer must fail the call, not echo its raw
+            # event stream back as the answer (issue #3).
+            if PROFILE["parser"] in cli_bridge.STRUCTURED_PARSERS:
+                session.resolve_final({"type": "error", "status": 502,
+                                        "detail": f"{PROVIDER} cli yielded no "
+                                                  f"parsed answer: {exc}"})
+                return
             payload = {"result": stdout.strip()}
         session.resolve_final({"type": "final", "payload": payload})
     except Exception as exc:                        # never leave a session parked forever
