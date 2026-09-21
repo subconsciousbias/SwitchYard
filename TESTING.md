@@ -74,8 +74,8 @@ down and the lane moves on, so you can start with one.
 | `OPENCODE_DATA_DIR`, `OPENCODE_CONFIG_DIR` | Your existing OpenCode credential paths — default `~/.local/share/opencode` and `~/.config/opencode`. Used by both the Grok and OpenCode Go sidecars. |
 | `LOCAL_API_BASE` | Ollama: `http://host.docker.internal:11434/v1`. LM Studio: `...:1234/v1`. |
 | `LOCAL_API_KEY` | Your local server's key. If it needs none, put any non-empty string — LiteLLM must send something. |
-| `CLAUDE_CONFIG_DIR` | `/Users/temporalis/.claude` — no API key; the sidecar uses your existing login. |
-| `CODEX_CONFIG_DIR` | `/Users/temporalis/.codex` — likewise for the ChatGPT seat (and Astra 6 / GPT 6 on it). |
+| `CLAUDE_CONFIG_DIR` | `$HOME/.claude` — no API key; the sidecar uses your existing login. |
+| `CODEX_CONFIG_DIR` | `$HOME/.codex` — likewise for the ChatGPT seat (and Astra 6 / GPT 6 on it). |
 
 Then confirm the local models are actually reachable from your host:
 
