@@ -158,6 +158,15 @@ class Picker:
                     if time.monotonic() >= deadline:
                         break
                     await asyncio.sleep(0.5)
+                # Past the deadline (which is zero for fail-fast), a pinned
+                # follow-up refuses to spill to a peer -- spilling would lose
+                # the prompt cache that is the whole point of the pin in the
+                # first place, and the caller can retry on its own clock. A
+                # non-pinned follow-up (wait was 0 above) falls through and
+                # re-leases wherever there is room.
+                if pinned:
+                    raise LaneSaturated(
+                        lane, f"pinned to {held} mid-tool-loop; it has no free slot")
                 # The pin is a preference with a deadline, not a guarantee.
                 # The wait rides out a burst so the loop stays on the plan
                 # holding the provider's prompt cache; past it the follow-up
