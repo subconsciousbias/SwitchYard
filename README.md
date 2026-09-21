@@ -121,6 +121,25 @@ CLI-backed member falls through to local instead of being refused.
 The `local` lane has no tail and no cloud members deliberately — when the box is
 busy you get a 429 and back off rather than silently spending money.
 
+### Point your client's *light* calls at a cheap lane
+
+Agent clients rarely make one call per turn. Most also fire a small background
+request — a conversation title, a summary, a classification — and by default it
+goes to whatever model the main turn uses. On a two-connection subscription that
+is half your capacity spent on naming the chat, and it shows up as two slots in
+use for what looked like one request.
+
+Most clients can be told where to send those. OpenCode takes a `small_model` in
+`provider/model` form:
+
+```json
+{ "small_model": "switchyard/bulk" }
+```
+
+Substitute the provider id you gave SwitchYard. `bulk` and `local` exist for
+exactly this: local models, no subscription quota, no competition with real
+work for a plan's connections.
+
 Context-window fallbacks are a separate mechanism from the lane order: a prompt
 too large for the chosen model is handed to the largest-context model available.
 Only models that declare `context_window` take part, so an undeclared window
