@@ -169,6 +169,11 @@ class Plan:
     # True keeps using it, which is right where a plan overflows into credits
     # or on-demand billing and you would rather spend that than queue.
     use_extra_quota: bool = False
+    # How many tool-calling sessions may sit parked awaiting a caller's result.
+    # A parked session runs no inference and holds no concurrency slot, but it
+    # is a live CLI process, so it gets a limit of its own. 0 means "twice
+    # max_parallel", which is the default.
+    max_parked_sessions: int = 0
     supports_tools: bool | None = None
     quotas: tuple[Quota, ...] = field(default_factory=lambda: (Quota(),))
     probe: Probe | None = None
@@ -235,6 +240,12 @@ class Plan:
         if not settings.pacing.enabled:
             return False
         return self.is_subscription or (self.metered and settings.pacing.include_metered)
+
+    @property
+    def parked_limit(self) -> int:
+        """Parked sessions allowed. Defaults to twice the connection limit."""
+        return (self.max_parked_sessions if self.max_parked_sessions > 0
+                else self.max_parallel * 2)
 
     def learns(self, settings: Settings) -> bool:
         """Whether the concurrency learner may move this plan's cap at all.
@@ -458,6 +469,7 @@ def load(path: str | None = None) -> Registry:
             pacing=body.get("pacing"),
             learning=body.get("learning"),
             use_extra_quota=bool(body.get("use_extra_quota", False)),
+            max_parked_sessions=int(body.get("max_parked_sessions") or 0),
             supports_tools=body.get("supports_tools"),
             quotas=quotas,
             probe=probe,

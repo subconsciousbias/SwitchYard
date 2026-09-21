@@ -102,7 +102,8 @@ REAP_INTERVAL = float(os.environ.get("MCP_REAP_INTERVAL_SECONDS", "30"))
 DISCONNECT_POLL = float(os.environ.get("MCP_DISCONNECT_POLL_SECONDS", "2"))
 # How long a session parked awaiting a follow-up is protected from preemption.
 # Past it, a new request may take its slot rather than be told the sidecar is
-# full: see reclaim_parked_slot for why that is the right trade.
+# full. Parked sessions no longer hold a slot, so this only bounds how long a
+# session may sit parked before enforce_parked_limit will consider it stale.
 PARKED_GRACE = float(os.environ.get("MCP_PARKED_GRACE_SECONDS", "60"))
 # How long the follow-up of a preempted session may wait for a slot on THIS
 # plan before giving up. Only a resumption ever waits: see resume_preempted.
@@ -256,6 +257,12 @@ class Session:
     # arriving. Nothing enforces a deadline on it -- the idle reaper does that --
     # but /health reports it, and a reap log says which state was abandoned.
     awaiting_followup: bool = False
+    # Whether this session currently holds a concurrency slot. A parked session
+    # does NOT: it is blocked on the caller's tool result and runs no inference,
+    # so holding a slot would cap useful work at the number of loops in flight
+    # rather than the number of model turns. The slot is taken again when the
+    # follow-up arrives, waiting if the plan is busy.
+    holds_slot: bool = False
     _flush_handle: object = None
 
     def touch(self) -> None:
@@ -526,41 +533,71 @@ async def end_session(session: Session) -> None:
     session.dead = True
     SESSIONS.pop(session.id, None)
     cleanup_workdir(Path(session.workdir))
-    await cli_bridge._gate.release()
+    if session.holds_slot:
+        session.holds_slot = False
+        await cli_bridge._gate.release()
 
 
-async def reclaim_parked_slot() -> bool:
-    """Free a slot by dropping the stalest session that is awaiting a follow-up.
+async def park_session(session: Session) -> None:
+    """Hand the ball to the caller and give the concurrency slot back.
 
-    The gate is held across the parked window on purpose: a parked session owns
-    a live CLI subprocess, which really is one of the plan's connections. But
-    that window is also where callers vanish, and through a proxy we cannot see
-    them go — LiteLLM holds its own upstream connection open, so the sidecar's
-    disconnect check never fires for anything behind the gateway. Waiting out
-    SESSION_TTL then means two abandoned loops take a 2-connection plan out of
-    its lane for half an hour.
-
-    So when the gate is full, weigh the two claimants honestly: a parked session
-    is speculative — the caller may never come back — while the request at the
-    door is real work. Past a short grace period the request wins.
-
-    Taking a slot is not the same as dropping the work: the victim's id is
-    remembered, and if its follow-up does arrive it is resumed on this same plan
-    (see resume_preempted) rather than refused. Staying on the plan matters —
-    the provider's prompt cache is keyed to the account's prefix, so a replayed
-    history still hits it here and would miss anywhere else.
+    A parked session is blocked on a tool result and runs no inference, so
+    holding a slot would cap useful work at the number of loops in flight
+    rather than the number of model turns. It is still a live CLI process,
+    though, so the number of parked sessions is capped separately.
     """
-    cutoff = time.time() - PARKED_GRACE
-    stale = [x for x in SESSIONS.values()
-             if x.awaiting_followup and not x.dead and x.last_active <= cutoff]
-    if not stale:
-        return False
-    victim = min(stale, key=lambda x: x.last_active)
-    log.warning("preempting parked mcp session %s (idle %.0fs) to admit a new "
-                "request", victim.id, time.time() - victim.last_active)
-    note_preempted(victim.id)
-    await reap_session(victim)
-    return True
+    session.awaiting_followup = True
+    session.touch()                   # the clock starts when the caller gets the ball
+    if session.holds_slot:
+        session.holds_slot = False
+        await cli_bridge._gate.release()
+    await enforce_parked_limit(exclude=session.id)
+
+
+async def unpark_session(session: Session) -> None:
+    """Take a slot back before the CLI runs again, waiting if the plan is busy.
+
+    This is the only place that queues. A follow-up has nowhere else to go --
+    its tool_call_ids exist in this process alone -- so it waits rather than
+    being refused, which is the opposite of a NEW request's contract.
+    """
+    session.awaiting_followup = False
+    if session.holds_slot:
+        return
+    limit = cli_bridge.config().concurrency
+    waited = time.time()
+    if not await cli_bridge._gate.acquire_waiting(limit, RESUME_WAIT):
+        raise HTTPException(
+            status_code=503,
+            detail=f"no slot freed within {RESUME_WAIT:.0f}s to resume this "
+                   f"tool call; the plan is busy with other turns",
+            headers={"Retry-After": "15"})
+    session.holds_slot = True
+    held = time.time() - waited
+    if held > 1:
+        log.info("session %s waited %.1fs for a slot to resume", session.id, held)
+
+
+async def enforce_parked_limit(exclude: str | None = None) -> None:
+    """Keep the number of parked sessions under the plan's limit.
+
+    Parked sessions cost no concurrency but each is a CLI process holding
+    memory and a connection pool, so they cannot accumulate without bound. The
+    stalest goes first, and it is owed a resumption exactly like a preempted
+    one -- its id is remembered and its follow-up rebuilds it.
+    """
+    limit = cli_bridge.config().parked_limit
+    while True:
+        parked = [x for x in SESSIONS.values()
+                  if x.awaiting_followup and not x.dead and x.id != exclude]
+        if len(parked) < limit:
+            return
+        victim = min(parked, key=lambda x: x.last_active)
+        log.warning("parked sessions at the limit (%d); dropping the stalest, "
+                    "%s (idle %.0fs)", limit, victim.id,
+                    time.time() - victim.last_active)
+        note_preempted(victim.id)
+        await reap_session(victim)
 
 
 async def await_turn(session: Session, request: "Request | None") -> dict:
@@ -699,12 +736,10 @@ async def handle_fresh(body: dict, tools: list[dict],
         log.warning("%s", warning)
 
     limit = cli_bridge.config().concurrency
-    if not await cli_bridge._gate.acquire(limit) and (
-            not await reclaim_parked_slot()
-            or not await cli_bridge._gate.acquire(limit)):
+    if not await cli_bridge._gate.acquire(limit):
         # Never queue, same contract as cli_bridge: SwitchYard needs "full"
         # immediately so it can spill to the next plan in the lane. Only a
-        # preempted session's follow-up may wait — see resume_preempted.
+        # follow-up waits, because it has nowhere else to go.
         raise HTTPException(status_code=429, detail=f"sidecar at capacity ({limit})",
                              headers={"Retry-After": "5"})
 
@@ -722,7 +757,10 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     """
     session_id = uuid.uuid4().hex
     workdir = Path(tempfile.mkdtemp(prefix=f"mcpb-{session_id[:8]}-"))
-    session = Session(id=session_id, provider=PROVIDER, model=model, workdir=str(workdir))
+    # The slot was acquired by the caller before getting here; the session owns
+    # it from now on, and gives it back when it parks or ends.
+    session = Session(id=session_id, provider=PROVIDER, model=model,
+                      workdir=str(workdir), holds_slot=True)
     try:
         tools_path = workdir / "tools.json"
         tools_path.write_text(json.dumps(mcp_tools))
@@ -741,8 +779,7 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     if result["type"] != "tool_calls":
         await end_session(session)
     else:
-        session.awaiting_followup = True
-        session.touch()               # the clock starts when the caller gets the ball
+        await park_session(session)
     return response
 
 
@@ -798,30 +835,12 @@ def flatten_with_tool_history(messages: list[dict]) -> tuple[str, str | None]:
 
 
 async def acquire_resume_slot(limit: int, timeout: float) -> bool:
-    """Get a slot for a resumption, preempting stale parked sessions if need be.
+    """Wait for a slot to resume a rebuilt session.
 
-    Waiting alone is not enough: the slots a resumption waits on are usually
-    held by *other* parked sessions, and an abandoned one would never yield,
-    so a session we preempted could sit out the whole deadline behind callers
-    who are never coming back. A resumption has at least as strong a claim as
-    the new request that displaced it, so it gets the same right to reclaim.
-
-    Preemption can cascade, which is fine and bounded: every session it takes a
-    slot from is itself resumable by exactly this path.
+    Nothing to reclaim here any more: parked sessions hold no slot, so the only
+    thing worth waiting for is a model turn finishing.
     """
-    deadline = time.monotonic() + timeout
-    while True:
-        if await cli_bridge._gate.acquire(limit):
-            return True
-        if await reclaim_parked_slot():
-            continue                      # a slot should be free now; go take it
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        # Wake up periodically rather than sleeping out the whole deadline: a
-        # session that is fresh now may be stale enough to reclaim in a moment.
-        if await cli_bridge._gate.acquire_waiting(limit, min(remaining, RECLAIM_POLL)):
-            return True
+    return await cli_bridge._gate.acquire_waiting(limit, timeout)
 
 
 async def resume_preempted(body: dict, tools: list[dict], session_id: str,
@@ -879,7 +898,6 @@ async def handle_followup(body: dict, tool_msgs: list[dict],
                                     "-- start a new tool-calling request rather than "
                                     "continuing this one")
 
-    session.awaiting_followup = False
     resolved = 0
     for m in tool_msgs:
         call = session.pending.pop(m["tool_call_id"], None)
@@ -896,6 +914,8 @@ async def handle_followup(body: dict, tool_msgs: list[dict],
         raise HTTPException(status_code=400,
                              detail="no matching parked tool call for the given tool_call_id(s)")
 
+    # The results are in; the model is about to run again, so take a slot back.
+    await unpark_session(session)
     session.touch()
     session.new_turn()
     result = await await_turn(session, request)
@@ -903,8 +923,7 @@ async def handle_followup(body: dict, tool_msgs: list[dict],
     if result["type"] != "tool_calls":
         await end_session(session)
     else:
-        session.awaiting_followup = True
-        session.touch()
+        await park_session(session)
     return response
 
 
@@ -926,6 +945,7 @@ async def health() -> dict:
             "sessions": len(SESSIONS),
             "awaiting_followup": sum(1 for x in SESSIONS.values()
                                      if x.awaiting_followup and not x.dead),
+            "parked_limit": cfg.parked_limit,
             "session_ttl_seconds": SESSION_TTL}
 
 

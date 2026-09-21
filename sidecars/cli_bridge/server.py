@@ -201,6 +201,15 @@ class Config:
     model: str
     models: set   # aliases a request may ask for
     source: str = "config"   # config | fallback — reported by /health
+    # How many sessions may sit parked awaiting a tool result. A parked session
+    # runs no inference, so it does not occupy a concurrency slot -- but it is
+    # still a live CLI process holding memory and a connection pool, so it needs
+    # a limit of its own. Defaults to twice the concurrency.
+    max_parked: int = 0
+
+    @property
+    def parked_limit(self) -> int:
+        return self.max_parked if self.max_parked > 0 else self.concurrency * 2
 
 
 _config: Config | None = None
@@ -223,6 +232,7 @@ def read_config() -> Config:
     env_conc = os.environ.get("SIDECAR_CONCURRENCY")
 
     cap: int | None = None
+    parked = 0
     models: set[str] = set()
     default: str | None = None
     target = PLAN or PROVIDER
@@ -238,6 +248,7 @@ def read_config() -> Config:
         else:
             raw_cap = plan.get("max_parallel", 1)
             cap = seed if str(raw_cap).lower() == "auto" else int(raw_cap)
+            parked = int(plan.get("max_parked_sessions") or 0)
             for key, body in (plan.get("models") or {}).items():
                 body = body or {}
                 if body.get("enabled") is False:
@@ -266,7 +277,8 @@ def read_config() -> Config:
                   "Check SWITCHYARD_PLAN and the plan's `models:` block.",
                   target, PLANS_PATH, model)
     return Config(concurrency=max(1, concurrency), model=model,
-                  models=models | {model}, source=source)
+                  models=models | {model}, source=source,
+                  max_parked=max(0, parked))
 
 
 def config() -> Config:

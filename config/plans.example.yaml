@@ -408,6 +408,10 @@ plans:
     max_parallel_ceiling: 2       # never probe above it
     api_base: http://claude-max-sidecar:8081/v1
     api_key: sidecar
+    # Sessions parked awaiting a caller's tool result. They run no inference and
+    # hold no connection slot, but each is a live CLI process, so they are
+    # capped separately. Omit for the default of twice max_parallel.
+    # max_parked_sessions: 4
     quotas:
       - name: 5h
         role: constraint          # do not blow the burst window

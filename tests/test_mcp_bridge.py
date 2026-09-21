@@ -437,48 +437,66 @@ def test_a_caller_that_hangs_up_mid_turn_drops_the_session():
     print(f"  hangup seen after {calls} poll(s): session killed, slot freed")
 
 
-def test_a_parked_session_is_preempted_rather_than_refusing_a_new_request():
-    """A stale parked session must yield its slot, and a fresh one must not.
+def test_a_parked_session_holds_no_concurrency_slot():
+    """Parking gives the slot back; unparking takes one again.
 
-    Observed live: two lane probes each left a session parked awaiting a
-    follow-up that never came, the gate stayed full, and the next request got
-    "sidecar at capacity (2)" — which SwitchYard read as concurrency pressure
-    and used to cool a perfectly healthy plan. Nothing frees those slots on its
-    own, because through a proxy the caller's disconnect is invisible.
+    A parked session is blocked on the caller's tool result and runs no
+    inference. Holding a slot through that capped useful work at the number of
+    loops in flight rather than the number of model turns — two parked loops
+    made a 2-connection plan report itself full while nothing was talking to
+    the provider at all.
     """
     async def scenario():
-        old_grace = server.PARKED_GRACE
-        server.PARKED_GRACE = 60.0
-        try:
-            fresh = _new_session()
-            fresh.awaiting_followup = True          # parked just now
-            assert not await server.reclaim_parked_slot(), \
-                "a session parked inside the grace period must be left alone"
+        gate = server.cli_bridge._gate
+        before = gate.in_flight
 
-            stale = _new_session()
-            stale.awaiting_followup = True
-            stale.last_active = time.time() - server.PARKED_GRACE - 5
-            stalest = _new_session()
-            stalest.awaiting_followup = True
-            stalest.last_active = time.time() - server.PARKED_GRACE - 500
+        session = _new_session()
+        session.holds_slot = True
+        assert await gate.acquire(before + 1), "fixture should be able to take a slot"
+        taken = gate.in_flight
 
-            assert await server.reclaim_parked_slot()
-            # The stalest goes first, and only one goes per call.
-            assert stalest.id not in server.SESSIONS
-            assert stale.id in server.SESSIONS
-            assert fresh.id in server.SESSIONS
+        await server.park_session(session)
+        assert session.awaiting_followup and not session.holds_slot
+        assert gate.in_flight == taken - 1, "parking must return the slot"
 
-            # A session mid-turn (not parked) is never a candidate.
-            busy = _new_session()
-            for victim in (stale, fresh):
-                await server.reap_session(victim)
-            assert not await server.reclaim_parked_slot()
-            await server.reap_session(busy)
-        finally:
-            server.PARKED_GRACE = old_grace
+        # Unparking takes one back before the model runs again.
+        await server.unpark_session(session)
+        assert session.holds_slot and not session.awaiting_followup
+        assert gate.in_flight == taken, "unparking must retake a slot"
+
+        await server.end_session(session)
+        assert gate.in_flight == before, "ending must not leak the slot"
 
     asyncio.run(scenario())
-    print("  stalest parked session preempted; fresh and mid-turn ones protected")
+    print("  parked sessions cost no concurrency; unparking reclaims a slot")
+
+
+def test_parked_sessions_are_capped_and_the_stalest_goes_first():
+    """They cost no slot, but each is a live CLI process, so they are bounded."""
+    async def scenario():
+        limit = server.cli_bridge.config().parked_limit
+        assert limit >= 2, limit
+
+        made = []
+        for i in range(limit + 1):
+            s = _new_session()
+            s.awaiting_followup = True
+            s.last_active = time.time() - (100 - i)   # first is stalest
+            made.append(s)
+
+        await server.enforce_parked_limit()
+        alive = [s for s in made if s.id in server.SESSIONS]
+        assert len(alive) <= limit, (len(alive), limit)
+        assert made[0].id not in server.SESSIONS, "the stalest should go first"
+        # An evicted session is owed a resumption, exactly like a preempted one.
+        assert made[0].id in server.PREEMPTED
+
+        for s in alive:
+            await server.reap_session(s)
+        return limit
+
+    limit = asyncio.run(scenario())
+    print(f"  parked limit {limit} enforced, stalest evicted and remembered")
 
 
 def test_tool_history_is_rendered_for_a_rebuilt_session():
@@ -535,7 +553,10 @@ def test_a_preempted_session_is_resumed_not_refused():
         session.awaiting_followup = True
         session.last_active = time.time() - server.PARKED_GRACE - 5
 
-        assert await server.reclaim_parked_slot()
+        # Evicted because the parked limit was reached, not to free a slot:
+        # parked sessions hold none. Either way it is owed a resumption.
+        server.note_preempted(session.id)
+        await server.reap_session(session)
         assert session.id in server.PREEMPTED
         with contextlib.suppress(Exception):
             await parked
