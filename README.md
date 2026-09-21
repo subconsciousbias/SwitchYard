@@ -17,11 +17,17 @@ provider below is optional, including the paid ones.
 ## Quickstart
 
 ```bash
-scripts/sync-env.sh      # creates .env, or adds new keys without touching yours
-$EDITOR .env             # fill in the keys for the plans you actually have
+scripts/sync-env.sh      # creates .env and config/plans.yaml from the examples
+$EDITOR .env             # keys for the plans you actually have
+$EDITOR config/plans.yaml   # your plans, their limits, and the lane order
 docker compose up -d
 open http://localhost:4001            # the portal
 ```
+
+`config/plans.yaml` is yours and is gitignored: it describes what you pay for,
+what each plan may spend, and which order the lanes try them in.
+`config/plans.example.yaml` is the shipped starting point — nine plans across
+seven providers, which you should cut down to the ones you have.
 
 Use `sync-env.sh` rather than `cp .env.example .env`: on an existing checkout
 that copy overwrites real credentials, which is the mistake the script exists

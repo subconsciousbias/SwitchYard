@@ -8,8 +8,10 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("SWITCHYARD_PLANS", os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "plans.yaml"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from plans_path import plans_path  # noqa: E402
+
+os.environ.setdefault("SWITCHYARD_PLANS", plans_path())
 
 from switchyard import models                      # noqa: E402
 from switchyard.picker import LaneSaturated, Picker  # noqa: F401  # noqa: E402
@@ -194,16 +196,44 @@ def test_plan_and_model_caps_are_separate_limits():
 
 
 def test_expiring_plans_are_drained_first():
-    """Cancelled capacity is promoted ahead of plans you keep paying for."""
+    """Cancelled capacity is promoted ahead of plans you keep paying for.
+
+    The expiry is synthesised rather than read from the config: whether any
+    plan happens to be expiring is a fact about one operator's billing and one
+    day's date, and the shipped example config sets no dates at all. Building
+    one here tests the rule on any checkout, on any day.
+    """
+    from dataclasses import replace
+    from datetime import date, timedelta
+
     reg = models.load()
-    order = reg.lane_members("judge")
-    window = reg.settings.drain_within_days
-    days = [reg.plan_of(m).days_left for m in order]
-    expiring = [i for i, d in enumerate(days) if d is not None and d <= window]
+    lane = "judge"
+    members = reg.lane_members(lane)
+    # The tail is excluded: it sorts last by design whatever its expiry, so
+    # using it as the victim tests the tail rule, not the drain rule.
+    ordered = [m for m in members if not reg.is_tail(lane, m.ref)]
+    assert len(ordered) >= 2, "need two non-tail plans to have an order at all"
+
+    # Take a plan that is NOT already first and give it a near expiry.
+    victim = reg.plan_of(ordered[-1])
+    # Tomorrow, not merely "inside the window": the rule is soonest-death-first,
+    # so a victim must out-expire anything the operator's own config already
+    # has, or a real plan expiring sooner legitimately keeps the front spot and
+    # the test fails on a working system.
+    soon = date.today() + timedelta(days=1)
+    plans = dict(reg.plans)
+    plans[victim.key] = replace(victim, expires=soon)
+    drained = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+
+    order = [m for m in drained.lane_members(lane)
+             if not drained.is_tail(lane, m.ref)]
+    days = [drained.plan_of(m).days_left for m in order]
+    assert order[0].plan_key == victim.key, list(zip((m.ref for m in order), days))
+    # And every plan with no end date sorts after it.
     keeping = [i for i, d in enumerate(days) if d is None]
-    assert expiring, "expected some expiring plans in the judge lane"
-    assert min(expiring) < min(keeping), list(zip((m.ref for m in order), days))
-    print("  judge lane order:", " -> ".join(m.ref for m in order))
+    assert not keeping or min(keeping) > 0, list(zip((m.ref for m in order), days))
+    print(f"  {victim.key} expiring in {days[0]}d jumps to the front: "
+          + " -> ".join(m.ref for m in order))
 
 
 def test_models_on_one_plan_share_its_connection_limit():
@@ -261,65 +291,6 @@ def test_models_on_one_plan_share_its_connection_limit():
     print(f"  judge took claude-max/opus -> plan {full}/{cap}, then refused: "
           f"{refusal.split(': ', 1)[1]}")
     print(f"  releasing apex's slot returned the plan to {freed}/{cap}")
-
-
-def test_plan_and_model_caps_are_separate_limits():
-    """Two counters, not one.
-
-    `local-box` allows 2 connections; each of its models allows 1. So one qwen
-    and one gemma may run together, a *second* qwen may not, and nothing more
-    may run at all. Enforcing the model's cap against the plan's counter — which
-    is what a single counter forces — would let only one request through in
-    total.
-    """
-    async def go():
-        reg, slots, picker = build()
-        box = reg.plans["local-box"]
-        assert box.max_parallel == 2
-        assert all(m.max_parallel == 1 for m in box.models.values())
-
-        first = await picker.pick("local", None)          # qwen
-        second = await picker.pick("local", None)         # qwen full -> gemma
-        assert first.ref != second.ref, (first.ref, second.ref)
-        assert {first.ref, second.ref} == {"local-box/qwen", "local-box/gemma"}
-
-        # The plan is now full, so nothing else fits — and the refusal names the
-        # plan's limit, because that is genuinely what bit.
-        try:
-            await picker.pick("local", None)
-            raise AssertionError("plan cap of 2 was exceeded")
-        except LaneSaturated as exc:
-            saturated = str(exc)
-        assert "plan full at 2" in saturated, saturated
-
-        # Free gemma: the plan now has room, but qwen is still at its own cap of
-        # 1. So the next pick must skip qwen *for a model reason* and take gemma.
-        gemma = first if first.ref.endswith("gemma") else second
-        await picker.release(gemma.plan.key, gemma.request_id, gemma.ref)
-        third = await picker.pick("local", None)
-        assert third.ref == gemma.ref, third.ref
-        return saturated, third
-
-    saturated, third = run(go())
-    skipped = ", ".join(third.considered)
-    assert "model full at 1" in skipped, skipped
-    print("  plan=2, models=1 each: qwen+gemma run together; a third is refused")
-    print(f"  plan full: {saturated.split(': ', 1)[1]}")
-    print(f"  with room on the plan but not the model: skipped {skipped}, "
-          f"took {third.ref}")
-
-
-def test_expiring_plans_are_drained_first():
-    """Cancelled capacity is promoted ahead of plans you keep paying for."""
-    reg = models.load()
-    order = reg.lane_members("judge")
-    window = reg.settings.drain_within_days
-    days = [reg.plan_of(m).days_left for m in order]
-    expiring = [i for i, d in enumerate(days) if d is not None and d <= window]
-    keeping = [i for i, d in enumerate(days) if d is None]
-    assert expiring, "expected some expiring plans in the judge lane"
-    assert min(expiring) < min(keeping), list(zip((m.ref for m in order), days))
-    print("  judge lane order:", " -> ".join(m.ref for m in order))
 
 
 def test_a_plan_marked_unsupported_is_skipped_for_tool_calls():

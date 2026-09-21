@@ -3,6 +3,9 @@
 # Four were committed and pushed before this line existed; history was
 # rewritten to drop them and every key in them was rotated.
 .env.backup.*
+# Your live plan configuration: subscriptions, costs, expiry dates. Start from
+# config/plans.example.yaml; scripts/sync-env.sh copies it if it is missing.
+config/plans.yaml
 .env.bak
 .env.*.bak
 __pycache__/

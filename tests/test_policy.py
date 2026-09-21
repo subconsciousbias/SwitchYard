@@ -15,8 +15,10 @@ from dataclasses import replace
 from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("SWITCHYARD_PLANS", os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "plans.yaml"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from plans_path import plans_path  # noqa: E402
+
+os.environ.setdefault("SWITCHYARD_PLANS", plans_path())
 
 from switchyard import models                        # noqa: E402
 from switchyard.periods import deadline, windows_remaining  # noqa: E402

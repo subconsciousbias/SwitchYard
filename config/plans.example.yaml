@@ -82,7 +82,7 @@ plans:
     label: "Minimax Ultra Token Plan"
     auth: api_key
     provider_family: minimax
-    monthly_cost: 132
+    monthly_cost: 20
     max_parallel: 4               # starting point; the learner adjusts
     max_parallel_ceiling: 6
     api_base: os.environ/MINIMAX_ULTRA_API_BASE
@@ -131,7 +131,7 @@ plans:
         5h:
           used_percent: [model_remains.model_name=general.current_interval_used_percent]
           reset_at: [model_remains.model_name=general.end_time]
-    notes: "Original workhorse. Good at coding with explicit instructions."
+    notes: "Good at coding when the instructions are explicit."
     models:
       m3:
         # NB: `minimax-m3-highspeed` does not exist. The catalogue offers
@@ -147,7 +147,7 @@ plans:
     label: "Minimax Max Token Plan"
     auth: api_key
     provider_family: minimax
-    monthly_cost: 55
+    monthly_cost: 20
     max_parallel: 4
     max_parallel_ceiling: 6
     api_base: os.environ/MINIMAX_MAX_API_BASE
@@ -193,7 +193,7 @@ plans:
         5h:
           used_percent: [model_remains.model_name=general.current_interval_used_percent]
           reset_at: [model_remains.model_name=general.end_time]
-    notes: "Second workhorse, added 2026-09-20 to stop the OpenRouter burn."
+    notes: "A second plan on the same provider, for more parallel capacity."
     models:
       m3:
         model: openai/MiniMax-M3
@@ -205,9 +205,9 @@ plans:
     label: "GLM Coding Plan (Z.AI)"
     auth: api_key
     provider_family: zai
-    monthly_cost: 58
+    monthly_cost: 10
     max_parallel: 2
-    expires: "2026-10-13"
+    expires: null            # set a date to have the drain rule prefer it
     # A Coding Plan key works ONLY on the coding endpoint. Verified by direct
     # call: coding returns 200, while api.z.ai/api/paas/v4 and
     # open.bigmodel.cn/api/paas/v4 both return 429 code 1113 "insufficient
@@ -228,7 +228,7 @@ plans:
         period: week
         allowance: null           # TODO: confirm; may be monthly instead
         source: probe
-    notes: "Cancelled. Severely limited — drain whatever is left."
+    notes: "Metered. The tail exists so a lane never silently falls back to this."
     probe:
       # z.ai publishes the Coding Plan's own quota here. The key goes in
       # Authorization RAW — a `Bearer ` prefix is rejected — which is why this
@@ -304,7 +304,7 @@ plans:
     auth: cli_sidecar
     monthly_cost: 10
     max_parallel: 2
-    expires: "2026-09-27"
+    expires: null            # set a date to have the drain rule prefer it
     api_base: http://opencode-go-sidecar:8084/v1
     api_key: sidecar
     # `source: ledger`, not a probe, and that was checked rather than assumed.
@@ -385,8 +385,8 @@ plans:
           # date is the next boundary that matters for a cancelled plan.
           reset_at: [access.endsAt]
     notes: >
-      Cancelled, 7 days left as of 2026-09-20. The drain rule puts it at the
-      front of the workhorse lane until it dies. Usage is SwitchYard's own
+      A short-lived plan. Give it an `expires:` date and the drain rule
+      moves it to the front of its lane as that date approaches. Usage is SwitchYard's own
       tally: no provider endpoint reports this plan's consumption.
     models:
       # provider/model as OpenCode names it — `opencode` and `opencode-go` are
@@ -399,7 +399,7 @@ plans:
   claude-max:
     label: "Claude Max $200"
     auth: cli_sidecar             # OAuth; the Claude CLI holds the credential
-    monthly_cost: 200
+    monthly_cost: 100
     max_parallel: 2
     max_parallel_ceiling: 2       # never probe above it
     api_base: http://claude-max-sidecar:8081/v1
@@ -468,10 +468,10 @@ plans:
     # A seat has no API key: the Codex CLI owns the OAuth login.
     auth: cli_sidecar
     provider_family: openai
-    monthly_cost: 100
+    monthly_cost: 30
     max_parallel: 2
     max_parallel_ceiling: 2       # the seat allows 2; do not probe past it
-    expires: "2026-10-04"
+    expires: null            # set a date to have the drain rule prefer it
     api_base: http://codex-sidecar:8082/v1
     api_key: sidecar
     # One window only: the seat meters weekly, with no 5-hour burst cap.
@@ -505,7 +505,7 @@ plans:
         weekly:
           used_percent: [rate_limits.primary.used_percent]
           reset_at: [rate_limits.primary.resets_at]
-    notes: "Cancelled. Both models share the seat's 2 connections and its quota."
+    notes: "Every model on this seat shares its 2 connections and its quota."
     models:
       # Verified ids on a ChatGPT seat, in capability order — sol strongest, then
       # terra, luna weakest. Prompt overhead for a 5-token reply in brackets.
@@ -532,10 +532,10 @@ plans:
     # `oauth_proxy`, not `cli_sidecar`: there is no CLI in this path at all.
     auth: oauth_proxy
     provider_family: xai
-    monthly_cost: 100
+    monthly_cost: 30
     max_parallel: 2
     max_parallel_ceiling: 4
-    expires: "2026-10-09"
+    expires: null            # set a date to have the drain rule prefer it
     api_base: http://xai-token-proxy:8090/v1
     api_key: sidecar
     # One window only: SuperGrok meters a weekly allowance, with no 5-hour
@@ -575,7 +575,7 @@ plans:
           used_percent: [config.creditUsagePercent,
                          config.productUsage.product=GrokBuild.usagePercent]
           reset_at: [config.currentPeriod.end, config.billingPeriodEnd]
-    notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
+    notes: "One weekly pool, shared across every surface the subscription covers."
     models:
       grok-4.6:
         # Plain `grok-4.6`, not `xai/grok-4.6`: the provider prefix was how the

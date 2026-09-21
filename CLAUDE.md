@@ -17,7 +17,14 @@ Rules, without exception:
 - Read `.env` only when the user asks you to debug it, and never echo a secret's
   value into the transcript — print `KEY=<set>` instead.
 
-## Config lives in `config/plans.yaml`
+## Config lives in `config/plans.yaml` — which is gitignored
+
+`config/plans.yaml` is the operator's live portfolio and is NOT tracked.
+`config/plans.example.yaml` is the tracked, genericised version. A change to the
+schema, a new key or a new plan shape has to land in the EXAMPLE as well, or a
+fresh clone gets a config that cannot express it.
+
+
 
 Caps, cost, expiry, lane order, quota windows, credentials-by-env-var-name and
 sidecar model aliases all come from that one file. `docker-compose.yml` must not

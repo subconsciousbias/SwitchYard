@@ -12,15 +12,28 @@ target=".env"
 
 [ -f "$example" ] || { echo "no $example here"; exit 1; }
 
+# config/plans.yaml is your live portfolio and is gitignored, so a fresh clone
+# has only the example. Nothing starts without it.
+if [ ! -f config/plans.yaml ] && [ -f config/plans.example.yaml ]; then
+  cp config/plans.example.yaml config/plans.yaml
+  echo "created config/plans.yaml from the example — edit it to match your plans"
+fi
+
 if [ ! -f "$target" ]; then
   cp "$example" "$target"
   echo "created $target from $example — fill in the blanks"
   exit 0
 fi
 
-# Back the file up before touching it at all. Cheap insurance.
-backup=".env.backup.$(date +%Y%m%d-%H%M%S)"
+# Back the file up before touching it at all. Cheap insurance — but OUTSIDE the
+# worktree: these snapshots hold real keys, and four of them were once committed
+# and pushed because .gitignore covered .env and not .env.backup.*. A file that
+# cannot be added is better than one that must be remembered.
+backup_dir="${SWITCHYARD_ENV_BACKUPS:-$HOME/.switchyard/env-backups}"
+mkdir -p "$backup_dir"
+backup="$backup_dir/env.$(date +%Y%m%d-%H%M%S)"
 cp "$target" "$backup"
+chmod 600 "$backup" 2>/dev/null || true
 
 added=0
 while IFS= read -r line; do
@@ -43,7 +56,7 @@ else
 fi
 
 # Report keys that exist but have no value, so nothing silently stays blank.
-empty=$(grep -E '^[A-Z_]+=$' "$target" | cut -d= -f1 || true)
+empty=$(grep -E '^[A-Z0-9_]+=$' "$target" | cut -d= -f1 || true)
 if [ -n "$empty" ]; then
   echo
   echo "still empty (fill these in):"

@@ -227,7 +227,9 @@ def test_limit_detection_survives_rewording_and_curly_quotes():
 
 
 # ----------------------------------------------------------- config reading ---
-PLANS = os.path.join(os.path.dirname(HERE), "config", "plans.yaml")
+from plans_path import plans_path  # noqa: E402
+
+PLANS = plans_path()
 
 
 def _read_for(plan: str, provider: str):

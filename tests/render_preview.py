@@ -10,8 +10,10 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("SWITCHYARD_PLANS", os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "plans.yaml"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from plans_path import plans_path  # noqa: E402
+
+os.environ.setdefault("SWITCHYARD_PLANS", plans_path())
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined  # noqa: E402
 

@@ -38,7 +38,10 @@ sys.path.insert(0, HERE)
 
 os.environ["PROVIDER"] = "claude"
 os.environ.setdefault("SWITCHYARD_PLAN", "claude-max")
-os.environ.setdefault("SWITCHYARD_PLANS", os.path.join(ROOT, "config", "plans.yaml"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from plans_path import plans_path  # noqa: E402
+
+os.environ.setdefault("SWITCHYARD_PLANS", plans_path())
 os.environ.setdefault("SIDECAR_PORT", "8081")
 
 from _modules import load  # noqa: E402
