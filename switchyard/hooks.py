@@ -138,11 +138,18 @@ class SwitchyardHandler(CustomLogger):
             key_hash = hashlib.sha256(str(token).encode()).hexdigest()[:8]
         session = derive_session(data, key_hash)
 
-        # A request carrying tool definitions cannot go to a CLI-backed plan.
+        # A request carrying tool definitions cannot go to a plan marked
+        # supports_tools: false; see Plan.can_use_tools.
         needs_tools = bool(data.get("tools"))
 
+        # A request carrying tool *results* is mid-loop: its tool_call_ids were
+        # minted by one plan's bridge, so it must go back to that same plan
+        # rather than spill to a peer that cannot read them. See Picker.pick.
+        pinned = any(m.get("role") == "tool" and m.get("tool_call_id")
+                     for m in (data.get("messages") or []) if isinstance(m, dict))
+
         try:
-            pick = await self.picker.pick(lane, session, needs_tools)
+            pick = await self.picker.pick(lane, session, needs_tools, pinned)
         except LaneSaturated as exc:
             # Surfacing this as a 429 is what lets clients back off instead of
             # hammering a lane whose paid capacity is genuinely gone.
@@ -267,6 +274,32 @@ class SwitchyardHandler(CustomLogger):
         if plan:
             await self.ledger.record(plan, failed=True)
         await self._handle_failure(ctx, kwargs.get("exception") or kwargs.get("original_exception"))
+
+    async def async_post_call_success_hook(
+        self, data: dict, user_api_key_dict: UserAPIKeyAuth, response, **_: Any
+    ):
+        """Tell the caller which plan actually served it.
+
+        The body's `model` echoes what was asked for — usually a lane name like
+        `judge` — so a caller doing its own token or cost accounting cannot see
+        which subscription the tokens came out of. LiteLLM puts the answer in
+        response *headers* (x-litellm-model-group and friends), which is easy to
+        miss and lost by any client that only keeps the JSON. So it goes in the
+        body too, under one namespaced key that a strict client will ignore.
+        """
+        ctx = (((data or {}).get("metadata") or {}).get(META_KEY))
+        if not isinstance(ctx, dict):
+            return response
+        stamp = {"lane": ctx.get("lane"), "plan": ctx.get("plan"),
+                 "model": ctx.get("model"), "sticky": bool(ctx.get("sticky"))}
+        try:
+            if isinstance(response, dict):
+                response["switchyard"] = stamp
+            else:
+                setattr(response, "switchyard", stamp)
+        except Exception:                 # never fail a served request over a label
+            log.debug("could not stamp response with switchyard routing info")
+        return response
 
     async def async_post_call_failure_hook(
         self, request_data: dict, original_exception: Exception, user_api_key_dict: UserAPIKeyAuth, **_: Any

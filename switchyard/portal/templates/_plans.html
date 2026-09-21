@@ -15,7 +15,7 @@
         <div class="muted" style="font-size:12px">
           {% if r.plan.monthly_cost %}${{ '%.0f'|format(r.plan.monthly_cost) }}/mo{% else %}metered{% endif %}
           {% if r.lanes %}· {{ r.lanes|join(', ') }}{% endif %}
-          {% if r.cli_backed %}· <span title="a CLI holds the credential; cannot serve tool calls">cli</span>{% endif %}
+          {% if r.cli_backed %}· <span title="a CLI holds the credential">cli</span>{% endif %}
         </div>
         {# Models are what lanes name; the plan is what owns the limits. #}
         <div class="muted mono" style="font-size:12px;margin-top:3px">

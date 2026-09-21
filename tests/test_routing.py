@@ -322,85 +322,157 @@ def test_expiring_plans_are_drained_first():
     print("  judge lane order:", " -> ".join(m.ref for m in order))
 
 
-def test_tool_calls_never_reach_a_cli_backed_plan():
-    """A request carrying `tools` must skip every CLI-backed plan.
-
-    Those plans are whole agent harnesses behind a sidecar: the caller's tool
-    definitions have nowhere to run, the harness's own tools act on the
-    sidecar's container rather than the caller's workspace, and the two system
-    prompts stack. Silently dropping the tools would look like the model simply
-    choosing not to call any.
-    """
-    async def go():
-        reg, slots, picker = build()
-        out = {}
-        for lane in ("forge", "judge"):
-            plain = [m.ref for m in await picker._members(lane)]
-            with_tools = [m.ref for m in await picker._members(lane, needs_tools=True)]
-            out[lane] = (plain, with_tools)
-            assert all(reg.plan_of(reg.model(r)).can_use_tools for r in with_tools), with_tools
-            dropped = set(plain) - set(with_tools)
-            assert all(reg.plan_of(reg.model(r)).is_cli_backed for r in dropped), dropped
-
-        # A tool-using request is routed, not rejected, as long as one plan can.
-        pick = await picker.pick("forge", None, needs_tools=True)
-        assert pick.plan.can_use_tools
-        return out, pick.ref
-
-    out, picked = run(go())
-    for lane, (plain, with_tools) in out.items():
-        print(f"  {lane}: {len(plain)} members, {len(with_tools)} can take tools "
-              f"(dropped {sorted(set(plain) - set(with_tools))})")
-    print(f"  a tool-using forge request landed on {picked}")
-
-
-def test_a_lane_with_no_tool_capable_member_says_so():
-    """A lane whose every member is CLI-backed must refuse a tool-using request
-    with an explanation, rather than quietly losing the tool definitions.
-
-    Built here rather than read from the config: every lane now ends in a local
-    tail, which *is* tool-capable, so no real lane exhibits this any more. That is
-    a happy consequence of the local-tail rule — tool-using requests fall to
-    local instead of failing — but the refusal path still needs testing.
+def test_a_plan_marked_unsupported_is_skipped_for_tool_calls():
+    """A request carrying `tools` must skip a plan explicitly marked
+    `supports_tools: false`, but that plan is still a candidate for a plain
+    request. Built with `dataclasses.replace` on an arbitrary member's plan —
+    not by relying on which plans happen to be CLI-backed today, since that is
+    no longer what determines tool capability.
     """
     from dataclasses import replace
 
     async def go():
         reg, slots, picker = build()
-        lanes = dict(reg.lanes)
-        # Strip apex's local tail, leaving only CLI-backed members.
-        lanes["apex"] = replace(lanes["apex"], tail=[])
-        reg = models.Registry(settings=reg.settings, plans=reg.plans, lanes=lanes)
-        picker = Picker(reg, slots)
+        lane = "forge"
+        members = reg.lane_members(lane)
+        assert len(members) >= 2, "need at least two members to make this meaningful"
+        # Start from a member whose plan is tool-capable in the live config, so
+        # flipping it to false is an actual change: several forge members are
+        # already marked false while their bridges are unproven.
+        target = next((m for m in members if reg.plan_of(m).can_use_tools), None)
+        assert target is not None, "forge needs a tool-capable member"
+        plan = reg.plan_of(target)
 
-        members = await picker._members("apex")
-        assert members, "apex should still have its CLI-backed order"
-        assert not await picker._members("apex", needs_tools=True)
+        plans = dict(reg.plans)
+        plans[plan.key] = replace(plan, supports_tools=False)
+        reg2 = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+        picker2 = Picker(reg2, slots)
+
+        plain = [m.ref for m in await picker2._members(lane)]
+        with_tools = [m.ref for m in await picker2._members(lane, needs_tools=True)]
+        assert target.ref in plain, plain
+        assert target.ref not in with_tools, with_tools
+        assert all(reg2.plan_of(reg2.model(r)).can_use_tools for r in with_tools), with_tools
+        return plain, with_tools, target.ref
+
+    plain, with_tools, dropped = run(go())
+    print(f"  {dropped}(supports_tools: false) stays in {len(plain)} plain members, "
+          f"drops out of {len(with_tools)} tool-capable members")
+
+
+def test_a_lane_with_no_tool_capable_member_says_so():
+    """A lane whose every member's plan is marked `supports_tools: false` must
+    refuse a tool-using request with an explanation, rather than quietly
+    losing the tool definitions.
+    """
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker = build()
+        lane = "apex"
+        members = reg.lane_members(lane)
+        assert members, "apex should have live members to make this meaningful"
+
+        plans = dict(reg.plans)
+        for m in members:
+            plans[m.plan_key] = replace(plans[m.plan_key], supports_tools=False)
+        reg2 = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+        picker2 = Picker(reg2, slots)
+
+        assert await picker2._members(lane)
+        assert not await picker2._members(lane, needs_tools=True)
         try:
-            await picker.pick("apex", None, needs_tools=True)
+            await picker2.pick(lane, None, needs_tools=True)
         except LaneSaturated as exc:
             return [m.ref for m in members], str(exc)
-        raise AssertionError("expected apex to refuse a tool-using request")
+        raise AssertionError("expected the lane to refuse a tool-using request")
 
     members, message = run(go())
-    print(f"  apex without its local tail is {members} — all CLI-backed")
+    print(f"  apex with every member marked supports_tools: false is {members}")
     print(f"  {message}")
 
 
-def test_every_lane_can_serve_tools_through_its_local_tail():
-    """The flip side: with the local tail in place, no lane hard-fails on tools."""
+def test_a_lane_with_one_tool_capable_member_routes_to_it():
+    """The flip side: as long as one member's plan can serve tools, a
+    tool-using request is routed there rather than refused.
+    """
+    from dataclasses import replace
+
     async def go():
         reg, slots, picker = build()
-        out = {}
-        for lane in reg.lanes:
-            capable = [m.ref for m in await picker._members(lane, needs_tools=True)]
-            out[lane] = capable
-        return out
-    out = run(go())
-    for lane, capable in out.items():
-        assert capable, f"{lane} cannot serve tool calls at all"
-    print("  tool-capable members per lane: " + ", ".join(
-        f"{lane}={len(c)}" for lane, c in out.items()))
+        lane = "judge"
+        members = reg.lane_members(lane)
+        assert len(members) >= 2, "need at least two members to make this meaningful"
+        capable = members[-1]
+
+        plans = dict(reg.plans)
+        for m in members:
+            plans[m.plan_key] = replace(
+                plans[m.plan_key], supports_tools=(m.plan_key == capable.plan_key))
+        reg2 = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+        picker2 = Picker(reg2, slots)
+
+        pick = await picker2.pick(lane, None, needs_tools=True)
+        assert pick.plan.can_use_tools
+        assert pick.ref == capable.ref, (pick.ref, capable.ref)
+        return capable.ref
+
+    picked = run(go())
+    print(f"  judge with only {picked}'s plan tool-capable routed a tool-using request there")
+
+
+def test_a_mid_tool_loop_followup_pins_to_its_plan_instead_of_spilling():
+    """A follow-up carrying tool results must not be spilled to another plan.
+
+    Its tool_call_ids were minted by one plan's bridge and mean nothing
+    anywhere else, so a peer would reject them outright — and a caller that had
+    already run the tool would get a hard error instead of a wait. Spilling is
+    still right for a plain request, which is what makes this a separate mode.
+    """
+    async def go():
+        reg, slots, picker = build()
+        lane = "forge"
+        session = "sess-pinned"
+
+        first = await picker.pick(lane, session)
+        held = await slots.get_lease(session)
+        assert held == first.ref, (held, first.ref)
+
+        # Fill the leased plan so its next claim must fail.
+        plan = reg.plan_of(first.model)
+        taken = [first.request_id]
+        for _ in range(plan.max_parallel * 2):
+            rid = f"filler-{len(taken)}"
+            if await slots.try_claim(plan.key, plan.max_parallel, rid,
+                                     first.ref, first.model.max_parallel) != 1:
+                break
+            taken.append(rid)
+
+        # A plain request follows capacity: it re-leases onto another plan.
+        spilled = await picker.pick(lane, session)
+        assert spilled.ref != first.ref, "a plain request should have spilled"
+        await picker.release(spilled.plan.key, spilled.request_id, spilled.ref)
+        await slots.set_lease(session, first.ref, reg.settings.lease_ttl_seconds)
+
+        # The same situation, pinned, refuses rather than spilling.
+        try:
+            await picker.pick(lane, session, pinned=True)
+        except LaneSaturated as exc:
+            assert first.ref in str(exc), str(exc)
+            detail = str(exc)
+        else:
+            raise AssertionError("a pinned follow-up must not be served by a peer plan")
+
+        for rid in taken:
+            await picker.release(plan.key, rid, first.ref)
+        # With a slot free again, the pin is honoured on the same plan.
+        resumed = await picker.pick(lane, session, pinned=True)
+        assert resumed.ref == first.ref, (resumed.ref, first.ref)
+        assert resumed.sticky
+        return first.ref, detail
+
+    ref, detail = run(go())
+    print(f"  pinned to {ref}: full -> {detail!r}, free -> same plan")
 
 
 if __name__ == "__main__":

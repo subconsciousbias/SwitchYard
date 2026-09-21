@@ -310,45 +310,97 @@ The sidecar will not run an alias that is not in `MODEL_ALLOW`; it falls back to
 the default and logs loudly, because an `apex` escalation silently served by the
 `judge` model is the kind of bug you would never notice.
 
-## CLI-backed lanes cannot serve tool calls
+## Tool capability is a per-plan property
 
-Worth understanding before you point an agent at one, because it is the sharpest
-limitation in the whole design.
+`Plan.can_use_tools` defaults to **true** for every plan, and a plan genuinely
+unable to serve a caller's tool definitions sets `supports_tools: false` in
+config to say so. The picker still filters on it: a request carrying `tools`
+skips any plan marked that way, and a lane with no tool-capable member refuses
+with an explanation rather than silently dropping the definitions, which would
+look like the model simply choosing not to call anything.
 
-Every OAuth subscription here is reached through a CLI — `claude -p`,
-`codex exec`, `opencode run`. Each of those is **a whole agent harness**, not a
-model endpoint. It has its own system prompt, its own tools and its own loop. So
-when another harness (OpenCode, Cursor, Claude Code, Paperclip) calls a lane
-backed by one:
+That used to be a blanket rule instead of a per-plan flag, because every OAuth
+subscription here was reached through a CLI — `claude -p`, `codex exec`,
+`opencode run` — and each of those is **a whole agent harness**, not a model
+endpoint. It has its own system prompt, its own tools and its own loop, so a
+caller's tool definitions had nowhere to go, the harness's own tools acted on
+the sidecar's container rather than the caller's workspace, and the two system
+prompts stacked. Every CLI-backed plan was therefore treated as unable to serve
+tools, regardless of what it actually supported.
 
-- **the system prompts stack** — the caller's instructions land on top of the
-  CLI's built-in agent prompt, which wastes tokens and gives the model two sets
-  of possibly contradictory rules;
-- **the caller's tools have nowhere to run** — they are definitions the inner
-  harness never sees;
-- **the inner harness's own tools act on the sidecar's container**, not the
-  caller's workspace, and their results never reach the caller.
+That blanket assumption is going away as each provider's path is fixed
+properly, rather than worked around:
 
-So Switchyard **refuses to route a request containing `tools` to a CLI-backed
-plan**, and the sidecar rejects one with a 400 if it arrives anyway. Dropping the
-definitions silently would look like the model simply choosing not to call
-anything — the worst possible failure mode.
+- **xAI and OpenAI** move to direct API calls under our own OAuth grant,
+  bypassing the CLI harness entirely for these two, so there is no inner loop
+  left to fight with the caller's tools.
+- **Claude and OpenCode Go** keep the CLI harness but sit behind an MCP bridge
+  that inverts it: the harness's own tool call is parked instead of executed,
+  and handed back to the caller to run and answer, so the caller's tools do
+  reach the model.
 
-What that means per lane:
+Live today: `claude-max` runs the bridge (`BRIDGE: mcp`) and serves real
+`tool_calls` on the `apex` and `judge` lanes, tool results included. `grok`,
+`openai` and `opencode-go` are still marked `supports_tools: false` — grok and
+opencode-go until their MCP profile is verified against a live `opencode run`,
+openai because Codex has no MCP client and needs the direct OAuth path instead.
+Every lane still has tool-capable capacity without them.
 
-| Lane | Any request | Requests with `tools` |
-|---|---|---|
-| `forge` | 7 plans | 5 — drops Grok, OpenCode Go |
-| `judge` | 4 plans | 1 — drops the OpenAI seat, Grok, Claude Max |
-| `apex` | Claude Max | **none** — fails with an explanation |
+### A parked session holds a real connection
 
-The practical rule: **point agent harnesses at API-keyed lanes** (`forge`,
-`bulk`, `local`), and use the subscription lanes for text-in/text-out reasoning
-where the caller is not running its own tool loop. Set `supports_tools: true` on
-a plan to override the inference if you have a backend that really does pass
-tools through.
+While the bridge waits for the caller to answer a tool call, the CLI subprocess
+stays alive, so a parked session genuinely occupies one of the plan's
+connections. That window is also where callers vanish — and behind a proxy we
+cannot see them go: LiteLLM holds its own upstream connection open, so the
+sidecar's disconnect check (which does work on a direct call) never fires for
+anything arriving through the gateway. Two abandoned loops would take a
+2-connection plan out of its lane for the full 30-minute idle TTL.
 
-Two mitigations for the prompt stacking on the text-only path:
+So the sidecar weighs the two claimants instead of waiting: a parked session is
+speculative, while the request at the door is real work, and past
+`MCP_PARKED_GRACE_SECONDS` (60s) the request preempts the stalest parked
+session rather than getting a 429 that Switchyard would misread as concurrency
+pressure and cool a healthy plan for.
+
+Preempting is not dropping the work. The victim's id is remembered, and if its
+follow-up does arrive it is **resumed on the same plan**:
+
+- Switchyard pins it there. A request carrying tool *results* is mid-loop, and
+  its `tool_call_id`s were minted by one plan's bridge — a peer would reject
+  them outright and would hold none of this conversation's prompt cache. So a
+  pinned follow-up waits for its plan instead of spilling down the lane.
+- The sidecar rebuilds the session from the caller's own request, which carries
+  the whole history, tool results and all. Staying on the plan is what makes
+  this cheap: the provider's prompt cache is keyed to the account's prefix, so
+  a replayed history still hits it here and would miss anywhere else.
+- This is the **only** path allowed to queue. A new request still fails fast so
+  Switchyard can spill it to the next plan in the lane; a resumption has
+  nowhere to spill to, so it waits up to `MCP_RESUME_WAIT_SECONDS` (300s),
+  reclaiming a slot from another stale parked session if one is there. Past the
+  deadline it gets a 503 with `Retry-After`.
+
+### Which plan served the request
+
+The response body's `model` echoes what was asked for — usually a lane name
+like `judge` — so a caller doing its own token accounting cannot otherwise tell
+which subscription the tokens came out of. Switchyard adds one namespaced key
+that a strict client will ignore:
+
+```json
+"switchyard": {"lane": "judge", "plan": "claude-max",
+               "model": "claude-max/opus", "sticky": true}
+```
+
+LiteLLM also puts it in response headers (`x-litellm-model-group`,
+`x-litellm-model-name`, `x-litellm-attempted-fallbacks`), which is easy to miss
+and lost by any client that keeps only the JSON.
+
+Where a plan still cannot serve tools — because its path hasn't been fixed yet,
+or because it genuinely never will — set `supports_tools: false` on it and the
+picker keeps routing tool-using requests around it, the same as it always has.
+
+Two mitigations for the prompt stacking that CLI-backed plans still have on the
+non-tool path:
 
 - `SYSTEM_MODE=replace` passes the caller's system prompt with the CLI's
   *override* flag rather than appending to the built-in one, so only one agent

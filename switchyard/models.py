@@ -22,8 +22,9 @@ import yaml
 CONFIG_PATH = os.environ.get("SWITCHYARD_PLANS", "/app/config/plans.yaml")
 SEED_CAP = 2   # starting guess when a plan says `max_parallel: auto`
 
-# Auth modes where a CLI harness stands between us and the model. Those cannot
-# serve a caller's tool definitions; see Plan.can_use_tools.
+# Auth modes where a CLI harness stands between us and the model. That still
+# matters for prompt-stacking and workspace isolation (see Plan.is_cli_backed),
+# but it no longer implies anything about tool support — see Plan.can_use_tools.
 CLI_AUTH = ("cli_sidecar", "oauth_sidecar")
 
 
@@ -180,17 +181,24 @@ class Plan:
     def can_use_tools(self) -> bool:
         """Whether a request carrying `tools` may be routed to this plan.
 
-        A CLI-backed plan cannot serve one: the sidecar drives a whole agent
-        harness with its own system prompt, tools and loop, so the caller's tool
-        definitions have nowhere to go and its results would come from the
-        sidecar's workspace. Text in, text out is the honest contract there.
+        Tool capability is a property of the plan, not an inference from how it
+        is reached: it defaults to true, and a plan genuinely unable to serve a
+        caller's tool definitions sets `supports_tools: false` in config to say
+        so explicitly. (Historically every CLI-backed plan needed that override,
+        because shelling out to an agent harness gave the caller's tools nowhere
+        to go. That is being fixed per-provider — direct API access for some,
+        an MCP bridge that hands the harness's tool call back to the caller for
+        others — so the restriction is no longer assumed here.)
         """
         if self.supports_tools is not None:
             return self.supports_tools
-        return self.auth not in CLI_AUTH
+        return True
 
     @property
     def is_cli_backed(self) -> bool:
+        """Reached by shelling out to a vendor CLI rather than calling an API
+        directly. Still meaningful for prompt-stacking and workspace isolation
+        (see README), just not for tool capability any more."""
         return self.auth in CLI_AUTH
 
     @property

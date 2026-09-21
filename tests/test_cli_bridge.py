@@ -12,10 +12,13 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(HERE), "sidecars", "cli_bridge"))
-os.environ.setdefault("PROVIDER", "opencode")
+sys.path.insert(0, HERE)
+os.environ["PROVIDER"] = "opencode"
 
-import server  # noqa: E402
+from _modules import load  # noqa: E402
+
+server = load("cli_bridge_server",
+              os.path.join(os.path.dirname(HERE), "sidecars", "cli_bridge", "server.py"))
 
 FIXTURE = os.path.join(HERE, "fixtures", "opencode-events.jsonl")
 
@@ -229,19 +232,19 @@ PLANS = os.path.join(os.path.dirname(HERE), "config", "plans.yaml")
 
 def _read_for(plan: str, provider: str):
     """read_config() for one plan, without disturbing the module's globals."""
-    import importlib
+    import _modules
     old = dict(os.environ)
     os.environ.update({"PROVIDER": provider, "SWITCHYARD_PLAN": plan,
                        "SWITCHYARD_PLANS": PLANS})
     for key in ("SIDECAR_CONCURRENCY", "CLAUDE_MODEL", "CODEX_MODEL", "OPENCODE_MODEL"):
         os.environ.pop(key, None)
     try:
-        mod = importlib.reload(server)
+        mod = _modules.reload(server)
         return mod.read_config()
     finally:
         os.environ.clear()
         os.environ.update(old)
-        importlib.reload(server)
+        _modules.reload(server)
 
 
 def test_sidecar_reads_models_from_the_plan():

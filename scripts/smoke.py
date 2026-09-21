@@ -15,11 +15,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+os.environ.setdefault("SWITCHYARD_PLANS", str(
+    Path(__file__).resolve().parent.parent / "config" / "plans.yaml"))
+from switchyard import models  # noqa: E402  # read-only: which plan a member belongs to
 
 GW = "http://localhost:4000"
 PORTAL = "http://localhost:4001"
@@ -138,24 +145,52 @@ def check_anthropic_protocol(api_key: str) -> None:
           f"model={d.get('model')} {text[:40]!r}")
 
 
-def check_tool_routing(api_key: str) -> None:
+_REGISTRY = None
+
+
+def registry() -> models.Registry:
+    global _REGISTRY
+    if _REGISTRY is None:
+        _REGISTRY = models.load()
+    return _REGISTRY
+
+
+def check_tool_routing(lane: str, api_key: str) -> None:
+    """A tool-carrying request must come back with real `tool_calls`, and the
+    member that served it must belong to a plan that actually reports tool
+    capability (`Plan.can_use_tools`) — not one we merely assume can, because
+    that assumption is exactly what used to be wrong.
+
+    Note: `can_use_tools` now defaults to true for every plan and is only
+    false where config says `supports_tools: false`. Today no plan sets that,
+    so a CLI-backed plan (claude-max, openai seat, grok, opencode-go) is a
+    legal pick here even though its sidecar still hard-rejects any request
+    carrying `tools` with a 400 (sidecars/cli_bridge/server.py) until the
+    direct-API and MCP-bridge workstreams land. If this check lands on one of
+    those plans and gets a 400, that is an accurate failure, not a bug in this
+    check — it means the lane's ordered fill reached a plan whose sidecar
+    can't serve tools yet.
+    """
     tools = [{"type": "function", "function": {
         "name": "get_weather", "description": "Get weather for a city",
         "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
                        "required": ["city"]}}}]
     d = post("/v1/chat/completions",
-             {"model": "judge", "max_tokens": 150, "tools": tools,
+             {"model": lane, "max_tokens": 150, "tools": tools,
               "messages": [{"role": "user", "content": "What is the weather in Oslo?"}]},
              api_key)
+    name = f"lane {lane}: tool calls routed to a tool-capable plan"
     if "__http__" in d:
-        check("tool calls routed to a tool-capable plan", False,
-              f"HTTP {d['__http__']}: {d['__body__'][:150]}")
+        check(name, False, f"HTTP {d['__http__']}: {d['__body__'][:150]}")
         return
     calls = d.get("choices", [{}])[0].get("message", {}).get("tool_calls") or []
-    member = routed_to("judge")
-    cli_backed = any(m in member for m in ("claude-max", "openai/", "grok/", "opencode-go"))
-    check("tool calls routed to a tool-capable plan", bool(calls) and not cli_backed,
-          f"-> {member}  tool_calls={[c['function']['name'] for c in calls]}")
+    member = routed_to(lane)
+    ref = member.split()[0] if member else ""   # routed_to() trails cap/sticky/skip notes
+    model = registry().model(ref) if ref else None
+    capable = bool(model) and registry().plan_of(model).can_use_tools
+    check(name, bool(calls) and capable,
+          f"-> {member}  tool_calls={[c['function']['name'] for c in calls]}  "
+          f"plan.can_use_tools={capable}")
 
 
 def check_affinity(api_key: str) -> None:
@@ -275,12 +310,14 @@ def main() -> int:
     check_cooldown_shrinks_capacity()
     check_pacing_switch()
     check_quota_windows_tracked()
-    check_tool_routing(api_key)
+    for lane in ("local", "bulk"):
+        check_tool_routing(lane, api_key)
 
     if args.paid:
         print("\npaid lanes (spending subscription quota)")
         for lane in ("forge", "judge", "apex"):
             check_lane(lane, api_key)
+            check_tool_routing(lane, api_key)
 
     if args.slow:
         print("\nCLI harness overhead")

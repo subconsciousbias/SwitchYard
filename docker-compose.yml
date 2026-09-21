@@ -110,6 +110,11 @@ services:
     # there is only ever one number to change.
     environment:
       PROVIDER: claude
+      # The inverted MCP bridge: a caller's tools are exposed to Claude Code as
+      # MCP tools, and the call is parked and handed back rather than executed
+      # here. Claude Max cannot be reached over the API under its terms, so this
+      # is the only route to tool calling on that subscription.
+      BRIDGE: mcp
       SIDECAR_PORT: "8081"
       SWITCHYARD_PLAN: claude-max
       SWITCHYARD_PLANS: /app/config/plans.yaml

@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""MCP stdio server spawned BY the vendor CLI -- `claude -p --mcp-config ...`
+or opencode's `mcp:` config -- the other half of the inverted bridge in
+server.py.
+
+It does not execute tools itself. `tools/list` answers from a file server.py
+wrote for this one request (the caller's OpenAI tools, translated to MCP);
+`tools/call` is forwarded over loopback HTTP to server.py's
+/internal/tools/call, which parks it until the real HTTP caller supplies a
+result. That HTTP request IS the parking mechanism: holding it open keeps this
+process -- and therefore the CLI's tool loop -- blocked exactly as long as
+needed, with no polling on either side.
+
+Dependency-free like probe_server.py, which proved the underlying trick:
+JSON-RPC over stdio, one frame per line, stdlib urllib for the callback (run in
+a thread, since urlopen blocks).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+PROTOCOL_VERSION = "2024-11-05"
+
+TOOLS_FILE = os.environ["SWITCHYARD_TOOLS_FILE"]
+SESSION_ID = os.environ["SWITCHYARD_SESSION_ID"]
+CALLBACK_URL = os.environ["SWITCHYARD_CALLBACK_URL"].rstrip("/")
+# No timeout here by default -- server.py's session TTL and reaper are what
+# bound how long a call may sit parked, not this process. A caller may be
+# minutes into a build or a test suite when it finally answers.
+_raw_timeout = os.environ.get("SWITCHYARD_CALLBACK_TIMEOUT", "")
+CALLBACK_TIMEOUT = float(_raw_timeout) if _raw_timeout else None
+
+
+def log(message: str) -> None:
+    """stderr only: stdout is the protocol channel."""
+    print(f"[tool_server {SESSION_ID[:8]}] {message}", file=sys.stderr, flush=True)
+
+
+def load_tools() -> list[dict]:
+    with open(TOOLS_FILE) as fh:
+        return json.load(fh)
+
+
+TOOLS = load_tools()
+
+
+async def write_reply(payload: dict, lock: asyncio.Lock) -> None:
+    # Several tools/call replies can be in flight at once (parallel tool
+    # calls); serialise the actual stdout writes so two never interleave.
+    async with lock:
+        sys.stdout.write(json.dumps(payload) + "\n")
+        sys.stdout.flush()
+
+
+def call_back(name: str, arguments: dict) -> dict:
+    """Blocking HTTP POST, run in a thread so it does not stall the stdin
+    reader. Never logs the arguments or the result -- they may carry
+    whatever the caller's tool handles, which is user data we have no
+    business printing."""
+    body = json.dumps({"session_id": SESSION_ID, "name": name,
+                        "arguments": arguments}).encode()
+    req = urllib.request.Request(
+        f"{CALLBACK_URL}/internal/tools/call", data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=CALLBACK_TIMEOUT) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:200]
+        return {"content": [{"type": "text",
+                              "text": f"switchyard bridge error {exc.code}: {detail}"}],
+                "isError": True}
+    except urllib.error.URLError as exc:
+        return {"content": [{"type": "text",
+                              "text": f"switchyard bridge unreachable: {exc.reason}"}],
+                "isError": True}
+
+
+async def handle_call(request_id, name: str, arguments: dict, lock: asyncio.Lock) -> None:
+    log(f"tools/call {name!r} parked")
+    result = await asyncio.to_thread(call_back, name, arguments)
+    log(f"tools/call {name!r} resolved isError={result.get('isError', False)}")
+    await write_reply({"jsonrpc": "2.0", "id": request_id, "result": result}, lock)
+
+
+async def handle(message: dict, lock: asyncio.Lock) -> None:
+    method = message.get("method")
+    request_id = message.get("id")
+
+    if method == "initialize":
+        await write_reply({"jsonrpc": "2.0", "id": request_id, "result": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "switchyard-mcp-bridge", "version": "0.1.0"},
+        }}, lock)
+        return
+
+    if method in ("notifications/initialized", "initialized"):
+        return                                  # notification: no response
+
+    if method == "tools/list":
+        await write_reply({"jsonrpc": "2.0", "id": request_id,
+                            "result": {"tools": TOOLS}}, lock)
+        return
+
+    if method == "tools/call":
+        params = message.get("params") or {}
+        # Fire-and-forget as a task: the stdin reader keeps consuming further
+        # frames while this one parks on the HTTP call, which is what lets
+        # several tools/call requests be in flight at once on one stdio
+        # connection -- the mechanism parallel tool calls rely on.
+        asyncio.create_task(handle_call(
+            request_id, str(params.get("name") or ""),
+            params.get("arguments") or {}, lock))
+        return
+
+    if request_id is not None:
+        # Unknown method with an id still needs an answer, or the client hangs.
+        await write_reply({"jsonrpc": "2.0", "id": request_id, "error": {
+            "code": -32601, "message": f"method not found: {method}"}}, lock)
+
+
+async def stdin_lines(queue: "asyncio.Queue[str | None]") -> None:
+    loop = asyncio.get_event_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            await queue.put(None)
+            return
+        line = line.strip()
+        if line:
+            await queue.put(line)
+
+
+async def main_async() -> None:
+    log("started")
+    queue: "asyncio.Queue[str | None]" = asyncio.Queue()
+    lock = asyncio.Lock()
+    asyncio.create_task(stdin_lines(queue))
+    while True:
+        line = await queue.get()
+        if line is None:
+            break
+        try:
+            message = json.loads(line)
+        except ValueError:
+            log(f"unparseable frame: {line[:120]}")
+            continue
+        try:
+            asyncio.create_task(handle(message, lock))
+        except Exception as exc:                # never die on one bad frame
+            log(f"handler error: {exc!r}")
+    log("stdin closed, exiting")
+
+
+def main() -> int:
+    asyncio.run(main_async())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

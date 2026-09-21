@@ -14,7 +14,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai
 
 WORKDIR /app
-COPY sidecars/cli_bridge/server.py /app/server.py
+# Both bridges ship in every sidecar image and BRIDGE picks one at runtime, so a
+# plan can move between the text path and the tool path without a rebuild. They
+# must stay siblings: mcp_bridge imports cli_bridge's argv building and error
+# classification rather than duplicating them.
+COPY sidecars/cli_bridge/server.py /app/cli_bridge/server.py
+COPY sidecars/mcp_bridge /app/mcp_bridge
 # Minimal harness configs. opencode.json is read as the project config from the
 # working directory and defines the `switchyard` agent (one-line prompt, every
 # tool disabled); codex-instructions.md is the default base-instruction override.
@@ -38,4 +43,4 @@ ENV HOME=/home/node \
 
 ENV PROVIDER=claude SWITCHYARD_PLANS=/app/config/plans.yaml
 EXPOSE 8081 8082 8083 8084
-CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${SIDECAR_PORT:-8081}"]
+CMD ["sh", "-c", "cd /app/${BRIDGE:-cli}_bridge && uvicorn server:app --host 0.0.0.0 --port ${SIDECAR_PORT:-8081}"]

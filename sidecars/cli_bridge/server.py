@@ -270,13 +270,16 @@ def config() -> Config:
 class Gate:
     """A concurrency gate whose limit can change between requests.
 
-    Never queues: a full gate answers immediately so Switchyard can spill to the
-    next plan in the lane instead of holding a worker open.
+    A *new* request never queues: a full gate answers immediately so Switchyard
+    can spill to the next plan in the lane instead of holding a worker open.
+    The one exception is acquire_waiting, used only to resume a tool-calling
+    session that was already committed to this plan — see mcp_bridge.
     """
 
     def __init__(self) -> None:
         self._in_flight = 0
         self._lock = asyncio.Lock()
+        self._freed = asyncio.Condition()
 
     @property
     def in_flight(self) -> int:
@@ -289,9 +292,32 @@ class Gate:
             self._in_flight += 1
             return True
 
+    async def acquire_waiting(self, limit: int, timeout: float) -> bool:
+        """Acquire, waiting up to `timeout` for a slot to come free.
+
+        Callers are woken in arrival order, so a queue of resuming sessions is
+        served first-come-first-served rather than by luck of scheduling.
+        """
+        deadline = time.monotonic() + timeout
+        if await self.acquire(limit):
+            return True
+        async with self._freed:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    await asyncio.wait_for(self._freed.wait(), remaining)
+                except asyncio.TimeoutError:
+                    return False
+                if await self.acquire(limit):
+                    return True
+
     async def release(self) -> None:
         async with self._lock:
             self._in_flight = max(0, self._in_flight - 1)
+        async with self._freed:
+            self._freed.notify()          # hand the slot to the longest waiter
 
 
 _gate = Gate()
@@ -480,9 +506,15 @@ def iter_json_objects(blob: str):
             yield obj
 
 
-def parse_output(stdout: str) -> dict:
-    """Normalise a CLI's output into {result, usage}."""
-    kind = PROFILE["parser"]
+def parse_output(stdout: str, kind: str | None = None) -> dict:
+    """Normalise a CLI's output into {result, usage}.
+
+    `kind` defaults to this process's own PROFILE, but mcp_bridge calls this
+    with its own provider's parser kind explicitly — the event shapes
+    ("claude_json", "events_json", "codex_jsonl") are the same regardless of
+    which sidecar is asking, so there is no reason to duplicate this parser.
+    """
+    kind = kind or PROFILE["parser"]
 
     if kind == "claude_json":
         return json.loads(stdout)
@@ -767,9 +799,12 @@ def error_from_events(stdout: str) -> tuple[int | None, str]:
     return status, " | ".join(unique)[:500]
 
 
-def _limit_error(blob: str) -> HTTPException:
+def _limit_error(blob: str, default_retry_after: int | None = None) -> HTTPException:
     # Default to the plan's window; if the CLI names a reset time, trust it.
-    retry_after = PROFILE["default_retry_after"]
+    # mcp_bridge passes its own provider profile's window explicitly, since it
+    # may be running as a different PROVIDER than this module was imported
+    # under (see the note on read_config for how the two stay independent).
+    retry_after = default_retry_after if default_retry_after is not None else PROFILE["default_retry_after"]
     detail = f"{PROVIDER} usage limit reached"
 
     blob = normalise(blob)
@@ -831,10 +866,13 @@ async def models() -> dict:
                      for m in sorted(config().models)]}
 
 
-@app.post("/v1/chat/completions")
-async def chat(request: Request):
-    body = await request.json()
-
+async def _handle_chat(body: dict):
+    """The text-only completion path, factored out of the route so mcp_bridge
+    can call it directly for a request with no `tools` — same gate, same
+    config, same error classification, not a re-implementation of any of it.
+    That identity is what "no regression on the text path" means here: there
+    is only one code path for it, whichever sidecar is asking.
+    """
     # Refuse tool calls loudly. Switchyard already routes these away from
     # CLI-backed plans; if one arrives anyway, dropping the definitions silently
     # would look like the model simply choosing not to call anything.
@@ -890,3 +928,8 @@ async def chat(request: Request):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(one_shot(), media_type="text/event-stream")
+
+
+@app.post("/v1/chat/completions")
+async def chat(request: Request):
+    return await _handle_chat(await request.json())

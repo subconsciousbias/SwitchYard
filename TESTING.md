@@ -452,10 +452,12 @@ Anthropic.
 
 ---
 
-## 4g. Tool calls must avoid the CLI-backed lanes
+## 4g. Tool capability is a per-plan property
 
 This is the check most likely to matter for Paperclip, since an agent sends tool
-definitions on nearly every call.
+definitions on nearly every call. `Plan.can_use_tools` defaults to true; a plan
+opts out with `supports_tools: false` in config, and the picker skips a plan
+marked that way for a request carrying `tools`.
 
 ```bash
 curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
@@ -470,29 +472,32 @@ curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
 docker compose logs --tail=5 gateway | grep 'lane=judge'
 ```
 
-**Expect:** the log line to include `tools` and to pick a member whose plan is
-*not* CLI-backed — for `judge` that means `local-box/qwen`, since every other
-member of that lane rides a CLI-backed plan. The response should contain a
-proper `tool_calls` block.
+**Expect:** the log line to include `tools`, and the response to contain a
+proper `tool_calls` block. Check which member it picked and cross-reference
+`config/plans.yaml`: the log line names a `plan/model` ref, and that plan
+should not have `supports_tools: false` set.
 
-Then confirm the refusal path is explicit rather than silent:
+**Interim caveat:** as of this writing no plan sets `supports_tools: false`, so
+every member of every lane is a legal pick for a tool-using request — but the
+CLI-backed sidecars (`claude-max`, `openai`, `grok`, `opencode-go`) still
+hard-reject any request carrying `tools` with a 400
+(`sidecars/cli_bridge/server.py`), because the direct-API and MCP-bridge
+workstreams that let them actually serve tools land separately from this
+change. So a tool-using `judge` or `apex` call may currently surface that 400
+through the gateway if the picker lands on one of those plans first — that is
+a real gap in the sidecar, not a routing bug, and it closes as each provider's
+workstream ships. If you hit it before then, and there is genuinely no way for
+that plan to serve tools, add `supports_tools: false` to it in
+`config/plans.yaml` so the picker routes around it until the fix lands.
 
-```bash
-curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-  -H 'Content-Type: application/json' -d '{
-    "model":"apex","messages":[{"role":"user","content":"hi"}],
-    "tools":[{"type":"function","function":{"name":"noop","parameters":{"type":"object","properties":{}}}}]
-  }' | python3 -m json.tool | head -12
-```
+**A 200 with no `tool_calls` would be the bug** regardless of which plan is
+picked — it would mean the definitions were silently dropped rather than
+either served or refused.
 
-**Expect:** a 429 whose detail says no plan in the lane can serve tool calls
-because every candidate is CLI-backed. That is correct: `apex` is entirely
-subscription-backed. **A 200 with no `tool_calls` would be the bug** — it would
-mean the definitions were silently dropped.
-
-The practical consequence for Paperclip: send agentic, tool-using work to
-`forge`, `bulk` or `local`, and reserve `judge` / `apex` for reasoning calls that
-do not carry tools.
+The practical consequence for Paperclip: `forge`, `bulk` and `local` are the
+lanes with local-box in easy reach, so tool-using work routed there is least
+likely to hit the interim gap above; `judge` / `apex` may or may not, depending
+on where each subscription's workstream stands.
 
 ## 5. Behaviour tests
 

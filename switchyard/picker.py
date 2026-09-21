@@ -77,19 +77,20 @@ class Picker:
         if self.policy is not None and not await self.policy.tail_enabled():
             members = [m for m in members if not self.registry.is_tail(lane, m.ref)]
         if needs_tools:
-            # A CLI-backed plan would silently drop the caller's tools, so it is
-            # not a candidate — better to fall through to one that can.
+            # A plan marked `supports_tools: false` would silently drop the
+            # caller's tools, so it is not a candidate — better to fall through
+            # to one that can serve them.
             members = [m for m in members
                        if self.registry.plan_of(m).can_use_tools]
         return members
 
     async def pick(self, lane: str, session: str | None,
-                   needs_tools: bool = False) -> Pick:
+                   needs_tools: bool = False, pinned: bool = False) -> Pick:
         rid = uuid.uuid4().hex
         members = await self._members(lane, needs_tools)
         if not members:
             detail = ("nothing in this lane can serve tool calls — every "
-                      "candidate is CLI-backed" if needs_tools
+                      "candidate plan is marked supports_tools: false" if needs_tools
                       else "no live models (all expired or disabled)")
             raise LaneSaturated(lane, detail)
 
@@ -108,6 +109,15 @@ class Picker:
                         plan.key, cap, rid, model.ref, model.max_parallel) == 1:
                     await self.slots.touch_lease(session, self.registry.settings.lease_ttl_seconds)
                     return Pick(lane, model, plan, rid, session, True, [], cap, reason)
+                if pinned:
+                    # A mid-tool-loop follow-up cannot be spilled. Its
+                    # tool_call_ids were minted by one plan's bridge and mean
+                    # nothing anywhere else, so another plan would reject them
+                    # outright — and even if it accepted them, it would have
+                    # none of the prompt cache this conversation has been
+                    # building. Better to make the caller wait for this plan.
+                    raise LaneSaturated(
+                        lane, f"pinned to {held} mid-tool-loop; it has no free slot")
                 # Its slots are full or it just got cooled down; fall through
                 # and re-lease. Sessions follow capacity rather than blocking.
                 skipped.append(f"{held}(lease unusable)")

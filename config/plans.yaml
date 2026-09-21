@@ -241,6 +241,9 @@ plans:
     notes: >
       Cancelled, 7 days left as of 2026-09-20. The drain rule puts it at the
       front of the workhorse lane until it dies.
+    # Text-only until opencode-go-sidecar runs BRIDGE=mcp against a verified
+    # OpenCode MCP profile.
+    supports_tools: false
     models:
       # provider/model as OpenCode names it — `opencode` and `opencode-go` are
       # DIFFERENT providers there (free/community versus this paid plan).
@@ -312,6 +315,9 @@ plans:
         allowance: null
         source: estimate
     notes: "Cancelled. Both models share the seat's 2 connections and its quota."
+    # Codex has no MCP client, so the sidecar cannot serve the caller's tools
+    # back to it. Tool-carrying requests must skip this plan, not 400 on it.
+    supports_tools: false
     models:
       # Verified ids on a ChatGPT seat, in capability order — sol strongest, then
       # terra, luna weakest. Prompt overhead for a 5-token reply in brackets.
@@ -355,6 +361,10 @@ plans:
         allowance: null           # TODO
         source: estimate
     notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
+    # Still on the text-only CLI bridge (BRIDGE=cli). Flip to true once this
+    # plan moves to the xAI token proxy, or once grok-sidecar runs BRIDGE=mcp
+    # against a verified OpenCode MCP profile.
+    supports_tools: false
     models:
       grok-4.6:
         model: openai/xai/grok-4.6
