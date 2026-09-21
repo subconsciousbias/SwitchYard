@@ -107,7 +107,15 @@ DISCONNECT_POLL = float(os.environ.get("MCP_DISCONNECT_POLL_SECONDS", "2"))
 PARKED_GRACE = float(os.environ.get("MCP_PARKED_GRACE_SECONDS", "60"))
 # How long the follow-up of a preempted session may wait for a slot on THIS
 # plan before giving up. Only a resumption ever waits: see resume_gone_session.
-RESUME_WAIT = float(os.environ.get("MCP_RESUME_WAIT_SECONDS", "300"))
+#
+# Bounded, not generous. A queued resumption holds a gateway plan slot for the
+# full wait while doing no model work, and a queued rebuild of a pinned session
+# starves that session's own follow-ups against the same plan (issue #14).
+# 15s lets one in-flight turn make progress; anything longer just hands the
+# caller time to retry into a slot we are still holding. Both queue sites share
+# the knob; the 503 + Retry-After path on each returns control to SwitchYard
+# immediately when the wait expires.
+RESUME_WAIT = float(os.environ.get("MCP_RESUME_WAIT_SECONDS", "15"))
 # A follow-up naming a session that is gone for any OTHER reason -- reaped
 # after the idle TTL (a caller that walked away mid-loop), dropped when its
 # caller hung up, crashed, hit the process timeout, or lost to a sidecar

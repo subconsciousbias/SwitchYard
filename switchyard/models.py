@@ -12,6 +12,7 @@ no separate grouping concept, because the plan already is one.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -370,6 +371,30 @@ class Registry:
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
+def router_signature(reg: Registry) -> str:
+    """Fingerprint of everything the generated LiteLLM config bakes in.
+
+    LiteLLM builds one deployment per plan/model pairing at startup, carrying
+    the model string, api_base, credentials and context windows. Only a change
+    to that surface forces `docker compose restart gateway` — a deployment the
+    router has never seen cannot be routed to, whatever the hook says.
+
+    Everything else — caps, quota windows, lane order, settings, pacing, costs,
+    expiry — is read from the registry at request time, so those edits hot-swap
+    without a restart. `max_parallel` is excluded on purpose: it lands in the
+    generated config only as a backstop (`max_parallel_requests`), while the
+    real gate is the slot table, which reads the live registry.
+    """
+    parts = sorted(
+        (m.plan_key, m.key, m.model, reg.plan_of(m).api_base,
+         reg.plan_of(m).api_key, m.context_window)
+        for m in reg.models.values()
+    )
+    lanes = tuple(sorted(reg.lanes))
+    blob = repr((parts, lanes)).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
 def _parse_date(v: Any) -> date | None:
     if v in (None, ""):
         return None

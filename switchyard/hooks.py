@@ -16,6 +16,7 @@ import hashlib
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Any
 
@@ -66,6 +67,9 @@ class SwitchyardHandler(CustomLogger):
         self._picker: Picker | None = None
         self._ledger: Ledger | None = None
         self._policy: CapacityPolicy | None = None
+        self._plans_mtime: float | None = self._stat_plans()
+        self._watcher: threading.Thread | None = None
+        self._sync_redis_client: Any = None
         # request_id -> heartbeat task, so a live request keeps its slot and a
         # dead one loses it within inflight_max_age_seconds.
         self._beats: dict[str, asyncio.Task] = {}
@@ -74,6 +78,7 @@ class SwitchyardHandler(CustomLogger):
             len(self.registry.plans), ",".join(self.registry.lanes),
             sum(1 for p in self.registry.plans.values() if p.can_use_tools),
         )
+        self._start_watcher()
 
     # -- wiring ------------------------------------------------------------
     @property
@@ -110,12 +115,108 @@ class SwitchyardHandler(CustomLogger):
             self._ledger = Ledger(self.redis)
         return self._ledger
 
-    # No reload() here on purpose. LiteLLM builds its router from the config
-    # generated at container start, so a change to models, api_base or
-    # credentials cannot take effect without a restart — and a method that
-    # refreshed only the routing policy would look like a live reload while
-    # leaving the router stale. `docker compose restart gateway` is the whole
-    # answer; the portal's /admin/reload refreshes the board it owns.
+    # -- live config reload ------------------------------------------------
+    # All state that matters lives in Redis — learned caps, pacing, cooldowns,
+    # session leases, usage — so rebuilding the registry costs nothing but a
+    # yaml parse. The LiteLLM router is the exception: it is built at startup
+    # from the generated config, which bakes in model strings, api_base,
+    # credentials and context windows. router_signature() draws exactly that
+    # line: a policy-only edit swaps in place within HOT_RELOAD_SECONDS, while
+    # an edit the router cannot follow keeps the old registry (so the running
+    # router and the routing policy never disagree) and says so loudly.
+    #
+    # A plain daemon thread, not an asyncio task: the handler is constructed at
+    # config-parse time, possibly before any event loop exists, and a watcher
+    # spawned from the pre-call hook would not start at all on an idle gateway
+    # — which is exactly when you edit the config. Blocking IO in a thread we
+    # own is fine; the swap is GIL-atomic attribute assignment, and every
+    # worker of a multi-worker gateway runs its own watcher against the same
+    # mounted file and converges on the same registry.
+    HOT_RELOAD_SECONDS = 5.0
+    ROUTER_SIG_KEY = "switchyard:router_sig"
+
+    def _start_watcher(self) -> None:
+        if self._watcher is not None:
+            return
+        self._watcher = threading.Thread(
+            target=self._watch_loop, name="switchyard-config-watcher", daemon=True)
+        self._watcher.start()
+
+    def _sync_redis(self):
+        if self._sync_redis_client is None:
+            import redis as sync_redis
+            self._sync_redis_client = sync_redis.Redis.from_url(
+                os.environ.get("SWITCHYARD_REDIS_URL", "redis://redis:6379/1"))
+        return self._sync_redis_client
+
+    def _publish_sig(self) -> None:
+        try:
+            self._sync_redis().set(self.ROUTER_SIG_KEY,
+                                    models.router_signature(self.registry))
+        except Exception as exc:
+            log.warning("could not publish router signature to redis: %r", exc)
+
+    def _stat_plans(self) -> float | None:
+        try:
+            return os.stat(models.CONFIG_PATH).st_mtime
+        except OSError:
+            return None
+
+    def _watch_loop(self) -> None:
+        # Publish first, every iteration, not just at startup: redis flush,
+        # gateway restart, or a refused router-shaped edit all leave the key
+        # holding what is actually routing, and reload.sh compares against it.
+        while True:
+            try:
+                self._maybe_reload()
+            except Exception as exc:
+                log.warning("config watcher iteration failed: %r", exc)
+            self._publish_sig()
+            time.sleep(self.HOT_RELOAD_SECONDS)
+
+    def _maybe_reload(self) -> None:
+        mtime = self._stat_plans()
+        if mtime is None or mtime == self._plans_mtime:
+            return
+        try:
+            fresh = models.load()
+        except Exception as exc:
+            # Advance the stamp so a broken file is reported once, not every
+            # cycle; the next edit gets a new stamp and is tried again.
+            self._plans_mtime = mtime
+            log.warning("plans.yaml reload skipped — %s: %s", type(exc).__name__, exc)
+            return
+        self._plans_mtime = mtime
+        if models.router_signature(fresh) != models.router_signature(self.registry):
+            log.warning(
+                "plans.yaml changed model strings / credentials / lanes — "
+                "the LiteLLM router is built at startup, KEEPING the current "
+                "routing; run scripts/reload.sh (or docker compose restart "
+                "gateway) to apply it.")
+            return
+        self._swap_registry(fresh)
+        log.info(
+            "plans.yaml reloaded in place: %d plans, lanes=%s, tool-capable=%d",
+            len(fresh.plans), ",".join(fresh.lanes),
+            sum(1 for p in fresh.plans.values() if p.can_use_tools))
+
+    def _swap_registry(self, fresh: models.Registry) -> None:
+        # Build the replacements before promoting any of them, so the swap is
+        # a sequence of assignments rather than a half-built state. The slot
+        # table and ledger carry over: they are plan-keyed Redis state, not
+        # registry state, and a request in flight is using them right now.
+        if self._slots is not None:
+            fresh_ttl = fresh.settings.inflight_max_age_seconds
+            if self._slots.inflight_max_age != fresh_ttl:
+                self._slots = SlotTable(self.redis, fresh_ttl)
+        fresh_slots = self._slots
+        fresh_ledger = self._ledger or Ledger(self.redis)
+        policy = CapacityPolicy(self.redis, fresh.settings, fresh_ledger)
+        picker = Picker(fresh, fresh_slots, policy)
+        self.registry = fresh
+        self._policy = policy
+        self._picker = picker
+        self._ledger = fresh_ledger
 
     # -- inbound: choose a provider ---------------------------------------
     async def async_pre_call_hook(

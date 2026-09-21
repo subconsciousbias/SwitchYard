@@ -110,13 +110,16 @@ def compose(*args: str) -> str:
 
 def newest_mtime(paths) -> float:
     newest = 0.0
+    # __pycache__ and *.pyc are interpreter by-products: any local test run
+    # refreshes them, and counting them would flag every image stale after a
+    # mere `python3 tests/test_*.py`, forcing a rebuild for a config-only edit.
     for s in paths:
         p = Path(s)
         if not p.exists():
             continue
         if p.is_dir():
             for f in p.rglob("*"):
-                if f.is_file():
+                if f.is_file() and "__pycache__" not in f.parts and f.suffix != ".pyc":
                     newest = max(newest, f.stat().st_mtime)
         else:
             newest = max(newest, p.stat().st_mtime)

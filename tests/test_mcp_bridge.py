@@ -1243,6 +1243,142 @@ def test_span2_follow_up_supersedes_dropped_sessions_so_the_invariant_holds():
         server._continue_followup = real
 
 
+def test_unpark_returns_503_quickly_when_gate_is_full():
+    """A pinned follow-up on a saturated plan must 503 fast, not hold the slot.
+
+    `unpark_session` queues on the plan's concurrency gate while a parked
+    session waits to be told a tool result. The gateway claimed the plan slot
+    on the way in, so the wait is paid against the gateway budget, not the
+    sidecar's. With RESUME_WAIT at 300s (issue #14's example), one queued
+    resumption ate the slot its own pinned follow-ups were about to be
+    429'd against -- a self-starvation loop. The fix is a short, bounded
+    wait that returns control to the gateway the moment it expires.
+    """
+    SHORT = 0.3   # tight enough for a fast test, long enough to be measurable
+
+    async def scenario():
+        # The shared `_gate` singleton has its Condition lazily bound to
+        # whichever event loop first calls `acquire_waiting`; an earlier
+        # test's loop is stale by the time we run. Swap in a fresh gate for
+        # this scenario so its locks bind to OUR event loop.
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        try:
+            limit = server.cli_bridge.config().concurrency
+
+            # Saturate the gate from a known clean state.
+            for _ in range(limit):
+                assert await gate.acquire(limit)
+            assert gate.in_flight == limit, gate.in_flight
+
+            session = _new_session()
+            session.holds_slot = False
+
+            saved_wait = server.RESUME_WAIT
+            server.RESUME_WAIT = SHORT
+            try:
+                started = time.monotonic()
+                try:
+                    await server.unpark_session(session)
+                except server.HTTPException as exc:
+                    elapsed = time.monotonic() - started
+                    assert exc.status_code == 503, exc.status_code
+                    assert "no slot freed" in exc.detail, exc.detail
+                    assert exc.headers and exc.headers.get("Retry-After") == "15", exc.headers
+                    # The whole point: bounded, not 300s. SHORT leaves room for
+                    # scheduling jitter without ever approaching the old default.
+                    assert elapsed < SHORT * 4, elapsed
+                else:
+                    raise AssertionError("unpark_session must 503 when the gate stays full")
+            finally:
+                server.RESUME_WAIT = saved_wait
+                _drop(session)
+        finally:
+            server.cli_bridge._gate = saved_gate
+
+    asyncio.run(scenario())
+    print(f"  unpark_session bounded to RESUME_WAIT (~{SHORT}s) instead of 300s")
+
+
+def test_resume_gone_returns_503_quickly_when_gate_is_full():
+    """A rebuild on a saturated plan must 503 fast, for the same reason.
+
+    `resume_gone_session` is the rebuild path: a follow-up for a session that
+    no longer exists (preempted, reaped, lost to a restart). It is the only
+    path allowed to queue -- a *new* request still has to fail fast so
+    SwitchYard can spill to the next plan. The queueing is still dangerous:
+    a rebuild that cannot find a slot within the wait burns the whole wait
+    holding a gateway plan slot, and the pinned session's own follow-ups
+    correctly fail-fast rather than spill, so the same session 429s against
+    the slot its own queued rebuild is holding.
+    """
+    SHORT = 0.3
+
+    async def scenario():
+        # Same fresh-gate reason as the unpark test: bind the lock/condition
+        # to this scenario's event loop, not one an earlier test used.
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        try:
+            limit = server.cli_bridge.config().concurrency
+
+            for _ in range(limit):
+                assert await gate.acquire(limit)
+            assert gate.in_flight == limit, gate.in_flight
+
+            # Use tools that pass translate_tools and a message with content, so
+            # we exercise the queue branch instead of failing earlier on the
+            # no-tools / no-content checks (which would mask the bug we care
+            # about).
+            body = {
+                "model": "m",
+                "tools": [{"type": "function", "function": {
+                    "name": "get_weather", "description": "",
+                    "parameters": {"type": "object", "properties": {}}}}],
+                "messages": [
+                    {"role": "user", "content": "weather in Oslo?"},
+                    {"role": "tool", "tool_call_id": "call_x", "content": '{"temp_c":-3}'},
+                ],
+            }
+            # Stub start_session so a regression that gets past the gate would
+            # still fail clearly instead of hanging on a real CLI spawn.
+            calls: list = []
+            restore_start = server.start_session
+
+            async def fake_start(body, mcp_tools, prompt, system, model, request):
+                calls.append({"prompt": prompt})
+                return {"stubbed": True}
+            server.start_session = fake_start
+
+            saved_wait = server.RESUME_WAIT
+            server.RESUME_WAIT = SHORT
+            try:
+                started = time.monotonic()
+                try:
+                    await server.resume_gone_session(
+                        body, body["tools"], "nonexistent-session-id", None,
+                        why="lost")
+                except server.HTTPException as exc:
+                    elapsed = time.monotonic() - started
+                    assert exc.status_code == 503, exc.status_code
+                    assert "no slot freed" in exc.detail, exc.detail
+                    assert exc.headers and exc.headers.get("Retry-After") == "30", exc.headers
+                    assert elapsed < SHORT * 4, elapsed
+                else:
+                    raise AssertionError("resume_gone_session must 503 when the gate stays full")
+                assert not calls, calls   # the real path was never reached
+            finally:
+                server.RESUME_WAIT = saved_wait
+                server.start_session = restore_start
+        finally:
+            server.cli_bridge._gate = saved_gate
+
+    asyncio.run(scenario())
+    print(f"  resume_gone_session bounded to RESUME_WAIT (~{SHORT}s) instead of 300s")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

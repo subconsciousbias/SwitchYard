@@ -708,25 +708,31 @@ file; the LiteLLM config is generated from it at container start
 Three things read that file, and they pick up changes differently:
 
 ```bash
-scripts/reload.sh        # validate, restart the gateway, refresh the board
+scripts/reload.sh        # validate, restart the gateway only if it must, refresh the board
 ```
 
 It checks the file before touching anything — a syntax error or a lane with no
 live members is reported while the old config is still running, rather than
-after the gateway has restarted onto it. Then it does what each component needs:
+after the gateway has restarted onto it. Then it compares the edited file's
+router signature against the one the gateway publishes in Redis, and does what
+each component needs:
 
 ```bash
-docker compose restart gateway                     # routing: required for most edits
+docker compose restart gateway                     # routing: only when the router cannot follow
 curl -X POST http://localhost:4001/admin/reload    # the portal's board
 # sidecars re-read plans.yaml themselves, within 30s
 ```
 
-**The gateway needs a restart, and there is no way around it.** LiteLLM builds
-its router from a config generated at container start, so a new model, a changed
-`api_base` or a different credential cannot take effect in a running process.
-Lane order, caps and quota windows would be enough to refresh in place, but a
-half-reload that leaves the router stale is worse than a restart that takes
-seconds — a plan you thought you had removed would keep serving.
+**Most edits need no restart.** The gateway watches `plans.yaml` and hot-swaps
+a policy-only change — caps, `max_parallel`, quota windows, lane order,
+settings, pacing, costs, expiry — into its live registry within ~5 seconds,
+with no dropped requests. The exception is the surface LiteLLM bakes into its
+router at container start: model strings, `api_base`, credentials, context
+windows and the set of lanes itself. A new model or a different credential
+cannot take effect in a running router, so `reload.sh` sees the signature
+differ and restarts the gateway only then — rather than risking a half-reload
+that leaves the router stale, where a plan you thought you had removed would
+keep serving.
 
 The portal is a separate process with its own copy, so `/admin/reload` keeps its
 board honest without touching traffic. The sidecars re-read `plans.yaml` on a
@@ -754,7 +760,9 @@ It does what `reload.sh` does, plus everything a brand-new plan needs:
    image's creation time. A pure `plans.yaml` edit rebuilds nothing, because
    `./config` is mounted, not baked;
 4. `docker compose up -d` — brings up any service a new plan added;
-5. runs `reload.sh` (gateway restart, portal board refresh, health wait);
+5. runs `reload.sh` (restarts the gateway only if the router cannot follow the
+   edit — policy-only changes hot-swap in place — portal board refresh, health
+   wait);
 6. audits auth per plan and prints the exact sign-in command for each plan
    that is missing one — env keys for `api_key` plans, the credential file
    under `./secrets/` for `cli_sidecar` plans, the OAuth grant for
