@@ -190,6 +190,11 @@ async def collect_plans() -> list[dict]:
     rows = []
     for plan in reg.plans.values():
         hr = await headroom(ledger, plan)
+        # Each window has its own reset time (5h vs weekly vs monthly). The
+        # template needs them pre-formatted so the per-bar caption does not
+        # have to know about the `_fmt_reset` rule elsewhere on the board.
+        for w in hr["windows"]:
+            w["reset_human"] = _fmt_reset(w.get("reset_at"))
         burn = await ledger.burn_rate(plan)
         series = await ledger.daily_series(plan.key, days=31)
         month_tokens = sum(

@@ -2,7 +2,7 @@
 <div class="panel">
 <table>
   <thead><tr>
-    <th>Plan</th><th>Quota left</th><th>Slots</th><th>Pacing</th><th>Resets</th>
+    <th>Plan</th><th>Quota left</th><th>Slots</th><th>Pacing</th>
     <th>Burn</th><th>This month</th><th>Effective</th><th>14 days</th><th></th>
   </tr></thead>
   <tbody>
@@ -29,6 +29,7 @@
         {% for w in hr.windows %}
           {% set wp = w.pct_used %}
           {% set binds = w.window == hr.binding.window and not hr.binding_is_target %}
+          {% set rh = w.reset_human %}
           <div style="margin-bottom:{{ '6px' if not loop.last else '0' }}">
             <div class="row" style="gap:6px">
               <span class="mono nowrap" style="font-size:12px"
@@ -36,6 +37,14 @@
               {% if wp is not none %}
                 <span class="mono muted nowrap" style="font-size:12px"
                       >{{ '%.0f'|format(100 - wp) }}% left</span>
+                {# Reset is per-window, not per-plan: the 5h burst can be
+                   holding back while the weekly limit is fine, and the old
+                   single "Resets" column hid that. Inline next to its own
+                   bar, only when we actually know the time. #}
+                {% if rh and rh != '—' %}
+                  <span class="mono muted nowrap" style="font-size:12px"
+                        title="{{ w.window }} resets">{{ rh }}</span>
+                {% endif %}
               {% endif %}
             </div>
             {% if wp is not none %}
@@ -85,7 +94,6 @@
           <span class="muted">—</span>
         {% endif %}
       </td>
-      <td class="mono nowrap">{{ r.reset_human }}</td>
       {# Economics are the model's, not the plan's — the plan owns limits.
          The model name leads the Burn line ONCE; This month and Effective
          repeat only the values, which align row for row with the names
