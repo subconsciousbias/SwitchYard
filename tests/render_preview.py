@@ -29,13 +29,23 @@ TPL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 
 
 def _window(q, frac, allowance, ahead):
+    # Two distinct reset horizons so the preview exercises per-window captions:
+    # the constraint window (5h-style) is close, the target (weekly) is days
+    # out. collect_plans formats this via _fmt_reset; do the same here so the
+    # preview shows what the real page will.
+    from switchyard.portal.app import _fmt_reset
+    if q.role == "constraint":
+        reset_at = time.time() + 2 * 3600
+    else:
+        reset_at = time.time() + 4 * 86400
     return {"window": q.label, "role": q.role, "period": q.period, "allowance": allowance,
             "basis": "configured", "consumed": allowance * frac, "consumed_frac": frac,
             "pace_line": allowance * 0.5, "ahead_by": ahead, "allowed_rate": 100.0,
             "spent": False, "deadline": time.time() + 8e4, "is_final_window": False,
             "elapsed_frac": 0.5, "remaining_seconds": 8e4, "total_seconds": 6e5,
             "pct_used": frac * 100, "limit": allowance, "kind": q.kind,
-            "used_tokens": allowance * frac, "used_cost": 0.0, "reset_at": None,
+            "used_tokens": allowance * frac, "used_cost": 0.0,
+            "reset_at": reset_at, "reset_human": _fmt_reset(reset_at),
             "last_exhausted_at": None}
 
 
