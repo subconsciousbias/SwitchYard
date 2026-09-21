@@ -235,10 +235,9 @@ class Prober:
         if probe is None:
             return ProbeResult(False, "no probe configured for this plan")
 
-        cookie = await self._cookie(plan.key)
-        if probe.kind == "cookie" and not cookie:
-            return ProbeResult(False, "no session cookie stored", needs_reauth=True)
-
+        # Configuration is checked BEFORE the cookie: a missing setting is
+        # something you can fix immediately, and reporting it second means being
+        # sent to fetch a cookie only to hit this straight afterwards.
         headers = {k: _resolve_env(v) for k, v in probe.headers.items()}
         # Name the *variable* to set, not just the header that wanted it: the
         # header name is not what the operator has to go and fill in.
@@ -251,6 +250,10 @@ class Prober:
             return await self._fail(
                 plan, f"probe needs {', '.join(missing)} set in .env", True)
         headers = {k: v for k, v in headers.items() if v}
+
+        cookie = await self._cookie(plan.key)
+        if probe.kind == "cookie" and not cookie:
+            return ProbeResult(False, "no session cookie stored", needs_reauth=True)
         if probe.kind == "cookie":
             headers["Cookie"] = cookie
             # Some consoles also require a matching UA/referer to answer at all.

@@ -608,86 +608,59 @@ Pacing column. Turn it back off with `?enabled=off` when you are done.
 
 ## 6. Usage probes — reading real headroom from a provider's console
 
-Three plans report true usage this way: **minimax-ultra**, **minimax-max** and
-**opencode-go**. All three publish it only to a logged-in browser, so each needs
-a session cookie pasted once. Everything below was verified against the live
-endpoints, so a failure here means something changed on their side, not that the
-config was a guess.
+**Setup lives in the README** ("Real numbers from a browser session"): which
+plans probe, the endpoints, the `OPENCODE_ORG_ID` one-liner, and how to copy each
+cookie. This section is only how to check it works.
 
-### 6a. What each one reports
+### 6a. Without any credential
 
-| Plan | Endpoint | Windows | Unit |
-|---|---|---|---|
-| minimax-ultra / -max | `platform.minimax.io/backend/account/token_plan/remains_percent` | `5h` + `weekly` | **percent used only** (every count is `-1`) |
-| opencode-go | `opencode.ai/console/api/go/status` | `5h` + `weekly` + `monthly` | **dollars** (microcents ÷ 1e8) |
-
-MiniMax's response is one entry per model family, so the config selects
-`general` by name — `model_remains.model_name=general.current_weekly_used_percent`
-— rather than by array position, which would shift if they added a family.
-
-OpenCode reports *spend against a limit* (`usedMicroCents` / `limitMicroCents`),
-so SwitchYard derives `remaining = limit - used`.
-
-### 6b. One extra setting for OpenCode Go
-
-Its route answers `{"code":"org_required"}` without a workspace header. Get the
-id from the console URL (`/console/wrk_...`) or:
-
-```bash
-# in a browser logged in to opencode.ai
-fetch("/console/api/orgs").then(r => r.json()).then(console.log)
-```
-
-Put it in `.env` as `OPENCODE_ORG_ID=wrk_...` (run `scripts/sync-env.sh` to add
-the key without touching your existing values), then `docker compose up -d portal`.
-Forget it and the probe says so by name rather than sending an empty header.
-
-### 6c. Paste the cookies
-
-1. Log in to **platform.minimax.io** and **opencode.ai/console**.
-2. For each: devtools → Network → click any request to that host → copy the whole
-   `Cookie:` request header value. (`document.cookie` in the console is not
-   enough — it omits HttpOnly cookies, which both sites use.)
-3. Portal → **Real usage** panel → paste into that plan's row → **save & test**.
-
-**Expect**, per plan:
-
-- **minimax**: `active`, with both windows as percentages, e.g. `5h 37% used ·
-  weekly 12% used`. There is deliberately no token figure: MiniMax publishes
-  none, and the board says `reported by provider (% only)` rather than inventing
-  a limit.
-- **opencode-go**: `active`, with three dollar figures, e.g. `5h $0.00/$12 ·
-  weekly $0.01/$30 · monthly $0.10/$60`.
-- `session rejected (401)` or `needs re-auth` — the cookie was incomplete; use
-  the full Network-tab value, not `document.cookie`.
-- `could not find a remaining value` plus a **raw JSON response** — the provider
-  changed a field name. Read the raw JSON on the panel and correct the paths
-  under that plan's `probe.windows:` in `plans.yaml`, then
-  `curl -X POST $PORTAL/admin/reload`.
-
-A window the response omits is reported as `ok; no data for <window>`, not as a
-failure, so one stale path cannot hide a good reading for another window.
-
-### 6d. What the numbers change
-
-The **binding** window — the one closest to biting — drives the board's warning,
-and it is not always the target. A plan at 12% of its weekly allowance but 37% of
-its 5-hour burst is limited by the burst, and the portal says so. Pacing then
-aims at the target window while never overshooting a constraint.
-
-Cookies are full account access, and logging out at the provider revokes them.
-`switchyard.probes` never logs or echoes one; the portal shows only a
-fingerprint (`"23 chars ending er=x"`).
-
-### 6e. Testing a probe without a real cookie
-
-To exercise the plumbing without any credential, point a plan's probe at a local
-stub and drive the real `Prober`. The suite already does this for both payload
-shapes (`tests/test_probes.py`), which is the cheaper check:
+The cheapest check, and the one that runs in CI: both real payload shapes are
+served by a stub and driven through the actual `Prober`.
 
 ```bash
 python3 -m pytest -q tests/test_probes.py
 ```
+
+**Expect** 9 passed, including `minimax_remains_percent_payload_is_read_as_percentages`
+and `opencode_go_status_payload_yields_all_three_meters`. These use the exact
+JSON the live endpoints returned, so a parsing regression fails here rather than
+in front of you.
+
+### 6b. Against the live endpoints
+
+Paste each cookie per the README, then on the portal's **Real usage** panel hit
+**save & test**. Expect, per plan:
+
+- **minimax**: `active`, both windows as percentages, e.g. `5h 37% used ·
+  weekly 12% used`. No token figure — MiniMax publishes none.
+- **opencode-go**: `active`, three dollar figures, e.g. `5h $0.00/$12 ·
+  weekly $0.01/$30 · monthly $0.10/$60`.
+
+Failures and what they mean:
+
+| Panel says | Cause |
+|---|---|
+| `session rejected (401)` / `needs re-auth` | cookie incomplete — `document.cookie` omits HttpOnly; use the Network-tab value |
+| `probe needs OPENCODE_ORG_ID … set in .env` | step 2 of the README setup was skipped |
+| `could not find a remaining value` + raw JSON | a field was renamed; map it from the raw response, fix `probe.windows:`, then `curl -X POST $PORTAL/admin/reload` |
+| `ok; no data for 5h` | that one window's path is stale — the others still read fine |
+
+### 6c. Confirm it reached the board
+
+```bash
+curl -s $PORTAL/api/state > /tmp/state.json
+python3 - <<'EOF'
+import json
+for p in json.load(open("/tmp/state.json"))["plans"]:
+    for w in p["quota"]["windows"]:
+        print(f"{p['key']:<15} {w['window']:<8} {w['pct_used']}% used   {w['basis']}")
+EOF
+```
+
+**Expect** one line per probed window. The **binding** window is the one closest
+to biting and need not be the target: at 12% weekly but 37% of the 5-hour burst,
+the burst is what limits you, and pacing aims at the target while never
+overshooting a constraint.
 
 ---
 

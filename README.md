@@ -675,26 +675,99 @@ after one wall.
 
 ### Real numbers from a browser session
 
-MiniMax is the awkward one: it *has* an exact endpoint, `/coding_plan/remains`,
-but the endpoint only answers a logged-in browser. An API key gets `cookie is
-missing (1004)` and there is no documented API-key route. Rather than settle for
-estimates, the portal has a **"Real usage"** panel: paste the session cookie
-once, and a poller keeps genuine headroom on the board.
+Three plans publish true headroom — **minimax-ultra**, **minimax-max** and
+**opencode-go** — and all three publish it only to a logged-in browser. An API
+key gets `cookie is missing (1004)` from MiniMax and `org_required` from
+OpenCode, and neither has a documented key-authenticated route. Rather than
+settle for estimates, the portal has a **"Real usage"** panel: paste the session
+cookie once, and a poller keeps genuine numbers on the board.
+
+Both endpoints below were read from live sessions, so the field paths in
+`plans.yaml` describe what they really return:
+
+| Plan | Endpoint | Windows | Unit |
+|---|---|---|---|
+| minimax-ultra / -max | `platform.minimax.io/backend/account/token_plan/remains_percent` | `5h` + `weekly` | **percent used only** — every `*_count` is `-1` |
+| opencode-go | `opencode.ai/console/api/go/status` | `5h` + `weekly` + `monthly` | **dollars**, as microcents ÷ 1e8 |
+
+Two consequences worth knowing. MiniMax returns one entry per model family, so
+the path picks `general` by name (`model_remains.model_name=general....`) rather
+than by array position, which would shift the day they add a family. And
+OpenCode reports *spend against a limit* (`usedMicroCents` / `limitMicroCents`),
+so SwitchYard derives `remaining = limit - used`.
+
+#### Setup, in three commands
+
+**1. OpenCode Go needs a workspace id.** Its route answers
+`{"code":"org_required"}` without one. In a browser logged in to opencode.ai,
+paste this in the devtools console:
+
+```js
+await fetch("/console/api/orgs").then(r => r.json())
+// [{"id":"wrk_...","name":"Default"}]  <- the id you want
+```
+
+**2. Put it in `.env`** — `sync-env.sh` appends the key without touching any
+value you have already set:
+
+```bash
+scripts/sync-env.sh            # adds OPENCODE_ORG_ID= if missing
+# then edit .env:  OPENCODE_ORG_ID=wrk_...
+docker compose up -d portal
+```
+
+Forget it and the probe names the variable rather than sending an empty header.
+
+**3. Paste each cookie.** These sites use HttpOnly cookies, so
+`document.cookie` is *not* enough — the value has to come from a request:
+devtools → Network → click any request to that host → copy the entire `Cookie:`
+request header. Then in the portal's **Real usage** panel, paste it into that
+plan's row and hit **save & test**.
+
+To confirm what the endpoint gives you before involving the portal at all, run
+this in the same logged-in browser:
+
+```js
+// MiniMax: both windows, percent-used, for the `general` model family
+await fetch("/backend/account/token_plan/remains_percent", {credentials: "include"})
+  .then(r => r.json())
+  .then(d => d.model_remains.find(m => m.model_name === "general"))
+
+// OpenCode Go: all three meters, in microcents
+await fetch("/console/api/go/status", {credentials: "include",
+                                       headers: {"x-org-id": "wrk_..."}})
+  .then(r => r.json()).then(d => d.access.meters)
+```
+
+#### What you get
+
+- **minimax**: both windows as percentages, e.g. `5h 37% used · weekly 12% used`.
+  There is deliberately no token figure — MiniMax publishes none, so the board
+  says `reported by provider (% only)` instead of inventing a limit.
+- **opencode-go**: three dollar figures against its real caps, e.g.
+  `5h $0.00/$12 · weekly $0.01/$30 · monthly $0.10/$60`.
+- A window the response omits reports `ok; no data for <window>` rather than
+  failing, so one renamed field cannot hide a good reading for another window.
+- The **binding** window drives the warning, and it is not always the target: a
+  plan at 12% of its weekly allowance but 37% of its 5-hour burst is limited by
+  the burst, and the board says so.
+
+Operational properties:
 
 - The cookie is stored in Redis on this host, **never logged, never returned by
-  the API** — status shows only a fingerprint like `412 chars ending 9f2a`.
+  the API** — status shows only a fingerprint like `23 chars ending er=x`.
 - When it expires the probe flips to `needs re-auth`, the board says so, and
   polling **stops** until you paste a fresh one. An expired session never
   becomes a request every minute forever.
-- Field paths in `plans.yaml` are candidate lists, because vendors rename
-  things. Hit **test now** and the panel prints the raw response so you can map
-  the real field names.
+- Field paths are candidate lists, because vendors rename things. Hit **test
+  now** and the panel prints the raw response so you can map the real names, then
+  `curl -X POST $PORTAL/admin/reload`.
 
 Worth being clear-eyed about: a session cookie is as powerful as being logged in
 — anything the account can do, including billing, it can do. Revoke it by
 logging out at the provider, which invalidates the session. If that trade is not
-worth it to you, delete the `probe:` block and headroom falls back to
-ledger estimates plus observed-allowance learning.
+worth it to you, delete the `probe:` block and headroom falls back to ledger
+estimates plus observed-allowance learning.
 
 ## Before this is live — worth checking
 
