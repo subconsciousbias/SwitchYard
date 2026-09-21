@@ -160,7 +160,7 @@ PROFILES: dict[str, dict] = {
         "model": os.environ.get("CODEX_MODEL", "gpt-5"),
         # --skip-git-repo-check: the sidecar's working directory is not a git
         #   repo, and codex otherwise refuses with "Not inside a trusted directory".
-        # --model: the ids follow a scheme I guessed wrong at first — not
+        # --model: the ids follow an unobvious scheme — not
         #   gpt-5/gpt-5-codex but gpt-5.6-sol / -terra / -luna and gpt-6-astra.
         #   An unknown id is rejected with "The '<id>' model is not supported when
         #   using Codex with a ChatGPT account", so confirm before setting one.

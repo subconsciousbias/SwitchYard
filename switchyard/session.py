@@ -2,7 +2,7 @@
 
 Affinity needs to know what a session *is*, and no wire protocol tells us.
 In order of preference:
-  1. an explicit header, for clients we control (Paperclip sets this);
+  1. an explicit header, for clients you control;
   2. a metadata field, same idea via the request body;
   3. LiteLLM's trace id, when the client threads one through;
   4. a hash of the conversation prefix, which is stable across the turns of
@@ -15,7 +15,9 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-HEADERS = ("x-switchyard-session", "x-session-id", "x-paperclip-session")
+# Any of these names is accepted, so a client that already sets a session header
+# needs no change. Add your own here if it uses a different one.
+HEADERS = ("x-switchyard-session", "x-session-id", "x-conversation-id")
 
 
 def _prefix_fingerprint(messages: list[dict[str, Any]] | None) -> str | None:

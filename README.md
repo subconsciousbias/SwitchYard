@@ -9,13 +9,23 @@ tool calling, which is the bulk of a gateway's code. SwitchYard supplies the
 part LiteLLM has no concept of — plans, connection caps, ordered fill,
 session affinity, quota headroom, and subscription economics.
 
+**Who this is for:** you pay for several LLM subscriptions and want one endpoint
+across all of them, with the spending routed by policy rather than by whichever
+one you happened to configure. You need Docker, and at least one plan — every
+provider below is optional, including the paid ones.
+
 ## Quickstart
 
 ```bash
-cp .env.example .env     # fill in keys; CLAUDE_CONFIG_DIR points at your ~/.claude
+scripts/sync-env.sh      # creates .env, or adds new keys without touching yours
+$EDITOR .env             # fill in the keys for the plans you actually have
 docker compose up -d
 open http://localhost:4001            # the portal
 ```
+
+Use `sync-env.sh` rather than `cp .env.example .env`: on an existing checkout
+that copy overwrites real credentials, which is the mistake the script exists
+to prevent.
 
 Then point anything at `http://<host>:4000` with `LITELLM_MASTER_KEY` as the key:
 
@@ -254,9 +264,10 @@ first**, so the capacity with the least time left is drained first. Cancelled
 capacity gets used up instead of quietly rotting, and it drops out of every lane
 by itself on the expiry date. No config edit, no restart.
 
-Today that makes `forge` run `opencode-go` (7d) → `grok` (19d) → Minimax Ultra →
-Minimax Max → `glm` (23d) → OpenRouter → Qwen. GLM joins the front of the queue
-on its own in two days, when it comes inside the 21-day window.
+With the example config, a `forge` lane whose plans expire in 7, 19 and 23 days
+runs the 7-day plan first, then the 19-day one, then the plans with no end date,
+and the 23-day plan promotes itself to the front once it comes inside the
+21-day window — without a config edit.
 
 ## The portal (`:4001`)
 
@@ -274,7 +285,7 @@ opening eight vendor dashboards.
 - **Effective $/Mtok** — monthly fee ÷ tokens actually delivered. The number that
   answers whether the $132 Ultra plan or the $55 Max plan is the better buy.
 
-`GET /api/state` returns all of it as JSON for Paperclip. `POST /admin/reload`
+`GET /api/state` returns all of it as JSON for your own client. `POST /admin/reload`
 picks up `plans.yaml` edits without a restart.
 
 ## No API key? Then apex is just Opus

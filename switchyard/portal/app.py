@@ -120,6 +120,24 @@ def _fmt_reset(ts: float | None) -> str:
 async def collect_capacity() -> dict:
     reg, picker, policy = state["registry"], state["picker"], state["policy"]
     lanes = [await picker.capacity(k) for k in reg.lanes]
+
+    # A plan can be out of quota while its slots still look free: nothing has
+    # refused a request yet, so there is no cooldown, and the capacity board
+    # would happily show four idle slots on a subscription with nothing left to
+    # spend. Carry each plan's binding window onto its rows so the board can say
+    # so — the quota table already knows, the capacity board did not.
+    quota: dict[str, dict] = {}
+    for plan in reg.plans.values():
+        hr = await headroom(state["ledger"], plan)
+        binding = hr.get("binding") or {}
+        quota[plan.key] = {"pct_used": binding.get("pct_used"),
+                           "window": binding.get("window")}
+    for lane in lanes:
+        for row in lane["plans"]:
+            row["quota"] = quota.get(row["plan"], {})
+        lane["exhausted"] = sorted({
+            row["plan"] for row in lane["plans"]
+            if (row["quota"].get("pct_used") or 0) >= 100 and not row["tail"]})
     return {
         "lanes": lanes,
         "total_available": sum(l["slots_available_now"] for l in lanes),
@@ -235,7 +253,7 @@ async def healthz() -> dict:
 
 @app.get("/api/state")
 async def api_state() -> dict:
-    """Everything the board shows, for Paperclip or a CLI to consume."""
+    """Everything the board shows, for your own client or a CLI to consume."""
     caps = await collect_capacity()
     plans = await collect_plans()
     return {

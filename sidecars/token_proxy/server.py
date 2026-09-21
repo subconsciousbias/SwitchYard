@@ -45,7 +45,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 # Sibling package, not installed — same layering as the gateway image, which
 # sets PYTHONPATH=/switchyard rather than pip-installing switchyard into the
-# base image. See this file's Dockerfile note in the deployment report.
+# base image. See Dockerfile.token_proxy.
 sys.path.insert(0, os.environ.get("SWITCHYARD_ROOT", "/switchyard"))
 from switchyard import oauth  # noqa: E402
 
@@ -93,8 +93,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
         chat_completions_path="/chat/completions",
         # xAI's Anthropic-shaped endpoint is forwarded to honestly rather than
         # asserted to exist: this process makes no claim about it beyond "here
-        # is what api.x.ai/v1/messages said back". Untested against a real
-        # grant, per this task's no-login constraint.
+        # is what api.x.ai/v1/messages said back". Not exercised against a
+        # real grant — the chat/completions route is the one in use.
         messages_path="/messages",
         extra_headers=_xai_headers,
     ),

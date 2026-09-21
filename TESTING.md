@@ -494,7 +494,7 @@ Anthropic.
 
 ## 4g. Tool capability is a per-plan property
 
-This is the check most likely to matter for Paperclip, since an agent sends tool
+This is the check most likely to matter in practice, since an agent sends tool
 definitions on nearly every call. `Plan.can_use_tools` defaults to true; a plan
 opts out with `supports_tools: false` in config, and the picker skips a plan
 marked that way for a request carrying `tools`.
@@ -653,12 +653,12 @@ overshooting a constraint.
 
 ---
 
-## 7. Point Paperclip at it
+## 7. Point your client at it
 
 Change one lane first, not all of them.
 
 ```bash
-# Paperclip's LLM config, per lane:
+# your client's LLM config, per lane:
 #   base_url: http://<switchyard-host>:4000/v1
 #   api_key:  $LITELLM_MASTER_KEY
 #   model:    forge        (or judge / apex / local / bulk)
@@ -673,7 +673,7 @@ small refactor or a status summary on a real issue.
 - the portal's `forge` board shows one slot in use during the call;
 - the plan's `This month` token count increases afterwards.
 
-If Paperclip can pass a stable per-task or per-conversation id as
+If your client can pass a stable per-task or per-conversation id as
 `X-Session-Id`, set it. Affinity then becomes exact instead of inferred from the
 conversation prefix, which keeps long tasks on one provider and its prompt cache
 warm.

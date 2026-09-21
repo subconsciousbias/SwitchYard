@@ -17,10 +17,11 @@
         {% endif %}
         {% if lane.tail_only %}
           <span class="tag warn" title="only the emergency tail is live in this lane">tail only</span>
-        {% elif lane.slots_configured != lane.slots_available_now %}
-          <span class="tag bad" title="capacity removed by cooldowns, sharing, or the tail">
-            {{ lane.slots_configured - lane.slots_available_now }} gone</span>
         {% endif %}
+        {# No lane-level "N gone" count. It read as lost capacity when the
+           number was almost always the tail held in reserve plus models
+           narrowing their own plan's cap — both by design. Real trouble shows
+           per plan below: a cooldown tag, or a withheld slot in the row. #}
       </div>
     </div>
     <table>
@@ -46,6 +47,7 @@
               fill the same row — but only the first is this lane's traffic, and
               conflating them made a quiet lane look busy.
             #}
+            {% set spent = ' spent' if (p.quota.pct_used or 0) >= 100 else '' %}
             {% set here = p.model_in_flight_here %}
             {% set elsewhere = p.model_in_flight_elsewhere + p.model_in_flight_direct %}
             {% for i in range(p.cap) %}
@@ -56,7 +58,7 @@
               {% if p.cooled %}
                 <span class="slot gone"></span>
               {% elif i < here %}
-                <span class="slot used{{ probed }}" title="in use by this lane{{ ' (learner probed above the configured ' ~ p.cap_configured ~ ')' if probed }}"></span>
+                <span class="slot used{{ probed }}{{ spent }}" title="in use by this lane{{ ' (learner probed above the configured ' ~ p.cap_configured ~ ')' if probed }}"></span>
               {% elif i < here + elsewhere %}
                 <span class="slot elsewhere"
                       title="{{ p.model }} in use by {{ p.lanes_sharing|join(', ') or 'another lane' }} — occupied, but not this lane's traffic"></span>
@@ -64,8 +66,9 @@
                 <span class="slot sibling"
                       title="another model on {{ p.plan }} is using this connection"></span>
               {% else %}
-                <span class="slot{{ probed }}"
-                      {% if probed %}title="learner probed above the configured {{ p.cap_configured }}, allowed by max_parallel_ceiling"{% endif %}></span>
+                <span class="slot{{ probed }}{{ spent }}"
+                      {% if spent %}title="{{ p.plan }} has no {{ p.quota.window }} quota left ({{ p.quota.pct_used }}% used) — this slot is free but the plan cannot serve"
+                      {% elif probed %}title="learner probed above the configured {{ p.cap_configured }}, allowed by max_parallel_ceiling"{% endif %}></span>
               {% endif %}
             {% endfor %}
             {% for i in range(p.cap, p.cap_configured) %}

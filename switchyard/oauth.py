@@ -121,9 +121,10 @@ class HeadlessFlow:
          redirect_uri={redirect_uri}, client_id=..., code_verifier=<verifier>
          -> the usual {access_token, refresh_token, expires_in, id_token}.
 
-    None of this has been run — no login was performed to get here, per the
-    constraint on this task. It is transcribed directly from the CLI's own
-    control flow, not guessed, but treat step 3's poll semantics (which
+    None of this has been exercised against a real login: the ChatGPT seat is
+    served through mcp_bridge's codex profile instead, so this path is
+    unnecessary. It is transcribed directly from the CLI's own control flow,
+    not guessed, but treat step 3's poll semantics (which
     statuses mean "pending" vs "denied") as worth reconfirming against a real
     device_auth_id before depending on it in anger.
     """
