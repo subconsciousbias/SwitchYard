@@ -43,6 +43,10 @@ def period_key(period: str | None, at: datetime | None = None) -> str:
 K_PERIOD = "sy:usage:{plan}:p:{period}"
 K_HOUR = "sy:usage:{plan}:h:{hour}"
 K_DAY = "sy:usage:{plan}:d:{day}"
+# Model-scoped buckets mirror the plan-level ones so per-model economics can
+# be queried without touching the plan-level burn rate, pacing or headroom.
+K_M_HOUR = "sy:usage:{plan}:m:{model}:h:{hour}"
+K_M_DAY = "sy:usage:{plan}:m:{model}:d:{day}"
 K_QUOTA = "sy:quota:{plan}"                 # plan-level facts
 K_WINDOW = "sy:qwin:{plan}:{window}"        # per-window facts (observed allowance)
 
@@ -61,6 +65,7 @@ class Ledger:
         completion_tokens: int = 0,
         cost: float = 0.0,
         failed: bool = False,
+        model: str | None = None,
     ) -> None:
         now = _now()
         # One bucket per quota window: a plan with a 5-hour *and* a weekly
@@ -73,6 +78,15 @@ class Ledger:
             (K_HOUR.format(plan=plan.key, hour=now.strftime("%Y-%m-%dT%H")), 7 * 86400),
             (K_DAY.format(plan=plan.key, day=now.strftime("%Y-%m-%d")), 400 * 86400),
         ]
+        # When a model ref is given, also write the model-scoped buckets so
+        # per-model economics can be computed without touching plan-level ones.
+        if model:
+            keys += [
+                (K_M_HOUR.format(plan=plan.key, model=model,
+                                 hour=now.strftime("%Y-%m-%dT%H")), 7 * 86400),
+                (K_M_DAY.format(plan=plan.key, model=model,
+                                day=now.strftime("%Y-%m-%d")), 400 * 86400),
+            ]
         pipe = self.redis.pipeline()
         for key, ttl in keys:
             pipe.hincrbyfloat(key, "requests", 1)
@@ -84,8 +98,11 @@ class Ledger:
             pipe.expire(key, ttl)
         await pipe.execute()
 
-    async def bucket(self, plan_key: str, key: str) -> dict[str, float]:
-        raw = await self.redis.hgetall(key)
+    @staticmethod
+    def _decode_bucket(raw) -> dict[str, float]:
+        """One hash reply -> a FIELDS-shaped dict. Shared by every reader so a
+        real Redis (bytes keys and values) decodes exactly like the fake one —
+        a decode done in one reader but not another reads as silent zeros."""
         out = {f: 0.0 for f in FIELDS}
         for k, v in (raw or {}).items():
             k = k.decode() if isinstance(k, bytes) else k
@@ -94,6 +111,9 @@ class Ledger:
             except (TypeError, ValueError):
                 pass
         return out
+
+    async def bucket(self, plan_key: str, key: str) -> dict[str, float]:
+        return self._decode_bucket(await self.redis.hgetall(key))
 
     async def window_usage(self, plan: Plan, quota: Quota,
                            at: datetime | None = None) -> dict[str, float]:
@@ -116,6 +136,55 @@ class Ledger:
             cost += b["cost"]
             tokens += b["prompt_tokens"] + b["completion_tokens"]
         return {"cost_per_hour": cost / hours, "tokens_per_hour": tokens / hours}
+
+    async def model_overview(
+        self, plan_key: str, model_refs: list[str], month: str,
+        hours: int = 3, days: int = 31,
+    ) -> dict[str, dict]:
+        """Per-model economics: burn rate over the last `hours` hours and month totals.
+
+        One pipelined round trip no matter how many refs. The month filter is
+        applied when choosing day keys, not after reading: early in a month the
+        31-day walk reaches back into the previous one, and "This month" that
+        includes August on September 3rd is a lie.
+        """
+        now = _now()
+        # Ordered read plan: results come back in queue order, so aggregation
+        # is a zip against this list, never positional arithmetic on slices.
+        reads: list[tuple[str, str, str]] = []
+        for ref in model_refs:
+            for i in range(hours):
+                at = now - timedelta(hours=i)
+                reads.append((ref, "hour", K_M_HOUR.format(
+                    plan=plan_key, model=ref, hour=at.strftime("%Y-%m-%dT%H"))))
+            for d in range(days):
+                day = (now - timedelta(days=d)).strftime("%Y-%m-%d")
+                if not day.startswith(month):
+                    continue
+                reads.append((ref, "day", K_M_DAY.format(
+                    plan=plan_key, model=ref, day=day)))
+
+        pipe = self.redis.pipeline()
+        for _, _, key in reads:
+            pipe.hgetall(key)
+        raw = await pipe.execute()
+
+        out = {ref: {"burn": {"cost_per_hour": 0.0, "tokens_per_hour": 0.0},
+                     "month_tokens": 0.0, "month_cost": 0.0}
+               for ref in model_refs}
+        for (ref, kind, _), r in zip(reads, raw):
+            b = self._decode_bucket(r)
+            row = out[ref]
+            if kind == "hour":
+                row["burn"]["cost_per_hour"] += b["cost"]
+                row["burn"]["tokens_per_hour"] += b["prompt_tokens"] + b["completion_tokens"]
+            else:
+                row["month_cost"] += b["cost"]
+                row["month_tokens"] += b["prompt_tokens"] + b["completion_tokens"]
+        for row in out.values():
+            row["burn"]["cost_per_hour"] /= hours
+            row["burn"]["tokens_per_hour"] /= hours
+        return out
 
     async def daily_series(self, plan_key: str, days: int = 30) -> list[dict]:
         now = _now()
@@ -349,3 +418,27 @@ def effective_cost_per_mtok(plan: Plan, tokens_this_month: float, metered_cost: 
     if spend <= 0:
         return 0.0
     return round(spend / (tokens_this_month / 1_000_000), 4)
+
+
+def model_effective_cost_per_mtok(
+    plan: Plan, model_tokens: float, model_cost: float, plan_tokens: float
+) -> float | None:
+    """Per-model effective $/Mtok, allocating the subscription fee pro-rata by token share.
+
+    Rules:
+    - below 1M tokens on the model -> None (same threshold as plan version);
+    - metered plan: spend = model_cost (actual spend);
+    - subscription plan: allocate monthly fee pro-rata by token share;
+    - spend <= 0 -> 0.0; else round to 4 decimals.
+    """
+    if model_tokens < 1_000_000:
+        return None
+    if plan.metered:
+        spend = model_cost
+    else:
+        if plan_tokens == 0:
+            return None
+        spend = (plan.monthly_cost or 0.0) * model_tokens / plan_tokens
+    if spend <= 0:
+        return 0.0
+    return round(spend / (model_tokens / 1_000_000), 4)

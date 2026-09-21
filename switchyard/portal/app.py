@@ -22,7 +22,7 @@ from ..policy import CapacityPolicy
 from ..probes import Prober
 from ..slots import SlotTable
 from ..periods import windows_remaining
-from ..usage import Ledger, effective_cost_per_mtok, headroom
+from ..usage import Ledger, effective_cost_per_mtok, headroom, model_effective_cost_per_mtok
 
 import logging
 
@@ -186,17 +186,34 @@ async def collect_plans() -> list[dict]:
         probe = await state["prober"].status(plan.key) if plan.probe else None
         # Models are what lanes name; the plan is what owns the limits. Named
         # `model_rows` rather than `models`, which is the imported module.
-        model_rows = [{
-            "key": m.key,
-            "ref": m.ref,
-            "label": m.display,
-            "provider_model": m.model,
-            "enabled": m.enabled,
-            "cap": plan.cap_for(m),
-            "narrowed": m.max_parallel is not None,
-            "context_window": m.context_window,
-            "lanes": reg.lanes_using(m),
-        } for m in plan.models.values()]
+        model_refs = [m.ref for m in plan.models.values()]
+        model_overview = await ledger.model_overview(
+            plan.key, model_refs, month
+        ) if model_refs else {}
+        model_rows = []
+        for m in plan.models.values():
+            overview = model_overview.get(m.ref, {})
+            model_rows.append({
+                "key": m.key,
+                "ref": m.ref,
+                "label": m.display,
+                "provider_model": m.model,
+                "enabled": m.enabled,
+                "cap": plan.cap_for(m),
+                "narrowed": m.max_parallel is not None,
+                "context_window": m.context_window,
+                "lanes": reg.lanes_using(m),
+                "burn": overview.get("burn") or {"cost_per_hour": 0.0,
+                                                 "tokens_per_hour": 0.0},
+                "month_tokens": overview.get("month_tokens", 0.0),
+                "month_cost": overview.get("month_cost", 0.0),
+                "eff_cost": model_effective_cost_per_mtok(
+                    plan,
+                    overview.get("month_tokens", 0.0),
+                    overview.get("month_cost", 0.0),
+                    month_tokens,
+                ),
+            })
         pace = await policy.pace_state(plan) if await policy.plan_is_paced(plan) else None
 
         alerting = []
@@ -237,10 +254,6 @@ async def collect_plans() -> list[dict]:
             "plan": plan,
             "headroom": hr,
             "reset_human": _fmt_reset(hr.get("reset_at")),
-            "burn": burn,
-            "month_tokens": month_tokens,
-            "month_cost": month_cost,
-            "eff_cost": effective_cost_per_mtok(plan, month_tokens, month_cost),
             "in_flight": in_flight,
             "cooled": cooled,
             "cooldown_remaining": ttl,
@@ -277,19 +290,26 @@ async def api_state() -> dict:
         "plans": [
             {
                 "key": r["plan"].key, "label": r["plan"].label,
-                "models": [m["ref"] for m in r["models"] if m["enabled"]],
+                "models": [
+                    {
+                        "ref": m["ref"],
+                        "burn": m.get("burn"),
+                        "month_tokens": m.get("month_tokens"),
+                        "month_cost": m.get("month_cost"),
+                        "effective_cost_per_mtok": m.get("eff_cost"),
+                    }
+                    for m in r["models"] if m["enabled"]
+                ],
                 "monthly_cost": r["plan"].monthly_cost,
                 "expires": str(r["plan"].expires) if r["plan"].expires else None,
                 "days_left": r["plan"].days_left,
                 "cap": r["plan"].max_parallel, "in_flight": r["in_flight"],
                 "cooled": r["cooled"], "cooldown_reason": r["cooldown_reason"],
-                "quota": r["headroom"], "burn": r["burn"],
+                "quota": r["headroom"],
                 "effective_cap": r["capacity"].cap,
                 "learned_cap": r["capacity"].learned,
                 "cap_reason": r["capacity"].reason,
                 "pacing": r["pace"],
-                "month_tokens": r["month_tokens"], "month_cost": r["month_cost"],
-                "effective_cost_per_mtok": r["eff_cost"],
                 "alerting": r["alerting"],
             }
             for r in plans

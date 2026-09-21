@@ -305,13 +305,18 @@ opening eight vendor dashboards.
   the provider reported (headers or the sidecar) → your configured allowance →
   *observed* allowance, meaning where the plan actually ran out last cycle. So a
   plan with an unknown allowance still gets a headroom bar after one cycle.
-- **Burn rate** — $/hr and tokens/hr over the last 3 hours, with a per-plan
-  alert threshold. This is what catches a $20/hour overflow early.
-- **Effective $/Mtok** — monthly fee ÷ tokens actually delivered. The number that
-  answers which of two plans on the same provider is the better buy.
+- **Burn rate** — $/hr and tokens/hr per model over the last 3 hours, with a
+  per-plan alert threshold. This is what catches a $20/hour overflow early.
+  (Subscriptions allocate the plan's spend pro-rata by token share; metered
+  plans show their own spend.)
+- **Effective $/Mtok** — per model on each plan row. For subscriptions: the
+  monthly fee allocated by token share. For metered plans: actual spend.
+  An em-dash means under 1M tokens so far this month.
 
-`GET /api/state` returns all of it as JSON for your own client. `POST /admin/reload`
-picks up `plans.yaml` edits without a restart.
+`GET /api/state` returns all of it as JSON for your own client. Burn rate,
+monthly tokens/cost, and effective $/Mtok live on each entry of `models[]`
+rather than the plan object. `POST /admin/reload` picks up `plans.yaml` edits
+without a restart.
 
 ## No API key? Then apex is just Opus
 

@@ -17,6 +17,9 @@ class FakePipeline:
     def hincrbyfloat(self, key, field, amount):
         self.ops.append(("hincrbyfloat", key, field, amount)); return self
 
+    def hgetall(self, key):
+        self.ops.append(("hgetall", key)); return self
+
     def hset(self, key, mapping=None, **_):
         self.ops.append(("hset", key, mapping or {})); return self
 
@@ -40,6 +43,9 @@ class FakePipeline:
                 h = self.store.hashes.setdefault(key, {})
                 h[field] = float(h.get(field, 0)) + float(amount)
                 results.append(h[field])
+            elif op[0] == "hgetall":
+                _, key = op
+                results.append(self.store.hashes.get(key, {}))
             elif op[0] == "hset":
                 _, key, mapping = op
                 self.store.hashes.setdefault(key, {}).update(

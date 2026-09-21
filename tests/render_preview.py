@@ -1,12 +1,13 @@
 """Render every portal template against a synthetic two-window fixture.
 
 Catches Jinja errors and layout regressions without needing Redis, the gateway
-or any provider. Writes /tmp/switchyard-preview.html for eyeballing.
+or any provider. Writes <tempdir>/switchyard-preview.html for eyeballing.
 """
 from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -94,10 +95,7 @@ def fixture(reg):
             "headroom": {**tgt, "windows": ws, "binding": binding,
                          "binding_is_target": binding is tgt},
             "reset_human": "in 22h",
-            "burn": {"cost_per_hour": 21.4 if plan.metered else 0.0,
-                     "tokens_per_hour": 5e5},
-            "month_tokens": 1.2e7, "month_cost": 12.5 if plan.metered else 0.0,
-            "eff_cost": 16.6 if plan.monthly_cost else None, "in_flight": 1,
+            "in_flight": 1,
             "cooled": False, "cooldown_remaining": 0, "cooldown_reason": "",
             "alerting": ["95% of quota used"] if plan.is_subscription else [],
             "lanes": sorted({l for m in plan.models.values() for l in reg.lanes_using(m)}),
@@ -117,11 +115,20 @@ def fixture(reg):
                       "remaining_seconds": 8e4, "consumed_frac": 0.3,
                       "projected_end_frac": 0.7} if plan.is_subscription else None),
             "windows": windows_remaining(plan.quota.period, plan.expires),
-            "models": [{"key": m.key, "ref": m.ref, "label": m.display,
-                        "provider_model": m.model, "enabled": m.enabled,
-                        "cap": plan.cap_for(m), "narrowed": m.max_parallel is not None,
-                        "context_window": m.context_window,
-                        "lanes": reg.lanes_using(m)} for m in plan.models.values()],
+            "models": [{
+                "key": m.key, "ref": m.ref, "label": m.display,
+                "provider_model": m.model, "enabled": m.enabled,
+                "cap": plan.cap_for(m), "narrowed": m.max_parallel is not None,
+                "context_window": m.context_window,
+                "lanes": reg.lanes_using(m),
+                # Economics live at model level: a subscription allocates its fee
+                # pro-rata by token share; metered plans show their own spend.
+                "burn": {"cost_per_hour": 0.42 if m.enabled else 0.0,
+                         "tokens_per_hour": 5e5 if m.enabled else 0.0},
+                "month_tokens": 1.23e7 if m.enabled else 0.0,
+                "month_cost": 8.10 if m.enabled else 0.0,
+                "eff_cost": 0.66 if m.enabled and plan.monthly_cost else None,
+            } for m in plan.models.values()],
             "cli_backed": plan.is_cli_backed,
             "probe": None,
         })
@@ -197,7 +204,7 @@ def main() -> int:
            "capacity": capacity, "plans": rows, "settings": reg.settings,
            "probes": probe_fixture(reg), "request": None}
     html = env.get_template("index.html").render(**ctx)
-    out = "/tmp/switchyard-preview.html"
+    out = os.path.join(tempfile.gettempdir(), "switchyard-preview.html")
     with open(out, "w") as fh:
         fh.write(html)
     for name in ("_capacity.html", "_plans.html", "_probes.html"):

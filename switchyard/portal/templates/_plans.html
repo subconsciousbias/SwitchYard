@@ -2,8 +2,7 @@
 <div class="panel">
 <table>
   <thead><tr>
-    <th>Plan</th><th>Quota left</th><th>Slots</th><th>Pacing</th><th>Resets</th>
-    <th>Burn</th><th>This month</th><th>Effective</th><th>14 days</th><th></th>
+    <th>Plan</th><th>Quota left</th><th>Slots</th><th>Pacing</th><th>Resets</th><th>14 days</th><th></th>
   </tr></thead>
   <tbody>
   {% for r in plans %}
@@ -17,11 +16,33 @@
           {% if r.lanes %}· {{ r.lanes|join(', ') }}{% endif %}
           {% if r.cli_backed %}· <span title="a CLI holds the credential">cli</span>{% endif %}
         </div>
-        {# Models are what lanes name; the plan is what owns the limits. #}
+        {# One line per model, and the model key leads every line: the plan is
+           what owns the limits, but what a subscription BOUGHT is per model —
+           burn over the last 3 hours, this month's tokens and metered spend,
+           and effective $/Mtok (the fee spread across models by token share,
+           or the model's own spend when metered). A row of numbers with no
+           name on it answers nothing. #}
         <div class="muted mono" style="font-size:12px;margin-top:3px">
           {% for m in r.models %}
-            <span title="{{ m.provider_model }}{% if m.context_window %} · {{ '{:,}'.format(m.context_window) }} ctx{% endif %}"
-                  {% if not m.enabled %}style="opacity:.45"{% endif %}>{{ m.key }}{% if m.narrowed %}·{{ m.cap }}{% endif %}</span>{% if not loop.last %} · {% endif %}
+            <div style="margin-bottom:2px">
+              <span title="{{ m.provider_model }}{% if m.context_window %} · {{ '{:,}'.format(m.context_window) }} ctx{% endif %}"
+                    {% if not m.enabled %}style="opacity:.45"{% endif %}><strong style="font-weight:600">{{ m.key }}</strong>{% if m.narrowed %}·{{ m.cap }}{% endif %}</span>
+              {#- burn: $/hr with tok/hr beside it, either alone, or idle -#}
+              {% if m.burn.cost_per_hour %}
+                · ${{ '%.2f'|format(m.burn.cost_per_hour) }}/hr
+                {% if m.burn.tokens_per_hour %}<span style="font-size:11px">{{ '{:,.0f}'.format(m.burn.tokens_per_hour) }} tok/hr</span>{% endif %}
+              {% elif m.burn.tokens_per_hour %}
+                · {{ '{:,.0f}'.format(m.burn.tokens_per_hour) }} tok/hr
+              {% else %}
+                · idle
+              {% endif %}
+              {#- this month: tokens always, metered dollars when there are any -#}
+              {% if m.month_tokens %}
+                · {{ '%.1f'|format(m.month_tokens / 1000000) }}M{% if m.month_cost %} · ${{ '%.2f'|format(m.month_cost) }}{% endif %}
+              {% endif %}
+              {#- effective $/Mtok; an em-dash means under 1M tokens so far -#}
+              · {% if m.eff_cost is not none %}${{ '%.2f'|format(m.eff_cost) }}/Mtok{% else %}<span style="opacity:.6">—</span>{% endif %}
+            </div>
           {% endfor %}
         </div>
       </td>
@@ -90,21 +111,6 @@
         {% endif %}
       </td>
       <td class="mono nowrap">{{ r.reset_human }}</td>
-      <td class="mono nowrap">
-        {% if r.burn.cost_per_hour %}${{ '%.2f'|format(r.burn.cost_per_hour) }}/hr{% endif %}
-        {% if r.burn.tokens_per_hour %}
-          <div class="muted" style="font-size:12px">{{ '{:,.0f}'.format(r.burn.tokens_per_hour) }} tok/hr</div>
-        {% endif %}
-        {% if not r.burn.cost_per_hour and not r.burn.tokens_per_hour %}<span class="muted">idle</span>{% endif %}
-      </td>
-      <td class="mono nowrap">
-        {{ '{:,.1f}'.format(r.month_tokens / 1000000) }}M
-        {% if r.month_cost %}<div class="muted" style="font-size:12px">${{ '%.2f'|format(r.month_cost) }}</div>{% endif %}
-      </td>
-      <td class="mono nowrap">
-        {% if r.eff_cost is not none %}${{ '%.2f'|format(r.eff_cost) }}<span class="muted">/Mtok</span>
-        {% else %}<span class="muted">—</span>{% endif %}
-      </td>
       <td>
         {% set peak = (r.series | map(attribute='prompt_tokens') | sum) or 1 %}
         <div class="spark">

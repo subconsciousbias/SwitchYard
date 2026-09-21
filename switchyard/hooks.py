@@ -230,15 +230,17 @@ class SwitchyardHandler(CustomLogger):
         something bypassed the routing rules (tool capability, the session
         lease, the mid-loop pin) and is worth seeing rather than absorbing.
 
-        Returns the plan to attribute usage to, or None if it cannot be resolved.
+        Returns (plan, served_ref): the plan to attribute usage to (None when
+        it cannot be resolved) and the ref of the deployment that answered, so
+        model-scoped economics land on the model that actually spent them.
         """
         picked = self.registry.plans.get(ctx["plan"])
         served_name = kwargs.get("model")
         if not served_name:
-            return picked
+            return picked, ctx.get("model")
         served = self.registry.model_for_deployment(str(served_name))
         if served is None or served.ref == ctx.get("model"):
-            return picked
+            return picked, ctx.get("model")
         actual = self.registry.plan_of(served)
         log.warning(
             "request was picked for %s but served by %s — LiteLLM moved it after "
@@ -246,7 +248,7 @@ class SwitchyardHandler(CustomLogger):
             "to %s, the plan whose quota it actually spent.",
             ctx.get("model"), served.ref, actual.key,
         )
-        return actual
+        return actual, served.ref
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         ctx = self._ctx(kwargs)
@@ -255,7 +257,7 @@ class SwitchyardHandler(CustomLogger):
         self._stop_heartbeat(ctx["request_id"])
         # Always release what we claimed, whoever ended up serving it.
         await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
-        plan = self._check_served_deployment(ctx, kwargs)
+        plan, served_ref = self._check_served_deployment(ctx, kwargs)
         if not plan:
             return
 
@@ -269,7 +271,7 @@ class SwitchyardHandler(CustomLogger):
                 "plan=%s returned HTTP 200 carrying a failure: %s",
                 plan.key, verdict.detail,
             )
-            await self.ledger.record(plan, failed=True)
+            await self.ledger.record(plan, failed=True, model=served_ref)
             await self._apply_verdict(plan, verdict, ctx)
             return
 
@@ -286,6 +288,7 @@ class SwitchyardHandler(CustomLogger):
         await self.ledger.record(
             plan, prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens, cost=cost,
+            model=served_ref,
         )
 
         # Per-slot throughput drives the pacer: one busy slot delivered this
@@ -307,7 +310,7 @@ class SwitchyardHandler(CustomLogger):
         await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
         plan = self.registry.plans.get(ctx["plan"])
         if plan:
-            await self.ledger.record(plan, failed=True)
+            await self.ledger.record(plan, failed=True, model=ctx["model"])
         await self._handle_failure(ctx, kwargs.get("exception") or kwargs.get("original_exception"))
 
     async def async_post_call_success_hook(
