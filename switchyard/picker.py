@@ -134,14 +134,16 @@ class Picker:
                 # plan, so it drains rather than being hammered.
                 cap, reason = await self._cap(model, allow_spent=pinned)
                 # When the plan's slots are all busy, a pinned follow-up waits
-                # briefly for one rather than 429ing. The wait holds no slot —
-                # this loop parks in the gateway, and other sessions keep
-                # being placed while it does — so a burst of concurrent turns
-                # on the pinned plan serialises here instead of bouncing
-                # retries that would all come back anyway. Past the deadline
-                # the caller gets the 429 and its own backoff takes over.
+                # briefly for one rather than spilling to a peer. The wait
+                # holds no slot — this loop parks in the gateway, and other
+                # sessions keep being placed while it does — so a burst of
+                # concurrent turns on the pinned plan serialises here instead
+                # of bouncing retries that would all come back anyway. Past
+                # the deadline the follow-up spills to a peer, the same path a
+                # fresh request would take; sessions follow capacity rather
+                # than blocking, and the lane only 429s when ALL of it is full.
                 # No wait when there is nothing to wait FOR: a cap of 0 or an
-                # active cooldown will not lift inside 10s, so fail (or spill)
+                # active cooldown will not lift inside the deadline, so spill
                 # straight away.
                 cooled, _, _ = await self.slots.cooldown_state(plan.key)
                 deadline = time.monotonic() + (wait if cap > 0 and not cooled else 0.0)

@@ -424,11 +424,12 @@ follow-up does arrive it is **resumed on the same plan**:
   holds the provider's prompt cache for this conversation and the loop's quota
   story, so a mid-loop follow-up finishes where it started, spent or not. If
   the pinned plan's slots are all busy, the follow-up waits up to
-  `pin_wait_seconds` (10s) for one to free before refusing — the wait holds no
-  slot, so other sessions keep being placed while it does; a plan under an
-  active cooldown is refused immediately. Past the lease window — by which
-  point no provider's cache is warm anyway — the lease is gone and the
-  follow-up places fresh, spilling down the lane like any new request.
+  `pin_wait_seconds` (10s) for one to free before spilling to a peer — the
+  wait holds no slot, so other sessions keep being placed while it does; a
+  plan under an active cooldown or a wait of 0 gives way to a peer
+  immediately. Past the lease window — by which point no provider's cache is
+  warm anyway — the lease is gone and the follow-up places fresh, spilling
+  down the lane like any new request.
 - The sidecar rebuilds the session from the caller's own request, which carries
   the whole history, tool results and all.
 - This is the **only** path allowed to queue. A new request still fails fast so
