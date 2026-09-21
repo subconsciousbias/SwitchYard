@@ -32,10 +32,27 @@ duplicate any of them — the sidecars read `plans.yaml` themselves. If you find
 yourself setting the same number in two places, the config is the source of
 truth and the other place is a bug.
 
+## This checkout is a worktree — never build or deploy from it
+
+Agent sessions run in `git worktree`s of this repo; the live stack runs from the
+**main checkout** (`~/Documents/GitHub/switchyard`). `docker-compose.yml` pins
+`name: switchyard`, so every worktree addresses the *same* compose project:
+`docker compose build` / `up -d` from a worktree does not spin up an isolated
+copy — it rebuilds and recreates the **live** containers from branch code, and
+mounts that worktree's `./config` into them. This was nearly done once from the
+issue-11 worktree and aborted by the user.
+
+From a worktree the job is: edit, run the offline test suite, commit. The
+rebuild/redeploy (and any `up -d --force-recreate`) happens from the main
+checkout after merge — `scripts/apply.sh --build` there. State that it is
+pending rather than running it. Read-only diagnosis is fine: `docker compose ps`,
+`docker logs`, the portal board.
+
 ## `switchyard/` is baked into three images, not mounted
 
 Only `./config` is mounted. `switchyard/*.py` is COPYed into the gateway, the
-portal and the sidecar images, so after editing it:
+portal and the sidecar images, so after editing it, rebuild and redeploy **from
+the main checkout** (see the worktree section above — never from a worktree):
 
 ```bash
 docker compose build gateway portal claude-max-sidecar xai-token-proxy
