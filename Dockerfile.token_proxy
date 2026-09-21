@@ -1,0 +1,28 @@
+# Attaches Switchyard's own OAuth bearer to a caller's request and forwards it
+# untouched. One image, one service per provider (SWITCHYARD_PROVIDER).
+#
+# Deliberately not the sidecar image: no vendor CLI, no node, nothing that could
+# start an agent harness. The whole value of this path is that the caller's
+# `tools` reach the model unaltered, so the less this container can do, the
+# better. It needs Python, httpx and the token store — nothing else.
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY sidecars/token_proxy/server.py /app/token_proxy/server.py
+# The refresh logic lives with the login command, so the proxy and the CLI that
+# minted the grant can never disagree about the token's shape or its expiry.
+COPY switchyard/oauth.py /app/switchyard/oauth.py
+COPY switchyard/__init__.py /app/switchyard/__init__.py
+
+# /app/secrets is the mount for ./secrets, which holds oauth.json. It is the
+# same file the host's `python3 -m switchyard.oauth login` writes.
+ENV SWITCHYARD_PROVIDER=xai \
+    SWITCHYARD_AUTH_STORE=/app/secrets/oauth.json \
+    SWITCHYARD_PLANS=/app/config/plans.yaml \
+    PYTHONPATH=/app
+
+EXPOSE 8090 8091
+CMD ["sh", "-c", "cd /app/token_proxy && uvicorn server:app --host 0.0.0.0 --port ${PROXY_PORT:-8090}"]

@@ -337,15 +337,18 @@ plans:
 
   grok:
     label: "Grok $300 Plan (SuperGrok)"
-    # OAuth-only, reached through OpenCode logged in to xAI. This rides the
+    # OAuth-only, and reached through Switchyard's OWN grant rather than the
+    # OpenCode CLI: api.x.ai is OpenAI-compatible, so the token proxy forwards
+    # the caller's body untouched and tool calling survives the trip. Rides the
     # subscription, on a quota entirely separate from metered api.x.ai credits.
-    auth: cli_sidecar
+    # `oauth_proxy`, not `cli_sidecar`: there is no CLI in this path at all.
+    auth: oauth_proxy
     provider_family: xai
     monthly_cost: 100
     max_parallel: 2
     max_parallel_ceiling: 4
     expires: "2026-10-09"
-    api_base: http://grok-sidecar:8083/v1
+    api_base: http://xai-token-proxy:8090/v1
     api_key: sidecar
     quotas:
       - name: burst
@@ -361,10 +364,6 @@ plans:
         allowance: null           # TODO
         source: estimate
     notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
-    # Still on the text-only CLI bridge (BRIDGE=cli). Flip to true once this
-    # plan moves to the xAI token proxy, or once grok-sidecar runs BRIDGE=mcp
-    # against a verified OpenCode MCP profile.
-    supports_tools: false
     models:
       grok-4.6:
         model: openai/xai/grok-4.6

@@ -33,7 +33,26 @@ from typing import Any
 
 import httpx
 
-STORE = os.environ.get("SWITCHYARD_AUTH_STORE", "/app/secrets/oauth.json")
+def _default_store() -> str:
+    """Where the token store lives, host or container.
+
+    The containers mount the repo's ./secrets at /app/secrets, so both sides
+    read the same file — but only the container has /app. Defaulting to the
+    container path meant `login` run from the shell (which is the only way to
+    run it: the grant needs a human at a browser) completed the grant and then
+    lost the tokens to a read-only /app.
+    """
+    override = os.environ.get("SWITCHYARD_AUTH_STORE")
+    if override:
+        return override
+    if os.path.isdir("/app/secrets"):
+        return "/app/secrets/oauth.json"
+    # The repo checkout: this file is <root>/switchyard/oauth.py.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "secrets", "oauth.json")
+
+
+STORE = _default_store()
 REFRESH_MARGIN = 120   # refresh this many seconds before expiry
 
 
@@ -162,7 +181,11 @@ def status(provider: str) -> dict[str, Any]:
     """Whether a grant exists and how long it has left. Never the grant itself."""
     entry = _load().get(provider) or {}
     if not entry:
-        return {"provider": provider, "authorised": False}
+        # The same keys as an authorised grant, so a caller can report on a
+        # provider that has never been logged in without special-casing it —
+        # /health crashed on a KeyError doing exactly that.
+        return {"provider": provider, "authorised": False, "expires_in": None,
+                "has_refresh": False, "scopes": "", "account_id": None}
     expires = entry.get("expires_at") or 0
     return {
         "provider": provider,

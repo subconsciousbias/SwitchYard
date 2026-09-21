@@ -249,13 +249,13 @@ async def health() -> dict:
     # Honesty convention from sidecars/cli_bridge/server.py: `ok` is false
     # whenever this process cannot actually serve a request right now, not
     # merely whenever something is technically running.
-    ok = bool(spec) and bool(st["authorised"]) and supports_chat
+    ok = bool(spec) and bool(st.get("authorised")) and supports_chat
     return {
         "ok": ok,
         "provider": PROVIDER,
-        "authorised": st["authorised"],
-        "expires_in": st["expires_in"],
-        "has_refresh": st["has_refresh"],
+        "authorised": st.get("authorised", False),
+        "expires_in": st.get("expires_in"),
+        "has_refresh": st.get("has_refresh", False),
         "account_id_on_file": bool(st.get("account_id")),
         "upstream_base": spec.api_base if spec else None,
         "supports_chat_completions": supports_chat,

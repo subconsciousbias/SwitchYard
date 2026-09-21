@@ -163,6 +163,10 @@ services:
   # from metered api.x.ai credits. Reached through OpenCode logged in to xAI.
   # Log in with: docker compose exec grok-sidecar opencode auth login
   # Expires 2026-10-09 — delete this service and the plan then.
+  # No longer referenced by any plan: the grok plan moved to xai-token-proxy
+  # above, which is the path that can serve tool calls. Kept until the proxy has
+  # served real traffic, as the fallback if that grant turns out not to work —
+  # delete this service once it has.
   grok-sidecar:
     image: switchyard-sidecar:latest     # built by claude-max-sidecar
     <<: *common
@@ -183,6 +187,33 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  # SuperGrok via Switchyard's own OAuth grant, not the OpenCode CLI. This is
+  # the path that lets a caller's `tools` reach the model untouched, because
+  # there is no agent harness in the way — see sidecars/token_proxy/server.py.
+  # Needs a grant first, from the host: python3 -m switchyard.oauth login xai
+  xai-token-proxy:
+    build: {context: ., dockerfile: Dockerfile.token_proxy}
+    image: switchyard-token-proxy:latest
+    <<: *common
+    expose: ["8090"]
+    environment:
+      SWITCHYARD_PROVIDER: xai
+      PROXY_PORT: "8090"
+      SWITCHYARD_PLAN: grok
+      SWITCHYARD_PLANS: /app/config/plans.yaml
+    volumes:
+      - ./config:/app/config:ro
+      # Read-write: the proxy refreshes the access token and writes it back, so
+      # the host CLI and every container share one current grant. Nothing else
+      # in ./secrets is readable from here.
+      - ./secrets:/app/secrets
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8090/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   # The OpenCode Go plan: same CLI, different login, SEPARATE quota — so it gets
   # its own process. One process per subscription is what keeps the connection

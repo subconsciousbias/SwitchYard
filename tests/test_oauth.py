@@ -196,6 +196,28 @@ def test_headless_flow_is_registered_for_openai_and_device_flow_for_xai():
     raise AssertionError("expected KeyError for an unregistered provider")
 
 
+def test_status_has_one_shape_whether_or_not_a_grant_exists():
+    """A provider that was never logged in must report the same keys.
+
+    The token proxy's /health reads these straight through; a short dict for an
+    unauthorised provider made it raise KeyError on the very state it exists to
+    report — a container that looked crashed when it was merely waiting for a
+    login.
+    """
+    oauth.STORE = _fresh_store()
+    missing = oauth.status("xai")
+    oauth._save({"xai": {"access_token": "t", "refresh_token": "r",
+                         "expires_at": time.time() + 600, "scope": "a b"}})
+    present = oauth.status("xai")
+
+    assert set(missing) == set(present), (sorted(missing), sorted(present))
+    assert missing["authorised"] is False and present["authorised"] is True
+    assert missing["expires_in"] is None and present["expires_in"] > 0
+    for shape in (missing, present):
+        assert "access_token" not in str(shape), "status must never carry a token"
+    print(f"  identical keys either way: {sorted(missing)}")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):
