@@ -386,7 +386,13 @@ class Prober:
         if plan.probe is None:
             return False
         st = await self.status(plan.key)
-        if not st["has_cookie"] or st["needs_reauth"]:
+        # Only a cookie-kind probe carries a credential through Redis. Bearer /
+        # none kinds pass theirs in headers or behind a sidecar, so the reauth
+        # signal for them is a 401/403 on the request itself (handled in run()),
+        # not the absence of a stored cookie. Gating every kind on `has_cookie`
+        # would skip every header-authed plan forever — and the ledger would
+        # never see a real headroom reading for it.
+        if plan.probe.kind == "cookie" and (not st["has_cookie"] or st["needs_reauth"]):
             return False
         last = st["last_attempt_at"] or 0
         return (time.time() - last) >= plan.probe.interval_seconds

@@ -371,6 +371,95 @@ def test_minimax_remains_percent_payload_is_read_as_percentages():
     print("  general family selected by name; 5h 37.5% binds over weekly 12%")
 
 
+def test_polling_runs_for_a_kind_none_plan_without_a_cookie():
+    """`probe.kind: none` plans carry no cookie; the poller must still run.
+
+    Before this was fixed, `due()` unconditionally rejected plans with no stored
+    cookie, which is correct for `kind: cookie` (where a missing cookie means
+    we can't reach the endpoint) and wrong for everything else. The consequence
+    was that four plans (glm, claude-max, openai, grok) never had `run()` ever
+    called on them, so the ledger never recorded a real headroom reading, and
+    `Picker.is_spent()` always returned False on them — a fully-spent seat
+    kept getting offered to new sessions.
+
+    Three things have to hold for the fix to be real:
+      1. `due()` is True on a freshly-loaded plan with no cookie.
+      2. After a successful `run()` against a stub server, the ledger carries
+         the provider-reported percentage on the target window.
+      3. `Picker.is_spent()` honours that percentage, so a 100% reading actually
+         takes the plan out of the candidate pool — closing the loop that the
+         bug had broken.
+    """
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+    from switchyard.policy import CapacityPolicy
+    from switchyard.slots import SlotTable
+
+    payload = {"data": {"limits": [
+        {"type": "TOKENS_LIMIT", "unit": 6, "number": 1, "percentage": 100,
+         "nextResetTime": 1790542882984},
+    ]}}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+    async def go():
+        redis = FakeRedis()
+        ledger = Ledger(redis)
+        prober = Prober(redis, ledger)
+        plan = models.load().plans["glm"]
+        # Point at the stub so the probe gets a real 200 with our payload.
+        plan = replace(plan, probe=replace(plan.probe, url=base + "/usage"))
+        # A `kind: none` plan must be due with no cookie stored — the cookie
+        # gate is meaningless for it.
+        no_cookie = await prober.due(plan)
+        os.environ["GLM_API_KEY"] = "sk-stub"
+        try:
+            result = await prober.run(plan)
+        finally:
+            os.environ.pop("GLM_API_KEY", None)
+        # The provider reported a percentage; it must land in the ledger so the
+        # picker's spent gate can read it.
+        facts = await ledger.window_facts(plan.key, plan.quota.label)
+        pct = facts.get("reported_pct_used")
+        # And the picker must agree with that percentage.
+        reg = models.Registry(settings=models.load().settings,
+                              plans={"glm": plan}, lanes=models.load().lanes)
+        policy = CapacityPolicy(redis, reg.settings, ledger)
+        slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+        from switchyard.picker import Picker
+        picker = Picker(reg, slots, policy)
+        spent = await picker.is_spent(plan)
+        return no_cookie, result, pct, spent
+
+    no_cookie, result, pct, spent = run(go())
+    srv.shutdown()
+
+    assert no_cookie is True, ("cookie gate fired on a kind: none plan — "
+                               "the regression this test pins")
+    assert result.ok, result
+    assert pct == 100.0, pct
+    assert spent is True, ("a 100% reading never reached the picker — the "
+                            "cookie gate had starved the poller")
+    print(f"  kind: none polled without a cookie; {pct:.0f}% reported; picker "
+          f"sees the plan as spent")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):
