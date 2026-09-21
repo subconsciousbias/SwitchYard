@@ -667,9 +667,17 @@ file; the LiteLLM config is generated from it at container start
 Three things read that file, and they pick up changes differently:
 
 ```bash
-docker compose restart gateway          # routing: required for most edits
-curl -X POST http://localhost:4001/admin/reload   # the portal's board
-# sidecars re-read it themselves, within 30s
+scripts/reload.sh        # validate, restart the gateway, refresh the board
+```
+
+It checks the file before touching anything — a syntax error or a lane with no
+live members is reported while the old config is still running, rather than
+after the gateway has restarted onto it. Then it does what each component needs:
+
+```bash
+docker compose restart gateway                     # routing: required for most edits
+curl -X POST http://localhost:4001/admin/reload    # the portal's board
+# sidecars re-read plans.yaml themselves, within 30s
 ```
 
 **The gateway needs a restart, and there is no way around it.** LiteLLM builds
