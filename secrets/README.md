@@ -28,7 +28,10 @@ Two reasons, both learned the hard way:
 1. **It does not work for Claude on macOS.** Claude Code stores its OAuth token
    in the login Keychain, not in a file, so there is nothing for a Linux
    container to read. Mounting `~/.claude` gets you the settings and history but
-   no credentials.
+   no credentials. The Linux equivalent is the user's keyring (GNOME Keyring /
+   KWallet, accessed by the CLI via `secret-tool`); on Windows the token lives
+   in Windows Credential Manager, encrypted with DPAPI. Either way, the
+   container can't see it.
 
 2. **It is not safe.** The container needs write access — OAuth refresh rotates
    the token and has to persist it — and that means a containerised CLI writing
@@ -46,6 +49,10 @@ If you would rather share (it does work for Codex and OpenCode, which are
 file-based), point the relevant variable in `.env` at your host directory:
 
 ```
+# macOS paths shown; on Linux substitute ~/.claude, ~/.codex,
+# ~/.local/share/opencode, ~/.config/opencode; on Windows substitute
+# %USERPROFILE%\.claude, %USERPROFILE%\.codex, %USERPROFILE%\.local\share\opencode,
+# %USERPROFILE%\.config\opencode.
 CLAUDE_CONFIG_DIR=/Users/you/.claude        # no credentials on macOS — settings only
 CODEX_CONFIG_DIR=/Users/you/.codex
 OPENCODE_DATA_DIR=/Users/you/.local/share/opencode

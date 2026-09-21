@@ -95,7 +95,10 @@ services:
   # Credentials live in ./secrets/claude, NOT your host ~/.claude — on macOS the
   # host token is in the Keychain and unreadable here anyway, and mounting your
   # live config directory read-write lets a containerised CLI rewrite the config
-  # of the CLI you are using interactively. See secrets/README.md.
+  # of the CLI you are using interactively. On Linux the token lives in the
+  # user's keyring (GNOME Keyring / KWallet via secret-tool) and on Windows it
+  # sits in Windows Credential Manager (DPAPI-encrypted) — none of those are
+  # reachable from the container. See secrets/README.md.
   #   docker compose exec claude-max-sidecar claude login
   # The four sidecars are the SAME image; only their environment differs. Only
   # this service declares `build`, and the rest reference the tag it produces —
