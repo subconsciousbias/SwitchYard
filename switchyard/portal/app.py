@@ -1,4 +1,4 @@
-"""Switchyard portal — capacity, quota headroom, and subscription economics.
+"""SwitchYard portal — capacity, quota headroom, and subscription economics.
 
 The point of the quota board: answer "how close am I to running out?" for
 every plan on one page, without opening eight vendor dashboards.
@@ -27,7 +27,7 @@ from ..usage import Ledger, effective_cost_per_mtok, headroom
 import logging
 
 BASE = os.path.dirname(__file__)
-app = FastAPI(title="Switchyard")
+app = FastAPI(title="SwitchYard")
 templates = Jinja2Templates(directory=os.path.join(BASE, "templates"))
 
 state: dict = {}

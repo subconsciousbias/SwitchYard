@@ -29,7 +29,7 @@ Two mitigations, neither of which makes these lanes agentic:
     which is why the code default stays `append`.
   * BARE=1 strips the inner harness's tools and caps it at one turn, which is
     as close to a plain completion as a CLI gets.
-Switchyard additionally refuses to route a request containing `tools` to any
+SwitchYard additionally refuses to route a request containing `tools` to any
 CLI-backed plan, and this process rejects one outright rather than dropping the
 definitions silently. Text in, text out is the contract.
 
@@ -39,14 +39,14 @@ process with its own SWITCHYARD_SUBSCRIPTION; sharing one process would conflate
 two connection limits into one gate.
 
 Concurrency, the default model and the allowed model aliases all come from
-`config/plans.yaml` — the same file Switchyard routes from — so there is exactly
+`config/plans.yaml` — the same file SwitchYard routes from — so there is exactly
 one place to change a connection limit. SWITCHYARD_SUBSCRIPTION names which
 subscription this process serves; every plan sharing it contributes its model
 alias, and the tightest `max_parallel` among them is the connection limit.
 
 The thing it must get exactly right is error mapping: a usage-limit rejection
 has to leave here as **HTTP 429 with Retry-After**, because that is the signal
-Switchyard uses to drop the plan's slots out of the lane. A 500 would look like
+SwitchYard uses to drop the plan's slots out of the lane. A 500 would look like
 a transient blip and the lane would keep feeding requests to dead capacity.
 """
 from __future__ import annotations
@@ -270,7 +270,7 @@ def config() -> Config:
 class Gate:
     """A concurrency gate whose limit can change between requests.
 
-    A *new* request never queues: a full gate answers immediately so Switchyard
+    A *new* request never queues: a full gate answers immediately so SwitchYard
     can spill to the next plan in the lane instead of holding a worker open.
     The one exception is acquire_waiting, used only to resume a tool-calling
     session that was already committed to this plan — see mcp_bridge.
@@ -408,7 +408,7 @@ def flatten(messages: list[dict]) -> tuple[str, str | None]:
     """Collapse a chat array into one prompt plus a system prompt.
 
     A limitation worth knowing: this is stateless, so each turn re-sends the
-    whole conversation and pays for it. Switchyard's session affinity keeps a
+    whole conversation and pays for it. SwitchYard's session affinity keeps a
     session pinned here, which is what makes the CLI's prompt cache effective.
     """
     system: list[str] = []
@@ -711,7 +711,7 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
         status, detail = error_from_events(stdout)
         if status and 400 <= status < 500 and status != 429:
             # A client error is our fault, not the provider's — surface it as-is
-            # so Switchyard does not cool the plan down over a bad request.
+            # so SwitchYard does not cool the plan down over a bad request.
             raise HTTPException(status_code=status,
                                 detail={"error": {"message": detail or blob[:300],
                                                   "type": "upstream_client_error"}})
@@ -873,7 +873,7 @@ async def _handle_chat(body: dict):
     That identity is what "no regression on the text path" means here: there
     is only one code path for it, whichever sidecar is asking.
     """
-    # Refuse tool calls loudly. Switchyard already routes these away from
+    # Refuse tool calls loudly. SwitchYard already routes these away from
     # CLI-backed plans; if one arrives anyway, dropping the definitions silently
     # would look like the model simply choosing not to call anything.
     if body.get("tools"):
@@ -899,7 +899,7 @@ async def _handle_chat(body: dict):
 
     limit = config().concurrency
     if not await _gate.acquire(limit):
-        # Never queue: Switchyard needs to hear "full" immediately so it can
+        # Never queue: SwitchYard needs to hear "full" immediately so it can
         # spill to the next plan in the lane instead of blocking a worker.
         raise HTTPException(status_code=429,
                             detail=f"sidecar at capacity ({limit})",

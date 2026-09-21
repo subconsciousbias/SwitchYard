@@ -171,13 +171,53 @@ MCP_PROFILES: dict[str, dict] = {
         "parser": "events_json",
         "default_retry_after": 3600,
     },
+    # Codex DOES have an MCP client, contrary to what this file used to say:
+    # `[mcp_servers.<name>]` in config.toml, settable per invocation with -c,
+    # plus `codex mcp add/list/get`. Verified against a live `codex exec` on a
+    # ChatGPT seat (0.155.1): the server starts, the model calls the tool, and a
+    # 90s parked call completes in 101s wall clock.
+    #
+    # That wrong assumption is why the OpenAI seat was going to be reached
+    # instead through `chatgpt.com/backend-api/codex/responses`, which a capture
+    # of the real request shows requires presenting Codex CLI's own identity
+    # (`originator: codex_exec`, `x-openai-internal-codex-responses-lite`, a
+    # session/thread id pair and an `x-codex-turn-metadata` blob) to a private
+    # internal endpoint. This path needs none of that: the seat's own official
+    # client makes the call, exactly as it does on the text path.
+    "codex": {
+        "cli": os.environ.get("CODEX_CLI", "codex"),
+        # --dangerously-bypass-approvals-and-sandbox is load-bearing and not
+        # gratuitous: codex refuses an MCP tool call under any headless approval
+        # policy ("MCP tool call requires approval, but approval policy is
+        # never"), and its own docs scope this flag to externally sandboxed
+        # environments -- which a sidecar container is. The alternative,
+        # --approve-for-me, routes every call through an extra model review,
+        # which is latency and quota per tool call on a high-volume path.
+        #
+        # The tool surface here is one MCP server that executes nothing locally:
+        # it parks an HTTP call back to this process. Codex's own shell tools are
+        # what the container boundary contains, the same as on the text path.
+        "argv": ["exec", "--json", "--skip-git-repo-check",
+                 "--dangerously-bypass-approvals-and-sandbox",
+                 "--model", "{model}",
+                 "-c", "mcp_servers.switchyard.command=python3",
+                 "-c", 'mcp_servers.switchyard.args=["{tool_server}"]',
+                 "-c", "mcp_servers.switchyard.startup_timeout_sec=20",
+                 "-c", 'mcp_servers.switchyard.env={SWITCHYARD_TOOLS_FILE="{tools_file}",SWITCHYARD_SESSION_ID="{session_id}",SWITCHYARD_CALLBACK_URL="{callback}"}',
+                 "{prompt}"],
+        # Codex reports the server and the tool separately in its event stream
+        # (`{"server":"switchyard","tool":"get_weather"}`) and takes no allowlist
+        # argument, so nothing needs qualifying -- but the key must exist for
+        # build_argv's shared allowlist construction.
+        "tool_qualifier": lambda name: name,
+        "parser": "codex_jsonl",
+        "default_retry_after": 3600,
+    },
 }
 
 if PROVIDER not in MCP_PROFILES:
     raise SystemExit(
-        f"mcp_bridge supports PROVIDER in {sorted(MCP_PROFILES)}, got {PROVIDER!r} "
-        "-- codex exec has no MCP client, so a tool-calling codex lane still "
-        "has to go through cli_bridge and refuse tools the ordinary way.")
+        f"mcp_bridge supports PROVIDER in {sorted(MCP_PROFILES)}, got {PROVIDER!r}")
 PROFILE = MCP_PROFILES[PROVIDER]
 
 
@@ -368,9 +408,21 @@ def write_opencode_dir(workdir: Path, session_id: str, tools_path: Path) -> None
 
 def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
                 session_id: str, tools_path: Path, allowed_tools: str) -> list[str]:
+    instructions: Path | None = None
     if PROVIDER == "claude":
         mcp_config = write_claude_mcp_config(workdir, session_id, tools_path)
         effective_prompt = prompt
+    elif PROVIDER == "codex":
+        # Codex takes its MCP server entirely on the command line (-c
+        # mcp_servers.*), so there is no project config to write. The system
+        # prompt goes through model_instructions_file, the same override
+        # cli_bridge uses -- a real replacement, not an append, and the only key
+        # that measurably cuts codex's own prompt.
+        mcp_config = None
+        effective_prompt = prompt
+        if system:
+            instructions = workdir / "instructions.md"
+            instructions.write_text(system)
     else:
         write_opencode_dir(workdir, session_id, tools_path)
         mcp_config = None
@@ -384,11 +436,17 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
                    .replace("{model}", model)
                    .replace("{workdir}", str(workdir))
                    .replace("{mcp_config}", str(mcp_config) if mcp_config else "")
+                   .replace("{tool_server}", str(TOOL_SERVER))
+                   .replace("{tools_file}", str(tools_path))
+                   .replace("{session_id}", session_id)
+                   .replace("{callback}", CALLBACK_BASE)
                    .replace("{allowed_tools}", allowed_tools))
 
     argv = [PROFILE["cli"]] + [fill(a) for a in PROFILE["argv"]]
     if PROVIDER == "claude" and system:
         argv += ["--system-prompt", system]
+    if instructions is not None:
+        argv += ["-c", f"model_instructions_file={instructions}"]
     return argv
 
 
@@ -643,7 +701,7 @@ async def handle_fresh(body: dict, tools: list[dict],
     if not await cli_bridge._gate.acquire(limit) and (
             not await reclaim_parked_slot()
             or not await cli_bridge._gate.acquire(limit)):
-        # Never queue, same contract as cli_bridge: Switchyard needs "full"
+        # Never queue, same contract as cli_bridge: SwitchYard needs "full"
         # immediately so it can spill to the next plan in the lane. Only a
         # preempted session's follow-up may wait — see resume_preempted.
         raise HTTPException(status_code=429, detail=f"sidecar at capacity ({limit})",
@@ -770,7 +828,7 @@ async def resume_preempted(body: dict, tools: list[dict], session_id: str,
     """Rebuild a session whose slot we took, on the same plan, once one frees.
 
     This is the only path allowed to queue. A *new* request must still fail fast
-    so Switchyard can spill it to the next plan in the lane, but a session that
+    so SwitchYard can spill it to the next plan in the lane, but a session that
     is already mid-loop has nowhere to spill to: its tool results belong to a
     conversation this plan has been building a prompt cache for, and starting it
     over elsewhere would both lose that cache and re-run work the caller has

@@ -1,5 +1,5 @@
 # ============================================================================
-# Switchyard — single source of truth for plans, models, capacity and lanes.
+# SwitchYard — single source of truth for plans, models, capacity and lanes.
 #
 # THE MODEL, in two sentences. A **plan** is a thing you pay for: it owns the
 # credentials, the quota windows, the connection limit, the monthly cost and the
@@ -87,28 +87,50 @@ plans:
     max_parallel_ceiling: 6
     api_base: os.environ/MINIMAX_ULTRA_API_BASE
     api_key: os.environ/MINIMAX_ULTRA_API_KEY
+    # Two windows: a weekly allowance to fill, and a 5-hour burst cap not to
+    # overshoot. No monthly pool — spend at the slowest rate either allows.
     quotas:
-      # A token plan is one budget, not a burst window plus an allowance.
-      - name: monthly
+      - name: 5h
+        role: constraint
+        kind: tokens
+        period: rolling_5h
+        allowance: null           # TODO: observe the burst ceiling
+        source: estimate
+      - name: weekly
         role: target
         kind: tokens
-        period: month
+        period: week
         allowance: null           # TODO, or let the probe report it
         source: probe
     probe:
-      # MiniMax publishes exact headroom here, but the endpoint only answers a
-      # browser session — an API key gets "cookie is missing (1004)". Paste the
-      # cookie in the portal; see switchyard/probes.py for the caveats.
+      # The console's own headroom route, captured from a live session at
+      # platform.minimax.io/console/usage. It only answers a browser session —
+      # an API key gets "cookie is missing (1004)" — so paste the cookie in the
+      # portal. An earlier guess at api.minimax.io/v1/coding_plan/remains was
+      # wrong on both host and path.
       kind: cookie
-      url: https://api.minimax.io/v1/coding_plan/remains   # TODO: confirm
+      url: https://platform.minimax.io/backend/account/token_plan/remains_percent
       method: GET
-      window: monthly
+      window: weekly                # which window the flat numbers describe
       interval_seconds: 600
-      referer: https://platform.minimax.io/
-      fields:
-        remaining: [data.remains, data.remaining_tokens, data.remain, remains]
-        total: [data.total, data.total_tokens, data.quota]
-        reset_at: [data.reset_at, data.next_reset_time, data.expire_time]
+      referer: https://platform.minimax.io/console/usage
+      # It reports PERCENTAGES and nothing else: every *_count field comes back
+      # -1, so used_percent is the only real measurement. One response carries
+      # both windows — `current_interval_*` is the 5-hour window (end_time minus
+      # start_time is 18000s) and `current_weekly_*` the weekly one — and entries
+      # are per model family, so the path selects `general` by name rather than
+      # trusting the array's order:
+      #   {"model_remains":[{"model_name":"general",
+      #      "end_time":1789966800000,"current_interval_used_percent":"0%",
+      #      "weekly_end_time":1790553600000,"current_weekly_used_percent":"0%",
+      #      "current_weekly_used_count":-1},{"model_name":"video",...}]}
+      windows:
+        weekly:
+          used_percent: [model_remains.model_name=general.current_weekly_used_percent]
+          reset_at: [model_remains.model_name=general.weekly_end_time]
+        5h:
+          used_percent: [model_remains.model_name=general.current_interval_used_percent]
+          reset_at: [model_remains.model_name=general.end_time]
     notes: "Original workhorse. Good at coding with explicit instructions."
     models:
       m3:
@@ -130,24 +152,47 @@ plans:
     max_parallel_ceiling: 6
     api_base: os.environ/MINIMAX_MAX_API_BASE
     api_key: os.environ/MINIMAX_MAX_API_KEY
+    # Two windows: a weekly allowance to fill, and a 5-hour burst cap not to
+    # overshoot. No monthly pool — spend at the slowest rate either allows.
     quotas:
-      - name: monthly
+      - name: 5h
+        role: constraint
+        kind: tokens
+        period: rolling_5h
+        allowance: null           # TODO: observe the burst ceiling
+        source: estimate
+      - name: weekly
         role: target
         kind: tokens
-        period: month
-        allowance: null
+        period: week
+        allowance: null           # TODO, or let the probe report it
         source: probe
     probe:
+      # Same route as minimax-ultra: one console, one cookie, but a separate
+      # plan with its own meters, so it gets its own probe and its own reading.
       kind: cookie
-      url: https://api.minimax.io/v1/coding_plan/remains
+      url: https://platform.minimax.io/backend/account/token_plan/remains_percent
       method: GET
-      window: monthly
+      window: weekly                # which window the flat numbers describe
       interval_seconds: 600
-      referer: https://platform.minimax.io/
-      fields:
-        remaining: [data.remains, data.remaining_tokens, data.remain, remains]
-        total: [data.total, data.total_tokens, data.quota]
-        reset_at: [data.reset_at, data.next_reset_time, data.expire_time]
+      referer: https://platform.minimax.io/console/usage
+      # It reports PERCENTAGES and nothing else: every *_count field comes back
+      # -1, so used_percent is the only real measurement. One response carries
+      # both windows — `current_interval_*` is the 5-hour window (end_time minus
+      # start_time is 18000s) and `current_weekly_*` the weekly one — and entries
+      # are per model family, so the path selects `general` by name rather than
+      # trusting the array's order:
+      #   {"model_remains":[{"model_name":"general",
+      #      "end_time":1789966800000,"current_interval_used_percent":"0%",
+      #      "weekly_end_time":1790553600000,"current_weekly_used_percent":"0%",
+      #      "current_weekly_used_count":-1},{"model_name":"video",...}]}
+      windows:
+        weekly:
+          used_percent: [model_remains.model_name=general.current_weekly_used_percent]
+          reset_at: [model_remains.model_name=general.weekly_end_time]
+        5h:
+          used_percent: [model_remains.model_name=general.current_interval_used_percent]
+          reset_at: [model_remains.model_name=general.end_time]
     notes: "Second workhorse, added 2026-09-20 to stop the OpenRouter burn."
     models:
       m3:
@@ -231,16 +276,87 @@ plans:
     expires: "2026-09-27"
     api_base: http://opencode-go-sidecar:8084/v1
     api_key: sidecar
+    # `source: ledger`, not a probe, and that was checked rather than assumed.
+    # The console at opencode.ai/console does have a usage API —
+    # `GET /console/api/usage/summary?range=7d` with an `x-org-id: wrk_...`
+    # header and the session cookie answers with real totals — but it is the Zen
+    # pay-as-you-go surface (requests, tokens, totalCostMicroCents) and reports
+    # zero for this plan: Go subscription traffic is not metered there. Its
+    # bundle references no plan, quota or limits route at all (only /api/usage,
+    # /api/billing, /api/budgets and config), and opencode's own CLI binary
+    # carries none either — the `billing` strings in it are bundled GitHub API
+    # surface. Upstream issue #16017 asks for exactly this endpoint and is still
+    # open.
+    #
+    # A probe against that summary route would therefore show a permanent 0,
+    # which reads as verified headroom and is worse than admitting there is no
+    # number. So the only usage figure is the one SwitchYard books itself from
+    # each response's token counts — a floor on consumption, labelled as such.
+    # Three windows, all in DOLLARS of model spend, not tokens: the Go plan is
+    # $10/month that buys metered model usage, and the console meters it as
+    # microcents against a limit. Monthly is the allowance worth filling; the
+    # weekly and 5-hour meters are caps not to overshoot. Every number here comes
+    # from the probe below, which reports all three from one response.
     quotas:
+      - name: 5h
+        role: constraint
+        kind: dollars
+        period: rolling_5h
+        allowance: 12.0           # limitMicroCents 1200000000
+        source: probe
+      - name: weekly
+        role: constraint
+        kind: dollars
+        period: week
+        allowance: 30.0           # limitMicroCents 3000000000
+        source: probe
       - name: monthly
         role: target
-        kind: tokens
+        kind: dollars
         period: month
-        allowance: null
-        source: estimate
+        allowance: 60.0           # limitMicroCents 6000000000
+        source: probe
+    probe:
+      # The Go plan's own status route, read from the console page at
+      # /console/<org>/go. Verified against a live session: it answers with all
+      # three meters at once, as usedMicroCents against limitMicroCents.
+      #   {"access":{"endsAt":"...","meters":{
+      #      "fiveHour":{"resetsAt":"...","limitMicroCents":"1200000000",
+      #                  "usedMicroCents":"383625"},
+      #      "week":{...},"month":{...}}}}
+      # `used` is what it publishes, so the prober derives remaining = limit-used.
+      kind: cookie
+      url: https://opencode.ai/console/api/go/status
+      method: GET
+      window: monthly
+      interval_seconds: 600
+      referer: https://opencode.ai/console
+      headers:
+        # Required: the route answers {"code":"org_required"} without it. Not a
+        # credential, but account-identifying, so it lives in .env rather than
+        # in this committed file.
+        x-org-id: os.environ/OPENCODE_ORG_ID
+      # microcents -> dollars.
+      scale: 0.00000001
+      windows:
+        5h:
+          used: [access.meters.fiveHour.usedMicroCents]
+          total: [access.meters.fiveHour.limitMicroCents]
+          reset_at: [access.meters.fiveHour.resetsAt]
+        weekly:
+          used: [access.meters.week.usedMicroCents]
+          total: [access.meters.week.limitMicroCents]
+          reset_at: [access.meters.week.resetsAt]
+        monthly:
+          used: [access.meters.month.usedMicroCents]
+          total: [access.meters.month.limitMicroCents]
+          # The month meter publishes no resetsAt; the subscription's own end
+          # date is the next boundary that matters for a cancelled plan.
+          reset_at: [access.endsAt]
     notes: >
       Cancelled, 7 days left as of 2026-09-20. The drain rule puts it at the
-      front of the workhorse lane until it dies.
+      front of the workhorse lane until it dies. Usage is SwitchYard's own
+      tally: no provider endpoint reports this plan's consumption.
     models:
       # provider/model as OpenCode names it — `opencode` and `opencode-go` are
       # DIFFERENT providers there (free/community versus this paid plan).
@@ -298,13 +414,8 @@ plans:
     expires: "2026-10-04"
     api_base: http://codex-sidecar:8082/v1
     api_key: sidecar
+    # One window only: the seat meters weekly, with no 5-hour burst cap.
     quotas:
-      - name: 5h
-        role: constraint
-        kind: tokens
-        period: rolling_5h
-        allowance: null
-        source: estimate
       - name: weekly
         role: target
         kind: tokens
@@ -312,9 +423,6 @@ plans:
         allowance: null
         source: estimate
     notes: "Cancelled. Both models share the seat's 2 connections and its quota."
-    # Codex has no MCP client, so the sidecar cannot serve the caller's tools
-    # back to it. Tool-carrying requests must skip this plan, not 400 on it.
-    supports_tools: false
     models:
       # Verified ids on a ChatGPT seat, in capability order — sol strongest, then
       # terra, luna weakest. Prompt overhead for a 5-token reply in brackets.
@@ -334,7 +442,7 @@ plans:
 
   grok:
     label: "Grok $300 Plan (SuperGrok)"
-    # OAuth-only, and reached through Switchyard's OWN grant rather than the
+    # OAuth-only, and reached through SwitchYard's OWN grant rather than the
     # OpenCode CLI: api.x.ai is OpenAI-compatible, so the token proxy forwards
     # the caller's body untouched and tool calling survives the trip. Rides the
     # subscription, on a quota entirely separate from metered api.x.ai credits.
@@ -347,18 +455,14 @@ plans:
     expires: "2026-10-09"
     api_base: http://xai-token-proxy:8090/v1
     api_key: sidecar
+    # One window only: SuperGrok meters a weekly allowance, with no 5-hour
+    # burst cap and no separate monthly pool.
     quotas:
-      - name: burst
-        role: constraint
-        kind: tokens
-        period: rolling_5h
-        allowance: null           # TODO: confirm xAI's burst window size
-        source: estimate
-      - name: monthly
+      - name: weekly
         role: target
         kind: tokens
-        period: month
-        allowance: null           # TODO
+        period: week
+        allowance: null           # TODO: set once a full week has been observed
         source: estimate
     notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
     models:

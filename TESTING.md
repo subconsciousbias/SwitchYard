@@ -1,4 +1,4 @@
-# Switchyard — first-run testing runbook
+# SwitchYard — first-run testing runbook
 
 Work through this in order. Each step has a command and **what you should see**.
 Stop at the first step that does not match, since later steps depend on it.
@@ -63,7 +63,7 @@ down and the lane moves on, so you can start with one.
 
 | Variable | Where to get it |
 |---|---|
-| `LITELLM_MASTER_KEY` | Invent one, e.g. `sk-switchyard-` plus random hex. This is what your tools authenticate to Switchyard with. |
+| `LITELLM_MASTER_KEY` | Invent one, e.g. `sk-switchyard-` plus random hex. This is what your tools authenticate to SwitchYard with. |
 | `MINIMAX_ULTRA_API_KEY`, `MINIMAX_MAX_API_KEY` | platform.minimax.io → API Keys. **Use a separate key per plan** so the two plans' quotas stay distinguishable. |
 | `MINIMAX_*_API_BASE` | `https://api.minimax.io/v1` (or the `api.minimaxi.com` host if that is what your account shows). |
 | `GLM_API_KEY` | z.ai → API keys. |
@@ -155,7 +155,7 @@ docker image prune -f            # dangling (untagged) images only — safe
 Those two are non-destructive to anything you are running. `docker image prune -a`
 removes every image not backing a running container, which will hit your other
 projects — only reach for it if the safe prunes are not enough. The whole
-Switchyard stack needs roughly 3GB: about 1.7GB for the gateway, 790MB for the
+SwitchYard stack needs roughly 3GB: about 1.7GB for the gateway, 790MB for the
 one shared sidecar image and 280MB for the portal.
 
 **Expect:** `redis`, `postgres`, `gateway`, `portal`, `claude-max-sidecar`,
@@ -246,7 +246,7 @@ reaching the client — pass `keepalive=false` in the tool arguments to measure
 the raw ceiling deliberately, which is how OpenCode's ~60s limit was found.
 
 SuperGrok is not in that list any more: the `grok` plan is served by
-`xai-token-proxy`, which holds Switchyard's own OAuth grant instead of shelling
+`xai-token-proxy`, which holds SwitchYard's own OAuth grant instead of shelling
 out to a CLI. Its grant is taken out **from the host**, because the device flow
 needs a human at a browser:
 
@@ -335,7 +335,7 @@ thinking truncated mid-sentence with `finish_reason: "length"` — e.g. at 16
 tokens you get `We need respond to user: "Reply with exactly: LOCAL OK". Need
 final`. That is the model, not the routing. Hence the 200 above.
 
-Then confirm Switchyard routed it, rather than LiteLLM quietly using the lane
+Then confirm SwitchYard routed it, rather than LiteLLM quietly using the lane
 alias's default deployment:
 
 ```bash
@@ -373,7 +373,7 @@ slot accounting, affinity and pacing — while still returning 200s.
 curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H 'Content-Type: application/json' -d '{
     "model":"bulk",
-    "messages":[{"role":"user","content":"Summarise in one sentence: Switchyard routes LLM requests across several subscription plans, filling each to its connection limit before spilling to the next."}],
+    "messages":[{"role":"user","content":"Summarise in one sentence: SwitchYard routes LLM requests across several subscription plans, filling each to its connection limit before spilling to the next."}],
     "max_tokens":80}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
 ```
 
@@ -606,27 +606,88 @@ Pacing column. Turn it back off with `?enabled=off` when you are done.
 
 ---
 
-## 6. Real MiniMax usage (optional, needs a session cookie)
+## 6. Usage probes — reading real headroom from a provider's console
 
-1. Log in to platform.minimax.io in a browser.
-2. Open devtools → Network → any request to the platform → copy the whole
-   `Cookie:` request header value. (Or run `document.cookie` in the console,
-   which may be missing HttpOnly cookies — if the probe then fails, use the
-   Network tab value.)
-3. On the portal, **Real usage** panel → paste into the row for the Ultra plan →
-   **save & test**.
+Three plans report true usage this way: **minimax-ultra**, **minimax-max** and
+**opencode-go**. All three publish it only to a logged-in browser, so each needs
+a session cookie pasted once. Everything below was verified against the live
+endpoints, so a failure here means something changed on their side, not that the
+config was a guess.
 
-**Expect one of:**
-- `active` with a real "N left" figure — done, the board now shows true headroom.
-- `could not find a remaining value` plus a **raw JSON response**. This is the
-  likely first outcome, because I could not verify the endpoint's field names.
-  Read the raw JSON, then correct the `fields:` paths under that plan's `probe:`
-  block in `plans.yaml`, `curl -X POST $PORTAL/admin/reload`, and test again.
-- `session rejected (401)` / `needs re-auth` — the cookie was incomplete; use the
-  full Network-tab header value.
+### 6a. What each one reports
 
-Remember this cookie is full account access, and logging out at MiniMax revokes
-it.
+| Plan | Endpoint | Windows | Unit |
+|---|---|---|---|
+| minimax-ultra / -max | `platform.minimax.io/backend/account/token_plan/remains_percent` | `5h` + `weekly` | **percent used only** (every count is `-1`) |
+| opencode-go | `opencode.ai/console/api/go/status` | `5h` + `weekly` + `monthly` | **dollars** (microcents ÷ 1e8) |
+
+MiniMax's response is one entry per model family, so the config selects
+`general` by name — `model_remains.model_name=general.current_weekly_used_percent`
+— rather than by array position, which would shift if they added a family.
+
+OpenCode reports *spend against a limit* (`usedMicroCents` / `limitMicroCents`),
+so SwitchYard derives `remaining = limit - used`.
+
+### 6b. One extra setting for OpenCode Go
+
+Its route answers `{"code":"org_required"}` without a workspace header. Get the
+id from the console URL (`/console/wrk_...`) or:
+
+```bash
+# in a browser logged in to opencode.ai
+fetch("/console/api/orgs").then(r => r.json()).then(console.log)
+```
+
+Put it in `.env` as `OPENCODE_ORG_ID=wrk_...` (run `scripts/sync-env.sh` to add
+the key without touching your existing values), then `docker compose up -d portal`.
+Forget it and the probe says so by name rather than sending an empty header.
+
+### 6c. Paste the cookies
+
+1. Log in to **platform.minimax.io** and **opencode.ai/console**.
+2. For each: devtools → Network → click any request to that host → copy the whole
+   `Cookie:` request header value. (`document.cookie` in the console is not
+   enough — it omits HttpOnly cookies, which both sites use.)
+3. Portal → **Real usage** panel → paste into that plan's row → **save & test**.
+
+**Expect**, per plan:
+
+- **minimax**: `active`, with both windows as percentages, e.g. `5h 37% used ·
+  weekly 12% used`. There is deliberately no token figure: MiniMax publishes
+  none, and the board says `reported by provider (% only)` rather than inventing
+  a limit.
+- **opencode-go**: `active`, with three dollar figures, e.g. `5h $0.00/$12 ·
+  weekly $0.01/$30 · monthly $0.10/$60`.
+- `session rejected (401)` or `needs re-auth` — the cookie was incomplete; use
+  the full Network-tab value, not `document.cookie`.
+- `could not find a remaining value` plus a **raw JSON response** — the provider
+  changed a field name. Read the raw JSON on the panel and correct the paths
+  under that plan's `probe.windows:` in `plans.yaml`, then
+  `curl -X POST $PORTAL/admin/reload`.
+
+A window the response omits is reported as `ok; no data for <window>`, not as a
+failure, so one stale path cannot hide a good reading for another window.
+
+### 6d. What the numbers change
+
+The **binding** window — the one closest to biting — drives the board's warning,
+and it is not always the target. A plan at 12% of its weekly allowance but 37% of
+its 5-hour burst is limited by the burst, and the portal says so. Pacing then
+aims at the target window while never overshooting a constraint.
+
+Cookies are full account access, and logging out at the provider revokes them.
+`switchyard.probes` never logs or echoes one; the portal shows only a
+fingerprint (`"23 chars ending er=x"`).
+
+### 6e. Testing a probe without a real cookie
+
+To exercise the plumbing without any credential, point a plan's probe at a local
+stub and drive the real `Prober`. The suite already does this for both payload
+shapes (`tests/test_probes.py`), which is the cheaper check:
+
+```bash
+python3 -m pytest -q tests/test_probes.py
+```
 
 ---
 
@@ -670,7 +731,7 @@ Verified by direct call with a Coding Plan key:
 | `https://open.bigmodel.cn/api/paas/v4` | 429, code 1113 (same, in Chinese) |
 
 So a wrong base URL returns **exactly the signal that means "this plan is
-spent"**. Switchyard will correctly classify code 1113 as quota exhaustion and
+spent"**. SwitchYard will correctly classify code 1113 as quota exhaustion and
 cool GLM down for 15 minutes, then do it again on the next attempt — a perfectly
 reasoned conclusion from a false premise. **If GLM reports quota exhaustion
 immediately, check the URL before believing it.**
@@ -697,8 +758,11 @@ Two related notes:
 These are the parts built from documentation rather than a live call, so check
 them first if something misbehaves:
 
-1. **The MiniMax probe endpoint's host, path and field names.** Step 6 exists
-   specifically to discover them.
+1. **Probe allowances.** Both probe endpoints are now verified against live
+   sessions (host, path, field names and units), so this is no longer an open
+   question — but MiniMax publishes *only* percentages, so its `allowance:` stays
+   null and pacing has no token figure to aim at for those plans. The OpenCode Go
+   limits ($12 / $30 / $60) came from its own payload.
 2. **Codex CLI flags.** `codex exec --json --model ... <prompt>` is the assumed
    invocation; flags move between releases. If the `judge` lane 502s on the
    `openai` plan, run `docker compose exec codex-sidecar codex exec --help` and

@@ -129,18 +129,22 @@ async def _pace(plan_key: str, consumed_frac: float, allowance: float = 100_000_
 
 
 def test_ahead_of_budget_holds_the_plan_closed():
-    """90% spent with a third of the window left -> stop, let the line catch up.
+    """Well past the line -> stop, let the line catch up.
 
     Closing is the only way to slow below one continuously busy slot, which at
-    real LLM throughput is already far too fast for a monthly allowance.
+    real LLM throughput is already far too fast for a weekly allowance. The
+    overspend is measured from the current elapsed fraction so the test means
+    the same thing on any day of any window.
     """
     async def go():
-        plan, st, cap = await _pace("minimax-ultra", consumed_frac=0.9)
+        _, at_zero, _ = await _pace("minimax-ultra", consumed_frac=0.0)
+        well_ahead = min(0.99, at_zero["elapsed_frac"] + 0.25)
+        plan, st, cap = await _pace("minimax-ultra", consumed_frac=well_ahead)
         return plan, st, cap
     plan, st, cap = run(go())
     assert st["active"] and cap.cap == 0, (st["reason"], cap.cap)
     assert "ahead of pace" in st["reason"] and st["ahead_by"] > 0
-    print(f"  90% spent at {st['elapsed_frac']*100:.0f}% elapsed "
+    print(f"  spent to {st['elapsed_frac']*100:.0f}%+25% elapsed "
           f"(pace line {st['pace_line']/1e6:.0f}M, ahead by {st['ahead_by']/1e6:.0f}M) "
           f"-> {cap.cap} slots: {st['reason']}")
 
@@ -157,10 +161,19 @@ def test_behind_budget_uses_the_full_learned_cap():
 
 
 def test_on_pace_uses_the_throughput_derived_cap():
-    """Just behind the line -> open, but only as wide as the burn rate allows."""
+    """Just behind the line -> open, but only as wide as the burn rate allows.
+
+    The consumption is derived from how far through the window we actually are,
+    not hardcoded: a fraction that sits just under a monthly line is well over a
+    weekly one, so a fixed number silently means different things per plan and
+    per day. This broke when minimax's target window became weekly.
+    """
     async def go():
-        # elapsed is ~66% of September by the 20th; sit just under the line.
-        return await _pace("minimax-ultra", consumed_frac=0.60, rate_per_slot=200.0)
+        # Where the pace line is right now, at zero spend.
+        _, at_zero, _ = await _pace("minimax-ultra", consumed_frac=0.0)
+        just_behind = max(0.0, at_zero["elapsed_frac"] - 0.05)
+        return await _pace("minimax-ultra", consumed_frac=just_behind,
+                           rate_per_slot=200.0)
     plan, st, cap = run(go())
     assert cap.cap >= 1 and st["reason"].startswith("pacing "), (st["reason"], cap)
     print(f"  60% spent vs {st['pace_line']/1e6:.0f}M line -> {cap.cap} slots "

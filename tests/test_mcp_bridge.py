@@ -385,7 +385,7 @@ def test_a_caller_that_hangs_up_mid_turn_drops_the_session():
 
     Before this, a caller that disappeared while the CLI was working left a live
     subprocess holding one of the plan's two connections for the full 30-minute
-    idle TTL: two such drops and Switchyard saw the plan as full and spilled
+    idle TTL: two such drops and SwitchYard saw the plan as full and spilled
     every request past it.
     """
     class _Hangup:
@@ -437,7 +437,7 @@ def test_a_parked_session_is_preempted_rather_than_refusing_a_new_request():
 
     Observed live: two lane probes each left a session parked awaiting a
     follow-up that never came, the gate stayed full, and the next request got
-    "sidecar at capacity (2)" — which Switchyard read as concurrency pressure
+    "sidecar at capacity (2)" — which SwitchYard read as concurrency pressure
     and used to cool a perfectly healthy plan. Nothing frees those slots on its
     own, because through a proxy the caller's disconnect is invisible.
     """
@@ -554,7 +554,7 @@ def test_a_preempted_session_is_resumed_not_refused():
 
 
 def test_only_a_resumption_is_allowed_to_queue():
-    """A new request fails fast so Switchyard can spill; a resumption waits.
+    """A new request fails fast so SwitchYard can spill; a resumption waits.
 
     Queuing a new request would hold it here while the rest of the lane sat
     idle, which is the opposite of what fill-and-spill is for.

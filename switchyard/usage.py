@@ -192,6 +192,28 @@ class Ledger:
             "concurrency_rejected_at_cap": plan.max_parallel,
         })
 
+    async def note_reported_percent(self, plan_key: str, used_percent: float | None,
+                                    reset_at: float | None,
+                                    window: str | None = None) -> None:
+        """Record a percentage a provider stated, when it publishes no counts.
+
+        MiniMax reports `current_weekly_used_percent` with every count set to -1,
+        so there is nothing to reconcile against our own tally — the percentage
+        IS the measurement. Kept in its own field so window_headroom can prefer
+        it without ever mixing percent into a token or dollar total.
+        """
+        mapping = {}
+        if used_percent is not None:
+            mapping["reported_pct_used"] = max(0.0, min(100.0, float(used_percent)))
+        if reset_at is not None:
+            mapping["reset_at"] = reset_at
+        if not mapping:
+            return
+        mapping["reported_at"] = time.time()
+        key = (K_WINDOW.format(plan=plan_key, window=window) if window
+               else K_QUOTA.format(plan=plan_key))
+        await self.redis.hset(key, mapping=mapping)
+
     async def note_reported(self, plan_key: str, remaining: float | None,
                             reset_at: float | None, window: str | None = None) -> None:
         """Record limits a provider actually told us about (headers/sidecar)."""
@@ -264,6 +286,15 @@ async def window_headroom(ledger: Ledger, plan: Plan, q: Quota) -> dict:
     else:  # window / unknown
         consumed = tokens
         basis = "ledger (tokens this window)"
+
+    if isinstance(facts.get("reported_pct_used"), float):
+        # The provider gave a percentage and no counts. It is the best number
+        # available, so it wins outright — but there is no limit to report, and
+        # inventing one from our own tally would be a guess dressed as a fact.
+        return {**meta, "kind": q.kind, "pct_used": round(float(facts["reported_pct_used"]), 1),
+                "limit": None, "consumed": consumed,
+                "basis": "reported by provider (% only)",
+                "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
 
     if facts.get("reported_remaining") is not None and isinstance(facts.get("reported_remaining"), float):
         # A number the provider gave us always beats our own estimate.

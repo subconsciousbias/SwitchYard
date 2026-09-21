@@ -1,4 +1,4 @@
-# Switchyard — `docker compose up -d` brings up the whole thing.
+# SwitchYard — `docker compose up -d` brings up the whole thing.
 #
 #   gateway  :4000  OpenAI- and Anthropic-compatible. Point every tool here.
 #   portal   :4001  capacity board, quota headroom, subscription economics.
@@ -144,6 +144,11 @@ services:
     # Expires 2026-10-04 — delete this service and both plans then.
     environment:
       PROVIDER: codex
+      # Codex has an MCP client after all (`[mcp_servers.*]`, settable with -c),
+      # verified against a live `codex exec` on the seat: the tool is called and
+      # a 90s parked call completes. So the seat serves tools through its own
+      # official client, with no need for chatgpt.com's private responses route.
+      BRIDGE: mcp
       SIDECAR_PORT: "8082"
       SWITCHYARD_PLAN: openai
       SWITCHYARD_PLANS: /app/config/plans.yaml
@@ -159,7 +164,7 @@ services:
       retries: 3
       start_period: 20s
 
-  # SuperGrok via Switchyard's own OAuth grant, not the OpenCode CLI. This is
+  # SuperGrok via SwitchYard's own OAuth grant, not the OpenCode CLI. This is
   # the path that lets a caller's `tools` reach the model untouched, because
   # there is no agent harness in the way — see sidecars/token_proxy/server.py.
   # Needs a grant first, from the host: python3 -m switchyard.oauth login xai

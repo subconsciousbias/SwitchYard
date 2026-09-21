@@ -2,7 +2,7 @@
 
 Why this exists, and why it is not `cli_bridge`: `cli_bridge` shells out to a
 vendor CLI, and the CLI's own agent harness owns the tool loop — a caller's
-`tools` never reach the model. `switchyard/oauth.py` takes out Switchyard's own
+`tools` never reach the model. `switchyard/oauth.py` takes out SwitchYard's own
 OAuth grant against the subscription instead, which authenticates an ordinary
 HTTP API where tool calling is first-class. So this process does the smallest
 possible thing: attach a fresh bearer token to the caller's request and forward
@@ -18,13 +18,13 @@ in config/plans.yaml, which is unaffected by this file.
 xAI is fully implemented: `api.x.ai/v1` is OpenAI-compatible, so the caller's
 body goes straight to `/v1/chat/completions` with only a bearer header added.
 
-OpenAI is NOT implemented for chat/completions or /v1/messages. The ChatGPT
-seat's OAuth grant is only honoured against
-`https://chatgpt.com/backend-api/codex/responses` — the **Responses** API, a
-different wire shape from what a caller sends (`chat/completions`-style
-`messages`). See `_translate_to_responses` for what was investigated and why a
-same-day translation was not attempted. `/health` reports this honestly:
-`ok` is false for the openai provider until that translation exists.
+OpenAI is deliberately NOT served here. A seat's grant only reaches
+`chatgpt.com/backend-api/codex/responses`, a private surface that expects Codex
+CLI's own identity (see `_translate_to_responses` for the captured request), and
+it turned out not to be needed: `codex exec` has an MCP client, so the seat
+serves tools through `sidecars/mcp_bridge` using its own official client.
+`/health` still reports `ok: false` for provider=openai, because this process
+genuinely cannot serve it.
 
 Never logs a token or an Authorization header — not even at DEBUG, not even
 truncated. `switchyard.oauth.status()` is the only thing this process prints
@@ -117,43 +117,44 @@ def _spec() -> ProviderSpec:
 
 
 def _translate_to_responses(body: bytes) -> bytes:
-    """Chat-completions body -> OpenAI Responses-API body, for the ChatGPT
-    backend. NOT IMPLEMENTED — investigated, not attempted, for this reason:
+    """Chat-completions body -> Responses body for the ChatGPT seat. NOT USED.
 
-    LiteLLM 1.102.0 (the version pinned in Dockerfile.gateway, confirmed with
-    `docker compose exec -T gateway python3 -c "import importlib.metadata as m;
-    print(m.version('litellm'))"`) DOES ship a chat/completions -> Responses
-    bridge: `litellm.completion_extras.litellm_responses_transformation`,
-    wired in `litellm/main.py` via `responses_api_bridge_check`. Set
-    `litellm.route_all_chat_openai_to_responses = True` (or prefix the model
-    with `responses/`) and `litellm.completion(custom_llm_provider="openai",
-    ...)` transforms the request, POSTs it through `litellm.responses()`, and
-    translates the reply back into chat.completion shape — including
-    tool_calls, verified by reading
-    completion_extras/litellm_responses_transformation/transformation.py.
+    This stayed unimplemented, and then stopped being the right idea at all.
 
-    That bridge targets the PUBLIC `api.openai.com` Responses API. The ChatGPT
-    seat's endpoint is `chatgpt.com/backend-api/codex/responses` — Codex CLI's
-    own private surface, reached only through this OAuth grant, not api.openai.com.
-    Nothing here confirms the two accept the same request body: Codex CLI is
-    known (from public issue trackers) to send extra fields on that route —
-    `originator`, a `session_id`, possibly `store:false` and prompt-cache
-    fields the public Responses API does not require — and none of that is
-    verifiable without either a real grant to probe against or a decompile of
-    Codex CLI itself, both out of scope here (no login is permitted, and only
-    OpenCode's binary was available to inspect). Bridging blind through
-    LiteLLM's generic translator risks a body the backend silently
-    misinterprets rather than rejects — worse than refusing outright.
+    The endpoint a seat's OAuth grant reaches is
+    `chatgpt.com/backend-api/codex/responses`, not api.openai.com. A capture of
+    what Codex CLI actually sends there (`-c model_providers.<id>.base_url`
+    pointed at a local recorder, so nothing was forwarded and no credential was
+    read) shows it is not the public Responses API with a different host:
 
-    So: not faked. This raises, `/health` reports `ok: false` with
-    `supports_chat_completions: false` for provider=openai, and the caller gets
-    a 501 that says exactly this, instead of a response that looks like it
-    worked.
+        POST /responses
+        originator: codex_exec
+        session-id / thread-id / x-client-request-id: <uuid triple>
+        x-codex-turn-metadata: {"installation_id":...,"window_id":...,...}
+        x-codex-window-id, x-openai-internal-codex-responses-lite: true
+        body: input[] (typed items), include:["reasoning.encrypted_content"],
+              store:false, prompt_cache_key, reasoning{context,effort},
+              text{verbosity}, client_metadata{...}
+
+    Serving that from SwitchYard would mean presenting Codex CLI's identity to a
+    private internal surface -- materially different from the xAI path, which
+    uses a public OAuth client against the documented, OpenAI-compatible
+    api.x.ai/v1.
+
+    None of it is necessary. `codex exec` has an MCP client (`[mcp_servers.*]`,
+    settable per invocation with -c), which the earlier note had wrong, so the
+    seat serves the caller's tools through mcp_bridge like Claude and OpenCode
+    do -- its own official client making its own calls. See
+    sidecars/mcp_bridge/server.py's codex profile.
+
+    Kept, not deleted, because the capture is the evidence for that choice: if
+    someone later wants the direct route, this is the shape and the reason to
+    think twice.
     """
     raise NotImplementedError(
-        "openai (ChatGPT seat) needs a chat/completions -> Responses API "
-        "translation for chatgpt.com/backend-api/codex/responses, which is "
-        "unverified against the real endpoint — see this function's docstring")
+        "the openai (ChatGPT seat) plan serves tools through mcp_bridge's codex "
+        "profile, not through this proxy -- see this function's docstring for the "
+        "captured request shape and why the direct route was not taken")
 
 
 async def _forward(request: Request, path_attr: str, path_name: str) -> StreamingResponse | JSONResponse:
@@ -172,7 +173,7 @@ async def _forward(request: Request, path_attr: str, path_name: str) -> Streamin
         token = oauth.access_token(PROVIDER)
     except RuntimeError as exc:
         # No grant, or an unrefreshable expired one — a setup problem, not a
-        # transient upstream failure. 503 so Switchyard's classifier treats it
+        # transient upstream failure. 503 so SwitchYard's classifier treats it
         # as "this plan cannot serve right now" rather than a hard rejection.
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 

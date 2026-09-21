@@ -20,7 +20,7 @@ def build(plans_path: str) -> dict:
 
     Credentials and the base URL come from the plan; the model string from the
     model. The per-deployment `max_parallel_requests` is a backstop only —
-    Switchyard's slot table is the real gate, keyed by plan so a plan's models
+    SwitchYard's slot table is the real gate, keyed by plan so a plan's models
     share it — but it stops a caller who names a deployment directly from
     exceeding the plan's connection limit.
     """
@@ -75,7 +75,7 @@ def build(plans_path: str) -> dict:
 
     # NO general fallbacks, on purpose. LiteLLM's fallbacks live in the router,
     # which runs *after* the proxy's pre-call hook, so every fallback attempt
-    # went behind Switchyard's back: it skipped the tool-capability filter (a
+    # went behind SwitchYard's back: it skipped the tool-capability filter (a
     # tool request could land on a plan whose sidecar hard-400s it), claimed no
     # slot, ignored the session lease and the mid-tool-loop pin, and -- worst --
     # the success hook booked its tokens against the plan the *picker* chose, so
@@ -84,7 +84,7 @@ def build(plans_path: str) -> dict:
     # It also hid the failures it rescued: a lane listing every member meant a
     # broken plan was silently retried on a healthy one and looked fine.
     #
-    # Switchyard owns placement. A failed request now returns to the caller,
+    # SwitchYard owns placement. A failed request now returns to the caller,
     # whose retry re-enters the picker and gets a correct pick -- against the
     # live cooldowns the failure just set, which is better placement than a
     # fixed list could give. See _check_served_deployment for the guard that
@@ -128,7 +128,7 @@ def build(plans_path: str) -> dict:
             "callbacks": ["switchyard.hooks.switchyard_handler"],
             "drop_params": True,
             "request_timeout": 600,
-            "num_retries": 0,   # Switchyard owns retry placement, not LiteLLM
+            "num_retries": 0,   # SwitchYard owns retry placement, not LiteLLM
         },
         "router_settings": {
             "enable_pre_call_checks": True,

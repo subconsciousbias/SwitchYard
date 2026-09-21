@@ -152,7 +152,10 @@ def test_openai_chat_completions_is_a_clearly_marked_not_implemented():
         resp = client.post("/v1/chat/completions",
                            content=json.dumps({"model": "gpt-5.6-sol", "messages": []}))
         assert resp.status_code == 501, resp.text
-        assert "Responses API" in resp.json()["detail"], resp.json()
+        # The message names where the seat IS served, so a 501 here reads as a
+        # routing fact rather than a gap: the openai plan goes through
+        # mcp_bridge's codex profile, not this proxy.
+        assert "mcp_bridge" in resp.json()["detail"], resp.json()
         assert _FakeAsyncClient.last == {}, "must not silently forward to the wrong wire shape"
         print(f"  openai chat/completions -> 501: {resp.json()['detail'][:70]}...")
     finally:

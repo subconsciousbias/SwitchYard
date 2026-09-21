@@ -1,11 +1,11 @@
-# Switchyard
+# SwitchYard
 
 One endpoint for every LLM tool, with ordered capacity across your subscriptions,
 sticky sessions, and a portal that tells you how close each plan is to running dry.
 
 Built as a plugin on top of LiteLLM rather than a replacement for it: LiteLLM
 already speaks both the OpenAI and Anthropic wire protocols with streaming and
-tool calling, which is the bulk of a gateway's code. Switchyard supplies the
+tool calling, which is the bulk of a gateway's code. SwitchYard supplies the
 part LiteLLM has no concept of — plans, connection caps, ordered fill,
 session affinity, quota headroom, and subscription economics.
 
@@ -143,7 +143,7 @@ verified against vendor docs and filed bugs, and both are covered by tests:
 the real status in `base_resp.status_code`. A status-code-only classifier scores
 the first as a transient blip worth retrying, and the second as a *success*. In
 the 200 case a dead plan looks perfectly healthy and keeps receiving every
-request the lane can give it. So Switchyard inspects successful response bodies
+request the lane can give it. So SwitchYard inspects successful response bodies
 too, not just failures.
 
 **Z.AI returns everything as HTTP 429** — ordinary rate limiting (1302),
@@ -169,7 +169,7 @@ Two outcomes beyond the obvious ones:
 ## Learning the real concurrency limit
 
 "Probably under 4 connections" is a guess, and the true number may vary by time
-of day. With `concurrency_learning.enabled`, Switchyard discovers it the way TCP
+of day. With `concurrency_learning.enabled`, SwitchYard discovers it the way TCP
 discovers bandwidth — additive increase, multiplicative decrease:
 
 - a connection-limit refusal (MiniMax 1041, or any provider saying the same in
@@ -196,7 +196,7 @@ Normally a plan runs flat out, exhausts itself early, and the lane spills onward
 Pacing inverts that: each subscription is throttled so its allowance runs out
 *just as the window rolls over*, so you get everything you paid for and nothing
 is wasted. If a caller asks for 10 parallel requests and spending 10 would drain
-Grok days before its rollover, Switchyard runs however few the maths allows —
+Grok days before its rollover, SwitchYard runs however few the maths allows —
 one, if that is what it takes.
 
 Concurrency alone is too coarse a knob for this. At real throughput a single busy
@@ -367,13 +367,13 @@ anything arriving through the gateway. Two abandoned loops would take a
 So the sidecar weighs the two claimants instead of waiting: a parked session is
 speculative, while the request at the door is real work, and past
 `MCP_PARKED_GRACE_SECONDS` (60s) the request preempts the stalest parked
-session rather than getting a 429 that Switchyard would misread as concurrency
+session rather than getting a 429 that SwitchYard would misread as concurrency
 pressure and cool a healthy plan for.
 
 Preempting is not dropping the work. The victim's id is remembered, and if its
 follow-up does arrive it is **resumed on the same plan**:
 
-- Switchyard pins it there. A request carrying tool *results* is mid-loop, and
+- SwitchYard pins it there. A request carrying tool *results* is mid-loop, and
   its `tool_call_id`s were minted by one plan's bridge — a peer would reject
   them outright and would hold none of this conversation's prompt cache. So a
   pinned follow-up waits for its plan instead of spilling down the lane.
@@ -382,14 +382,14 @@ follow-up does arrive it is **resumed on the same plan**:
   this cheap: the provider's prompt cache is keyed to the account's prefix, so
   a replayed history still hits it here and would miss anywhere else.
 - This is the **only** path allowed to queue. A new request still fails fast so
-  Switchyard can spill it to the next plan in the lane; a resumption has
+  SwitchYard can spill it to the next plan in the lane; a resumption has
   nowhere to spill to, so it waits up to `MCP_RESUME_WAIT_SECONDS` (300s),
   reclaiming a slot from another stale parked session if one is there. Past the
   deadline it gets a 503 with `Retry-After`.
 
 ### No router-level fallbacks
 
-Switchyard owns placement, so `router_settings.fallbacks` is empty and
+SwitchYard owns placement, so `router_settings.fallbacks` is empty and
 `num_retries` is 0. LiteLLM applies both inside the router, *after* the proxy's
 pre-call hook, so every fallback attempt went behind the picker's back: it
 skipped the tool-capability filter (a tool request could land on a plan whose
@@ -415,7 +415,7 @@ actually spent it.
 
 The response body's `model` echoes what was asked for — usually a lane name
 like `judge` — so a caller doing its own token accounting cannot otherwise tell
-which subscription the tokens came out of. Switchyard adds one namespaced key
+which subscription the tokens came out of. SwitchYard adds one namespaced key
 that a strict client will ignore:
 
 ```json
@@ -479,7 +479,7 @@ Concurrency is N CLI **subprocesses inside one container**, not N containers. So
 - the login persists in a host bind mount, surviving restarts, `compose down/up`
   and image rebuilds — it is genuinely one-time;
 - the connection limit is enforced by a gate in that one process, which is also
-  what makes "refuse immediately when full" possible, so Switchyard can spill to
+  what makes "refuse immediately when full" possible, so SwitchYard can spill to
   the next plan instead of holding a worker open.
 
 ### The CLI versions are pinned

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Switchyard's mechanical checks against the running stack.
+"""Run SwitchYard's mechanical checks against the running stack.
 
 Everything in TESTING.md that a machine can verify lives here, so it is run and
 not hand-typed. Exits non-zero if any check fails.

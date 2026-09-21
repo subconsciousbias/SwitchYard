@@ -1,4 +1,4 @@
-"""Switchyard's own OAuth grants for subscription providers.
+"""SwitchYard's own OAuth grants for subscription providers.
 
 Why this exists: shelling out to a vendor CLI means routing through that CLI's
 agent harness, and the harness owns the tool loop. A caller's tool definitions
@@ -10,7 +10,7 @@ The subscriptions themselves have no such limitation. They authenticate ordinary
 HTTP APIs where tool calling is a first-class feature — `api.x.ai/v1` is
 OpenAI-compatible, so a request body with `tools` passes straight through and
 `tool_calls` come straight back. Third-party clients are plainly contemplated:
-OpenCode uses exactly these flows. So Switchyard takes out **its own grant**
+OpenCode uses exactly these flows. So SwitchYard takes out **its own grant**
 rather than borrowing another client's credential.
 
 The flow parameters below are the public OAuth client registrations these

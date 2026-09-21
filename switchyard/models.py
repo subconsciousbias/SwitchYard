@@ -56,7 +56,14 @@ class Quota:
 
 @dataclass(frozen=True)
 class Probe:
-    """How to read real headroom from a provider's own console endpoint."""
+    """How to read real headroom from a provider's own console endpoint.
+
+    One response often carries every window the provider enforces at once — a
+    weekly allowance *and* a 5-hour burst — so `windows` maps each quota window's
+    name to its own field paths. `window` + `fields` remain the shorthand for a
+    provider that publishes only one, and are folded into `windows` at load time
+    so everything downstream reads one shape.
+    """
     url: str
     kind: str = "cookie"              # cookie | bearer | none
     method: str = "GET"
@@ -64,6 +71,10 @@ class Probe:
     interval_seconds: int = 600
     timeout_seconds: float = 15.0
     fields: dict[str, list[str]] = field(default_factory=dict)
+    windows: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    # Multiplier applied to every number read. Providers report in their own
+    # unit: OpenCode's Go meters are microcents, so 1e-8 turns them into dollars.
+    scale: float = 1.0
     headers: dict[str, str] = field(default_factory=dict)
     referer: str = ""
     user_agent: str = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -367,13 +378,23 @@ def _parse_quotas(body: dict) -> tuple[Quota, ...]:
     return tuple(parsed)
 
 
+def _listify(mapping: Any) -> dict[str, list[str]]:
+    return {k: (v if isinstance(v, list) else [v])
+            for k, v in (mapping or {}).items()}
+
+
 def _parse_probe(raw: Any) -> Probe | None:
     if not raw:
         return None
     body = dict(raw)
-    fields = {k: (v if isinstance(v, list) else [v])
-              for k, v in (body.pop("fields", None) or {}).items()}
-    return Probe(fields=fields, **body)
+    fields = _listify(body.pop("fields", None))
+    windows = {name: _listify(paths)
+               for name, paths in (body.pop("windows", None) or {}).items()}
+    # The single-window shorthand is just one entry, so nothing downstream has
+    # to know which form the config used.
+    if fields and not windows:
+        windows = {body.get("window") or "": fields}
+    return Probe(fields=fields, windows=windows, **body)
 
 
 def _parse_models(plan_key: str, raw: Any) -> dict[str, Model]:
