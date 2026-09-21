@@ -342,6 +342,9 @@ class CapacityPolicy:
         self.settings = settings
         self.learner = ConcurrencyLearner(redis, settings)
         self.pacer = Pacer(redis, settings, ledger)
+        # Held directly as well: the picker asks whether a plan's target window
+        # is reported spent, which is a ledger question rather than a pacing one.
+        self.ledger = ledger
 
     async def pacing_enabled(self) -> bool:
         """plans.yaml sets the default; the portal can flip it at runtime."""

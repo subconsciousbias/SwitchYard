@@ -57,7 +57,7 @@ class Picker:
     # the connection limit. Two models on one plan therefore share it — which is
     # how `apex` and `judge` cannot between them open two connections against a
     # one-connection Claude Max plan.
-    async def _cap(self, model: Model) -> tuple[int, str]:
+    async def _cap(self, model: Model, allow_spent: bool = False) -> tuple[int, str]:
         """The PLAN's effective cap — the ceiling on total concurrency.
 
         A model's own `max_parallel` is a separate, narrower limit on that model
@@ -67,8 +67,27 @@ class Picker:
         plan = self.registry.plan_of(model)
         if self.policy is None:
             return plan.max_parallel, "configured"
+        # A plan the provider says is spent has no capacity, however many
+        # connections it will still accept. Without this a session leased to it
+        # stays leased -- affinity only re-leases when the plan has no free
+        # slot -- and every turn keeps landing on a subscription with nothing
+        # left, silently spending whatever overflow the provider allows.
+        if not allow_spent and await self.is_spent(plan):
+            return 0, "quota spent"
         cap = await self.policy.effective(plan)
         return cap.cap, cap.reason
+
+    async def is_spent(self, plan) -> bool:
+        """The provider reports the target window at 100%, and this plan is not
+        allowed to spend past it (`use_extra_quota: true`)."""
+        if plan.use_extra_quota or self.policy is None:
+            return False
+        facts = await self.policy.ledger.window_facts(plan.key, plan.quota.label)
+        pct = facts.get("reported_pct_used")
+        if isinstance(pct, float):
+            return pct >= 100.0
+        remaining = facts.get("reported_remaining")
+        return isinstance(remaining, float) and remaining <= 0
 
     async def _members(self, lane: str, needs_tools: bool = False) -> list[Model]:
         """Lane order, minus the tail when pacing is on and minus members whose
@@ -104,7 +123,13 @@ class Picker:
             if held and held in by_ref:
                 model = by_ref[held]
                 plan = self.registry.plan_of(model)
-                cap, reason = await self._cap(model)
+                # A mid-tool-loop follow-up finishes where it started, spent or
+                # not. The alternative is worse than one turn of overflow: its
+                # tool_call_ids exist only in that plan's bridge, so anywhere
+                # else answers 400 and the caller loses work it has already
+                # done. New requests still skip the plan, so it drains rather
+                # than being hammered.
+                cap, reason = await self._cap(model, allow_spent=pinned)
                 if cap > 0 and await self.slots.try_claim(
                         plan.key, cap, rid, model.ref, model.max_parallel,
                         lane=lane) == 1:

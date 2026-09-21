@@ -161,6 +161,11 @@ class Plan:
     # None means "follow the global setting". Set `learning: false` on a plan
     # whose concurrency must stay exactly as configured.
     learning: bool | None = None
+    # What to do once the provider reports the target window fully spent.
+    # False (the default) stops routing to the plan until the window resets;
+    # True keeps using it, which is right where a plan overflows into credits
+    # or on-demand billing and you would rather spend that than queue.
+    use_extra_quota: bool = False
     supports_tools: bool | None = None
     quotas: tuple[Quota, ...] = field(default_factory=lambda: (Quota(),))
     probe: Probe | None = None
@@ -449,6 +454,7 @@ def load(path: str | None = None) -> Registry:
                                   if body.get("max_parallel_ceiling") else None),
             pacing=body.get("pacing"),
             learning=body.get("learning"),
+            use_extra_quota=bool(body.get("use_extra_quota", False)),
             supports_tools=body.get("supports_tools"),
             quotas=quotas,
             probe=probe,

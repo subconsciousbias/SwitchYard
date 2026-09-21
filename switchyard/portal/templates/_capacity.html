@@ -66,8 +66,17 @@
                       {% elif probed %}title="learner probed above the configured {{ p.cap_configured }}, allowed by max_parallel_ceiling"{% endif %}></span>
               {% endif %}
             {% endfor %}
+            {# Slots the effective cap withholds. A spent plan's cap is 0, so
+               ALL of its slots land here — they must still read as "out of
+               quota" rather than as generic withheld capacity, or the red
+               outline disappears at exactly the moment it matters. #}
             {% for i in range(p.cap, p.cap_configured) %}
-              <span class="slot gone" title="withheld: {{ p.cap_reason }}"></span>
+              {% if spent %}
+                <span class="slot spent"
+                      title="{{ p.plan }} has no {{ p.quota.window }} quota left ({{ p.quota.pct_used }}% used) — not routed to until the window resets"></span>
+              {% else %}
+                <span class="slot gone" title="withheld: {{ p.cap_reason }}"></span>
+              {% endif %}
             {% endfor %}
           </div>
         </td>

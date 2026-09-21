@@ -145,8 +145,7 @@ class SwitchyardHandler(CustomLogger):
         # A request carrying tool *results* is mid-loop: its tool_call_ids were
         # minted by one plan's bridge, so it must go back to that same plan
         # rather than spill to a peer that cannot read them. See Picker.pick.
-        pinned = any(m.get("role") == "tool" and m.get("tool_call_id")
-                     for m in (data.get("messages") or []) if isinstance(m, dict))
+        pinned = _carries_tool_results(data.get("messages"))
 
         try:
             pick = await self.picker.pick(lane, session, needs_tools, pinned)
@@ -421,6 +420,32 @@ class SwitchyardHandler(CustomLogger):
             if remaining is not None or reset is not None or limit is not None:
                 await self.ledger.note_reported(plan.key, remaining, reset,
                                                 window=q.label, limit=limit)
+
+
+def _carries_tool_results(messages: Any) -> bool:
+    """Is this a mid-tool-loop follow-up, in EITHER wire format?
+
+    The two protocols disagree about where a tool result lives, and checking
+    only one of them is a silent failure rather than a loud one: an
+    Anthropic-shaped follow-up looked like a fresh request, so it was free to
+    spill to another plan, whose bridge had never minted those ids and answered
+    400 "tool results must all belong to exactly one live mcp_bridge session".
+
+      OpenAI:     {"role": "tool", "tool_call_id": "..."}
+      Anthropic:  {"role": "user", "content": [{"type": "tool_result",
+                                                "tool_use_id": "..."}]}
+    """
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool" and message.get("tool_call_id"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    return True
+    return False
 
 
 def _payload_of(response_obj: Any) -> Any:

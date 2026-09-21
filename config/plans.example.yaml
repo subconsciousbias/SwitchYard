@@ -576,6 +576,12 @@ plans:
                          config.productUsage.product=GrokBuild.usagePercent]
           reset_at: [config.currentPeriod.end, config.billingPeriodEnd]
     notes: "One weekly pool, shared across every surface the subscription covers."
+    # Once xAI reports the weekly pool at 100%, further requests bill the
+    # prepaid credit balance rather than the subscription. Left false, so the
+    # plan drops out of its lane until the window resets — set it true to burn
+    # that balance down deliberately.
+    use_extra_quota: false
+
     models:
       grok-4.6:
         # Plain `grok-4.6`, not `xai/grok-4.6`: the provider prefix was how the

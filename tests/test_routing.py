@@ -562,6 +562,131 @@ def test_a_lane_board_separates_its_own_traffic_from_a_sibling_lanes():
     print(f"  {ref}: 1 slot reads as 'here' on local and 'elsewhere' on bulk")
 
 
+def test_a_spent_plan_is_skipped_unless_it_may_use_extra_quota():
+    """100% of the target window means no capacity — and breaks affinity.
+
+    Session affinity re-leases only when the leased plan has no free SLOT, so a
+    plan that is out of quota but still accepting connections kept every turn
+    of a pinned session. Observed live: a session leased to a subscription at
+    100% weekly stayed there for hours, each turn quietly spending the prepaid
+    credits the provider overflows into.
+
+    `use_extra_quota: true` is the opt-in for exactly that overflow, so a plan
+    that bills past its allowance can still be used on purpose.
+    """
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker = build()
+        from switchyard.policy import CapacityPolicy
+        from switchyard.usage import Ledger
+        redis = slots.redis
+        policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+        picker.policy = policy
+
+        lane = "forge"
+        members = reg.lane_members(lane)
+        target = members[0]
+        plan = reg.plan_of(target)
+        assert not plan.use_extra_quota, "fixture plan should default to not overspending"
+
+        # Lease a session to it, the way a live conversation does.
+        session = "sess-spent"
+        await slots.set_lease(session, target.ref, reg.settings.lease_ttl_seconds)
+        first = await picker.pick(lane, session)
+        assert first.ref == target.ref and first.sticky, first
+        await picker.release(first.plan.key, first.request_id, first.ref)
+
+        # The provider now says the target window is fully spent.
+        await policy.ledger.note_reported_percent(
+            plan.key, 100.0, None, window=plan.quota.label)
+
+        moved = await picker.pick(lane, session)
+        await picker.release(moved.plan.key, moved.request_id, moved.ref)
+
+        # Same state, but the plan is allowed to spend past its allowance.
+        plans = dict(reg.plans)
+        plans[plan.key] = replace(plan, use_extra_quota=True)
+        reg2 = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+        picker2 = Picker(reg2, slots, policy)
+        await slots.set_lease(session, target.ref, reg.settings.lease_ttl_seconds)
+        allowed = await picker2.pick(lane, session)
+        return target.ref, moved, allowed
+
+    ref, moved, allowed = run(go())
+    assert moved.ref != ref, f"a spent plan must not keep the lease: {moved.ref}"
+    assert allowed.ref == ref, f"use_extra_quota should keep using it: {allowed.ref}"
+    print(f"  {ref} spent -> moved to {moved.ref}; with use_extra_quota it stays")
+
+
+def test_a_mid_loop_followup_finishes_on_a_spent_plan():
+    """A started tool loop completes where it started, spent or not.
+
+    Both halves of this were live failures. A session pinned to a plan that
+    went to 100% was moved by the spent gate, and its next turn carried tool
+    results whose ids only that plan's bridge had minted — the new plan
+    answered 400 "tool results must all belong to exactly one live mcp_bridge
+    session" and the caller lost the work it had already done. One extra turn
+    of overflow is the cheaper mistake, and new requests still skip the plan,
+    so it drains rather than being hammered.
+    """
+    async def go():
+        from switchyard.policy import CapacityPolicy
+        from switchyard.usage import Ledger
+
+        reg, slots, picker = build()
+        policy = CapacityPolicy(slots.redis, reg.settings, Ledger(slots.redis))
+        picker.policy = policy
+
+        lane = "forge"
+        target = reg.lane_members(lane)[0]
+        plan = reg.plan_of(target)
+        session = "sess-midloop"
+        await slots.set_lease(session, target.ref, reg.settings.lease_ttl_seconds)
+        await policy.ledger.note_reported_percent(
+            plan.key, 100.0, None, window=plan.quota.label)
+
+        # A fresh request routes away from the spent plan...
+        fresh = await picker.pick(lane, session, pinned=False)
+        await picker.release(fresh.plan.key, fresh.request_id, fresh.ref)
+
+        # ...but a follow-up carrying tool results stays on it.
+        await slots.set_lease(session, target.ref, reg.settings.lease_ttl_seconds)
+        followup = await picker.pick(lane, session, pinned=True)
+        await picker.release(followup.plan.key, followup.request_id, followup.ref)
+        return target.ref, fresh, followup
+
+    ref, fresh, followup = run(go())
+    assert fresh.ref != ref, f"a new request should avoid the spent plan: {fresh.ref}"
+    assert followup.ref == ref, f"a follow-up must finish on {ref}, got {followup.ref}"
+    assert followup.sticky
+    print(f"  {ref} spent: new work -> {fresh.ref}, the running loop stays put")
+
+
+def test_a_followup_is_recognised_in_both_wire_formats():
+    """Tool results look different on each protocol, and missing one is silent.
+
+    The Anthropic shape was not detected, so a follow-up from a Claude-protocol
+    client looked like a fresh request and was free to spill to a plan whose
+    bridge had never minted its ids.
+    """
+    from switchyard.hooks import _carries_tool_results as carries
+
+    openai = [{"role": "tool", "tool_call_id": "call_1", "content": "{}"}]
+    anthropic = [{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "{}"}]}]
+    assert carries(openai), "OpenAI-shaped tool result missed"
+    assert carries(anthropic), "Anthropic-shaped tool result missed"
+
+    # Neither a plain turn nor the assistant's own tool CALL is a follow-up:
+    # treating the call as one would pin a request that has nothing to return.
+    assert not carries([{"role": "user", "content": "hello"}])
+    assert not carries([{"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "get_weather"}]}])
+    assert not carries(None) and not carries([])
+    print("  both protocols' tool results detected; calls and plain turns are not")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):

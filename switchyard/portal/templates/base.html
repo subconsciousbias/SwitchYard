@@ -64,7 +64,13 @@
           font-size:11px;color:var(--muted);margin-top:8px}
   .legend .slot{width:9px;height:12px}
   .legend span.k{display:inline-flex;align-items:center;gap:4px}
-  .slot.gone{background:repeating-linear-gradient(45deg,var(--track),var(--track)2px,transparent 2px,transparent 4px)}
+  /* Withheld capacity. The stripes used to be drawn in --track over the panel
+     background -- two near-identical colours -- so it read as an ordinary empty
+     slot. Muted stripes and a dashed border make it legible without competing
+     with the red of a spent plan. */
+  .slot.gone{border-style:dashed;border-color:var(--muted);
+             background:repeating-linear-gradient(45deg,transparent,transparent 2px,
+                        var(--muted) 2px,var(--muted) 3px);opacity:.75}
   .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;
        border:1px solid var(--line);color:var(--muted);white-space:nowrap}
   .tag.bad{color:var(--bad);border-color:currentColor}
