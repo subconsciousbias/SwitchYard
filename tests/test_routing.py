@@ -687,6 +687,44 @@ def test_a_followup_is_recognised_in_both_wire_formats():
     print("  both protocols' tool results detected; calls and plain turns are not")
 
 
+def test_naming_a_deployment_still_claims_a_slot_and_honours_limits():
+    """Asking for one model is legitimate; bypassing the plan's limits is not.
+
+    A request naming `sy.claude-max.opus` used to skip SwitchYard entirely: no
+    slot claimed, no usage recorded, no cooldown or quota respected, nothing on
+    the board. The plan's limits are the plan's limits however the request is
+    addressed. There is deliberately no spill -- a lane means "best of these",
+    a deployment means "this one", so a full plan is an honest refusal.
+    """
+    async def go():
+        reg, slots, picker = build()
+        model = reg.lane_members("forge")[0]
+        plan = reg.plan_of(model)
+
+        picks = []
+        for _ in range(plan.max_parallel):
+            picks.append(await picker.pick_direct(model))
+        assert all(p.ref == model.ref for p in picks), picks
+        assert await slots.in_flight(plan.key) == plan.max_parallel
+
+        try:
+            await picker.pick_direct(model)
+        except LaneSaturated as exc:
+            refused = str(exc)
+        else:
+            raise AssertionError("a full plan must refuse, not substitute")
+
+        for p in picks:
+            await picker.release(p.plan.key, p.request_id, p.ref)
+        again = await picker.pick_direct(model)
+        await picker.release(again.plan.key, again.request_id, again.ref)
+        return model.ref, plan.max_parallel, refused
+
+    ref, cap, refused = run(go())
+    assert ref in refused, refused
+    print(f"  {ref}: {cap} concurrent, then refused ({refused.split(':')[-1].strip()})")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):

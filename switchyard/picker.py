@@ -177,6 +177,33 @@ class Picker:
 
         raise LaneSaturated(lane, ", ".join(skipped))
 
+    async def pick_direct(self, model: Model, session: str | None = None) -> Pick:
+        """Claim a slot for a caller that named one deployment, not a lane.
+
+        Asking for `sy.claude-max.opus` is a legitimate thing to want -- you
+        want that model, not the best available one -- but it used to bypass
+        SwitchYard entirely: no slot claimed, no usage recorded, no cooldown or
+        quota respected, and nothing on the board. The plan's limits are the
+        plan's limits however the request is addressed.
+
+        There is no spill here by design. A lane means "the best of these"; a
+        deployment means "this one", so a full or cooled plan is an honest 429
+        rather than a quiet substitution the caller did not ask for.
+        """
+        rid = uuid.uuid4().hex
+        plan = self.registry.plan_of(model)
+        cap, reason = await self._cap(model)
+        if cap <= 0:
+            raise LaneSaturated(model.ref, f"{model.ref} unavailable: {reason}")
+        result = await self.slots.try_claim(
+            plan.key, cap, rid, model.ref, model.max_parallel, lane=model.ref)
+        if result != 1:
+            if result == 0 and self.policy is not None:
+                await self.policy.learner.note_pressure(plan.key)
+            raise LaneSaturated(
+                model.ref, f"{model.ref}({_why(result, cap, model.max_parallel)})")
+        return Pick(model.ref, model, plan, rid, session, False, [], cap, reason)
+
     async def release(self, plan_key: str, request_id: str, model_ref: str) -> None:
         await self.slots.release(plan_key, request_id, model_ref)
 

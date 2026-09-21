@@ -126,8 +126,13 @@ class SwitchyardHandler(CustomLogger):
         call_type: str,
     ) -> dict:
         lane = data.get("model")
+        direct = None
         if lane not in self.registry.lanes:
-            return data  # a caller naming a deployment directly bypasses us
+            # A caller naming one deployment still gets slot accounting, quota
+            # gating and usage recording -- everything except lane spill.
+            direct = self.registry.model_for_deployment(str(lane))
+            if direct is None:
+                return data      # not ours at all: a raw LiteLLM model name
 
         key_hash = None
         token = getattr(user_api_key_dict, "api_key", None)
@@ -145,7 +150,8 @@ class SwitchyardHandler(CustomLogger):
         pinned = _carries_tool_results(data.get("messages"))
 
         try:
-            pick = await self.picker.pick(lane, session, needs_tools, pinned)
+            pick = (await self.picker.pick_direct(direct, session) if direct
+                    else await self.picker.pick(lane, session, needs_tools, pinned))
         except LaneSaturated as exc:
             # Surfacing this as a 429 is what lets clients back off instead of
             # hammering a lane whose paid capacity is genuinely gone.
