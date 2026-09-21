@@ -394,18 +394,21 @@ def test_a_lane_with_one_tool_capable_member_routes_to_it():
     print(f"  judge with only {picked}'s plan tool-capable routed a tool-using request there")
 
 
-def test_a_mid_tool_loop_followup_pins_to_its_plan_instead_of_spilling():
-    """A follow-up carrying tool results sticks to its plan — within the lease.
+def test_a_pinned_followup_with_zero_wait_spills_to_a_peer():
+    """A pinned follow-up is a preference, not a guarantee.
 
     The pin is the session lease: while it is alive the plan still holds the
-    provider's prompt cache for this conversation, so the follow-up finishes
-    where it started (even spent) rather than waiting on a peer or spilling.
+    provider's prompt cache for this conversation, so a follow-up whose plan
+    has a free slot honours it on the same plan. With `pin_wait_seconds: 0`
+    a pinned follow-up whose plan is full, however, spills to a peer — there
+    is no wait, because a wait the caller has not asked for would just turn
+    into a retry that lands on the same peer anyway. Sessions follow capacity
+    rather than block.
+
     Past the lease TTL the pin is gone with the cache, and the same follow-up
     places fresh — safe now that any bridge rebuilds a lost session from the
-    caller's own request.
-
-    Runs with `pin_wait_seconds: 0` so the fail-fast contract is exercised
-    directly; the waiting behaviour has its own test below.
+    caller's own request. The waiting-then-spilling case is covered by the
+    test below.
     """
     async def go():
         reg, slots, picker = build()
@@ -436,16 +439,21 @@ def test_a_mid_tool_loop_followup_pins_to_its_plan_instead_of_spilling():
         await picker.release(spilled.plan.key, spilled.request_id, spilled.ref)
         await slots.set_lease(session, first.ref, reg.settings.lease_ttl_seconds)
 
-        # The same situation, pinned, refuses rather than spilling.
-        try:
-            await picker.pick(lane, session, pinned=True)
-        except LaneSaturated as exc:
-            assert first.ref in str(exc), str(exc)
-            detail = str(exc)
-        else:
-            raise AssertionError("a pinned follow-up must not be served by a peer plan")
+        # The same situation, pinned with wait=0: the follow-up also spills
+        # to a peer. The pin is a preference, not a guarantee, and zero wait
+        # makes that immediate — refusing instead would just bounce a retry
+        # the caller would re-fire onto the peer plan anyway.
+        pinned_spill = await picker.pick(lane, session, pinned=True)
+        assert pinned_spill.ref != first.ref, (
+            "wait=0 must let the pin give way to a peer")
+        assert not pinned_spill.sticky
+        await picker.release(pinned_spill.plan.key, pinned_spill.request_id,
+                             pinned_spill.ref)
+        await slots.set_lease(session, first.ref, reg.settings.lease_ttl_seconds)
 
-        # With a slot free again, the pin is honoured on the same plan.
+        # With a slot free on the pinned plan, the pin IS honoured — the wait
+        # loop runs once, claims the slot, and returns before the deadline
+        # matters.
         for rid in taken:
             await picker.release(plan.key, rid, first.ref)
         resumed = await picker.pick(lane, session, pinned=True)
@@ -453,12 +461,8 @@ def test_a_mid_tool_loop_followup_pins_to_its_plan_instead_of_spilling():
         assert resumed.sticky
         await picker.release(resumed.plan.key, resumed.request_id, resumed.ref)
 
-        # But the pin is the lease, and the lease has a TTL: past it (a real
-        # Redis drops the key; dropping it here is the same observable state
-        # -- get_lease returns None) the follow-up places fresh, spilling to
-        # the next plan in lane order. That is the walk-away case: by the time
-        # the caller answers a tool call 30 minutes later, no provider's prompt
-        # cache is warm anyway, and any bridge can rebuild a lost session from
+        # Past the lease TTL the pin is gone with the cache, and the follow-up
+        # places fresh — safe now that any bridge rebuilds a lost session from
         # the caller's own request.
         refilled = []
         for n in range(plan.max_parallel * 2):
@@ -481,11 +485,11 @@ def test_a_mid_tool_loop_followup_pins_to_its_plan_instead_of_spilling():
         resumed = await picker.pick(lane, session, pinned=True)
         assert resumed.ref == late.ref, (resumed.ref, late.ref)
         assert resumed.sticky
-        return first.ref, detail
+        return first.ref, pinned_spill.ref
 
-    ref, detail = run(go())
-    print(f"  pinned to {ref}: full -> {detail!r}, free -> same plan; "
-          f"past the lease TTL it spills and re-pins there")
+    pinned, spilled_to = run(go())
+    print(f"  pinned to {pinned} (wait=0): full -> {spilled_to} (peer); "
+          f"free -> same plan; past the lease TTL it spills and re-pins there")
 
 
 def test_a_heartbeat_keeps_a_long_request_past_the_staleness_sweep():
@@ -765,15 +769,16 @@ def test_naming_a_deployment_still_claims_a_slot_and_honours_limits():
     print(f"  {ref}: {cap} concurrent, then refused ({refused.split(':')[-1].strip()})")
 
 
-def test_a_pinned_followup_waits_for_a_slot_before_refusing():
-    """The pin waits out a short burst instead of 429ing immediately.
+def test_a_pinned_followup_waits_then_spills_to_a_peer():
+    """The pin waits out a short burst, then gives way to a peer.
 
-    The old behaviour 429'd the instant the pinned plan had no free slot, and
-    since nearly every agentic turn carries tool results, a busy plan turned
-    its sessions' next turns into retry storms while the peer plans sat idle.
-    Now the follow-up parks in the gateway for `pin_wait_seconds` — holding
-    no slot, so other sessions keep being placed — and claims the first slot
-    that frees. The refusal comes only after the wait.
+    A pinned follow-up whose plan is full parks in the gateway for
+    `pin_wait_seconds`, holding no slot, so other sessions keep being placed
+    while it does. A slot freed inside the deadline is claimed; one that
+    doesn't free in time gives way to a peer plan rather than blocking, the
+    same way a fresh request would. A plan under an active cooldown is not
+    waited on at all — cooldowns run for minutes, not seconds, so the wait
+    would just be wasted, and the follow-up spills to a peer immediately.
     """
     import time as _time
 
@@ -814,9 +819,9 @@ def test_a_pinned_followup_waits_for_a_slot_before_refusing():
         assert 0.3 <= elapsed < 2.5, elapsed
         await picker.release(resumed.plan.key, resumed.request_id, resumed.ref)
 
-        # With no slot ever freeing, the wait ends in the same refusal — and
-        # the wait happens only when the plan might free up: a cooled plan is
-        # refused immediately.
+        # With no slot ever freeing, the wait runs to the deadline and the
+        # follow-up spills to a peer. The wait happened (elapsed is past
+        # the deadline) and the spill is honest — a different ref, not sticky.
         refilled = []
         for n in range(plan.max_parallel * 2):
             rid = f"wait-filler-b-{n}"
@@ -825,33 +830,41 @@ def test_a_pinned_followup_waits_for_a_slot_before_refusing():
                 break
             refilled.append(rid)
         started = _time.monotonic()
-        try:
-            await picker.pick(lane, session, pinned=True)
-        except LaneSaturated as exc:
-            detail = str(exc)
-        else:
-            raise AssertionError("a full pinned plan must still refuse eventually")
+        spilled = await picker.pick(lane, session, pinned=True)
         elapsed = _time.monotonic() - started
-        assert first.ref in detail, detail
-        assert elapsed >= 2.5, elapsed
+        assert spilled.ref != first.ref, (
+            "wait past the deadline must give way to a peer, not refuse")
+        assert not spilled.sticky
+        assert elapsed >= 2.5, f"the wait should have run its course: {elapsed}"
+        await picker.release(spilled.plan.key, spilled.request_id, spilled.ref)
+        # The spill re-leased onto the peer — put the lease back so the
+        # next scenario exercises the pinned-on-the-original-plan path.
+        await slots.set_lease(session, first.ref, reg.settings.lease_ttl_seconds)
 
+        # A plan under an active cooldown is not waited on at all. Cooldowns
+        # run for minutes, not seconds, so the wait would just be wasted, and
+        # the follow-up gives way to a peer immediately. The failure mode the
+        # old code had (silently holding the request for the whole cooldown)
+        # was strictly worse: a 429 here, the caller's retry finds the same
+        # cooldown, and it 429s again on its own clock.
         await slots.cool_down(plan.key, 900, "quota_exhausted")
         started = _time.monotonic()
-        try:
-            await picker.pick(lane, session, pinned=True)
-        except LaneSaturated:
-            pass
-        else:
-            raise AssertionError("a cooled pinned plan must refuse, not wait")
-        assert _time.monotonic() - started < 0.5, "cooled plan must fail fast"
+        cooled = await picker.pick(lane, session, pinned=True)
+        elapsed = _time.monotonic() - started
+        assert cooled.ref != first.ref, (
+            "a cooled pinned plan must give way to a peer, not wait")
+        assert not cooled.sticky
+        assert elapsed < 0.5, f"cooled plan must not be waited on: {elapsed}"
+        await picker.release(cooled.plan.key, cooled.request_id, cooled.ref)
 
         for rid in refilled:
             await picker.release(plan.key, rid, first.ref)
-        return first.ref, detail
+        return first.ref, spilled.ref, cooled.ref
 
-    ref, detail = run(go())
-    print(f"  pinned to {ref}: waited out the burst, refused only after the "
-          f"deadline ({detail[:70]}...)")
+    pinned, spilled_to, cooled_to = run(go())
+    print(f"  pinned to {pinned} (wait=3s): a free slot in <3s lands here; "
+          f"a held plan spills to {spilled_to} after the deadline; a cooled "
+          f"plan spills to {cooled_to} without waiting")
 
 
 if __name__ == "__main__":

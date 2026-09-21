@@ -25,12 +25,14 @@ settings:
   # active session never migrates; an idle one lets its slot go.
   lease_ttl_seconds: 1800
   # How long a mid-tool-loop follow-up waits for a slot on its pinned plan
-  # before the 429. Zero restores the old fail-fast. 10s rides out the moment
-  # when every slot of the pinned plan is momentarily busy, so a running loop
-  # stays on the plan holding the provider's prompt cache instead of bouncing
-  # a retry the caller then re-fires anyway. Note the wait happens in the
-  # gateway with the request parked, NOT on a slot: other sessions keep being
-  # placed while one waits.
+  # before spilling to a peer. Zero means spill immediately — the pin never
+  # blocks. 10s rides out the moment when every slot of the pinned plan is
+  # momentarily busy, so a running loop stays on the plan holding the
+  # provider's prompt cache instead of bouncing a retry the caller then
+  # re-fires anyway. The wait happens in the gateway with the request parked,
+  # NOT on a slot: other sessions keep being placed while one waits. Cooled
+  # plans and cap==0 plans are never waited on (they will not lift inside the
+  # deadline).
   pin_wait_seconds: 10
   # Providers that wrap chain-of-thought in <think>...</think> leak it into
   # streamed content — LiteLLM lifts it into reasoning_content only for a
