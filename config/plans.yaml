@@ -366,7 +366,10 @@ plans:
     notes: "Cancelled. Better than Minimax, short of Opus. Use it up."
     models:
       grok-4.6:
-        model: openai/xai/grok-4.6
+        # Plain `grok-4.6`, not `xai/grok-4.6`: the provider prefix was how the
+        # OpenCode CLI named it, and api.x.ai itself rejects it as not-found.
+        # (Only the leading `openai/` is a LiteLLM provider hint and is stripped.)
+        model: openai/grok-4.6
         max_parallel: 2
 
   # ---------------------------------------------------------------- local ----

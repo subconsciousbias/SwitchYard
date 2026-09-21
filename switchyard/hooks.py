@@ -214,13 +214,43 @@ class SwitchyardHandler(CustomLogger):
         ctx = meta.get(META_KEY)
         return ctx if isinstance(ctx, dict) else None
 
+    def _check_served_deployment(self, ctx: dict, kwargs: dict):
+        """Which plan actually served this, when it is not the one we picked.
+
+        LiteLLM's router-level retries and context-window fallbacks run after the
+        pre-call hook, so they can move a request to a deployment the picker
+        never chose. Booking its tokens against the pick would spend one
+        subscription's quota and debit another's, so the served plan is
+        identified and used instead — and the move is logged, because it means
+        something bypassed the routing rules (tool capability, the session
+        lease, the mid-loop pin) and is worth seeing rather than absorbing.
+
+        Returns the plan to attribute usage to, or None if it cannot be resolved.
+        """
+        picked = self.registry.plans.get(ctx["plan"])
+        served_name = kwargs.get("model")
+        if not served_name:
+            return picked
+        served = self.registry.model_for_deployment(str(served_name))
+        if served is None or served.ref == ctx.get("model"):
+            return picked
+        actual = self.registry.plan_of(served)
+        log.warning(
+            "request was picked for %s but served by %s — LiteLLM moved it after "
+            "the pre-call hook, so it bypassed the routing rules. Booking usage "
+            "to %s, the plan whose quota it actually spent.",
+            ctx.get("model"), served.ref, actual.key,
+        )
+        return actual
+
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         ctx = self._ctx(kwargs)
         if not ctx:
             return
-        plan = self.registry.plans.get(ctx["plan"])
         self._stop_heartbeat(ctx["request_id"])
+        # Always release what we claimed, whoever ended up serving it.
         await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
+        plan = self._check_served_deployment(ctx, kwargs)
         if not plan:
             return
 

@@ -238,8 +238,8 @@ async def api_state() -> dict:
 @app.get("/")
 async def index(request: Request):
     return templates.TemplateResponse(
-        "index.html",
-        {"request": request, "capacity": await collect_capacity(),
+        request, "index.html",
+        {"capacity": await collect_capacity(),
          "plans": await collect_plans(), "probes": await collect_probes(),
          "settings": state["registry"].settings},
     )
@@ -248,14 +248,14 @@ async def index(request: Request):
 @app.get("/fragments/capacity")
 async def frag_capacity(request: Request):
     return templates.TemplateResponse(
-        "_capacity.html", {"request": request, "capacity": await collect_capacity()}
+        request, "_capacity.html", {"capacity": await collect_capacity()}
     )
 
 
 @app.get("/fragments/probes")
 async def frag_probes(request: Request):
     return templates.TemplateResponse(
-        "_probes.html", {"request": request, "probes": await collect_probes()}
+        request, "_probes.html", {"probes": await collect_probes()}
     )
 
 
@@ -287,7 +287,7 @@ async def save_cookie(plan_key: str, request: Request, cookie: str = Form("")):
         "total": result.total, "raw": result.raw, "at": datetime.now(timezone.utc).timestamp(),
     }
     return templates.TemplateResponse(
-        "_probes.html", {"request": request, "probes": await collect_probes()}
+        request, "_probes.html", {"probes": await collect_probes()}
     )
 
 
@@ -302,7 +302,7 @@ async def test_probe(plan_key: str, request: Request):
         "total": result.total, "raw": result.raw, "at": datetime.now(timezone.utc).timestamp(),
     }
     return templates.TemplateResponse(
-        "_probes.html", {"request": request, "probes": await collect_probes()}
+        request, "_probes.html", {"probes": await collect_probes()}
     )
 
 
@@ -311,14 +311,14 @@ async def forget_cookie(plan_key: str, request: Request):
     await state["prober"].clear_cookie(plan_key)
     state.setdefault("probe_tests", {}).pop(plan_key, None)
     return templates.TemplateResponse(
-        "_probes.html", {"request": request, "probes": await collect_probes()}
+        request, "_probes.html", {"probes": await collect_probes()}
     )
 
 
 @app.get("/fragments/plans")
 async def frag_plans(request: Request):
     return templates.TemplateResponse(
-        "_plans.html", {"request": request, "plans": await collect_plans()}
+        request, "_plans.html", {"plans": await collect_plans()}
     )
 
 

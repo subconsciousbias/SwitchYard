@@ -513,6 +513,39 @@ def test_a_heartbeat_keeps_a_long_request_past_the_staleness_sweep():
           f"release freed both counters")
 
 
+def test_the_generated_config_declares_no_general_fallbacks():
+    """Router-level fallbacks must stay out: they route behind the picker.
+
+    LiteLLM applies them inside the router, after the proxy's pre-call hook, so
+    a fallback attempt skips the tool-capability filter, claims no slot, ignores
+    the session lease and the mid-loop pin, and its tokens were booked against
+    the plan the picker chose rather than the one that served it -- spending one
+    subscription's quota and debiting another's. It also hid what it rescued: a
+    lane listing every member meant a broken plan was retried on a healthy one
+    and looked fine.
+
+    Context-window fallbacks are the allowed exception: a prompt bigger than the
+    window cannot be served where it was sent at all.
+    """
+    from switchyard import gen_litellm
+
+    cfg = gen_litellm.build(os.environ["SWITCHYARD_PLANS"])
+    rs = cfg["router_settings"]
+    assert rs["fallbacks"] == [], rs["fallbacks"]
+    assert rs.get("num_retries", 0) == 0 or cfg["litellm_settings"]["num_retries"] == 0
+    assert "context_window_fallbacks" in rs
+
+    # Every deployment a context fallback names must be a real one, or LiteLLM
+    # would route to a model group that does not exist.
+    names = {m["model_name"] for m in cfg["model_list"]}
+    for entry in rs["context_window_fallbacks"]:
+        for src, targets in entry.items():
+            for t in targets:
+                assert t in names, (src, t, sorted(names)[:5])
+    print(f"  no general fallbacks; {len(rs['context_window_fallbacks'])} "
+          f"context-window entries, all naming real deployments")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):

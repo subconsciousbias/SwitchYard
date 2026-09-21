@@ -260,8 +260,14 @@ def test_sidecar_reads_models_from_the_plan():
 
 def test_sidecar_model_aliases_keep_provider_prefixes_where_needed():
     """`openai/claude-opus-5` is `claude-opus-5` to the CLI, but
-    `openai/opencode-go/glm-5.3-flash` must keep its provider/model shape."""
-    assert _read_for("grok", "opencode").model == "xai/grok-4.6"
+    `openai/opencode-go/glm-5.3-flash` must keep its provider/model shape.
+
+    Only the leading `openai/` is a LiteLLM provider hint. Anything after it is
+    the provider's own name for the model and has to survive, because OpenCode
+    genuinely needs `opencode-go/glm-5.3-flash`. Conversely a plan calling an
+    API directly must NOT carry such a prefix: `xai/grok-4.6` is what OpenCode
+    calls it, and api.x.ai answers 404 for it.
+    """
     assert _read_for("opencode-go", "opencode").model == "opencode-go/glm-5.3-flash"
     assert _read_for("openai", "codex").model.startswith("gpt-5.6-")
     print("  only the LiteLLM provider prefix is stripped")

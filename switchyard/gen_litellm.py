@@ -73,24 +73,32 @@ def build(plans_path: str) -> dict:
             "model_info": {"switchyard_lane": lane_key, "default_model": first.ref},
         })
 
-    # Mid-call failover. Switchyard picks the entry point; if that call dies in
-    # flight, LiteLLM walks the rest of the lane rather than failing the request.
-    # The hook's cooldown still removes a dead plan from future picks, so this is
-    # belt-and-braces, not the primary mechanism.
+    # NO general fallbacks, on purpose. LiteLLM's fallbacks live in the router,
+    # which runs *after* the proxy's pre-call hook, so every fallback attempt
+    # went behind Switchyard's back: it skipped the tool-capability filter (a
+    # tool request could land on a plan whose sidecar hard-400s it), claimed no
+    # slot, ignored the session lease and the mid-tool-loop pin, and -- worst --
+    # the success hook booked its tokens against the plan the *picker* chose, so
+    # one subscription's quota was spent and another's was debited.
+    #
+    # It also hid the failures it rescued: a lane listing every member meant a
+    # broken plan was silently retried on a healthy one and looked fine.
+    #
+    # Switchyard owns placement. A failed request now returns to the caller,
+    # whose retry re-enters the picker and gets a correct pick -- against the
+    # live cooldowns the failure just set, which is better placement than a
+    # fixed list could give. See _check_served_deployment for the guard that
+    # keeps any remaining router-level retry from hiding.
     fallbacks: list[dict[str, list[str]]] = []
-    for lane_key in reg.lanes:
-        members = reg.lane_members(lane_key)
-        for i, model in enumerate(members):
-            tail = [m.deployment for m in members[i + 1:]]
-            if tail:
-                fallbacks.append({model.deployment: tail})
-        if members:
-            fallbacks.append({lane_key: [m.deployment for m in members]})
 
-    # Context-window fallbacks: when a prompt is too big for the model we picked,
-    # hand it to the largest-context model we have. Only models that declare
-    # `context_window` take part, so an unknown window never silently becomes a
-    # wrong routing decision.
+    # Context-window fallbacks are kept, as the exception: a prompt bigger than
+    # the model's window cannot be served where it was sent, so the alternative
+    # is hard-failing it. They carry the same attribution caveat as any
+    # router-level retry, which is why _check_served_deployment logs when one
+    # fires rather than letting the mis-booking pass unnoticed.
+    #
+    # Only models that declare `context_window` take part, so an unknown window
+    # never silently becomes a wrong routing decision.
     sized = sorted(
         (m for m in reg.models.values()
          if m.context_window and m.enabled

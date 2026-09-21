@@ -379,6 +379,30 @@ follow-up does arrive it is **resumed on the same plan**:
   reclaiming a slot from another stale parked session if one is there. Past the
   deadline it gets a 503 with `Retry-After`.
 
+### No router-level fallbacks
+
+Switchyard owns placement, so `router_settings.fallbacks` is empty and
+`num_retries` is 0. LiteLLM applies both inside the router, *after* the proxy's
+pre-call hook, so every fallback attempt went behind the picker's back: it
+skipped the tool-capability filter (a tool request could land on a plan whose
+sidecar hard-400s it), claimed no slot, ignored the session lease and the
+mid-loop pin, and the success hook booked its tokens against the plan the
+*picker* chose — spending one subscription's quota while debiting another's.
+
+It also hid the failures it rescued. A lane listing every member meant a broken
+plan was silently retried on a healthy one and looked fine; removing the lists
+surfaced `The model xai/grok-4.6 does not exist` on the first try, a stale
+OpenCode-style model id that had been masked since the plan moved to the token
+proxy.
+
+A failed request now returns to the caller. Its retry re-enters the picker and
+gets a fresh pick against the cooldowns the failure just set, which is better
+placement than a fixed list can give. Context-window fallbacks stay, as the one
+exception: a prompt bigger than the model's window cannot be served where it was
+sent at all. `_check_served_deployment` logs loudly whenever the deployment that
+answered is not the one that was picked, and books the usage to the plan that
+actually spent it.
+
 ### Which plan served the request
 
 The response body's `model` echoes what was asked for — usually a lane name
