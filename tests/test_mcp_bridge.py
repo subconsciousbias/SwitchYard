@@ -29,6 +29,7 @@ import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -161,16 +162,25 @@ def test_followup_correlates_by_tool_call_id_and_resumes_the_model():
     print(f"  follow-up correlated by tool_call_id -> {response['choices'][0]['message']['content']!r}")
 
 
-def test_followup_with_unknown_session_is_rejected():
+def test_followup_with_unknown_session_is_rebuilt():
+    """An unknown/expired session is no longer rejected — it is rebuilt.
+
+    This used to assert the hard 410. That made a caller that answered a tool
+    call after the idle TTL (walked away, long build, laptop asleep) start over
+    client-side, when its request already carried everything needed to resume.
+    test_a_reaped_session_is_rebuilt_not_410d covers the happy rebuild; here we
+    pin the degenerate shape: a follow-up with no tool definitions cannot be
+    rebuilt, and gets a clean 400 instead of the old 410.
+    """
     body = {"messages": [{"role": "tool", "tool_call_id": "call_" + "0" * 32 + "_1",
                           "content": "x"}]}
     try:
         asyncio.run(server.handle_followup(body, body["messages"]))
     except Exception as exc:
-        assert getattr(exc, "status_code", None) == 410, exc
-        print(f"  unknown/expired session -> {exc.status_code}")
+        assert getattr(exc, "status_code", None) == 400, exc
+        print(f"  unknown session without tools -> {exc.status_code} (rebuild is impossible)")
         return
-    raise AssertionError("expected a 410 for a session that is not live")
+    raise AssertionError("expected a 400 for a follow-up that cannot be rebuilt")
 
 
 # ------------------------------------------------------------- parallel calls ---
@@ -560,23 +570,129 @@ def test_a_preempted_session_is_resumed_not_refused():
         assert session.id in server.PREEMPTED
         with contextlib.suppress(Exception):
             await parked
-
-        # An id from a session nobody preempted still gets the honest 410.
-        unknown = f"call_{'0' * 32}_1"
-        body = {"model": "m", "tools": [], "messages": [
-            {"role": "tool", "tool_call_id": unknown, "content": "x"}]}
-        try:
-            await server.handle_followup(body, body["messages"])
-        except Exception as exc:
-            assert getattr(exc, "status_code", None) == 410, exc
-        else:
-            raise AssertionError("an unknown session must not be resumed")
-
         return call_id
 
     call_id = asyncio.run(scenario())
     assert call_id and server.session_id_from_call_id(call_id), call_id
-    print("  preempted id remembered and resumable; unknown id still 410s")
+    print("  preempted id remembered as ours, owed a resumption")
+
+
+def _stub_start_session(recorder: list):
+    """Replace start_session with a capture stub for handler-level tests.
+
+    The real one spawns the vendor CLI; here we only need to observe what the
+    rebuild path would have fed it. Returns the restore callable.
+    """
+    real = server.start_session
+
+    async def fake(body, mcp_tools, prompt, system, model, request):
+        recorder.append({"tools": mcp_tools, "prompt": prompt,
+                         "system": system, "model": model})
+        return {"stubbed": True}
+
+    server.start_session = fake
+
+    def restore():
+        server.start_session = real
+    return restore
+
+
+def test_a_reaped_session_is_rebuilt_not_410d():
+    """A follow-up past the idle TTL must resume the loop, not error.
+
+    This is the walk-away-between-meetings case: the reaper collected the
+    session after 30 idle minutes, the caller comes back and answers the tool
+    call, and the old hard 410 forced it to start over client-side. The
+    request already carries the whole loop, so the sidecar rebuilds from it
+    and the client never learns the session died.
+    """
+    calls = []
+    restore = _stub_start_session(calls)
+    try:
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            parked = asyncio.create_task(
+                server.register_tool_call(session.id, "get_weather", {"city": "Oslo"}))
+            await asyncio.sleep(0)
+            turn = await session.turn_future
+            assert turn["type"] == "tool_calls", turn
+            session.awaiting_followup = True
+            # Past the TTL: exactly what reap_loop checks before reaping.
+            session.last_active = time.time() - server.SESSION_TTL - 5
+            await server.reap_session(session)
+            assert session.id not in server.SESSIONS
+            with contextlib.suppress(Exception):
+                await parked
+
+            # The caller's follow-up, with everything it replayed on its own:
+            # its tool call and the result it computed while away.
+            body = {
+                "model": "m",
+                "tools": [{"type": "function", "function": {
+                    "name": "get_weather", "description": "",
+                    "parameters": {"type": "object", "properties": {}}}}],
+                "messages": [
+                    {"role": "user", "content": "weather in Oslo?"},
+                    {"role": "assistant", "content": None, "tool_calls": [
+                        {"id": f"call_{session.id}_1", "type": "function",
+                         "function": {"name": "get_weather",
+                                      "arguments": '{"city":"Oslo"}'}}]},
+                    {"role": "tool", "tool_call_id": f"call_{session.id}_1",
+                     "content": '{"temp_c":-3}'},
+                ],
+            }
+            return await server.handle_followup(body, body["messages"][2:])
+
+        result = asyncio.run(scenario())
+        assert result == {"stubbed": True}, result
+        assert len(calls) == 1, calls
+        rebuilt = calls[0]
+        assert '[called get_weather({"city":"Oslo"})]' in rebuilt["prompt"], rebuilt
+        assert "[result of get_weather: {\"temp_c\":-3}]" in rebuilt["prompt"], rebuilt
+        assert "weather in Oslo?" in rebuilt["prompt"], rebuilt
+        assert rebuilt["tools"] and rebuilt["tools"][0]["name"] == "get_weather"
+        print("  reaped session rebuilt from the request; loop carried as narration")
+
+        # The kill-switch restores the old hard 410 for non-preempted losses.
+        server.REBUILD_LOST = False
+        try:
+            async def refused():
+                body = {"model": "m", "tools": [], "messages": [
+                    {"role": "tool", "tool_call_id": f"call_{'0' * 32}_1",
+                     "content": "x"}]}
+                await server.handle_followup(body, body["messages"])
+            try:
+                asyncio.run(refused())
+            except Exception as exc:
+                assert getattr(exc, "status_code", None) == 410, exc
+            else:
+                raise AssertionError("kill-switch must restore the 410")
+        finally:
+            server.REBUILD_LOST = True
+        print("  MCP_REBUILD_LOST=0 restores the old 410")
+    finally:
+        restore()
+
+
+def test_an_id_that_was_never_ours_is_still_refused():
+    """A tool_call_id in someone else's format proves nothing to rebuild from.
+
+    `handle_followup` correlates results to a session purely by our id shape;
+    ids that do not parse to a session at all never reach the rebuild path.
+    """
+    async def scenario():
+        body = {"model": "m", "tools": [], "messages": [
+            {"role": "tool", "tool_call_id": "not-one-of-ours", "content": "x"}]}
+        await server.handle_followup(body, body["messages"])
+
+    try:
+        asyncio.run(scenario())
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 400, exc
+    else:
+        raise AssertionError("a foreign id must not be accepted")
+    print("  foreign tool_call_id still 400s before any rebuild is attempted")
 
 
 def test_only_a_resumption_is_allowed_to_queue():
@@ -657,6 +773,55 @@ def test_a_streamed_reply_is_framed_as_sse_with_its_tool_calls():
     assert json.loads(frames[0][6:])["choices"][0]["delta"]["content"] == "OK"
     assert json.loads(frames[-2][6:])["choices"][0]["finish_reason"] == "stop"
     print("  tool calls and text both framed as SSE, with usage and finish_reason")
+
+
+# ------------------------------------------------------- oversized prompt -> stdin ---
+def test_a_prompt_over_the_argv_limit_travels_on_stdin():
+    """A prompt past MAX_ARG_STRLEN must not reach the exec() call at all.
+
+    create_subprocess_exec dies with "[Errno 7] Argument list too long" on a
+    single argv element over ~128 KiB -- seen live when a folded system prompt
+    plus long history rode in as one argument, killing the session and leaving
+    its follow-ups 410ing. Over the limit, the prompt slot must vanish from
+    argv (codex keeps its "-" placeholder) and come back as stdin data.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-bigprompt-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    huge = "x" * (server.STDIN_PROMPT_LIMIT + 10)
+    argv, stdin_data = server.build_argv(huge, None, "m", workdir, "sess", tools_path, "")
+    assert stdin_data == huge, "oversized prompt must be returned for stdin"
+    assert huge not in argv, argv
+    assert argv[0] == server.PROFILE["cli"], argv
+
+    if server.PROVIDER == "codex":
+        assert "-" in argv, argv
+    else:
+        assert "-" not in argv, argv
+
+    # A small prompt keeps the old argv behaviour exactly.
+    argv, stdin_data = server.build_argv("small", None, "m", workdir, "sess", tools_path, "")
+    assert stdin_data is None
+    assert "small" in argv, argv
+
+    # And the driver feeds the stdin data to the process when given it.
+    fake_cli = _write_fake_cli(
+        "import sys\n"
+        "data = sys.stdin.read()\n"
+        "assert data.startswith('x' * 100), f'short stdin: {len(data)}'\n"
+        "import json\n"
+        "print(json.dumps({'result': f'saw {len(data)} chars'}))\n")
+
+    async def scenario():
+        session = _new_session()
+        session.new_turn()
+        await server.run_session(session, [sys.executable, fake_cli], huge)
+        return session.turn_future.result()
+
+    result = asyncio.run(scenario())
+    assert result["type"] == "final", result
+    assert result["payload"]["result"] == f"saw {len(huge)} chars", result
+    print(f"  {len(huge)}-char prompt stayed off argv and arrived whole on stdin")
 
 
 if __name__ == "__main__":

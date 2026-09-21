@@ -163,13 +163,37 @@ def test_the_real_error_is_read_from_stdout_not_stderr():
 
 def test_codex_is_invoked_without_an_explicit_model():
     """A ChatGPT-account seat rejects every explicit model id, so the CLI picks."""
-    argv = server.build_argv("PROMPT", None)
+    argv, stdin_data = server.build_argv("PROMPT", None)
     if server.PROVIDER == "codex":
         assert "--model" not in argv, argv
         assert "--skip-git-repo-check" in argv, argv
         print(f"  {' '.join(argv)}")
     else:
         print(f"  (skipped: PROVIDER={server.PROVIDER})")
+
+
+def test_an_oversized_prompt_travels_on_stdin():
+    """A prompt past MAX_ARG_STRLEN must not reach the exec() call at all.
+
+    create_subprocess_exec dies with "[Errno 7] Argument list too long" on a
+    single argv element over ~128 KiB. Over the limit the prompt slot must
+    vanish from argv (codex keeps its "-" placeholder) and come back as stdin
+    data; under it, argv behaviour is exactly as before.
+    """
+    huge = "x" * (server.STDIN_PROMPT_LIMIT + 10)
+    argv, stdin_data = server.build_argv(huge, None)
+    assert stdin_data == huge
+    assert huge not in argv, argv
+    assert argv[0] == server.CLI, argv
+    if server.PROVIDER == "codex":
+        assert "-" in argv, argv
+    else:
+        assert "-" not in argv, argv
+
+    argv, stdin_data = server.build_argv("small", None)
+    assert stdin_data is None
+    assert "small" in argv, argv
+    print(f"  {len(huge)}-char prompt kept off argv; small prompt unchanged")
 
 
 CODEX_FIXTURE = os.path.join(HERE, "fixtures", "codex-events.jsonl")

@@ -395,12 +395,14 @@ def test_a_lane_with_one_tool_capable_member_routes_to_it():
 
 
 def test_a_mid_tool_loop_followup_pins_to_its_plan_instead_of_spilling():
-    """A follow-up carrying tool results must not be spilled to another plan.
+    """A follow-up carrying tool results sticks to its plan — within the lease.
 
-    Its tool_call_ids were minted by one plan's bridge and mean nothing
-    anywhere else, so a peer would reject them outright — and a caller that had
-    already run the tool would get a hard error instead of a wait. Spilling is
-    still right for a plain request, which is what makes this a separate mode.
+    The pin is the session lease: while it is alive the plan still holds the
+    provider's prompt cache for this conversation, so the follow-up finishes
+    where it started (even spent) rather than waiting on a peer or spilling.
+    Past the lease TTL the pin is gone with the cache, and the same follow-up
+    places fresh — safe now that any bridge rebuilds a lost session from the
+    caller's own request.
     """
     async def go():
         reg, slots, picker = build()
@@ -411,11 +413,12 @@ def test_a_mid_tool_loop_followup_pins_to_its_plan_instead_of_spilling():
         held = await slots.get_lease(session)
         assert held == first.ref, (held, first.ref)
 
-        # Fill the leased plan so its next claim must fail.
+        # Fill the leased plan so its next claim must fail. The pick above
+        # still holds one slot of the plan itself, hence the seed.
         plan = reg.plan_of(first.model)
         taken = [first.request_id]
-        for _ in range(plan.max_parallel * 2):
-            rid = f"filler-{len(taken)}"
+        for n in range(plan.max_parallel * 2):
+            rid = f"filler-a-{n}"
             if await slots.try_claim(plan.key, plan.max_parallel, rid,
                                      first.ref, first.model.max_parallel) != 1:
                 break
@@ -436,16 +439,47 @@ def test_a_mid_tool_loop_followup_pins_to_its_plan_instead_of_spilling():
         else:
             raise AssertionError("a pinned follow-up must not be served by a peer plan")
 
+        # With a slot free again, the pin is honoured on the same plan.
         for rid in taken:
             await picker.release(plan.key, rid, first.ref)
-        # With a slot free again, the pin is honoured on the same plan.
         resumed = await picker.pick(lane, session, pinned=True)
         assert resumed.ref == first.ref, (resumed.ref, first.ref)
+        assert resumed.sticky
+        await picker.release(resumed.plan.key, resumed.request_id, resumed.ref)
+
+        # But the pin is the lease, and the lease has a TTL: past it (a real
+        # Redis drops the key; dropping it here is the same observable state
+        # -- get_lease returns None) the follow-up places fresh, spilling to
+        # the next plan in lane order. That is the walk-away case: by the time
+        # the caller answers a tool call 30 minutes later, no provider's prompt
+        # cache is warm anyway, and any bridge can rebuild a lost session from
+        # the caller's own request.
+        refilled = []
+        for n in range(plan.max_parallel * 2):
+            rid = f"filler-b-{n}"
+            if await slots.try_claim(plan.key, plan.max_parallel, rid,
+                                     first.ref, first.model.max_parallel) != 1:
+                break
+            refilled.append(rid)
+        await slots.drop_lease(session)
+        late = await picker.pick(lane, session, needs_tools=True, pinned=True)
+        assert late.ref != first.ref, (late.ref, first.ref)
+        assert not late.sticky
+        await picker.release(late.plan.key, late.request_id, late.ref)
+
+        for rid in refilled:
+            await picker.release(plan.key, rid, first.ref)
+        # The spilled follow-up re-leased the session onto the peer, so the
+        # loop continues there: a further follow-up pins to the NEW plan the
+        # same way the original one pinned to its plan.
+        resumed = await picker.pick(lane, session, pinned=True)
+        assert resumed.ref == late.ref, (resumed.ref, late.ref)
         assert resumed.sticky
         return first.ref, detail
 
     ref, detail = run(go())
-    print(f"  pinned to {ref}: full -> {detail!r}, free -> same plan")
+    print(f"  pinned to {ref}: full -> {detail!r}, free -> same plan; "
+          f"past the lease TTL it spills and re-pins there")
 
 
 def test_a_heartbeat_keeps_a_long_request_past_the_staleness_sweep():

@@ -87,6 +87,14 @@ EXTRA_ARGS = [a for a in os.environ.get("CLI_EXTRA_ARGS", "").split() if a]
 SYSTEM_MODE = os.environ.get("SYSTEM_MODE", "append").lower()
 # Strip the inner harness's tools and cap it at a single turn.
 BARE = os.environ.get("BARE", "1") not in ("0", "false", "no")
+# One argv element may not exceed the kernel's MAX_ARG_STRLEN (128 KiB on
+# Linux); a longer one makes create_subprocess_exec fail with
+# "[Errno 7] Argument list too long" before the CLI even starts. Same limit
+# and same stdin escape hatch as mcp_bridge's STDIN_PROMPT_LIMIT -- keep the
+# two in step. All three profile CLIs take the prompt on stdin: `claude -p`
+# and `opencode run` read a piped prompt, `codex exec -` reads stdin when its
+# PROMPT argument is `-`.
+STDIN_PROMPT_LIMIT = int(os.environ.get("MCP_STDIN_PROMPT_LIMIT", "100000"))
 
 # Per-provider invocation. `prompt` and `system` are substituted; `system` is
 # dropped entirely when the CLI has no equivalent flag.
@@ -469,18 +477,34 @@ def resolve_model(requested: str | None) -> tuple[str, str | None]:
     if requested in cfg.models:
         return requested, None
     return cfg.model, (f"model {requested!r} is not an enabled plan on "
-                       f"subscription {SUBSCRIPTION or PROVIDER!r} "
+                       f"subscription {PLAN or PROVIDER!r} "
                        f"({sorted(cfg.models)}); ran {cfg.model} instead")
 
 
-def build_argv(prompt: str, system: str | None, model: str | None = None) -> list[str]:
+def build_argv(prompt: str, system: str | None,
+               model: str | None = None) -> tuple[list[str], str | None]:
+    """Build the CLI argv, plus the prompt to feed it on stdin (or None).
+
+    Returns a pair so an oversized prompt can travel on stdin instead of argv
+    (see STDIN_PROMPT_LIMIT for why). The {prompt} slot is handled outside
+    fill(): on the argv path it is substituted directly, on the stdin path
+    codex's "-" placeholder stays in the template and claude/opencode drop the
+    element entirely.
+    """
     model = model or config().model
+    use_stdin = len(prompt) > STDIN_PROMPT_LIMIT
 
     def fill(tpl: str) -> str:
-        return tpl.replace("{prompt}", prompt).replace("{model}", model).replace(
-            "{system}", system or "")
+        return tpl.replace("{model}", model).replace("{system}", system or "")
 
-    argv = [CLI] + [fill(a) for a in PROFILE["args"]]
+    argv = [CLI]
+    for element in PROFILE["args"]:
+        if element != "{prompt}":
+            argv.append(fill(element))
+        elif use_stdin and PROVIDER == "codex":
+            argv.append("-")
+        elif not use_stdin:
+            argv.append(prompt)
 
     key = ("system_args_replace" if SYSTEM_MODE == "replace"
            and PROFILE.get("system_args_replace") else "system_args")
@@ -493,7 +517,7 @@ def build_argv(prompt: str, system: str | None, model: str | None = None) -> lis
     if key == "system_args_replace" and system and PROFILE.get("replace_extra_args"):
         argv += [fill(a) for a in PROFILE["replace_extra_args"]]
 
-    return argv + EXTRA_ARGS
+    return argv + EXTRA_ARGS, (prompt if use_stdin else None)
 
 
 def _int(v) -> int:
@@ -688,18 +712,25 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None) -> 
 
 async def _run_cli(prompt: str, system: str | None, model: str | None,
                    extra_args: list) -> dict:
-    cmd = build_argv(prompt, system, model) + list(extra_args)
+    cmd, stdin_data = build_argv(prompt, system, model)
+    cmd = cmd + list(extra_args)
 
     # stdin must be closed explicitly: codex reads "additional input from stdin"
     # and would block forever on an inherited descriptor that never closes.
+    # communicate() closes the pipe after writing, and the stdin path is only
+    # ever taken when an oversized prompt rides there (see build_argv).
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None
+        else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
+        out, err = await asyncio.wait_for(
+            proc.communicate(input=stdin_data.encode() if stdin_data is not None
+                             else None),
+            timeout=TIMEOUT)
     except asyncio.TimeoutError:
         proc.kill()
         raise HTTPException(status_code=408, detail=f"{PROVIDER} cli timed out")

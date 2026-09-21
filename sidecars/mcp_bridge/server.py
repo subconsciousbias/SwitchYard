@@ -106,8 +106,16 @@ DISCONNECT_POLL = float(os.environ.get("MCP_DISCONNECT_POLL_SECONDS", "2"))
 # session may sit parked before enforce_parked_limit will consider it stale.
 PARKED_GRACE = float(os.environ.get("MCP_PARKED_GRACE_SECONDS", "60"))
 # How long the follow-up of a preempted session may wait for a slot on THIS
-# plan before giving up. Only a resumption ever waits: see resume_preempted.
+# plan before giving up. Only a resumption ever waits: see resume_gone_session.
 RESUME_WAIT = float(os.environ.get("MCP_RESUME_WAIT_SECONDS", "300"))
+# A follow-up naming a session that is gone for any OTHER reason -- reaped
+# after the idle TTL (a caller that walked away mid-loop), dropped when its
+# caller hung up, crashed, hit the process timeout, or lost to a sidecar
+# restart -- rebuilds exactly like a preempted one: the request itself carries
+# the whole history, tool results included, so the loop can continue as if
+# nothing happened and the client never learns the session died. Off switches
+# the behaviour back to the old hard 410.
+REBUILD_LOST = os.environ.get("MCP_REBUILD_LOST", "1") not in ("0", "false", "no")
 # How many preempted session ids to remember, so their follow-ups can be
 # recognised and resumed rather than refused. Ids are cheap; this only needs to
 # outlive the callers' tool execution, not the process.
@@ -125,6 +133,14 @@ PROCESS_TIMEOUT = float(os.environ.get("MCP_PROCESS_TIMEOUT_SECONDS", str(6 * 36
 # separate tools/call frames, and nothing tells us in advance how many are
 # coming, so we wait for the burst to go quiet.
 BATCH_WINDOW = float(os.environ.get("MCP_BATCH_WINDOW_SECONDS", "0.25"))
+# A single argv element may not exceed the kernel's MAX_ARG_STRLEN (128 KiB on
+# Linux); a longer one makes create_subprocess_exec fail with
+# "[Errno 7] Argument list too long" before the CLI even starts -- observed
+# live when a folded system prompt + long history rode along as one argument.
+# At or over this threshold the prompt is handed to the CLI on stdin instead.
+# All three profile CLIs take it there: `claude -p` and `opencode run` read a
+# piped prompt, `codex exec -` reads stdin when its PROMPT argument is `-`.
+STDIN_PROMPT_LIMIT = int(os.environ.get("MCP_STDIN_PROMPT_LIMIT", "100000"))
 
 MCP_PROFILES: dict[str, dict] = {
     "claude": {
@@ -313,6 +329,8 @@ class Session:
 SESSIONS: dict[str, Session] = {}
 # session id -> when it was preempted. A follow-up naming one of these is not a
 # caller error: we took its slot, so we owe it a resumption rather than a 410.
+# Kept even though a lost session rebuilds regardless now (REBUILD_LOST): it
+# keeps the log honest about WHICH loss the caller is resuming from.
 PREEMPTED: "collections.OrderedDict[str, float]" = collections.OrderedDict()
 
 
@@ -415,7 +433,14 @@ def write_opencode_dir(workdir: Path, session_id: str, tools_path: Path) -> None
 
 
 def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
-                session_id: str, tools_path: Path, allowed_tools: str) -> list[str]:
+                session_id: str, tools_path: Path,
+                allowed_tools: str) -> tuple[list[str], str | None]:
+    """Build the CLI argv, plus the prompt to feed it on stdin (or None).
+
+    Returns a pair so an oversized prompt can travel on stdin instead of argv
+    (see STDIN_PROMPT_LIMIT for why). The caller passes the second element
+    straight into run_session.
+    """
     instructions: Path | None = None
     if PROVIDER == "claude":
         mcp_config = write_claude_mcp_config(workdir, session_id, tools_path)
@@ -440,8 +465,7 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
         effective_prompt = f"{system}\n\n{prompt}" if system else prompt
 
     def fill(tpl: str) -> str:
-        return (tpl.replace("{prompt}", effective_prompt)
-                   .replace("{model}", model)
+        return (tpl.replace("{model}", model)
                    .replace("{workdir}", str(workdir))
                    .replace("{mcp_config}", str(mcp_config) if mcp_config else "")
                    .replace("{tool_server}", str(TOOL_SERVER))
@@ -450,12 +474,23 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
                    .replace("{callback}", CALLBACK_BASE)
                    .replace("{allowed_tools}", allowed_tools))
 
-    argv = [PROFILE["cli"]] + [fill(a) for a in PROFILE["argv"]]
+    # The {prompt} slot is handled outside fill(): on the argv path it is
+    # substituted directly, on the stdin path codex's "-" placeholder stays in
+    # the template and claude/opencode drop the element entirely.
+    use_stdin = len(effective_prompt) > STDIN_PROMPT_LIMIT
+    argv = [PROFILE["cli"]]
+    for element in PROFILE["argv"]:
+        if element != "{prompt}":
+            argv.append(fill(element))
+        elif use_stdin and PROVIDER == "codex":
+            argv.append("-")
+        elif not use_stdin:
+            argv.append(effective_prompt)
     if PROVIDER == "claude" and system:
         argv += ["--system-prompt", system]
     if instructions is not None:
         argv += ["-c", f"model_instructions_file={instructions}"]
-    return argv
+    return argv, (effective_prompt if use_stdin else None)
 
 
 # ---------------------------------------------------------------------------
@@ -464,17 +499,22 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
 # except at the very end (or on error/timeout) -- every tool-call turn is
 # resolved by Session._flush, triggered from register_tool_call below.
 # ---------------------------------------------------------------------------
-async def run_session(session: Session, argv: list[str]) -> None:
+async def run_session(session: Session, argv: list[str],
+                      stdin_data: str | None = None) -> None:
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE if stdin_data is not None
+            else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         session.proc = proc
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=PROCESS_TIMEOUT)
+            out, err = await asyncio.wait_for(
+                proc.communicate(input=stdin_data.encode() if stdin_data is not None
+                                 else None),
+                timeout=PROCESS_TIMEOUT)
         except asyncio.TimeoutError:
             proc.kill()
             session.resolve_final({"type": "error", "status": 408,
@@ -765,7 +805,8 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
         tools_path = workdir / "tools.json"
         tools_path.write_text(json.dumps(mcp_tools))
         allowed = ",".join(PROFILE["tool_qualifier"](t["name"]) for t in mcp_tools)
-        argv = build_argv(prompt, system, model, workdir, session_id, tools_path, allowed)
+        argv, stdin_data = build_argv(prompt, system, model, workdir, session_id,
+                                      tools_path, allowed)
     except Exception:
         await cli_bridge._gate.release()
         cleanup_workdir(workdir)
@@ -773,7 +814,7 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
 
     SESSIONS[session_id] = session
     session.new_turn()
-    asyncio.create_task(run_session(session, argv))
+    asyncio.create_task(run_session(session, argv, stdin_data))
     result = await await_turn(session, request)
     response = render_turn(session, result, body.get("model"))
     if result["type"] != "tool_calls":
@@ -843,9 +884,9 @@ async def acquire_resume_slot(limit: int, timeout: float) -> bool:
     return await cli_bridge._gate.acquire_waiting(limit, timeout)
 
 
-async def resume_preempted(body: dict, tools: list[dict], session_id: str,
-                           request: "Request | None") -> dict:
-    """Rebuild a session whose slot we took, on the same plan, once one frees.
+async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
+                              request: "Request | None", why: str) -> dict:
+    """Rebuild a lost session on the same plan, once a slot frees.
 
     This is the only path allowed to queue. A *new* request must still fail fast
     so SwitchYard can spill it to the next plan in the lane, but a session that
@@ -853,6 +894,17 @@ async def resume_preempted(body: dict, tools: list[dict], session_id: str,
     conversation this plan has been building a prompt cache for, and starting it
     over elsewhere would both lose that cache and re-run work the caller has
     already paid for. So it waits its turn here instead.
+
+    "Lost" covers more than preemption: the idle reaper (a caller that walked
+    away between meetings and answered the tool call past the TTL), a crashed
+    CLI, the process timeout, a caller we saw hang up, and a sidecar restart
+    that took every session with it. The rebuild is possible in every case for
+    the same reason: the caller's request carries the whole history, tool
+    results included, so `flatten_with_tool_history` can render the loop as
+    narration for a fresh CLI session. What is genuinely lost is the CLI's own
+    context -- the replayed history is longer than the tool results alone and
+    the provider sees a new prompt prefix -- which is a quota cost, not a
+    correctness one, and a fair price for the caller never seeing a 410.
     """
     mcp_tools = translate_tools(tools)
     if not mcp_tools:
@@ -870,10 +922,10 @@ async def resume_preempted(body: dict, tools: list[dict], session_id: str,
         raise HTTPException(
             status_code=503,
             detail=(f"no slot freed on this plan within {RESUME_WAIT:.0f}s to resume "
-                    f"the preempted session"),
+                    f"the {why} session"),
             headers={"Retry-After": "30"})
-    log.info("resuming preempted session %s after waiting %.1fs for a slot",
-             session_id, time.time() - waited)
+    log.info("resuming %s session %s after waiting %.1fs for a slot",
+             why, session_id, time.time() - waited)
     return await start_session(body, mcp_tools, prompt, system, model, request)
 
 
@@ -888,15 +940,23 @@ async def handle_followup(body: dict, tool_msgs: list[dict],
     wanted = session_ids.pop()
     session = SESSIONS.get(wanted)
     if session is None or session.dead:
-        if wanted in PREEMPTED:
-            # We took this session's slot; it is owed a resumption on this plan,
-            # not a refusal. The caller's own request carries the whole history,
-            # tool results included, so it can be rebuilt from what it sent.
-            return await resume_preempted(body, body.get("tools") or [], wanted, request)
-        raise HTTPException(status_code=410,
-                             detail="session is gone (finished, reaped, or never existed) "
-                                    "-- start a new tool-calling request rather than "
-                                    "continuing this one")
+        # Gone for one of: preempted (we took its slot), reaped past the idle
+        # TTL while its caller was away, dropped on a caller hang-up, crashed,
+        # process timeout, or a sidecar restart. None of these is the caller's
+        # fault and none is visible to it, and every one is recoverable the
+        # same way: the request itself carries the whole history, tool results
+        # included, so the loop can be rebuilt from what it sent. The caller's
+        # tool already RAN on its side -- only the delivery of its result is
+        # late -- so there is no double-execution risk in replaying it.
+        if wanted not in PREEMPTED and not REBUILD_LOST:
+            raise HTTPException(
+                status_code=410,
+                detail="session is gone (finished, reaped, or never existed) "
+                       "-- start a new tool-calling request rather than "
+                       "continuing this one")
+        why = "preempted" if wanted in PREEMPTED else "reaped or otherwise lost"
+        return await resume_gone_session(body, body.get("tools") or [], wanted,
+                                         request, why)
 
     resolved = 0
     for m in tool_msgs:

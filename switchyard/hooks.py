@@ -144,9 +144,12 @@ class SwitchyardHandler(CustomLogger):
         # supports_tools: false; see Plan.can_use_tools.
         needs_tools = bool(data.get("tools"))
 
-        # A request carrying tool *results* is mid-loop: its tool_call_ids were
-        # minted by one plan's bridge, so it must go back to that same plan
-        # rather than spill to a peer that cannot read them. See Picker.pick.
+        # A request carrying tool *results* is mid-loop. While its session
+        # lease is alive it returns to the plan that minted its tool_call_ids
+        # -- the prompt cache and the loop's quota are both there. Past the
+        # lease TTL the pin is gone and it places fresh, which is safe because
+        # any bridge rebuilds a lost session from the request itself. See
+        # Picker.pick.
         pinned = _carries_tool_results(data.get("messages"))
 
         try:

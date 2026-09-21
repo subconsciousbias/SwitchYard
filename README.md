@@ -412,19 +412,45 @@ pressure and cool a healthy plan for.
 Preempting is not dropping the work. The victim's id is remembered, and if its
 follow-up does arrive it is **resumed on the same plan**:
 
-- SwitchYard pins it there. A request carrying tool *results* is mid-loop, and
-  its `tool_call_id`s were minted by one plan's bridge — a peer would reject
-  them outright and would hold none of this conversation's prompt cache. So a
-  pinned follow-up waits for its plan instead of spilling down the lane.
+- SwitchYard pins it there — but the pin is the session lease, and the lease
+  has a TTL (`lease_ttl_seconds`, 1800s). Inside the window the plan still
+  holds the provider's prompt cache for this conversation and the loop's quota
+  story, so a mid-loop follow-up finishes where it started, spent or not. Past
+  the window — by which point no provider's cache is warm anyway — the lease
+  is gone and the follow-up places fresh, spilling down the lane like any new
+  request.
 - The sidecar rebuilds the session from the caller's own request, which carries
-  the whole history, tool results and all. Staying on the plan is what makes
-  this cheap: the provider's prompt cache is keyed to the account's prefix, so
-  a replayed history still hits it here and would miss anywhere else.
+  the whole history, tool results and all.
 - This is the **only** path allowed to queue. A new request still fails fast so
   SwitchYard can spill it to the next plan in the lane; a resumption has
   nowhere to spill to, so it waits up to `MCP_RESUME_WAIT_SECONDS` (300s),
   reclaiming a slot from another stale parked session if one is there. Past the
   deadline it gets a 503 with `Retry-After`.
+
+### Every lost session resumes, not just preempted ones
+
+Preemption was only ever one way a session could vanish before its follow-up
+arrived. The others: the idle reaper collecting it after 30 minutes because the
+caller walked away mid-loop (between meetings, a long build, a laptop asleep),
+a crashed CLI, the process timeout, a caller the sidecar saw hang up, or a
+sidecar restart taking every session with it. All of these used to answer the
+late follow-up with a hard 410 that forced the client to start over.
+
+They all rebuild now, by the same mechanism and the same argument: the
+request itself carries the whole history, tool results included, so the loop
+continues as if nothing happened and the client never learns the session died.
+There is no double-execution risk — the caller's tool already ran on its side;
+only the delivery of its result is late. What is genuinely lost is the CLI's
+own context: the replayed history costs more tokens than answering a live
+session would. That is a fair price for never having to walk a client through
+recovering client-side. `MCP_REBUILD_LOST=0` restores the old 410.
+
+Rebuild is also what makes the lease expiry safe. Before it existed, a
+follow-up that arrived after `lease_ttl_seconds` placed fresh — and if that
+put it on a peer plan, the peer's bridge answered 410 to tool_call_ids it had
+never minted, and the caller lost the loop anyway. The two now compose: the
+lease expiry unpins the stale conversation, and the rebuild lets whichever
+plan wins the placement continue it.
 
 ### No router-level fallbacks
 

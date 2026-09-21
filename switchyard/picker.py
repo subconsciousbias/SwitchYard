@@ -123,12 +123,11 @@ class Picker:
             if held and held in by_ref:
                 model = by_ref[held]
                 plan = self.registry.plan_of(model)
-                # A mid-tool-loop follow-up finishes where it started, spent or
-                # not. The alternative is worse than one turn of overflow: its
-                # tool_call_ids exist only in that plan's bridge, so anywhere
-                # else answers 400 and the caller loses work it has already
-                # done. New requests still skip the plan, so it drains rather
-                # than being hammered.
+                # A mid-tool-loop follow-up inside the lease window finishes
+                # where it started, spent or not: the plan still holds the
+                # provider's prompt cache for this conversation and the loop's
+                # quota story stays on one plan. New requests still skip the
+                # plan, so it drains rather than being hammered.
                 cap, reason = await self._cap(model, allow_spent=pinned)
                 if cap > 0 and await self.slots.try_claim(
                         plan.key, cap, rid, model.ref, model.max_parallel,
@@ -136,12 +135,14 @@ class Picker:
                     await self.slots.touch_lease(session, self.registry.settings.lease_ttl_seconds)
                     return Pick(lane, model, plan, rid, session, True, [], cap, reason)
                 if pinned:
-                    # A mid-tool-loop follow-up cannot be spilled. Its
-                    # tool_call_ids were minted by one plan's bridge and mean
-                    # nothing anywhere else, so another plan would reject them
-                    # outright — and even if it accepted them, it would have
-                    # none of the prompt cache this conversation has been
-                    # building. Better to make the caller wait for this plan.
+                    # The pin outranks a spill only inside the lease window,
+                    # where the cached prefix is still plausibly warm. It is
+                    # not forever: when the lease lapses this branch no longer
+                    # runs, the follow-up places fresh below, and that is safe
+                    # -- every bridge now rebuilds a lost session from the
+                    # caller's own request (mcp_bridge resume_gone_session),
+                    # and native plans take foreign tool_call_ids as the
+                    # opaque strings they are.
                     raise LaneSaturated(
                         lane, f"pinned to {held} mid-tool-loop; it has no free slot")
                 # Its slots are full or it just got cooled down; fall through
