@@ -1,4 +1,10 @@
 .env
+# sync-env.sh snapshots .env before touching it, so these hold REAL keys.
+# Four were committed and pushed before this line existed; history was
+# rewritten to drop them and every key in them was rotated.
+.env.backup.*
+.env.bak
+.env.*.bak
 __pycache__/
 *.pyc
 config/litellm.generated.yaml
