@@ -141,9 +141,24 @@ def probe_fixture(reg):
                        "needs_reauth": not healthy,
                        "remaining": 41_200_000.0 if healthy else None,
                        "total": 100_000_000.0 if healthy else None},
-            "last_test": None if healthy else {
-                "ok": False, "detail": "session rejected (401)",
+            # Both outcomes are rendered: a healthy plan shows its per-window
+            # readings with the raw body collapsed, a failed one leads with the
+            # error. Percent-only and dollar windows both appear, since the two
+            # providers report in different units.
+            "last_test": {
+                "ok": True, "detail": "ok",
                 "remaining": None, "total": None,
+                "windows": [
+                    {"window": "5h", "text": "37% used", "reset_at": None,
+                     "reset_human": "in 2h 10m", "missing": False},
+                    {"window": "weekly", "text": "12% used", "reset_at": None,
+                     "reset_human": "in 4d", "missing": False},
+                ],
+                "raw": '{"model_remains":[{"model_name":"general",'
+                       '"current_weekly_used_percent":"12%"}]}',
+                "at": time.time()} if healthy else {
+                "ok": False, "detail": "session rejected (401)",
+                "remaining": None, "total": None, "windows": [],
                 "raw": '{"base_resp":{"status_code":1004,'
                        '"status_msg":"cookie is missing, log in again"}}',
                 "at": time.time()},

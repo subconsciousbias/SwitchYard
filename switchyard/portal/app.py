@@ -259,6 +259,26 @@ async def frag_probes(request: Request):
     )
 
 
+def _probe_window(w) -> dict:
+    """One window of a probe reading, formatted for the panel.
+
+    Providers report in different units — MiniMax publishes a percentage and no
+    counts, OpenCode dollars against a limit — so the row carries a rendered
+    string rather than making the template guess.
+    """
+    if w.used_percent is not None:
+        text = f"{w.used_percent:g}% used"
+    elif w.remaining is not None and w.total:
+        text = f"{w.remaining:,.2f} left of {w.total:,.2f}"
+    elif w.remaining is not None:
+        text = f"{w.remaining:,.2f} left"
+    else:
+        text = "no data"
+    return {"window": w.window, "text": text,
+            "reset_at": w.reset_at, "reset_human": _fmt_reset(w.reset_at),
+            "missing": w.remaining is None and w.used_percent is None}
+
+
 async def collect_probes() -> list[dict]:
     """Plans whose real headroom comes from a console endpoint."""
     reg, prober = state["registry"], state["prober"]
@@ -285,6 +305,9 @@ async def save_cookie(plan_key: str, request: Request, cookie: str = Form("")):
     state.setdefault("probe_tests", {})[plan_key] = {
         "ok": result.ok, "detail": result.detail, "remaining": result.remaining,
         "total": result.total, "raw": result.raw, "at": datetime.now(timezone.utc).timestamp(),
+        # The per-window numbers are what the panel should show; the raw body is
+        # only for mapping a renamed field, so it hides behind a disclosure.
+        "windows": [_probe_window(w) for w in result.windows],
     }
     return templates.TemplateResponse(
         request, "_probes.html", {"probes": await collect_probes()}
@@ -300,6 +323,9 @@ async def test_probe(plan_key: str, request: Request):
     state.setdefault("probe_tests", {})[plan_key] = {
         "ok": result.ok, "detail": result.detail, "remaining": result.remaining,
         "total": result.total, "raw": result.raw, "at": datetime.now(timezone.utc).timestamp(),
+        # The per-window numbers are what the panel should show; the raw body is
+        # only for mapping a renamed field, so it hides behind a disclosure.
+        "windows": [_probe_window(w) for w in result.windows],
     }
     return templates.TemplateResponse(
         request, "_probes.html", {"probes": await collect_probes()}

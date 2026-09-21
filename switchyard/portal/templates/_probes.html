@@ -70,14 +70,29 @@
           <div class="muted" style="font-size:12px">
             {{ 'Read OK' if p.last_test.ok else 'Failed' }}: {{ p.last_test.detail }}
             {% if not p.last_test.ok and p.last_test.raw %}
-              — the raw response is below; correct the field paths in
+              — open the raw response below and correct the field paths in
               <span class="mono">plans.yaml</span> to match it.
             {% endif %}
           </div>
+          {# What the probe actually read, per window. This is the answer; the
+             raw body is reference material for when a field has been renamed,
+             so it stays collapsed instead of burying the numbers. #}
+          {% if p.last_test.windows %}
+            <div class="mono" style="font-size:12px;margin-top:4px">
+              {% for w in p.last_test.windows %}
+                <span class="tag {{ 'warn' if w.missing }}"
+                      {% if w.reset_at %}title="resets {{ w.reset_human }}"{% endif %}>
+                  {{ w.window }}: {{ w.text }}</span>
+              {% endfor %}
+            </div>
+          {% endif %}
           {% if p.last_test.raw %}
-            <pre class="mono" style="font-size:11px;white-space:pre-wrap;word-break:break-all;
-                 background:var(--track);padding:8px;border-radius:6px;margin:6px 0 0;
-                 max-height:140px;overflow:auto">{{ p.last_test.raw }}</pre>
+            <details style="margin-top:6px">
+              <summary class="muted" style="font-size:11px;cursor:pointer">raw response</summary>
+              <pre class="mono" style="font-size:11px;white-space:pre-wrap;word-break:break-all;
+                   background:var(--track);padding:8px;border-radius:6px;margin:6px 0 0;
+                   max-height:140px;overflow:auto">{{ p.last_test.raw }}</pre>
+            </details>
           {% endif %}
         </td>
       </tr>

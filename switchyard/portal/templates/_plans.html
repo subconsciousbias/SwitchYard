@@ -25,41 +25,43 @@
           {% endfor %}
         </div>
       </td>
-      <td style="min-width:190px">
-        {# One bar per quota window. The window closest to biting is marked,
-           because a 5-hour burst limit can stop you while weekly looks fine. #}
+      <td style="min-width:190px" title="{{ hr.basis }}">
+        {# One bar per quota window. The window closest to biting is the one in
+           warn colour — a 5-hour burst can stop you while weekly looks fine —
+           which says it without spending a row on a label. Where each number
+           came from is the cell's tooltip rather than a line of text. #}
         {% for w in hr.windows %}
           {% set wp = w.pct_used %}
+          {% set binds = w.window == hr.binding.window and not hr.binding_is_target %}
           <div style="margin-bottom:{{ '6px' if not loop.last else '0' }}">
             <div class="row" style="gap:6px">
-              <span class="mono" style="font-size:12px">
-                {{ w.window }}{% if w.role == 'target' %}<span class="muted"> · target</span>{% endif %}
-              </span>
+              <span class="mono nowrap" style="font-size:12px"
+                    {% if binds %}title="binds first"{% endif %}>{{ w.window }}</span>
               {% if wp is not none %}
-                <span class="mono muted" style="font-size:12px">{{ '%.0f'|format(100 - wp) }}% left</span>
+                <span class="mono muted nowrap" style="font-size:12px"
+                      >{{ '%.0f'|format(100 - wp) }}% left</span>
               {% endif %}
             </div>
             {% if wp is not none %}
-              <div class="bar {% if wp >= 90 %}bad{% elif wp >= 70 %}warn{% endif %}">
+              <div class="bar {% if wp >= 90 %}bad{% elif wp >= 70 or binds %}warn{% endif %}">
                 <i style="width:{{ wp }}%"></i></div>
             {% elif w.kind == 'unlimited' %}
               <span class="tag ok">unlimited</span>
             {% else %}
-              <span class="muted" style="font-size:12px">
-                no allowance set · used {{ '{:,.0f}'.format(w.consumed or 0) }}</span>
+              <span class="muted nowrap" style="font-size:12px"
+                    >no allowance · used {{ '{:,.0f}'.format(w.consumed or 0) }}</span>
             {% endif %}
           </div>
         {% endfor %}
-        {% if not hr.binding_is_target %}
-          <div class="muted" style="font-size:12px">
-            <span class="tag warn">{{ hr.binding.window }} binds first</span></div>
-        {% endif %}
-        <div class="muted" style="font-size:12px">{{ hr.basis }}</div>
       </td>
       <td class="mono nowrap">
         {% set c = r.capacity %}
         <strong>{{ c.cap }}</strong>{% if c.configured %}<span class="muted">/{{ c.configured }}</span>{% endif %}
-        <div class="muted" style="font-size:12px">{{ c.reason }}</div>
+        {# "configured" under 4/4 says nothing the numbers do not. Only a cap
+           that is NOT simply the configured one earns a caption. #}
+        {% if c.reason and c.reason != 'configured' %}
+          <div class="muted" style="font-size:12px">{{ c.reason }}</div>
+        {% endif %}
       </td>
       <td class="mono nowrap" style="min-width:120px">
         {% if r.pace and r.pace.active %}
