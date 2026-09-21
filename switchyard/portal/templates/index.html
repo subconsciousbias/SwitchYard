@@ -29,27 +29,12 @@
   </table>
 </div>
 
-<div class="panel row" style="margin-bottom:14px">
-  <div>
-    <strong>Pacing mode {{ 'on' if capacity.pacing else 'off' }}</strong>
-    <div class="muted" style="font-size:13px">
-      {% if capacity.pacing %}
-        Subscriptions are throttled to land at ~100% of their allowance at rollover.
-        The tail is disabled; metered providers keep fixed caps.
-      {% else %}
-        Plans run at their full learned caps and spill to the tail when exhausted.
-      {% endif %}
-      {% if capacity.pacing != capacity.pacing_configured %}
-        <span class="tag warn">runtime override — plans.yaml says
-          {{ 'on' if capacity.pacing_configured else 'off' }}</span>
-      {% endif %}
-      {% if capacity.learning %}<span class="tag ok">learning concurrency</span>{% endif %}
-    </div>
-  </div>
-  <button class="tag" hx-post="/admin/pacing?enabled=toggle" hx-swap="none"
-          hx-on::after-request="htmx.trigger('#capacity','refresh');htmx.trigger('#plans','refresh')">
-    turn {{ 'off' if capacity.pacing else 'on' }}
-  </button>
+{# Wrap the pacing panel so it can be re-rendered after a toggle without a
+   full page reload. The wrapper carries the id and the htmx polling/refresh
+   triggers; the panel itself lives in _pacing.html. #}
+<div id="pacing" hx-get="/fragments/pacing" hx-trigger="every 3s, refresh"
+     hx-swap="outerHTML">
+  {% include "_pacing.html" %}
 </div>
 
 <h2>Lanes — ordered capacity</h2>

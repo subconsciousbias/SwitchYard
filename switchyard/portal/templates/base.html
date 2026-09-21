@@ -81,6 +81,16 @@
   .tag.bad{color:var(--bad);border-color:currentColor}
   .tag.warn{color:var(--warn);border-color:currentColor}
   .tag.ok{color:var(--ok);border-color:currentColor}
+  /* An actual button, not a tag chip: bigger, with a cursor and a hover, and a
+     pressed fill so the on/off distinction reads at a glance. Used by the
+     pacing toggle; aria-pressed is the source of truth, the colour follows. */
+  .toggle{font:inherit;font-size:13px;line-height:1;padding:7px 14px;
+          border-radius:6px;cursor:pointer;background:var(--panel);color:var(--ink);
+          border:1px solid var(--line);
+          transition:background-color .15s,border-color .15s,color .15s}
+  .toggle:hover{border-color:var(--ink)}
+  .toggle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .toggle[aria-pressed="true"]{background:var(--ok);border-color:var(--ok);color:#fff}
   .big{font-size:26px;font-weight:600;letter-spacing:-.02em}
   .row{display:flex;align-items:center;gap:10px;justify-content:space-between}
   .muted{color:var(--muted)} .nowrap{white-space:nowrap}

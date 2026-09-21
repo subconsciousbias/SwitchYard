@@ -357,6 +357,13 @@ async def frag_capacity(request: Request):
     )
 
 
+@app.get("/fragments/pacing")
+async def frag_pacing(request: Request):
+    return templates.TemplateResponse(
+        request, "_pacing.html", {"capacity": await collect_capacity()}
+    )
+
+
 @app.get("/fragments/probes")
 async def frag_probes(request: Request):
     return templates.TemplateResponse(

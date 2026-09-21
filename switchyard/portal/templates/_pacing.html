@@ -1,0 +1,30 @@
+<div class="panel row" style="margin-bottom:14px">
+  <div>
+    <strong>Pacing mode {{ 'on' if capacity.pacing else 'off' }}</strong>
+    <div class="muted" style="font-size:13px">
+      {% if capacity.pacing %}
+        Subscriptions are throttled to land at ~100% of their allowance at rollover.
+        The tail is disabled; metered providers keep fixed caps.
+      {% else %}
+        Plans run at their full learned caps and spill to the tail when exhausted.
+      {% endif %}
+      {% if capacity.pacing != capacity.pacing_configured %}
+        <span class="tag warn">runtime override — plans.yaml says
+          {{ 'on' if capacity.pacing_configured else 'off' }}</span>
+      {% endif %}
+      {% if capacity.learning %}<span class="tag ok">learning concurrency</span>{% endif %}
+    </div>
+  </div>
+  {# An actual button, not a .tag chip: a clear cursor, a hover state, and a
+     green pressed fill so the on/off distinction reads at a glance. aria-pressed
+     is the source of truth for the state, and the colour follows it. The
+     #pacing refresh is what makes the click visible — without it the panel
+     silently stayed stale until a full page reload. #}
+  <button type="button"
+          class="toggle"
+          aria-pressed="{{ 'true' if capacity.pacing else 'false' }}"
+          hx-post="/admin/pacing?enabled=toggle" hx-swap="none"
+          hx-on::after-request="htmx.trigger('#pacing','refresh');htmx.trigger('#capacity','refresh');htmx.trigger('#plans','refresh')">
+    Turn {{ 'off' if capacity.pacing else 'on' }}
+  </button>
+</div>
