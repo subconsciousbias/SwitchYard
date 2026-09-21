@@ -158,15 +158,6 @@ class Picker:
                     if time.monotonic() >= deadline:
                         break
                     await asyncio.sleep(0.5)
-                # Past the deadline (which is zero for fail-fast), a pinned
-                # follow-up refuses to spill to a peer -- spilling would lose
-                # the prompt cache that is the whole point of the pin in the
-                # first place, and the caller can retry on its own clock. A
-                # non-pinned follow-up (wait was 0 above) falls through and
-                # re-leases wherever there is room.
-                if pinned:
-                    raise LaneSaturated(
-                        lane, f"pinned to {held} mid-tool-loop; it has no free slot")
                 # The pin is a preference with a deadline, not a guarantee.
                 # The wait rides out a burst so the loop stays on the plan
                 # holding the provider's prompt cache; past it the follow-up
@@ -175,8 +166,12 @@ class Picker:
                 # (mcp_bridge resume_gone_session), and native plans take
                 # foreign tool_call_ids as the opaque strings they are. Its
                 # slots are full or it just got cooled down; re-lease wherever
-                # there is room. Sessions follow capacity rather than
-                # blocking, and the lane only 429s when ALL of it is full.
+                # there is room. Refusing instead does not save the cache
+                # either: the caller's 429 retry lands on the peer plan anyway,
+                # only after its own backoff, and while any plan in the lane
+                # has a free slot the refusal is a false "no capacity". Sessions
+                # follow capacity rather than blocking, and the lane only 429s
+                # when ALL of it is full.
                 skipped.append(f"{held}(pinned, no free slot after {wait:g}s)"
                                if pinned else f"{held}(lease unusable)")
             elif held:
