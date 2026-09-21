@@ -32,21 +32,41 @@ duplicate any of them — the sidecars read `plans.yaml` themselves. If you find
 yourself setting the same number in two places, the config is the source of
 truth and the other place is a bug.
 
-## This checkout is a worktree — never build or deploy from it
+## This checkout is a worktree — commit here, never build or deploy from it
 
 Agent sessions run in `git worktree`s of this repo; the live stack runs from the
-**main checkout** (`~/Documents/GitHub/switchyard`). `docker-compose.yml` pins
-`name: switchyard`, so every worktree addresses the *same* compose project:
-`docker compose build` / `up -d` from a worktree does not spin up an isolated
-copy — it rebuilds and recreates the **live** containers from branch code, and
-mounts that worktree's `./config` into them. This was nearly done once from the
-issue-11 worktree and aborted by the user.
+**main checkout** (`~/Documents/GitHub/switchyard`). The worktree is where the
+work *finishes*: edit, run the offline test suite, and **commit on the
+worktree's branch** when the change is ready. The main checkout is where the
+work *ships*: the rebuild and redeploy happen there after the worktree branch
+is merged.
 
-From a worktree the job is: edit, run the offline test suite, commit. The
-rebuild/redeploy (and any `up -d --force-recreate`) happens from the main
-checkout after merge — `scripts/apply.sh --build` there. State that it is
-pending rather than running it. Read-only diagnosis is fine: `docker compose ps`,
-`docker logs`, the portal board.
+Two things must not happen on a worktree:
+
+  1. **Never `docker compose build` / `up -d` / `up -d --force-recreate` here.**
+     `docker-compose.yml` pins `name: switchyard`, so every worktree addresses
+     the *same* compose project: building or recreating from a worktree does
+     not spin up an isolated copy — it rebuilds and recreates the **live**
+     containers from branch code, and mounts that worktree's `./config` into
+     them. This was nearly done once from the issue-11 worktree and aborted
+     by the user.
+
+  2. **Never merge the worktree branch into main here.** The main checkout
+     owns that handoff — running `git merge` from a worktree drags the
+     worktree's branch into the main checkout's working tree, which then has
+     to be rebuilt anyway. Just commit; let the merge happen at the main
+     checkout (or via a PR).
+
+What "done on the worktree" looks like:
+
+  * `git status` clean, `git log` shows the new commit on the worktree branch.
+  * Offline test suite (`for t in tests/test_*.py; do python3 "$t" >/dev/null ...`)
+    green.
+  * The user has the new commit hash and the branch name; the rebuild/redeploy
+    (`scripts/apply.sh --build` from the main checkout) is theirs to run.
+
+Read-only diagnosis from a worktree is fine: `docker compose ps`, `docker logs`,
+the portal board. None of those mutate the live stack.
 
 ## `switchyard/` is baked into three images, not mounted
 

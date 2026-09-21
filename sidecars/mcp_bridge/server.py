@@ -287,10 +287,37 @@ class Session:
     # rather than the number of model turns. The slot is taken again when the
     # follow-up arrives, waiting if the plan is busy.
     holds_slot: bool = False
+    # tool_call_ids the session has delivered to tool_server.py (i.e. consumed
+    # from `pending` and handed back to the CLI), keyed by resolution time.
+    # Used to tell a *duplicate* delivery ("caller retried a request whose
+    # response was lost") apart from a *lost* session ("nothing parked here
+    # matches those ids") -- see _continue_followup. Bounded so a long-running
+    # session does not accumulate forever; 256 covers a generous tool-loop
+    # burst and is well under the size of any plausible retry window.
+    resolved_recently: dict = field(default_factory=dict)
+    # The most recent chat-completion response rendered for this session.
+    # Returned verbatim when a duplicate follow-up arrives: the caller is
+    # retrying because the previous response never arrived, not asking for a
+    # new turn. None until the first render.
+    last_response: dict | None = None
     _flush_handle: object = None
 
     def touch(self) -> None:
         self.last_active = time.time()
+
+    def mark_resolved(self, call_id: str) -> None:
+        """Record that `call_id` has been delivered to tool_server.py.
+
+        A subsequent follow-up that names this id again is a duplicate
+        delivery -- the caller's retry of a request whose response never
+        arrived, or a GUI replaying an already-consumed batch. Without this
+        record, the duplicate would look like a lost session and trigger a
+        rebuild (issue #13, defect 1).
+        """
+        self.resolved_recently[call_id] = time.time()
+        while len(self.resolved_recently) > 256:
+            oldest = min(self.resolved_recently, key=self.resolved_recently.get)
+            self.resolved_recently.pop(oldest, None)
 
     def mint_call_id(self) -> str:
         """call_<session_id>_<n> -- opaque to the caller, but round-trips the
@@ -594,6 +621,29 @@ async def end_session(session: Session) -> None:
         await cli_bridge._gate.release()
 
 
+async def supersede_session(session: Session, reason: str) -> None:
+    """Tear down a session that is about to be replaced by a rebuilt one.
+
+    Distinct from end_session: the natural termination path (final answer or
+    final tool_calls delivered) has no parked calls and a finished subprocess.
+    A session being superseded may have parked tool calls whose tool_server.py
+    requests will never receive a response, and a CLI subprocess blocked on a
+    follow-up that will never come -- both must be torn down here, otherwise
+    the rebuild path leaves the superseded session live (issue #13, defect 2:
+    one tool loop spanning two live CLI sessions).
+    """
+    log.info("superseding mcp_bridge session %s (%s); %d pending call(s)",
+             session.id, reason, len(session.pending))
+    session.fail_pending(f"session {session.id} superseded ({reason})")
+    if session.turn_future is not None and not session.turn_future.done():
+        session.turn_future.set_exception(
+            RuntimeError(f"session {session.id} superseded ({reason})"))
+    if session.proc is not None and session.proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            session.proc.kill()
+    await end_session(session)
+
+
 async def park_session(session: Session) -> None:
     """Hand the ball to the caller and give the concurrency slot back.
 
@@ -833,6 +883,12 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     asyncio.create_task(run_session(session, argv, stdin_data))
     result = await await_turn(session, request)
     response = render_turn(session, result, body.get("model"))
+    # Cache the rendered response so a duplicate follow-up can be answered
+    # with the same tool_calls response instead of being misread as a lost
+    # session (issue #13, defect 1). For a brand-new session, no follow-up
+    # has been minted yet so this is defensive -- _continue_followup also
+    # caches, and supersedes on rebuild.
+    session.last_response = response
     if result["type"] != "tool_calls":
         await end_session(session)
     else:
@@ -978,6 +1034,18 @@ async def handle_followup(body: dict, tool_msgs: list[dict],
                 "follow-up tool results span %d live mcp_bridge sessions (%s); "
                 "resolving against %s and dropping the others' tool results",
                 len(live_ids), live_ids, wanted)
+            # A session whose results were dropped can never be continued
+            # coherently: its CLI is blocked on tool_server.py requests whose
+            # replies will not arrive. Supersede each one now so it stops
+            # looking live -- otherwise the invariant "one caller tool loop
+            # <-> at most one live mcp_bridge session" is broken (issue #13,
+            # defect 2).
+            for sid in live_ids[1:]:
+                dropped = SESSIONS.get(sid)
+                if dropped is not None and not dropped.dead:
+                    await supersede_session(
+                        dropped, f"dropped from span-{len(live_ids)} follow-up "
+                                 f"routed to {wanted[:8]}")
         session_msgs = [m for m, sid in parsed if sid == wanted]
         # Dead-but-still-present ids (matched a session that has been reaped
         # since the GUI started assembling this batch) are treated like lost
@@ -1028,6 +1096,12 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
     resolved = 0
     for m in tool_msgs:
         call = session.pending.pop(m["tool_call_id"], None)
+        # Always record the id as resolved: whether we just consumed it or it
+        # was already popped on a prior delivery, the call is no longer
+        # parked in this session. Without this, a retry of an already-delivered
+        # batch looks identical to a lost session and triggers a rebuild
+        # (issue #13, defect 1).
+        session.mark_resolved(m["tool_call_id"])
         if call is None:
             continue          # already resolved, or a stale id -- tolerate rather than fail
         if call.future.done():
@@ -1038,17 +1112,38 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
         })
         resolved += 1
     if resolved == 0:
-        # Nothing parked in this live session matched. Could be the GUI
-        # replaying an already-delivered result, ids from a parallel batch we
-        # already finished, or just garbled input. Rebuilding from the request
-        # is at most one wasted turn of narration and keeps the caller
-        # moving instead of throwing a 400 they cannot recover from.
+        delivered_ids = [m["tool_call_id"] for m in tool_msgs]
+        # Defect 1: every delivered id is already resolved and the session is
+        # still parked, so this is a duplicate delivery of a batch we already
+        # turned into a tool_calls response. Return the cached response rather
+        # than rebuilding -- the caller is retrying because the original
+        # response never arrived, not asking for a new turn. (We only return
+        # the cached response while the session is parked: once the CLI has
+        # continued, last_response is from a stale turn and the right answer
+        # is whatever the new turn produces.)
+        if (session.last_response is not None
+                and session.awaiting_followup
+                and all(cid in session.resolved_recently for cid in delivered_ids)):
+            log.info(
+                "live mcp_bridge session %s received a duplicate delivery of "
+                "%d already-resolved tool_call_id(s); returning the cached "
+                "tool_calls response rather than rebuilding",
+                session.id, len(delivered_ids))
+            return session.last_response
+        # Could be a lost session, ids from a parallel batch we already
+        # finished mid-turn, or just garbled input. Rebuilding from the
+        # request keeps the caller moving instead of throwing a 400 they
+        # cannot recover from -- but the superseded session must be torn down
+        # first, otherwise the rebuild leaves two live sessions on one tool
+        # loop (issue #13, defect 2).
         log.warning(
             "live mcp_bridge session %s had no parked tool call matching the "
-            "delivered ids; rebuilding from the request so the caller is not "
-            "trapped", wanted)
+            "delivered ids; superseding it and rebuilding from the request "
+            "so the caller is not trapped", session.id)
+        await supersede_session(
+            session, "no parked call matched delivered ids (rebuilding)")
         return await resume_gone_session(
-            body, body.get("tools") or [], wanted, request,
+            body, body.get("tools") or [], session.id, request,
             why="no parked call matched delivered ids")
 
     # The results are in; the model is about to run again, so take a slot back.
@@ -1057,6 +1152,10 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
     await session.new_turn()
     result = await await_turn(session, request)
     response = render_turn(session, result, body.get("model"))
+    # Cache the rendered response so a later duplicate delivery of THIS
+    # batch's tool_call_ids can be answered with the same tool_calls response
+    # -- without this, every retry looks like a lost session and rebuilds.
+    session.last_response = response
     if result["type"] != "tool_calls":
         await end_session(session)
     else:
