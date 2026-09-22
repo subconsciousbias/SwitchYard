@@ -216,17 +216,143 @@ def test_resolve_probe_beats_host():
 
 
 def test_resolve_host_fallback_only_platform_never_cwd():
-    """Host fallback is platform ONLY. A caller-supplied cwd is never
-    taken from the host -- the docker host's working directory has no
-    reliable relationship to the caller's."""
+    """Host fallback is platform ONLY. The docker host's working directory
+    has no reliable relationship to the caller's, so the fallback NEVER
+    carries a cwd or a shell -- only the platform itself. (The `host_hint`
+    parameter this test replaced was dead code; the cwd-suppression
+    property is enforced by the fallback branch hard-coding cwd=None,
+    not by anything threading the host through.)"""
     cfg = _StubCfg(fallback_platform="macos")
-    host_hint = caller_env.CallerEnvironment(cwd="/docker/build/dir",
-                                              platform="macos", source="host")
-    env = caller_env.resolve({}, cfg, host_hint=host_hint)
+    env = caller_env.resolve({}, cfg)
     assert env.source == "host"
     assert env.platform == "macos"
     assert env.cwd is None, env.cwd
-    print(f"  host fallback: platform only, cwd always None -> {env}")
+    assert env.shell is None, env.shell
+    print(f"  host fallback: platform only, cwd+shell always None -> {env}")
+
+
+def test_resolve_drops_relay_looking_fallback_platform():
+    """A `fallback_platform` that itself names the relay container cannot
+    be honored -- otherwise a Linux /app host-side misconfiguration would
+    silently become the caller's environment, the exact bug the change
+    exists to prevent. The relay-path guard `_is_relay_path` catches
+    `/app/mcp_bridge`, `/app/cli_bridge`, `/tmp/mcpb-*` and similar.
+    Without a valid fallback_platform AND without a request body env,
+    resolution falls through to `unknown`."""
+    cfg = _StubCfg(fallback_platform="/app/mcp_bridge")    # relay path
+    env = caller_env.resolve({}, cfg)
+    assert env.source == "unknown"
+    assert env.platform is None
+    assert env.cwd is None
+    print(f"  relay-path fallback_platform rejected -> {env}")
+
+
+def test_resolve_required_raises_when_unresolvable():
+    """`probe: required` must RAISE CallerEnvironmentRequired instead of
+    falling through to `unknown`. The operator opted in to loud refusal;
+    returning `unknown` would defeat the whole point of the option.
+
+    The bridges translate the exception to an HTTPException. The text
+    path downgrades `required` to `auto` BEFORE calling resolve, so
+    this exception only fires on the mcp path -- but the resolver's
+    contract is the same regardless of caller."""
+    cfg = _StubCfg(probe="required")
+    try:
+        caller_env.resolve({}, cfg)
+    except caller_env.CallerEnvironmentRequired as exc:
+        # The message names the operator's chosen behaviour and tells
+        # them how to unblock: forced values, passive env, or auto mode.
+        assert "probe=required" in str(exc), exc
+        assert "refuse" in str(exc), exc
+        print(f"  probe=required + unresolvable -> raised: {str(exc)[:60]}...")
+        return
+    raise AssertionError("probe=required must raise, not return unknown")
+
+
+def test_resolve_required_does_not_raise_when_forced_config_present():
+    """`probe: required` is about LOUDNESS when unresolvable; it does not
+    change the precedence chain. A forced config value (the very thing
+    required-mode is asking for) still wins and returns source=config
+    without raising."""
+    cfg = _StubCfg(probe="required", platform="windows", cwd=r"C:\x",
+                   shell="powershell")
+    env = caller_env.resolve({}, cfg)
+    assert env.source == "config"
+    assert env.platform == "windows"
+    assert env.cwd == r"C:\x"
+    assert env.shell == "powershell"
+    print(f"  probe=required + forced config -> no raise, source=config")
+
+
+def test_resolve_required_does_not_raise_when_request_has_env():
+    """`probe: required` + a request that already carries its env (a
+    passive OpenCode-style block, say) is fully resolved. Required-mode
+    only refuses when NOTHING yields an env."""
+    cfg = _StubCfg(probe="required")
+    request_data = {"messages": [
+        {"role": "system", "content": (
+            "<environment>\n"
+            "  <working_directory>/u/alice/proj</working_directory>\n"
+            "  <platform>linux</platform>\n"
+            "</environment>"
+        )},
+    ]}
+    env = caller_env.resolve(request_data, cfg)
+    assert env.source == "request"
+    assert env.platform == "linux"
+    assert env.cwd == "/u/alice/proj"
+    print(f"  probe=required + passive env -> no raise, source=request")
+
+
+def test_from_wire_metadata_rejects_config_claim():
+    """The wire is caller-controlled; only the operator's plans.yaml
+    may produce `source=config`. A metadata stamp claiming `config` is
+    re-labeled to `request` so the precedence chain is honest: the
+    values still flow through, but at the request tier, not the config
+    tier. Without this, a caller who reached the sidecar directly
+    could bypass the precedence chain by stamping `source=config`
+    on a fake Linux /app env -- the relay-env-as-caller-env bug
+    the whole change exists to prevent."""
+    rejected = caller_env.from_wire_metadata({
+        "platform": "linux", "cwd": "/app/mcp_bridge", "shell": "/bin/sh",
+        "source": "config"})
+    assert rejected is not None
+    assert rejected.source == "request"   # re-labeled, never honored as-is
+    # The values still flow through (we are not losing data, just
+    # preventing the precedence bypass).
+    assert rejected.platform == "linux"
+    assert rejected.cwd == "/app/mcp_bridge"
+    assert rejected.shell == "/bin/sh"
+    print(f"  metadata claims source=config -> re-labeled to {rejected.source}")
+
+
+def test_from_wire_metadata_passes_through_non_config_sources():
+    """Non-`config` claims (`request`, `probe`, `host`) flow through as-is.
+    The re-labeling is targeted, not blanket."""
+    passthrough = caller_env.from_wire_metadata({
+        "platform": "windows", "cwd": r"C:\Users\x", "shell": "powershell",
+        "source": "request"})
+    assert passthrough is not None
+    assert passthrough.source == "request"
+    assert passthrough.platform == "windows"
+    print(f"  metadata source=request -> honored as {passthrough.source}")
+
+
+def test_from_wire_metadata_rejects_malformed_input():
+    """Non-dicts, empty dicts, and dicts with no usable fields all return
+    None -- the caller falls back to passive parse."""
+    assert caller_env.from_wire_metadata(None) is None
+    assert caller_env.from_wire_metadata("not a dict") is None
+    assert caller_env.from_wire_metadata([]) is None
+    assert caller_env.from_wire_metadata({}) is None
+    assert caller_env.from_wire_metadata({"source": "request"}) is None
+    # A dict with both an unknown label AND a real field still parses:
+    # the field drives presence, the unknown label becomes source=unknown.
+    parsed = caller_env.from_wire_metadata(
+        {"source": "made_up", "platform": "linux"})
+    assert parsed is not None and parsed.source == "unknown" \
+        and parsed.platform == "linux", parsed
+    print("  malformed/empty metadata -> None; real fields drive presence")
 
 
 def test_resolve_unknown_when_nothing_yields():

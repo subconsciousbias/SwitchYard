@@ -423,6 +423,18 @@ RESOLVED_PROBES: dict[str, Any] = {}
 FAILED_PROBES: dict[str, str] = {}
 PROBE_CACHE_LIMIT = int(os.environ.get("MCP_PROBE_CACHE_LIMIT", "512"))
 
+# Sentinel published into RESOLVED_PROBES the moment we mint a probe,
+# before releasing PROBE_LOCK. A concurrent same-fingerprint caller
+# arriving after the lock is released sees fp in RESOLVED_PROBES and
+# skips the probe path entirely, so we mint exactly one probe per
+# fingerprint even under asyncio.gather. The sentinel is overwritten
+# with the real CallerEnvironment when the probe result comes back
+# through `_consume_probe_results`. Without the lock, two concurrent
+# requests both pass the `fp in {FAILED,RESOLVED}_PROBES` checks and
+# both mint duplicate probes for the same session.
+_PROBE_PENDING = object()
+PROBE_LOCK = asyncio.Lock()
+
 
 def remember_probe_env(fp: str, env: Any) -> None:
     RESOLVED_PROBES[fp] = env
@@ -481,17 +493,13 @@ def _resolve_env(body: dict, *, known: Any = None) -> Any:
     if _caller_env is None:
         return None
     meta = (((body or {}).get("metadata") or {}).get("switchyard") or {}).get("caller_env")
-    if isinstance(meta, dict) and meta.get("source") in ("config", "request", "host", "probe"):
-        try:
-            return _caller_env.CallerEnvironment(
-                cwd=meta.get("cwd"),
-                platform=meta.get("platform"),
-                shell=meta.get("shell"),
-                source=meta["source"] if meta.get("source") in
-                       ("config", "request", "probe", "host", "unknown") else "unknown",
-            )
-        except Exception:
-            pass
+    # NEVER trust a wire-stamped `source=config`: the only path that
+    # produces source=config is the operator's plans.yaml settings.
+    # Values still flow through at the request tier. See
+    # switchyard/caller_env.py:from_wire_metadata.
+    parsed = _caller_env.from_wire_metadata(meta)
+    if parsed is not None:
+        return parsed
     return _caller_env.parse_request(body)
 
 
@@ -569,52 +577,76 @@ def _has_synthetic_probe(messages: list[dict]) -> bool:
     return False
 
 
-def _maybe_probe(body: dict, tools: list[dict]) -> dict | None:
+def _maybe_probe(body: dict, tools: list[dict]) -> "asyncio.Future | None":
     """If the env is still unknown AND a probe is allowed AND we have a
     recognisable command tool, mint a synthetic tool_calls response.
 
-    Returns the rendered chat.completion dict on a hit, None otherwise.
+    Returns a Future that resolves to the rendered chat.completion dict
+    on a hit, None otherwise. The caller `await`s it. The coroutine
+    shape is required for the lock: the check-and-mint pair is held
+    under PROBE_LOCK so two concurrent same-fingerprint requests
+    cannot both mint duplicate probes (issue #66 review).
+
     Does NOT take a gate slot or a session slot: the probe is a tiny
     JSON response that travels back to the caller, who executes it
     locally and answers on the next request. The next request is what
     builds a real session.
     """
-    if _caller_env is None:
-        return None
-    cfg = cli_bridge.config()
-    ce_settings = getattr(cfg, "caller_environment", None)
-    if ce_settings is None:
-        return None
-    if getattr(ce_settings, "probe", "auto") == "disabled":
-        return None
-    messages = body.get("messages") or []
-    env = _resolve_env(body)
-    if env is not None and env.source != "unknown":
-        return None
-    fp = _caller_env.fingerprint(messages)
-    if fp in FAILED_PROBES:
-        return None
-    if fp in RESOLVED_PROBES:
-        # Cache hit but the env was set on the request -- nothing to do.
-        return None
-    tool = _caller_env.find_command_tool(tools)
-    if tool is None:
-        return None
-    name, arg_key = tool
-    call_id = _caller_env.mint_probe_call_id(fp)
-    message = {"role": "assistant", "content": None, "tool_calls": [
-        {"id": call_id, "type": "function",
-         "function": {"name": name,
-                      "arguments": json.dumps({arg_key: _caller_env.PROBE_COMMAND})}}
-    ]}
-    return {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": body.get("model") or "",
-        "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
+    async def _run() -> dict | None:
+        if _caller_env is None:
+            return None
+        cfg = cli_bridge.config()
+        ce_settings = getattr(cfg, "caller_environment", None)
+        if ce_settings is None:
+            return None
+        if getattr(ce_settings, "probe", "auto") == "disabled":
+            return None
+        messages = body.get("messages") or []
+        env = _resolve_env(body)
+        if env is not None and env.source != "unknown":
+            return None
+        fp = _caller_env.fingerprint(messages)
+        # Atomic check+mint. Without the lock, two concurrent
+        # same-fingerprint callers both pass the `fp not in caches`
+        # checks below and both mint duplicate probes; the second
+        # is silently dropped at consume-time but still consumed a
+        # slot on the way out and polluted the caller's history.
+        # With the lock, the first caller publishes a PENDING
+        # sentinel into RESOLVED_PROBES before releasing; the
+        # second caller sees fp already-taken and returns None.
+        async with PROBE_LOCK:
+            if fp in FAILED_PROBES:
+                return None
+            if fp in RESOLVED_PROBES:
+                # Cache hit but the env was set on the request --
+                # nothing to do.
+                return None
+            tool = _caller_env.find_command_tool(tools)
+            if tool is None:
+                return None
+            name, arg_key = tool
+            call_id = _caller_env.mint_probe_call_id(fp)
+            # Publish PENDING so a concurrent caller arriving after
+            # we release the lock sees fp as already-taken. The real
+            # env overwrites this when _consume_probe_results runs.
+            remember_probe_env(fp, _PROBE_PENDING)
+        # Build the response OUTSIDE the lock: nothing in it touches
+        # shared state, and no other caller is blocked behind us.
+        message = {"role": "assistant", "content": None, "tool_calls": [
+            {"id": call_id, "type": "function",
+             "function": {"name": name,
+                          "arguments": json.dumps({arg_key: _caller_env.PROBE_COMMAND})}}
+        ]}
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": body.get("model") or "",
+            "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    return asyncio.ensure_future(_run())
 
 
 def translate_tool(openai_tool: dict) -> dict | None:
@@ -1233,12 +1265,28 @@ async def handle_fresh(body: dict, tools: list[dict],
         # and the request body is the primary source.
         env = _resolve_env(body)
         if env is None or env.source == "unknown":
-            # host_hint = the docker host's platform only -- cwd is never
-            # inherited from the host. Falls through to CallerEnvironment.unknown()
-            # when host_hint is also unset or disabled by config.
-            host_hint = None
-            env = _caller_env.resolve(body, _caller_env_settings(),
-                                       host_hint=host_hint) if _caller_env else None
+            try:
+                env = _caller_env.resolve(body, _caller_env_settings()) \
+                    if _caller_env else None
+            except _caller_env.CallerEnvironmentRequired as exc:
+                # The operator set probe=required and we cannot resolve
+                # the env. Refuse the request instead of rendering
+                # "Caller platform: unknown" -- the whole point of the
+                # option is loud refusal. 503 matches the file's existing
+                # capacity / resume-gone conventions, with a Retry-After
+                # so a caller whose CLI just gained permission can retry.
+                log.warning("probe=required but env unresolvable; refusing "
+                            "request: %s", exc)
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": {
+                        "type": "caller_environment_required",
+                        "message": (str(exc)
+                            + " Configure caller_environment.platform/cwd/shell "
+                              "in plans.yaml, supply a passive environment in the "
+                              "request body, or set probe=auto to fall back to "
+                              "the unknown-env wording.")}},
+                    headers={"Retry-After": "5"})
         if env is None:
             env = _caller_env.CallerEnvironment.unknown() if _caller_env else None
 
@@ -1454,7 +1502,24 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
         # argv. Pass `first_turn=True`: a rebuild is a new first turn.
         env = _resolve_env(body)
         if env is None or env.source == "unknown":
-            env = _caller_env.resolve(body, _caller_env_settings()) if _caller_env else None
+            try:
+                env = _caller_env.resolve(body, _caller_env_settings()) \
+                    if _caller_env else None
+            except _caller_env.CallerEnvironmentRequired as exc:
+                # Same refusal semantics as handle_fresh: probe=required +
+                # unresolvable env = 503, not "unknown" wording.
+                log.warning("probe=required but env unresolvable on rebuild; "
+                            "refusing request: %s", exc)
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": {
+                        "type": "caller_environment_required",
+                        "message": (str(exc)
+                            + " Configure caller_environment.platform/cwd/shell "
+                              "in plans.yaml, supply a passive environment in the "
+                              "request body, or set probe=auto to fall back to "
+                              "the unknown-env wording.")}},
+                    headers={"Retry-After": "5"})
         if env is None:
             env = _caller_env.CallerEnvironment.unknown() if _caller_env else None
 
@@ -1670,9 +1735,11 @@ async def handle_tool_request(body: dict, tools: list[dict],
     # response is a one-shot synthetic tool_calls that travels back to
     # the caller immediately; no slot is held while waiting for the
     # caller to execute the command and answer.
-    probe_response = _maybe_probe(body, tools)
-    if probe_response is not None:
-        return probe_response
+    probe_future = _maybe_probe(body, tools)
+    if probe_future is not None:
+        probe_response = await probe_future
+        if probe_response is not None:
+            return probe_response
     return await handle_fresh(body, tools, request)
 
 

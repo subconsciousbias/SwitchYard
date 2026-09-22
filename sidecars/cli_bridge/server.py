@@ -1561,6 +1561,15 @@ async def _handle_chat(body: dict):
         # whatever is in the request itself (stamped metadata or passive
         # parse), and the configured fallback_platform -- which is platform
         # only, NEVER a cwd.
+        #
+        # NOTE on `probe: required`: the text path cannot probe (no tool
+        # round-trip), so a `required` config here would refuse every
+        # request that does not already carry a passive environment. That
+        # is not the right default for a permissive caller -- the operator
+        # who set `required` wants loud refusal only on the mcp path,
+        # where probing is possible. The text path treats `required` as
+        # `auto`: render "unknown" wording if passive parse fails, never
+        # 503. The mcp_bridge (which can probe) honours the full contract.
         if _caller_env is not None:
             ce_cfg = config().caller_environment
             if ce_cfg is None:
@@ -1569,36 +1578,45 @@ async def _handle_chat(body: dict):
                     ce_cfg = CallerEnvironmentSettings()
                 except Exception:
                     ce_cfg = None
+            # Downgrade `required` -> `auto` for the text path only. Done
+            # via a tiny shim rather than mutating the dataclass so the
+            # other consumer (mcp_bridge) still sees the operator's value.
+            resolve_cfg = ce_cfg
+            if ce_cfg is not None and getattr(ce_cfg, "probe", "auto") == "required":
+                from dataclasses import replace
+                resolve_cfg = replace(ce_cfg, probe="auto")
             meta = (((body or {}).get("metadata") or {}).get("switchyard") or {}).get("caller_env")
-            env = None
-            if isinstance(meta, dict) and meta.get("source") in ("config", "request", "host"):
+            # NEVER trust a wire-stamped `source=config`: the only path
+            # that produces source=config is the operator's plans.yaml
+            # settings. See switchyard/caller_env.py:from_wire_metadata.
+            env = _caller_env.from_wire_metadata(meta)
+            if env is None and resolve_cfg is not None:
                 try:
-                    env = _caller_env.CallerEnvironment(
-                        cwd=meta.get("cwd"), platform=meta.get("platform"),
-                        shell=meta.get("shell"),
-                        source=meta["source"] if meta.get("source") in
-                               ("config", "request", "probe", "host", "unknown")
-                               else "unknown")
-                except Exception:
+                    env = _caller_env.resolve(body, resolve_cfg)
+                except _caller_env.CallerEnvironmentRequired:
+                    # Cannot happen on the text path -- resolve_cfg.probe
+                    # was just downgraded to `auto`. Kept as a defence
+                    # in depth: if a future refactor changes the
+                    # downgrade, the worst case here is still rendering
+                    # the "unknown" wording rather than a 503 on text.
                     env = None
-            if env is None and ce_cfg is not None:
-                env = _caller_env.resolve(body, ce_cfg)
-            if env is not None:
-                env_block = _caller_env.render_system_block(env)
-                # Append to the system string BEFORE profile flags so SYSTEM_MODE=replace
-                # semantics are untouched: the block rides inside the caller's system
-                # content, not on top of it. See fold_system and the profile's
-                # system_args_replace in build_argv for why replace mode is the
-                # only way this can fail loudly, not silently.
-                system = (f"{system}\n\n{env_block}" if system else env_block)
-                # Reminder on the first user turn, claude profile only -- the
-                # other profiles have no system-block + first-turn-mismatch
-                # failure mode (their CLI's own Environment block lands at the
-                # end of the prompt, not in the middle of a `# Environment`
-                # trailer). Same first-turn rule as the mcp_bridge rebuild.
-                if PROVIDER == "claude":
-                    reminder = _caller_env.render_first_turn_reminder(env)
-                    prompt = f"{reminder}\n\n{prompt}" if prompt else reminder
+            if env is None:
+                env = _caller_env.CallerEnvironment.unknown()
+            env_block = _caller_env.render_system_block(env)
+            # Append to the system string BEFORE profile flags so SYSTEM_MODE=replace
+            # semantics are untouched: the block rides inside the caller's system
+            # content, not on top of it. See fold_system and the profile's
+            # system_args_replace in build_argv for why replace mode is the
+            # only way this can fail loudly, not silently.
+            system = (f"{system}\n\n{env_block}" if system else env_block)
+            # Reminder on the first user turn, claude profile only --
+            # the other profiles have no system-block + first-turn-mismatch
+            # failure mode (their CLI's own Environment block lands at the
+            # end of the prompt, not in the middle of a `# Environment`
+            # trailer). Same first-turn rule as the mcp_bridge rebuild.
+            if PROVIDER == "claude":
+                reminder = _caller_env.render_first_turn_reminder(env)
+                prompt = f"{reminder}\n\n{prompt}" if prompt else reminder
 
         limit = config().concurrency
         if not await _gate.acquire(limit):

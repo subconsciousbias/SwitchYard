@@ -113,6 +113,62 @@ class CallerEnvironment:
         return cls(cwd=None, platform=None, shell=None, source="unknown")
 
 
+class CallerEnvironmentRequired(Exception):
+    """Raised by `resolve()` when `cfg.probe == "required"` and the env
+    could not be resolved.
+
+    The operator opted in to loud refusal -- the alternative, rendering
+    "Caller platform: unknown" into the inner CLI's system prompt, is
+    exactly the relay-env-as-caller-env bug the change exists to
+    prevent. The bridges translate this to an HTTPException (503 on
+    the mcp path; the text path downgrades `required` to `auto` before
+    calling resolve, since there is no probe possible there and
+    refusing every request that lacks a passive env would be the wrong
+    default for a permissive caller).
+    """
+
+
+def from_wire_metadata(meta: dict | None) -> CallerEnvironment | None:
+    """Parse a `metadata.switchyard.caller_env` stamped onto the wire.
+
+    The metadata field is caller-controlled. It MAY have been minted by
+    the gateway, which DID read the operator's plans.yaml -- but at this
+    layer we have no way to verify the stamp was minted by the gateway
+    versus by a caller that reached the sidecar directly. The safe
+    answer: NEVER honor a claimed `source=config` from the wire. The
+    ONLY path that produces `source=config` is the operator's plans.yaml
+    settings, resolved through `CallerEnvironmentSettings` -> `resolve()`.
+
+    Re-labeling claim-as-config -> request is strictly defensive:
+    values still flow through, but at the request tier of the
+    precedence chain, not the config tier. A caller who stamps
+    `source=config` to try to bypass the precedence chain gets the
+    request tier instead -- the relay-env-as-caller-env bug remains
+    fixed.
+
+    Returns None for malformed input or when no field carries data.
+    """
+    if not isinstance(meta, dict):
+        return None
+    cwd = meta.get("cwd")
+    platform = meta.get("platform")
+    shell = meta.get("shell")
+    if not (cwd or platform or shell):
+        return None
+    raw_source = meta.get("source")
+    # `config` is NEVER honored from the wire. Anything else with a
+    # sensible label falls through to that label; unknown labels (or
+    # absent ones) become `unknown` so the renderer can decide.
+    if raw_source == "config":
+        source = "request"       # re-labeled, never honored as-is
+    elif raw_source in ("request", "probe", "host"):
+        source = raw_source
+    else:
+        source = "unknown"
+    return CallerEnvironment(cwd=cwd, platform=platform, shell=shell,
+                             source=source)
+
+
 # ---------------------------------------------------------------------------
 # Passive parsers
 # ---------------------------------------------------------------------------
@@ -532,8 +588,7 @@ def render_first_turn_reminder(env: CallerEnvironment) -> str:
 # Resolution
 # ---------------------------------------------------------------------------
 def resolve(data: dict[str, Any], cfg: Any,
-            probe_result: CallerEnvironment | None = None,
-            host_hint: CallerEnvironment | None = None) -> CallerEnvironment:
+            probe_result: CallerEnvironment | None = None) -> CallerEnvironment:
     """Apply the precedence rules to produce one CallerEnvironment.
 
     `cfg` is a CallerEnvironmentSettings (or anything with the four
@@ -552,6 +607,14 @@ def resolve(data: dict[str, Any], cfg: Any,
 
     Host working directory is never used as caller cwd. Probe never
     overwrites a known value. Config beats all.
+
+    When `cfg.probe == "required"` and resolution falls through to (5),
+    raises CallerEnvironmentRequired instead of returning unknown --
+    the operator asked us to refuse unresolvable envs, so we do. The
+    bridges translate this to an HTTPException; the text path
+    downgrades "required" to "auto" before calling because it cannot
+    probe and refusing every request that lacks a passive env would
+    be the wrong default for a permissive caller.
     """
     def _set_source(env: CallerEnvironment | None, source: str) -> CallerEnvironment | None:
         if env is None:
@@ -578,5 +641,13 @@ def resolve(data: dict[str, Any], cfg: Any,
     if fb_platform and not _is_relay_path(fb_platform):
         return CallerEnvironment(cwd=None, platform=fb_platform,
                                  shell=None, source="host")
+
+    if getattr(cfg, "probe", "auto") == "required":
+        raise CallerEnvironmentRequired(
+            "caller_environment.probe=required but the caller's environment "
+            "could not be resolved: no forced override, no passive parse, "
+            "no probe result, and no fallback_platform. The sidecar will "
+            "refuse the request rather than render 'unknown' -- an operator "
+            "who set probe=required wants loud refusal, not silent fallback.")
 
     return CallerEnvironment.unknown()

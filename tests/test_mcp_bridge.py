@@ -2068,6 +2068,241 @@ def test_run_session_subprocess_cwd_is_session_workdir():
         _shutil.rmtree(workdir, ignore_errors=True)
 
 
+# ---------------------------------------- PR #66 review fixes ----------------
+def _set_caller_environment_probe(probe: str):
+    """Replace cli_bridge._config with one whose caller_environment.probe
+    is `probe`. The probe mode determines how the mcp_bridge handles
+    unresolvable envs (auto=fallback unknown, required=503, disabled=skip
+    probe entirely). Returns a restore callable."""
+    from dataclasses import replace as _replace
+    saved = server.cli_bridge._config
+    ce = server.cli_bridge.config().caller_environment
+    new_ce = _replace(ce, probe=probe) if ce is not None else None
+    server.cli_bridge._config = _replace(saved, caller_environment=new_ce)
+    def restore():
+        server.cli_bridge._config = saved
+    return restore
+
+
+def test_probe_required_unresolvable_returns_503_no_unknown_wording():
+    """PR #66 blocker: probe=required + an unresolvable env must refuse
+    the request with a clear HTTP 503 (type=caller_environment_required),
+    NOT silently fall through to the unknown-env wording. The 503 is
+    what the operator opted in to; the unknown-env rendering is the bug
+    the option exists to prevent.
+
+    The scenario: a caller has tools (so a probe is minted), but refuses
+    the probe on the second turn (is_error=true). The second turn has no
+    passive env in the request body and the probe was refused -- the env
+    cannot be resolved. With probe=required, handle_fresh must raise the
+    503 instead of falling through to `unknown`."""
+    from fastapi import HTTPException
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    restore_cfg = _set_caller_environment_probe("required")
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        messages = [
+            {"role": "system", "content": "no env"},
+            {"role": "user", "content": "What OS am I on?"},
+        ]
+        # 1. First request: env unknown, probe minted.
+        first = asyncio.run(server.handle_tool_request(
+            {"model": "m", "tools": tools, "messages": messages}, tools, None))
+        probe_id = first["choices"][0]["message"]["tool_calls"][0]["id"]
+
+        # 2. Second request: caller REFUSED the probe (is_error=true).
+        # With probe=required, the env is now unresolvable and the
+        # sidecar MUST refuse -- not silently fall through to the
+        # unknown-env wording.
+        refusal = messages + [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": probe_id, "type": "function",
+                 "function": {"name": "Bash",
+                              "arguments": json.dumps({"command": "pwd"})}}]},
+            {"role": "tool", "tool_call_id": probe_id, "is_error": True,
+             "content": "permission denied"},
+            {"role": "user", "content": "ok thanks anyway"},
+        ]
+        try:
+            response = asyncio.run(server.handle_tool_request(
+                {"model": "m", "tools": tools, "messages": refusal},
+                tools, None))
+        except HTTPException as exc:
+            assert exc.status_code == 503, \
+                f"probe=required must 503, got {exc.status_code}: {exc.detail}"
+            assert isinstance(exc.detail, dict), exc.detail
+            assert exc.detail.get("error", {}).get("type") == \
+                "caller_environment_required", exc.detail
+            # Retry-After matches the file's existing capacity/resume-gone
+            # conventions. fastapi preserves the header name case verbatim.
+            assert exc.headers and exc.headers.get("Retry-After") == "5", exc.headers
+            print(f"  probe=required + refused probe -> HTTP 503 "
+                  f"type=caller_environment_required, Retry-After: 5")
+            return
+        raise AssertionError(
+            f"probe=required must raise 503, but handle_tool_request returned "
+            f"{response!r} (silent fallback to unknown is the regression)")
+    finally:
+        restore_cfg()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_metadata_source_config_is_relabeled_to_request():
+    """PR #66 should-fix: a metadata stamp claiming source=config must
+    be re-labeled to source=request. The values still flow through (we
+    do not want to lose data), but at the request tier of the
+    precedence chain, not the config tier. The invariant: the ONLY
+    path that produces source=config is the operator's plans.yaml
+    settings; anything arriving over the wire cannot.
+
+    A caller that stamps `source=config` to bypass the precedence chain
+    -- say, to force the sidecar to honor a fake Linux /app env as the
+    caller's environment, exactly the bug #44 is meant to prevent --
+    gets the request tier instead. The relay-env-as-caller-env
+    invariant stays intact."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        body = {"model": "m", "tools": tools,
+                "metadata": {"switchyard": {"caller_env": {
+                    # The classic bug attempt: claim config-tier so
+                    # the precedence chain skips the passive parse
+                    # AND uses these values as operator-forced.
+                    "platform": "linux", "cwd": "/app/mcp_bridge",
+                    "shell": "/bin/sh", "source": "config"}}},
+                "messages": [
+                    {"role": "system", "content": (
+                        "<environment>\n"
+                        "  <working_directory>C:\\Users\\demo</working_directory>\n"
+                        "  <platform>windows</platform>\n"
+                        "</environment>"
+                    )},
+                    {"role": "user", "content": "hi"},
+                ]}
+        response = asyncio.run(server.handle_tool_request(body, tools, None))
+        # The CLI sees the env block; the values are honored (we don't
+        # drop data) but at the REQUEST tier, not the config tier.
+        seen = captured[-1]
+        env = seen["env"]
+        assert env.source == "request", \
+            f"metadata-stamped source=config must be re-labeled to request, " \
+            f"got {env.source!r}"
+        assert env.platform == "linux"
+        assert env.cwd == "/app/mcp_bridge"
+        # The metadata-stamped values WON, not the passive parse's
+        # windows values, because metadata is consulted first and both
+        # are at the request tier. Either is consistent with the
+        # invariant; the point is the source label.
+        print(f"  metadata claims source=config -> re-labeled to "
+              f"{env.source!r}, values still flow through")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_concurrent_same_fingerprint_mints_only_one_probe():
+    """PR #66 should-fix: _maybe_probe's check+mint pair is atomic under
+    asyncio.gather. Without the lock, two (or three) concurrent calls
+    with the same fingerprint would all pass the `fp not in caches`
+    check and all mint duplicate probes -- one would carry through and
+    the others would be silently dropped at consume-time, polluting
+    the caller's history with extra synthetic tool_calls and wasting
+    work. With PROBE_LOCK + the _PROBE_PENDING sentinel published
+    before releasing the lock, exactly one mints and the others see
+    fp already-taken and fall through to handle_fresh.
+
+    Stubbed start_session so the handle_fresh path does not actually
+    spawn a CLI; the test asserts the count distribution: 1 probe
+    response + (N-1) stubbed sessions."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        body = {"model": "m", "tools": tools, "messages": [
+            {"role": "system", "content": "no env"},
+            {"role": "user", "content": "What OS am I on?"},
+        ]}
+
+        async def scenario():
+            return await asyncio.gather(
+                server.handle_tool_request(dict(body), tools, None),
+                server.handle_tool_request(dict(body), tools, None),
+                server.handle_tool_request(dict(body), tools, None),
+            )
+
+        responses = asyncio.run(scenario())
+        # Exactly one probe response was emitted.
+        probes = [r for r in responses
+                  if "choices" in r
+                  and r["choices"][0].get("finish_reason") == "tool_calls"
+                  and any((tc.get("id") or "").startswith(
+                          caller_env_module.PROBE_PREFIX)
+                          for tc in (r["choices"][0]["message"]
+                                      .get("tool_calls") or []))]
+        assert len(probes) == 1, \
+            f"asyncio.gather(3x same-fingerprint) must mint exactly 1 probe, " \
+            f"got {len(probes)} (duplicate probes is the regression)"
+        # The other two went through start_session (stubbed).
+        stubbed = [r for r in responses if r == {"stubbed": True}]
+        assert len(stubbed) == 2, \
+            f"expected 2 stubbed sessions, got {len(stubbed)}"
+        # The PENDING sentinel is in RESOLVED_PROBES; only the probe
+        # result can overwrite it with a real env (or FAILED_PROBES).
+        assert len(server.RESOLVED_PROBES) == 1, dict(server.RESOLVED_PROBES)
+        assert next(iter(server.RESOLVED_PROBES.values())) is \
+            server._PROBE_PENDING, dict(server.RESOLVED_PROBES)
+        print(f"  asyncio.gather(3x same-fingerprint) -> 1 probe + 2 stubbed; "
+              f"PENDING sentinel in RESOLVED_PROBES")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
 # Module-level alias for tests that want the probe prefix string.
 caller_env_module = sys.modules.get("switchyard.caller_env")
 if caller_env_module is None:
