@@ -158,12 +158,22 @@ MCP_PROFILES: dict[str, dict] = {
         # refused outright when running as root (every sidecar container
         # does), and an explicit allowlist is tighter anyway. Verified against
         # a real round-trip -- see TESTING.md for the transcript.
+        #
+        # --disallowed-tools is NOT in the template: Claude Code concatenates
+        # flag values across repeated flags rather than overriding the first,
+        # so a Read-allowing image request would still be denied Read. The list
+        # is built per request by build_argv (Read dropped when images are
+        # present, exactly like cli_bridge's bare_args_images pattern).
         "argv": ["-p", "{prompt}", "--model", "{model}",
                  "--mcp-config", "{mcp_config}",
                  "--allowed-tools", "{allowed_tools}",
-                 "--disallowed-tools",
-                 "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit",
                  "--output-format", "json"],
+        # Shared with build_argv when it has to emit --disallowed-tools. Read
+        # is removed in the image variant; everything else is the same.
+        "disallowed_tools_default":
+            "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit",
+        "disallowed_tools_images":
+            "Bash,Edit,Write,Glob,Grep,WebFetch,WebSearch,NotebookEdit",
         # Claude Code names an MCP server's tools mcp__<server>__<tool>; the
         # server name here (`switchyard`) must match the key used in
         # write_claude_mcp_config below.
@@ -410,6 +420,57 @@ def stringify_tool_content(content) -> str:
     return str(content) if content is not None else ""
 
 
+def openai_tool_content_to_mcp(content) -> tuple[list[dict], bool]:
+    """OpenAI tool message content -> MCP tool result content blocks.
+
+    Three shapes arrive here: a plain string (kept as one text block), an
+    Anthropic-style image block with `source.type == "base64"`, and an
+    OpenAI image_url block whose `url` is a `data:` URL. Anything we cannot
+    decode into bytes (a remote http(s) URL the sidecar has no way to fetch)
+    becomes a loud isError text block, never a silent drop — the caller's
+    model would otherwise happily hallucinate a reading of it.
+
+    Returns (content_blocks, is_error). The contract matches what
+    tool_server.py hands back to the CLI over stdio.
+    """
+    is_error = False
+    if isinstance(content, list):
+        blocks: list[dict] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "text":
+                blocks.append({"type": "text", "text": str(part.get("text") or "")})
+            elif ptype == "image":
+                # Anthropic-style: source.base64 / source.media_type.
+                src = part.get("source") if isinstance(part.get("source"), dict) else {}
+                if src.get("type") == "base64" and src.get("data"):
+                    blocks.append({"type": "image",
+                                    "mimeType": src.get("media_type") or "image/png",
+                                    "data": src["data"]})
+                else:
+                    log.warning("tool result image could not be passed through "
+                                "(no base64 source); surfacing as isError")
+                    is_error = True
+            elif ptype == "image_url":
+                url = (part.get("image_url") or {}).get("url") \
+                    if isinstance(part.get("image_url"), dict) else None
+                media, _b = cli_bridge._decode_data_url(url or "") or (None, None)
+                if media and url and url.startswith("data:") and "," in url:
+                    blocks.append({"type": "image", "mimeType": media,
+                                    "data": url.split(",", 1)[1]})
+                else:
+                    log.warning("tool result image could not be passed through "
+                                "(remote URL or unrecognised shape); surfacing as isError")
+                    is_error = True
+        if not blocks:
+            blocks.append({"type": "text", "text": ""})
+        return blocks, is_error
+    text = str(content) if content is not None else ""
+    return [{"type": "text", "text": text}], False
+
+
 def cleanup_workdir(workdir: Path) -> None:
     shutil.rmtree(workdir, ignore_errors=True)
 
@@ -433,12 +494,20 @@ def write_claude_mcp_config(workdir: Path, session_id: str, tools_path: Path) ->
     return path
 
 
-def write_opencode_dir(workdir: Path, session_id: str, tools_path: Path) -> None:
+def write_opencode_dir(workdir: Path, session_id: str, tools_path: Path,
+                       images: bool = False) -> None:
     """`opencode run --dir <workdir>` reads project config from that
     directory. This adds one local MCP server and an agent that exposes
     only its tools -- the same pattern cli_bridge/harness/opencode.json uses
     to gate the built-in ones. Verified against a live run on OpenCode v1; the
-    keys are all renamed in v2 -- see MCP_PROFILES for the mapping."""
+    keys are all renamed in v2 -- see MCP_PROFILES for the mapping.
+
+    `images=True` re-enables the `read` tool: staged image files must be
+    readable for the model to see them (the alternative `-f` flag attaches
+    them to the prompt, but Read still needs to exist for the loop on a
+    rebuilt session). The MCP server's own tools are not affected either
+    way.
+    """
     cfg = {
         "mcp": {
             "switchyard": {
@@ -456,9 +525,12 @@ def write_opencode_dir(workdir: Path, session_id: str, tools_path: Path) -> None
         # cli_bridge/harness/opencode.json's `switchyard` agent -- confirmed
         # against a real config there, unlike a wildcard key, which is not a
         # documented part of this schema. The MCP server's own tools are not
-        # in this list, so they are not disabled by it.
+        # in this list, so they are not disabled by it. `read` is the one
+        # exception: a session that has to read its own staged images needs
+        # it back. That is opt-in via `images`, since most sessions are
+        # text-only and the Read tool would be unnecessary surface area.
         "agent": {"switchyard": {"tools": {
-            "bash": False, "edit": False, "write": False, "read": False,
+            "bash": False, "edit": False, "write": False, "read": bool(images),
             "grep": False, "glob": False, "list": False, "patch": False,
             "todowrite": False, "todoread": False, "webfetch": False,
             "websearch": False, "task": False, "multiedit": False,
@@ -469,14 +541,30 @@ def write_opencode_dir(workdir: Path, session_id: str, tools_path: Path) -> None
 
 def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
                 session_id: str, tools_path: Path,
-                allowed_tools: str) -> tuple[list[str], str | None]:
+                allowed_tools: str,
+                image_paths: list | None = None) -> tuple[list[str], str | None]:
     """Build the CLI argv, plus the prompt to feed it on stdin (or None).
 
     Returns a pair so an oversized prompt can travel on stdin instead of argv
     (see STDIN_PROMPT_LIMIT for why). The caller passes the second element
     straight into run_session.
+
+    `image_paths`, when present, are added per-profile: claude gets
+    `--add-dir` + an explicit Read allowlist; codex gets one `-i FILE` per
+    path; opencode gets one `-f FILE` per path. The text bridge's
+    build_argv does the same work for non-tool sessions, and the per-CLI
+    mechanism is the same one (see cli_bridge/server.py's build_argv for
+    why each profile wants it this way).
+
+    For the claude profile only, `--disallowed-tools` is also emitted here
+    (the MCP-tools `--allowed-tools` allowlist stays in the argv template
+    so every code path keeps the switchyard tool qualifiers). When images
+    are present, Read is dropped from the disallowed list -- otherwise the
+    model cannot Read its own staged image, the same bug cli_bridge's
+    bare_args_images variant already avoids.
     """
     instructions: Path | None = None
+    image_paths = image_paths or []
     if PROVIDER == "claude":
         mcp_config = write_claude_mcp_config(workdir, session_id, tools_path)
         effective_prompt = prompt
@@ -492,7 +580,8 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
             instructions = workdir / "instructions.md"
             instructions.write_text(system)
     else:
-        write_opencode_dir(workdir, session_id, tools_path)
+        write_opencode_dir(workdir, session_id, tools_path,
+                           images=bool(image_paths))
         mcp_config = None
         # No system-prompt mechanism in `opencode run` (see cli_bridge's
         # fold_system for the same fact on the text path) -- fold it into the
@@ -537,6 +626,28 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
             argv += ["--system-prompt", system]
     if instructions is not None:
         argv += ["-c", f"model_instructions_file={instructions}"]
+
+    # claude only: --disallowed-tools is conditional because the list omits
+    # Read when images are present. Appended at the end so the two-list
+    # question (template vs build_argv) is obvious in the code rather than
+    # split across two layers. Concatenation semantics means even an extra
+    # empty list would be safer than getting Read wrong here.
+    if PROVIDER == "claude":
+        key = "disallowed_tools_images" if image_paths else "disallowed_tools_default"
+        argv += ["--disallowed-tools", PROFILE[key]]
+
+    if image_paths:
+        if PROVIDER == "claude":
+            img_dir = Path(image_paths[0]).parent
+            argv += ["--add-dir", str(img_dir),
+                     "--allowed-tools", f"Read({img_dir}/**)"]
+        elif PROVIDER == "codex":
+            for path in image_paths:
+                argv += ["-i", str(path)]
+        else:   # opencode: `-f FILE(s)` attaches to the message
+            for path in image_paths:
+                argv += ["-f", str(path)]
+
     return argv, (effective_prompt if use_stdin else None)
 
 
@@ -863,32 +974,63 @@ async def handle_fresh(body: dict, tools: list[dict],
     if not mcp_tools:
         raise HTTPException(status_code=400, detail="no usable tool definitions")
 
-    prompt, system = cli_bridge.flatten(body.get("messages") or [])
-    if not prompt:
-        raise HTTPException(status_code=400, detail="no usable message content")
-    model, warning = cli_bridge.resolve_model(body.get("model"))
-    if warning:
-        log.warning("%s", warning)
+    messages = body.get("messages") or []
+    # Stage images BEFORE flatten so the markers `[image N: <path>]` survive
+    # into the prompt text. An unsupported image (a remote URL we cannot
+    # fetch) is an error here, not a silent drop -- the bug fix in #30.
+    try:
+        image_paths, img_dir = cli_bridge.stage_or_fail(messages)
+    except cli_bridge.ImageUnsupportedError as exc:
+        raise exc.http()
+    # Mirror cli_bridge's _handle_chat: the img_dir is owned here until
+    # start_session takes it. Any exception that escapes between now and
+    # then (e.g. an unexpected failure in flatten / resolve_model / the
+    # gate) leaks the dir without this finally -- start_session has its own
+    # cleanup, but it never gets the dir if we never reach it.
+    try:
+        prompt, system = cli_bridge.flatten(messages)
+        if image_paths:
+            prompt += cli_bridge.image_note(image_paths)
+        if not prompt:
+            raise HTTPException(status_code=400, detail="no usable message content")
+        model, warning = cli_bridge.resolve_model(body.get("model"))
+        if warning:
+            log.warning("%s", warning)
 
-    limit = cli_bridge.config().concurrency
-    if not await cli_bridge._gate.acquire(limit):
-        # Never queue, same contract as cli_bridge: SwitchYard needs "full"
-        # immediately so it can spill to the next plan in the lane. Only a
-        # follow-up waits, because it has nowhere else to go.
-        raise HTTPException(status_code=429, detail=f"sidecar at capacity ({limit})",
-                             headers={"Retry-After": "5"})
+        limit = cli_bridge.config().concurrency
+        if not await cli_bridge._gate.acquire(limit):
+            # Never queue, same contract as cli_bridge: SwitchYard needs "full"
+            # immediately so it can spill to the next plan in the lane. Only a
+            # follow-up waits, because it has nowhere else to go.
+            raise HTTPException(status_code=429, detail=f"sidecar at capacity ({limit})",
+                                 headers={"Retry-After": "5"})
 
-    return await start_session(body, mcp_tools, prompt, system, model, request)
+        return await start_session(body, mcp_tools, prompt, system, model, request,
+                                   image_paths, img_dir)
+    except Exception:
+        if img_dir is not None:
+            shutil.rmtree(img_dir, ignore_errors=True)
+        raise
 
 
 async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
                         system: str | None, model: str,
-                        request: "Request | None") -> dict:
+                        request: "Request | None",
+                        image_paths: list | None = None,
+                        img_dir: Path | None = None) -> dict:
     """Spawn a CLI session and run one turn. The gate slot is already held.
 
     Shared by a fresh request and a resumption, so the two cannot drift: the
     only difference between them is how the prompt was built and how the slot
     was obtained.
+
+    `image_paths` are appended to the CLI's argv per profile (see build_argv);
+    they are the only thing build_argv needs. `img_dir`, when set, is the
+    caller's separate temp staging dir (cli_bridge.stage_or_fail always mints
+    one -- even on a fresh request, which has its own workdir): this function
+    owns its cleanup, since the workdir is unrelated. `workdir` is cleaned
+    separately by end_session (called above for the final case, park_session
+    for the parked case); on an exception it is cleaned below.
     """
     session_id = uuid.uuid4().hex
     workdir = Path(tempfile.mkdtemp(prefix=f"mcpb-{session_id[:8]}-"))
@@ -901,10 +1043,12 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
         tools_path.write_text(json.dumps(mcp_tools))
         allowed = ",".join(PROFILE["tool_qualifier"](t["name"]) for t in mcp_tools)
         argv, stdin_data = build_argv(prompt, system, model, workdir, session_id,
-                                      tools_path, allowed)
+                                      tools_path, allowed, image_paths)
     except Exception:
         await cli_bridge._gate.release()
         cleanup_workdir(workdir)
+        if img_dir is not None:
+            shutil.rmtree(img_dir, ignore_errors=True)
         raise
 
     SESSIONS[session_id] = session
@@ -922,6 +1066,10 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
         await end_session(session)
     else:
         await park_session(session)
+    if img_dir is not None:
+        # Clean up the staging dir we own. end_session above already cleaned
+        # the session workdir, which is a separate tree.
+        shutil.rmtree(img_dir, ignore_errors=True)
     return response
 
 
@@ -1010,24 +1158,45 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
     mcp_tools = translate_tools(tools)
     if not mcp_tools:
         raise HTTPException(status_code=400, detail="no usable tool definitions")
-    prompt, system = flatten_with_tool_history(body.get("messages") or [])
-    if not prompt:
-        raise HTTPException(status_code=400, detail="no usable message content")
-    model, warning = cli_bridge.resolve_model(body.get("model"))
-    if warning:
-        log.warning("%s", warning)
+    messages = body.get("messages") or []
+    # Stage images BEFORE flatten_with_tool_history, so the markers survive
+    # into the rendered narration and the rebuilt CLI can be told the paths.
+    # The new workdir does not exist yet (start_session creates it), so the
+    # staging dir is a separate temp dir the call owns and cleans up.
+    try:
+        image_paths, img_dir = cli_bridge.stage_or_fail(messages)
+    except cli_bridge.ImageUnsupportedError as exc:
+        raise exc.http()
+    # Same broadened cleanup as handle_fresh: anything that escapes between
+    # here and start_session (a gate acquire failure past RESUME_WAIT, an
+    # unexpected exception in flatten_with_tool_history) would otherwise
+    # leak the swimg-* dir.
+    try:
+        prompt, system = flatten_with_tool_history(messages)
+        if image_paths:
+            prompt += cli_bridge.image_note(image_paths)
+        if not prompt:
+            raise HTTPException(status_code=400, detail="no usable message content")
+        model, warning = cli_bridge.resolve_model(body.get("model"))
+        if warning:
+            log.warning("%s", warning)
 
-    limit = cli_bridge.config().concurrency
-    waited = time.time()
-    if not await acquire_resume_slot(limit, RESUME_WAIT):
-        raise HTTPException(
-            status_code=503,
-            detail=(f"no slot freed on this plan within {RESUME_WAIT:.0f}s to resume "
-                    f"the {why} session"),
-            headers={"Retry-After": "30"})
-    log.info("resuming %s session %s after waiting %.1fs for a slot",
-             why, session_id, time.time() - waited)
-    return await start_session(body, mcp_tools, prompt, system, model, request)
+        limit = cli_bridge.config().concurrency
+        waited = time.time()
+        if not await acquire_resume_slot(limit, RESUME_WAIT):
+            raise HTTPException(
+                status_code=503,
+                detail=(f"no slot freed on this plan within {RESUME_WAIT:.0f}s to resume "
+                        f"the {why} session"),
+                headers={"Retry-After": "30"})
+        log.info("resuming %s session %s after waiting %.1fs for a slot",
+                 why, session_id, time.time() - waited)
+        return await start_session(body, mcp_tools, prompt, system, model, request,
+                                    image_paths, img_dir)
+    except Exception:
+        if img_dir is not None:
+            shutil.rmtree(img_dir, ignore_errors=True)
+        raise
 
 
 async def handle_followup(body: dict, tool_msgs: list[dict],
@@ -1135,9 +1304,13 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
             continue          # already resolved, or a stale id -- tolerate rather than fail
         if call.future.done():
             continue
+        mcp_content, content_is_error = openai_tool_content_to_mcp(m.get("content"))
         call.future.set_result({
-            "content": [{"type": "text", "text": stringify_tool_content(m.get("content"))}],
-            "isError": bool(m.get("is_error")),
+            "content": mcp_content,
+            # isError is OR'd, not replaced: the caller's explicit flag still wins
+            # (e.g. "I already know this tool failed"), but we surface what we
+            # could not deliver ourselves too.
+            "isError": bool(m.get("is_error")) or content_is_error,
         })
         resolved += 1
     if resolved == 0:
@@ -1205,6 +1378,11 @@ async def handle_tool_request(body: dict, tools: list[dict],
 async def health() -> dict:
     cfg = cli_bridge.config()
     return {"ok": cfg.source == "config", "provider": PROVIDER, "supports_tools": True,
+            # All three MCP_PROFILES carry images via the same per-profile
+            # flags as cli_bridge (see build_argv / write_opencode_dir).
+            # Expressed as a set-membership check rather than a constant so
+            # adding a future provider here matches the cli_bridge side.
+            "supports_images": PROVIDER in ("claude", "opencode", "codex"),
             "config_source": cfg.source, "model": cfg.model, "models": sorted(cfg.models),
             "concurrency": cfg.concurrency, "in_flight": cli_bridge._gate.in_flight,
             "sessions": len(SESSIONS),

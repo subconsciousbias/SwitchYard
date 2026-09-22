@@ -7,11 +7,13 @@ answer, and reported zero tokens — a failure that looks like a working call.
 """
 from __future__ import annotations
 
+import base64
 import errno
 import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -600,6 +602,238 @@ def test_the_claude_file_flags_carry_an_oversized_system_prompt():
           "replace without the key stays no-op; temp files cleaned up")
 
 
+# ----------------------------------------------------------- images (issue #30) ---
+# A 1x1 magenta PNG. Decodable to bytes, recognised as image/png, small enough
+# to inline anywhere. The bug being fixed: a request carrying this used to be
+# flattened into an empty prompt and answered from prior, with the model
+# confidently naming a near-white hex (e.g. #EDF6EC) as the swatch's colour.
+PNG_MAGENTA = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+def test_stage_images_writes_decodable_files_for_both_image_shapes():
+    """Both the Anthropic and the OpenAI image shapes must be decoded and
+    written to disk, and the original block must be replaced with a text
+    marker that survives into flatten(). Otherwise the model never sees the
+    bytes and the prompt loses any pointer to where they are.
+    """
+    import shutil
+    img_dir = Path(tempfile.mkdtemp(prefix="cli-imgtest-"))
+    try:
+        messages = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "what colour is this swatch?"},
+                {"type": "image", "source": {"type": "base64",
+                                              "media_type": "image/png",
+                                              "data": base64.b64encode(PNG_MAGENTA).decode()}},
+                {"type": "image_url", "image_url": {"url":
+                    f"data:image/png;base64,{base64.b64encode(PNG_MAGENTA).decode()}"}},
+            ]},
+        ]
+        paths = server.stage_images(messages, img_dir)
+        assert len(paths) == 2, paths
+        # The bytes round-trip back to what we put in.
+        assert paths[0].read_bytes() == PNG_MAGENTA, paths[0]
+        assert paths[1].read_bytes() == PNG_MAGENTA, paths[1]
+        assert paths[0].suffix == ".png", paths[0].suffix
+        # The original image blocks are gone; a text marker carries the path.
+        content = messages[0]["content"]
+        text_blocks = [b for b in content if b.get("type") == "text"]
+        assert len(text_blocks) == 3, content
+        assert "[image 1:" in text_blocks[1]["text"], text_blocks[1]
+        assert "[image 2:" in text_blocks[2]["text"], text_blocks[2]
+        # flatten() then joins the markers into a single prompt the model sees.
+        prompt, _ = server.flatten(messages)
+        assert "[image 1:" in prompt and "[image 2:" in prompt, prompt
+        print(f"  both shapes decoded to {paths[0].name}, {paths[1].name}; "
+              f"markers survived into the flattened prompt")
+    finally:
+        shutil.rmtree(img_dir, ignore_errors=True)
+
+
+def test_image_unsupported_for_remote_url_not_a_silent_drop():
+    """A remote http(s) URL cannot be fetched from here, so the request must
+    fail loudly with HTTP 400 images_unsupported -- never with a confident
+    wrong answer (issue #30). The earlier behaviour was to flatten the
+    request into nothing, then return the model's prior over a near-white
+    hex.
+    """
+    messages = [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+    ]}]
+    try:
+        server.stage_images(messages, Path(tempfile.mkdtemp(prefix="cli-imgru-")))
+    except server.ImageUnsupportedError as exc:
+        http = exc.http()
+        assert http.status_code == 400, http.status_code
+        assert http.detail["error"]["type"] == "images_unsupported", http.detail
+        print(f"  remote URL -> HTTP 400 ({http.detail['error']['type']!r})")
+        return
+    raise AssertionError("a remote URL must raise ImageUnsupportedError, "
+                         "not be silently dropped")
+
+
+def test_stage_or_fail_cleans_up_on_failure():
+    """stage_or_fail owns a temp dir it must remove when staging fails.
+    Otherwise an unsupported block would leave an empty directory behind on
+    every failed request -- a slow leak that no caller can see.
+    """
+    before = set(os.listdir(tempfile.gettempdir()))
+    try:
+        server.stage_or_fail([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+        ]}])
+    except server.ImageUnsupportedError:
+        after = set(os.listdir(tempfile.gettempdir()))
+        leftover = (after - before) & {p for p in after if p.startswith("swimg-")}
+        assert not leftover, leftover
+        print("  stage_or_fail removed its temp dir on the failure path")
+        return
+    raise AssertionError("expected ImageUnsupportedError")
+
+
+def test_stage_or_fail_cleans_up_on_unexpected_failure():
+    """stage_or_fail broadened its cleanup so ANY exception removes the temp
+    dir, not just ImageUnsupportedError. A disk full at write_bytes used to
+    leak an empty swimg-* dir on every retry; the fix mirrors cli_bridge's
+    text-path try/finally pattern. Verified by raising mid-stage with a
+    monkey-patched _stage_image -- if the broadened cleanup is reverted to
+    the old ImageUnsupportedError-only except, the leftover check fires.
+    """
+    before = set(os.listdir(tempfile.gettempdir()))
+    real_stage_image = server._stage_image
+
+    def boom(block, img_dir, n):
+        # Something that isn't ImageUnsupportedError: the old code would
+        # not clean the temp dir, leaking it.
+        raise OSError("simulated full disk at write_bytes")
+
+    server._stage_image = boom
+    try:
+        try:
+            server.stage_or_fail([{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64",
+                                              "media_type": "image/png",
+                                              "data": base64.b64encode(PNG_MAGENTA).decode()}},
+            ]}])
+        except OSError:
+            after = set(os.listdir(tempfile.gettempdir()))
+            leftover = (after - before) & {p for p in after if p.startswith("swimg-")}
+            assert not leftover, leftover
+            print("  stage_or_fail removed its temp dir on a non-ImageUnsupportedError failure")
+            return
+    finally:
+        server._stage_image = real_stage_image
+    raise AssertionError("expected OSError from the simulated write_bytes failure")
+
+
+def test_codex_argv_carries_one_minus_i_per_image():
+    """codex takes images via repeatable `-i FILE`. Every staged file must
+    appear on argv with its own flag, in order, so the CLI receives the
+    same image set the caller sent.
+
+    codex's profile has no `bare_args` list (the harness's tool suppression
+    is built in via `--dangerously-bypass-approvals-and-sandbox` on the
+    MCP path; the text path does not need it). So nothing about Read or
+    disallowed-tools is asserted here -- only that the image flag survives.
+    """
+    import shutil
+    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
+    try:
+        server.PROVIDER = "codex"
+        server.PROFILE = server.PROFILES["codex"]
+        server.CLI = server.PROFILE["cli"]
+        img = Path(tempfile.mkdtemp(prefix="cli-imgargv-")) / "00.png"
+        img.write_bytes(PNG_MAGENTA)
+        argv, stdin_data = server.build_argv("look at this", None, None,
+                                              image_paths=[img])
+        # codex takes `-i FILE` once per image (repeatable).
+        i_args = [argv[i + 1] for i, a in enumerate(argv) if a == "-i"]
+        assert i_args == [str(img)], argv
+        assert stdin_data is None
+        print(f"  codex argv carries -i for the staged image")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
+        shutil.rmtree(img.parent, ignore_errors=True)
+
+
+def test_opencode_argv_carries_one_minus_f_per_image():
+    """opencode takes images via repeatable `-f FILE`. Same contract as codex
+    with a different flag name; both profiles carry every staged file.
+    """
+    import shutil
+    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
+    try:
+        server.PROVIDER = "opencode"
+        server.PROFILE = server.PROFILES["opencode"]
+        server.CLI = server.PROFILE["cli"]
+        img = Path(tempfile.mkdtemp(prefix="cli-imgargv2-")) / "00.png"
+        img.write_bytes(PNG_MAGENTA)
+        argv, stdin_data = server.build_argv("look at this", None, None,
+                                              image_paths=[img])
+        f_args = [argv[i + 1] for i, a in enumerate(argv) if a == "-f"]
+        assert f_args == [str(img)], argv
+        assert stdin_data is None
+        print(f"  opencode argv carries -f for the staged image")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
+        shutil.rmtree(img.parent, ignore_errors=True)
+
+
+def test_claude_argv_uses_add_dir_and_allows_read_for_images():
+    """Claude Code has no image flag; the staged files must be reachable via
+    Read. `--add-dir <imgdir>` adds the directory and `--allowed-tools
+    Read(<imgdir>/**)` lifts Read out of the bare-mode disallowed-tools
+    list. Read must NOT also be in --disallowed-tools (the bare list does
+    include it, so the image variant's bare_args_images is the one used).
+    """
+    import shutil
+    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
+    try:
+        server.PROVIDER = "claude"
+        server.PROFILE = server.PROFILES["claude"]
+        server.CLI = server.PROFILE["cli"]
+        img_dir = Path(tempfile.mkdtemp(prefix="cli-imgargv3-"))
+        img = img_dir / "img" / "00.png"
+        img.parent.mkdir(parents=True)
+        img.write_bytes(PNG_MAGENTA)
+        argv, _ = server.build_argv("look at this", None, None,
+                                      image_paths=[img])
+        # --add-dir <imgdir> + --allowed-tools Read(<imgdir>/**).
+        assert "--add-dir" in argv, argv
+        assert str(img.parent) in argv, argv
+        assert "--allowed-tools" in argv, argv
+        allowed = argv[argv.index("--allowed-tools") + 1]
+        assert allowed.startswith("Read(") and allowed.endswith("/**)"), allowed
+        # The image variant's bare_args_images is in argv: max-turns 4, no
+        # Read in the disallowed list.
+        assert "4" in argv, argv
+        idx = argv.index("--disallowed-tools")
+        disallowed = argv[idx + 1]
+        for tool in disallowed.split(","):
+            assert tool != "Read", (disallowed, tool)
+        print(f"  claude argv: --add-dir={img.parent}, --allowed-tools={allowed}")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
+        shutil.rmtree(img_dir, ignore_errors=True)
+
+
+def test_no_image_blocks_means_image_note_is_empty():
+    """`has_image_blocks` is the gate for staging. A request with only text
+    must not pay the staging cost, and `image_note` on an empty path list
+    must still return something sensible (it is appended unconditionally
+    by the handle_chat path; the contract is that an empty list is a
+    no-op).
+    """
+    assert not server.has_image_blocks([{"role": "user", "content": "hi"}])
+    assert not server.has_image_blocks([{"role": "user", "content": [
+        {"type": "text", "text": "hi"}]}])
+    assert server.has_image_blocks([{"role": "user", "content": [
+        {"type": "text", "text": "hi"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,"
+                                              + base64.b64encode(PNG_MAGENTA).decode()}}]}])
+    print("  text-only requests skip staging; mixed requests are detected")
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

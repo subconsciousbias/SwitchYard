@@ -52,12 +52,15 @@ a transient blip and the lane would keep feeding requests to dead capacity.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import errno
 import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -111,6 +114,166 @@ def over_argv_limit(text: str) -> bool:
     """
     return len(text.encode("utf-8")) > STDIN_PROMPT_LIMIT
 
+
+# ------------------------------------------------------------------ images ---
+# flatten() used to drop every non-text content block, so a request with a
+# screenshot was accepted, answered confidently, and wrong -- `#EDF6EC` for a
+# magenta swatch (issue #30). Not a refusal the caller could see: an answer.
+#
+# The fix stages the bytes to disk and lets each CLI carry them the way that
+# CLI actually can (verified against the installed versions):
+#   claude 2.1.278 `-p`   -- no image flag; stage to disk and let the model
+#                            Read() the files (--add-dir + an allowed-tools
+#                            Read rule; and Read must NOT also be in
+#                            --disallowed-tools, which bare mode used to list).
+#   codex 0.153.4 `exec`  -- native `-i FILE`, repeatable.
+#   opencode 1.18.32 `run`-- native `-f FILE(s)`, repeatable.
+# Any image block that cannot be carried that way -- a plain http(s) URL, a
+# corrupt payload -- is an error, never a silent drop: a wrong answer is the
+# one failure a caller cannot distinguish from a real reading.
+MEDIA_TYPES = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+               "image/webp": "webp"}
+
+
+class ImageUnsupportedError(Exception):
+    """A request carried an image this plan has no way to deliver.
+
+    Raised instead of quietly continuing without the image, which is what
+    made vision through the bridge look like confident hallucination.
+    Callers turn this into HTTP 400 images_unsupported via .http().
+    """
+
+    def http(self) -> HTTPException:
+        return HTTPException(
+            status_code=400,
+            detail={"error": {"message": str(self), "type": "images_unsupported"}})
+
+
+def _decode_data_url(url: str) -> tuple[str, bytes] | None:
+    """(media_type, bytes) from a `data:<mt>;base64,<blob>` URL, or None."""
+    m = re.match(r"data:([^;,]+);base64,(.+)", url or "", re.S)
+    if not m:
+        return None
+    try:
+        return m.group(1), base64.b64decode(m.group(2))
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _stage_image(block: dict, img_dir: Path, n: int) -> Path:
+    """Write one image content block to disk; return its path.
+
+    Handles the Anthropic shape ({"type": "image", "source": {"type":
+    "base64", ...}}), the OpenAI one ({"type": "image_url", "image_url":
+    {"url": "data:...;base64,..."}}), and the MCP tool-result one
+    ({"type": "image", "mimeType": ..., "data": ...}). Anything else -- a
+    remote URL most commonly -- cannot be fetched from here.
+    """
+    data = None
+    media = None
+    if block.get("type") == "image":
+        source = block.get("source") if isinstance(block.get("source"), dict) else {}
+        if source.get("type") == "base64":
+            media = source.get("media_type")
+            try:
+                data = base64.b64decode(source.get("data") or "")
+            except (binascii.Error, ValueError):
+                data = None
+        elif block.get("data") and block.get("mimeType"):
+            media = block.get("mimeType")
+            try:
+                data = base64.b64decode(block["data"])
+            except (binascii.Error, ValueError):
+                data = None
+    elif block.get("type") == "image_url":
+        url = (block.get("image_url") or {}).get("url") \
+            if isinstance(block.get("image_url"), dict) else None
+        decoded = _decode_data_url(url)
+        if decoded:
+            media, data = decoded
+    if not data:
+        raise ImageUnsupportedError(
+            f"image block {n} carries no inline base64 data (a remote URL "
+            "cannot be fetched here); this plan refuses to drop it silently")
+    ext = MEDIA_TYPES.get(media or "", (media or "img").split("/")[-1] or "img")
+    img_dir.mkdir(parents=True, exist_ok=True)
+    path = img_dir / f"{n:02d}.{ext}"
+    path.write_bytes(data)
+    return path
+
+
+def stage_images(messages: list[dict], img_dir: Path) -> list[Path]:
+    """Decode every image content block into `img_dir`, in place.
+
+    Each image block is replaced with a text block carrying
+    `[image N: <path>]`, so the text collapser keeps a pointer instead of
+    nothing, and the model can be told where the bytes are. Works on user
+    messages, system, and `tool` messages alike -- the rebuild path in
+    mcp_bridge relies on the last of those. Blocks that cannot be decoded
+    raise ImageUnsupportedError rather than vanishing.
+    """
+    staged: list[Path] = []
+    for m in messages:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        replaced: list = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in ("image", "image_url"):
+                n = len(staged) + 1
+                path = _stage_image(block, img_dir, n)
+                staged.append(path)
+                replaced.append({"type": "text", "text": f"[image {n}: {path}]"})
+            else:
+                replaced.append(block)
+        m["content"] = replaced
+    return staged
+
+
+def image_note(paths: list[Path]) -> str:
+    """The line appended to the prompt that makes the model look instead of
+    guess. Without it the path markers were just decoration: the model answered
+    from its prior about what such a screenshot usually shows."""
+    listing = "\n".join(f"- {p}" for p in paths)
+    if PROVIDER in ("codex", "opencode"):
+        return (f"\n\n[{len(paths)} image(s) attached to this prompt: "
+                f"{', '.join(str(p) for p in paths)}]")
+    return ("\n\nThe images above are saved as files:\n" + listing
+            + "\nRead each file with your Read tool to see it before answering "
+              "-- do not guess at its contents.")
+
+
+def has_image_blocks(messages: list[dict]) -> bool:
+    """Whether any message carries an image content block in either shape."""
+    for m in messages or []:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") in ("image", "image_url"):
+                return True
+    return False
+
+
+def stage_or_fail(messages: list[dict]) -> tuple[list[Path], Path | None]:
+    """Stage a request's images into a fresh temp dir, or 400 loudly.
+
+    Returns (paths, dir); the caller owns the dir and must remove it. Shared
+    by cli_bridge and mcp_bridge so the loud-failure contract cannot drift
+    between the two.
+    """
+    if not has_image_blocks(messages):
+        return [], None
+    img_dir = Path(tempfile.mkdtemp(prefix="swimg-"))
+    # except BaseException, not just ImageUnsupportedError: an OSError from
+    # write_bytes (full disk, permission flip mid-request) is otherwise a
+    # silent `swimg-*` dir leak on every retry until the temp partition fills.
+    try:
+        return stage_images(messages, img_dir / "img"), img_dir
+    except BaseException:
+        shutil.rmtree(img_dir, ignore_errors=True)
+        raise
+
 # Per-provider invocation. `prompt` and `system` are substituted; `system` is
 # dropped entirely when the CLI has no equivalent flag.
 PROFILES: dict[str, dict] = {
@@ -139,6 +302,13 @@ PROFILES: dict[str, dict] = {
         # container, not the caller's workspace, and the caller never sees them.
         "bare_args": ["--max-turns", "1", "--disallowed-tools",
                       "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit"],
+        # Image requests need Read for the staged files (see image_note) and
+        # more than one turn -- reading the image and then answering is two
+        # agentic turns, and --max-turns 1 would kill the answer with
+        # error_max_turns. Every other tool stays stripped.
+        "bare_args_images": ["--max-turns", "4", "--disallowed-tools",
+                             "Bash,Edit,Write,Glob,Grep,WebFetch,WebSearch,"
+                             "NotebookEdit"],
         # Only valid alongside --system-prompt. Drops the CLI's dynamically
         # injected sections (working directory, git state, environment), which
         # are pure noise when the caller supplies its own prompt — and which the
@@ -389,13 +559,14 @@ _warm = asyncio.Event()
 _warmup_lock = asyncio.Lock()
 
 
-async def invoke(prompt: str, system: str | None, model: str | None) -> dict:
+async def invoke(prompt: str, system: str | None, model: str | None,
+                image_paths: list[Path] | None = None) -> dict:
     if _warm.is_set():
-        return await run_cli(prompt, system, model)
+        return await run_cli(prompt, system, model, image_paths)
     async with _warmup_lock:
         if _warm.is_set():                     # someone warmed it while we waited
-            return await run_cli(prompt, system, model)
-        payload = await run_cli(prompt, system, model)
+            return await run_cli(prompt, system, model, image_paths)
+        payload = await run_cli(prompt, system, model, image_paths)
         _warm.set()
         log.info("%s: first call succeeded, releasing full concurrency", PROVIDER)
         return payload
@@ -509,7 +680,8 @@ def resolve_model(requested: str | None) -> tuple[str, str | None]:
 
 
 def build_argv(prompt: str, system: str | None,
-               model: str | None = None) -> tuple[list[str], str | None]:
+               model: str | None = None,
+               image_paths: list[Path] | None = None) -> tuple[list[str], str | None]:
     """Build the CLI argv, plus the prompt to feed it on stdin (or None).
 
     Returns a pair so an oversized prompt can travel on stdin instead of argv
@@ -517,9 +689,15 @@ def build_argv(prompt: str, system: str | None,
     fill(): on the argv path it is substituted directly, on the stdin path
     codex's "-" placeholder stays in the template and claude/opencode drop the
     element entirely.
+
+    `image_paths` are staged image files (see stage_images); each profile
+    carries them by its own mechanism. No CLI gets them as prompt text: a
+    base64 blob in the prompt would blow past MAX_ARG_STRLEN and the model
+    cannot read raw bytes anyway.
     """
     model = model or config().model
     use_stdin = over_argv_limit(prompt)
+    image_paths = image_paths or []
 
     def fill(tpl: str) -> str:
         return tpl.replace("{model}", model).replace("{system}", system or "")
@@ -539,10 +717,25 @@ def build_argv(prompt: str, system: str | None,
         argv += [fill(a) for a in PROFILE[key]]
 
     if BARE and PROFILE.get("bare_args"):
-        argv += [fill(a) for a in PROFILE["bare_args"]]
+        # Image requests get the image-variant list: Read available (the
+        # files can only be seen through it) and enough turns to use it.
+        bare_key = "bare_args_images" if image_paths else "bare_args"
+        argv += [fill(a) for a in PROFILE[bare_key]]
 
     if key == "system_args_replace" and system and PROFILE.get("replace_extra_args"):
         argv += [fill(a) for a in PROFILE["replace_extra_args"]]
+
+    if image_paths:
+        if PROVIDER == "claude":
+            img_dir = image_paths[0].parent
+            argv += ["--add-dir", str(img_dir),
+                     "--allowed-tools", f"Read({img_dir}/**)"]
+        elif PROVIDER == "codex":
+            for path in image_paths:          # repeatable `-i` per file
+                argv += ["-i", str(path)]
+        else:   # opencode: `-f FILE(s)` attaches to the message
+            for path in image_paths:
+                argv += ["-f", str(path)]
 
     return argv + EXTRA_ARGS, (prompt if use_stdin else None)
 
@@ -785,7 +978,8 @@ def system_prompt_file(system: str | None):
                 os.unlink(tmp.name)
 
 
-async def run_cli(prompt: str, system: str | None, model: str | None = None) -> dict:
+async def run_cli(prompt: str, system: str | None, model: str | None = None,
+                image_paths: list[Path] | None = None) -> dict:
     prompt, system = fold_system(prompt, system)
     with instructions_file(system) as (extra_args, system):
         with system_prompt_file(system) as (sys_args, system):
@@ -793,12 +987,14 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None) -> 
             # which short-circuits build_argv's inline --system-prompt branch
             # and the matching replace_extra_args one — the file path now
             # carries the same content, with the same extras appended above.
-            return await _run_cli(prompt, system, model, extra_args + sys_args)
+            return await _run_cli(prompt, system, model, extra_args + sys_args,
+                                  image_paths)
 
 
 async def _run_cli(prompt: str, system: str | None, model: str | None,
-                   extra_args: list) -> dict:
-    cmd, stdin_data = build_argv(prompt, system, model)
+                   extra_args: list,
+                   image_paths: list[Path] | None = None) -> dict:
+    cmd, stdin_data = build_argv(prompt, system, model, image_paths)
     cmd = cmd + list(extra_args)
 
     # stdin must be closed explicitly: codex reads "additional input from stdin"
@@ -1215,6 +1411,11 @@ async def health() -> dict:
     cfg = config()
     return {"ok": cfg.source == "config", "provider": PROVIDER,
             "config_source": cfg.source, "supports_tools": False,
+            # All three profiles carry images in some form (see stage_images /
+            # build_argv in this file). A "false" here would mean: callers may
+            # still send image blocks, but the sidecar will drop them. Better
+            # honest than optimistic.
+            "supports_images": PROVIDER in ("claude", "codex", "opencode"),
             "home": os.environ.get("HOME", ""), "warm": _warm.is_set(),
             # The CLIs have no token cap, so max_tokens becomes a prompt
             # instruction: a real reduction, but not a guarantee.
@@ -1251,30 +1452,50 @@ async def _handle_chat(body: dict):
                             "Route tool-using requests to an API-keyed plan."),
                 "type": "tools_unsupported"}})
 
-    prompt, system = flatten(body.get("messages") or [])
-    # No CLI accepts a token cap, so express it as an instruction instead of
-    # dropping it on the floor.
-    system = fold_max_tokens(system, body.get("max_tokens"))
-    if not prompt:
-        raise HTTPException(status_code=400, detail="no usable message content")
-    model, warning = resolve_model(body.get("model"))
-    if warning:
-        # Loud, because silently running a weaker model than the lane asked for
-        # would make an `apex` escalation quietly indistinguishable from `judge`.
-        log.warning("%s", warning)
-
-    limit = config().concurrency
-    if not await _gate.acquire(limit):
-        # Never queue: SwitchYard needs to hear "full" immediately so it can
-        # spill to the next plan in the lane instead of blocking a worker.
-        raise HTTPException(status_code=429,
-                            detail=f"sidecar at capacity ({limit})",
-                            headers={"Retry-After": "5"})
+    messages = body.get("messages") or []
+    # Stage images BEFORE flatten, so the markers `[image N: <path>]` survive
+    # into the prompt text and the per-CLI argv flags can carry the files.
+    # A request with an unsupported image (a remote URL we cannot fetch) is
+    # an error, never a silent drop — that is the bug fix in #30.
     try:
-        payload = await invoke(prompt, system, model)
+        image_paths, img_dir = stage_or_fail(messages)
+    except ImageUnsupportedError as exc:
+        raise exc.http()
+    try:
+        prompt, system = flatten(messages)
+        # No CLI accepts a token cap, so express it as an instruction instead of
+        # dropping it on the floor.
+        system = fold_max_tokens(system, body.get("max_tokens"))
+        if not prompt:
+            raise HTTPException(status_code=400, detail="no usable message content")
+        if image_paths:
+            # The prompt is what makes the model LOOK at the staged files: the
+            # markers on their own are just decoration.
+            prompt += image_note(image_paths)
+        model, warning = resolve_model(body.get("model"))
+        if warning:
+            # Loud, because silently running a weaker model than the lane asked for
+            # would make an `apex` escalation quietly indistinguishable from `judge`.
+            log.warning("%s", warning)
+
+        limit = config().concurrency
+        if not await _gate.acquire(limit):
+            # Never queue: SwitchYard needs to hear "full" immediately so it can
+            # spill to the next plan in the lane instead of blocking a worker.
+            raise HTTPException(status_code=429,
+                                detail=f"sidecar at capacity ({limit})",
+                                headers={"Retry-After": "5"})
+        try:
+            payload = await invoke(prompt, system, model, image_paths or None)
+        finally:
+            await _gate.release()
+        result = to_openai(payload, model)
     finally:
-        await _gate.release()
-    result = to_openai(payload, model)
+        # Image dir is owned here; the workdir on the mcp_bridge path is owned
+        # by the session and outlives the request, so this only cleans up
+        # fresh-request dirs. Stage failed before we get here in that case.
+        if img_dir is not None:
+            shutil.rmtree(img_dir, ignore_errors=True)
 
     if not body.get("stream"):
         return result
