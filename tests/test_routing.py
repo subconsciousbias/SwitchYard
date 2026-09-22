@@ -954,6 +954,63 @@ def test_a_row_signals_when_its_narrowing_is_the_models_own():
           f"{m3['cap_model_owned']}")
 
 
+def test_a_cli_plan_row_signals_its_own_narrowing_under_policy():
+    """The model-owned signal must survive the policy's rewriting of
+    `cap_reason`.
+
+    `claude-max` is a CLI-backed plan: `policy._apply_gate_headroom` rewrites
+    `cap_reason` from "configured" to "configured + gate headroom N", and
+    shrinks the cap by the headroom slots so the gateway's slot table stops
+    racing the sidecar's own gate. The previous predicate gated on the exact
+    string "configured" — that string match broke under headroom, so a row
+    whose narrowing was still the model's own (`claude-max/fable`: model 1,
+    plan 2, post-headroom cap 1) read as `cap_model_owned: False`, drew the
+    "model limit" tag, and the withheld-slot loop ran for a slot that was
+    never withheld — the row's own one slot.
+
+    With `build_with_policy()` the policy path is live; for the apex row
+    `claude-max/fable` the picker reports `cap == 1`, the rewritten reason
+    contains "gate headroom" (proving the string predicate was the load-
+    bearing one), and `cap_model_owned` is True. The other three shapes stay
+    where the predicate above put them: local-box/gemma is still model-owned
+    under policy; grok/grok-4.6 (model == plan) and minimax-ultra/m3
+    (no model cap at all) are still False.
+    """
+    async def go():
+        _, _, picker, _ = build_with_policy()
+        local = await picker.capacity("local")
+        forge = await picker.capacity("forge")
+        apex = await picker.capacity("apex")
+
+        def row(cap, ref):
+            return next(r for r in cap["plans"] if r["ref"] == ref)
+
+        fable = row(apex, "claude-max/fable")
+        gemma = row(local, "local-box/gemma")
+        grok = row(forge, "grok/grok-4.6")
+        m3 = row(forge, "minimax-ultra/m3")
+        return fable, gemma, grok, m3
+
+    fable, gemma, grok, m3 = run(go())
+    # CLI-plan row, the regression bar. Plan 2 with headroom 1 -> cap 1;
+    # model 1; the model narrows to its own ceiling and the signal must
+    # fire even though the reason string is no longer exactly "configured".
+    assert fable["cap"] == 1, fable
+    assert fable["model_cap"] == 1, fable
+    assert "gate headroom" in fable["cap_reason"], fable
+    assert fable["cap_model_owned"] is True, fable
+    # The other shapes are unchanged from the predicate above: this row's
+    # signal is about a CLI-plan narrowing, the others pin that we did not
+    # flip them by accident while widening the gate.
+    assert gemma["cap_model_owned"] is True, gemma
+    assert grok["cap_model_owned"] is False, grok
+    assert m3["cap_model_owned"] is False, m3
+    print(f"  claude-max/fable (cli-backed, cap 1 of 2 + headroom): "
+          f"cap_model_owned={fable['cap_model_owned']} "
+          f"(\"{fable['cap_reason']}\"); local-box/gemma stays True, "
+          f"grok/grok-4.6 and minimax-ultra/m3 stay False")
+
+
 def test_a_spent_plan_is_skipped_unless_it_may_use_extra_quota():
     """100% of the target window means no capacity — and breaks affinity.
 

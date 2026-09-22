@@ -730,9 +730,9 @@ class Picker:
 
             cap_model_owned = (
                 not cooled
-                and cap_reason == "configured"
                 and model.max_parallel is not None
-                and model.max_parallel < cap
+                and model.max_parallel < plan.max_parallel
+                and model.max_parallel <= cap
             )
 
             rows.append({

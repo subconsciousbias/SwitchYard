@@ -280,6 +280,23 @@ def test_capacity_fragment_hides_withheld_for_model_narrowed_rows():
         assert 'class="slot gone"' not in gemma, gemma
         assert 'class="tag bad"' not in gemma, gemma
 
+        # The CLI-plan shape: `claude-max/fable` (plan 2, model 1) is narrowed
+        # by the model, but `policy._apply_gate_headroom` has also rewritten
+        # `cap_reason` from "configured" to "configured + gate headroom 1".
+        # The pre-fix predicate gated on the exact string "configured" and so
+        # flipped this row's `cap_model_owned` to False under policy — the
+        # template then ran the withheld-slot loop and rendered the "model
+        # limit" tag for a slot that was never withheld. Post-fix the same
+        # one reachable slot renders, with the same absence of markers, just
+        # like local-box/gemma: one free slot, no gone squares, no "model
+        # limit" text, no "withheld:" tooltip.
+        fable = row_with_ref(trs, "claude-max", "fable")
+        assert fable is not None, "claude-max/fable row missing in /fragments/capacity"
+        assert "model limit" not in fable, fable
+        assert "withheld:" not in fable, fable
+        assert 'class="slot gone"' not in fable, fable
+        assert fable.count('<span class="slot"') == 1, fable
+
         # An externally-narrowed row keeps ALL the old machinery. Cool
         # minimax-ultra — the pinned example's `forge` lead row — and read
         # the fragment again. Every slot the row would have shown is now
