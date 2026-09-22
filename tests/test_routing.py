@@ -642,6 +642,56 @@ def test_a_row_draws_its_own_model_cap_not_the_plans():
           "(1 gemma + 1 qwen = plan's 2)")
 
 
+def test_a_row_signals_when_its_narrowing_is_the_models_own():
+    """The board decides how to draw a row from one boolean: was its narrowing
+    the model's own choice, or something the operator did (cooldown, paced to
+    zero, spent)?
+
+    A row whose cap is narrower than the plan's width SOLELY because of the
+    model's own `max_parallel` gets `cap_model_owned: True`. The template
+    uses that to skip the withheld-slot loop and the "model limit N" tag, so
+    a slow model on a generous plan reads as its own N slots rather than as
+    a slice of broken capacity. A row whose model cap is unset, equal to the
+    plan, or narrowed for any external reason gets False: the existing
+    markup stays in place.
+
+    Per the pinned example fixture:
+      - local-box/gemma: model 1, plan 2 → True (narrowed by the model)
+      - glm/glm-5.3-flash: model 2, plan 2 → False (model = plan, no narrowing)
+      - minimax-ultra/m3: model None, plan 4 → False (no model cap at all)
+    """
+    async def go():
+        reg, _, picker = build()
+        local = await picker.capacity("local")
+        forge = await picker.capacity("forge")
+
+        def row(cap, ref):
+            return next(r for r in cap["plans"] if r["ref"] == ref)
+
+        gemma = row(local, "local-box/gemma")
+        glm = row(forge, "glm/glm-5.3-flash")
+        m3 = row(forge, "minimax-ultra/m3")
+
+        # The signal tracks the picker's own narrowing step, not a reroll
+        # over the plan's nominal ceiling. It is True exactly when the row's
+        # effective cap is below the plan's cap AND nothing else can claim
+        # credit — the model's own ceiling IS the reason.
+        return gemma, glm, m3
+
+    gemma, glm, m3 = run(go())
+    assert gemma["cap_model_owned"] is True, gemma
+    assert glm["cap_model_owned"] is False, glm
+    assert m3["cap_model_owned"] is False, m3
+    # And the cap_reason tells the same story from the other direction: the
+    # model-owned row carries "model limit 1", the others carry their own
+    # reasons or no reason at all.
+    assert gemma["cap_reason"] == "model limit 1", gemma
+    print(f"  local-box/gemma -> cap_model_owned={gemma['cap_model_owned']} "
+          f"(\"{gemma['cap_reason']}\"); glm/glm-5.3-flash -> "
+          f"{glm['cap_model_owned']}; minimax-ultra/m3 -> "
+          f"{m3['cap_model_owned']}")
+
+
 def test_a_spent_plan_is_skipped_unless_it_may_use_extra_quota():
     """100% of the target window means no capacity — and breaks affinity.
 
