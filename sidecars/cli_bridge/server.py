@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -94,7 +95,21 @@ BARE = os.environ.get("BARE", "1") not in ("0", "false", "no")
 # two in step. All three profile CLIs take the prompt on stdin: `claude -p`
 # and `opencode run` read a piped prompt, `codex exec -` reads stdin when its
 # PROMPT argument is `-`.
+#
+# The limit is measured in UTF-8 BYTES, because that is what MAX_ARG_STRLEN
+# caps -- len() counts characters, and a CJK prompt of 40k characters is
+# 120k bytes, easily past the kernel's line while looking comfortably under
+# a character count (issue #29).
 STDIN_PROMPT_LIMIT = int(os.environ.get("MCP_STDIN_PROMPT_LIMIT", "100000"))
+
+
+def over_argv_limit(text: str) -> bool:
+    """True when `text` is too big to ride argv as a single element.
+
+    The kernel counts bytes, so the check does too: UTF-8 is the encoding
+    communicate() writes to the pipe and execve assumes for argv.
+    """
+    return len(text.encode("utf-8")) > STDIN_PROMPT_LIMIT
 
 # Per-provider invocation. `prompt` and `system` are substituted; `system` is
 # dropped entirely when the CLI has no equivalent flag.
@@ -108,6 +123,18 @@ PROFILES: dict[str, dict] = {
         # prompt-stacking note in the module docstring.
         "system_args": ["--append-system-prompt", "{system}"],
         "system_args_replace": ["--system-prompt", "{system}"],
+        # The same two flags in their -file forms, used when the caller's
+        # system prompt is itself over the argv limit (issue #29): an inline
+        # --append-system-prompt is one argv element, and the kernel rejects
+        # execve with E2BIG long before the total argument block is anywhere
+        # near ARG_MAX. Verified on the pinned CLI with
+        # `claude --help | grep system-prompt` (2.1.278 documents
+        # --system-prompt[-file] / --append-system-prompt[-file]); like the
+        # inline flags, a wrong flag is a hard error, so the file form is
+        # reached only on the oversized path -- ordinary requests keep the
+        # verified inline behaviour.
+        "system_file_args": ["--append-system-prompt-file", "{path}"],
+        "system_file_args_replace": ["--system-prompt-file", "{path}"],
         # Strip the inner harness's own tools: they would act on the sidecar's
         # container, not the caller's workspace, and the caller never sees them.
         "bare_args": ["--max-turns", "1", "--disallowed-tools",
@@ -492,7 +519,7 @@ def build_argv(prompt: str, system: str | None,
     element entirely.
     """
     model = model or config().model
-    use_stdin = len(prompt) > STDIN_PROMPT_LIMIT
+    use_stdin = over_argv_limit(prompt)
 
     def fill(tpl: str) -> str:
         return tpl.replace("{model}", model).replace("{system}", system or "")
@@ -709,10 +736,54 @@ def fold_system(prompt: str, system: str | None) -> tuple[str, str | None]:
     return prompt, system
 
 
+@contextlib.contextmanager
+def system_prompt_file(system: str | None):
+    """Move an oversized system prompt off argv and into a temp file.
+
+    The prompt has a stdin escape hatch (build_argv); the system prompt is
+    its own argv element, and --append-system-prompt carries it inline, so
+    a large system block fails execve with E2BIG exactly as the prompt
+    once did (issue #29). Past the limit the text is written to a temp
+    file and the -file form of the same flag is passed instead — the
+    pinned CLI (2.1.278) documents both. Yields ([], system) unchanged
+    when there is nothing to do: no system, a system under the limit, or
+    a profile with no file flag (opencode folds the system prompt into the
+    stdin prompt, codex overrides via instructions_file, so neither ever
+    needs this).
+    """
+    key = ("system_file_args_replace" if SYSTEM_MODE == "replace"
+           and PROFILE.get("system_file_args_replace") else "system_file_args")
+    if not system or not PROFILE.get(key) or not over_argv_limit(system):
+        yield [], system
+        return
+    tmp = None
+    try:
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+        tmp.write(system if system.endswith("\n") else system + "\n")
+        tmp.close()
+        parts = [a.replace("{path}", tmp.name) for a in PROFILE[key]]
+        # --exclude-dynamic-system-prompt-sections is only valid alongside
+        # the system-prompt flag; build_argv adds it for the inline replace
+        # path, so the file path has to carry it too or SYSTEM_MODE=replace
+        # would silently stop stripping the CLI's injected sections.
+        if key == "system_file_args_replace" and PROFILE.get("replace_extra_args"):
+            parts += PROFILE["replace_extra_args"]
+        yield parts, None
+    finally:
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp.name)
+
+
 async def run_cli(prompt: str, system: str | None, model: str | None = None) -> dict:
     prompt, system = fold_system(prompt, system)
     with instructions_file(system) as (extra_args, system):
-        return await _run_cli(prompt, system, model, extra_args)
+        with system_prompt_file(system) as (sys_args, system):
+            # When system_prompt_file wrote a temp file it None's `system`,
+            # which short-circuits build_argv's inline --system-prompt branch
+            # and the matching replace_extra_args one — the file path now
+            # carries the same content, with the same extras appended above.
+            return await _run_cli(prompt, system, model, extra_args + sys_args)
 
 
 async def _run_cli(prompt: str, system: str | None, model: str | None,
@@ -724,13 +795,31 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
     # and would block forever on an inherited descriptor that never closes.
     # communicate() closes the pipe after writing, and the stdin path is only
     # ever taken when an oversized prompt rides there (see build_argv).
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE if stdin_data is not None
-        else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE if stdin_data is not None
+            else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        # A spawn that never happened is not a broken gateway: E2BIG is the
+        # caller's request being too big for argv even after the stdin and
+        # file escape hatches (issue #29 asks for 413, so a client can tell
+        # "too large" from "down"), and any other spawn failure is this
+        # plan's capacity being broken, which must read as 502 so the router
+        # cools the plan instead of retrying it as a transient blip.
+        if exc.errno == errno.E2BIG:
+            raise HTTPException(
+                status_code=413,
+                detail={"error": {
+                    "message": (f"request too large for {PROVIDER} cli "
+                                f"({exc.strerror}); reduce its size"),
+                    "type": "request_too_large"}}) from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"{PROVIDER} cli could not be spawned: {exc}") from exc
     try:
         out, err = await asyncio.wait_for(
             proc.communicate(input=stdin_data.encode() if stdin_data is not None

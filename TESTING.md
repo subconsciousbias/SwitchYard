@@ -397,6 +397,28 @@ drain rule working: expiring plans go first. If you skipped OpenCode Go's
 credentials, expect `opencode-go(cooled)` in the skipped list and the pick
 falling to `grok`.
 
+#### Oversized prompt regression (issue #29)
+
+```bash
+python3 - <<'PY' | curl -s $GW/v1/chat/completions \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H 'Content-Type: application/json' \
+  -d @- | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["choices"][0]["message"]["content"][:120] if "choices" in d else d)'
+import json
+pad = ("Reference text to be summarised in one sentence. " * 2300)
+print(json.dumps({"model": "forge", "max_tokens": 100, "messages": [
+    {"role": "user", "content": "Summarise in one sentence.\n\n" + pad}]}))
+PY
+```
+
+**Expect:** a one-sentence answer — HTTP 200, never a 500. A prompt this size
+(~110 KB) rides stdin, and an oversized system prompt rides
+`--append-system-prompt-file` / `--system-prompt-file`. Before the fix the
+prompt was one argv element, `execve` refused it with E2BIG
+(`MAX_ARG_STRLEN`, 128 KiB per element), and the client saw a bare 500 that
+read as "gateway broken" rather than "prompt too big". Only lanes with
+CLI-backed members (`cli_bridge`/`mcp_bridge` plans) ever had the bug;
+API-keyed plans post their bodies over HTTP.
+
 ### 4d. `judge` — one connection, via the sidecar
 
 ```bash

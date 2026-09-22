@@ -7,6 +7,7 @@ answer, and reported zero tokens — a failure that looks like a working call.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -407,6 +408,139 @@ def test_disabled_models_are_not_offered():
         alias = plan["models"][key]["model"].split("/", 1)[1]
         assert alias not in cfg.models, alias
     print(f"  {len(disabled)} disabled model(s) withheld from the allowlist")
+
+
+# ------------------------------------------ issue #29: argv E2BIG regression ---
+def test_multibyte_prompts_are_measured_in_bytes_not_characters():
+    """MAX_ARG_STRLEN counts bytes, but the old check used len() -- characters.
+
+    A 40k-character CJK prompt is 120k UTF-8 bytes, comfortably over the
+    128 KiB-per-element limit on paper as 40k characters, but the kernel
+    would still refuse to exec it. Without the byte-based check, a CJK
+    prompt slips onto argv where it fails execve with E2BIG (issue #29).
+    """
+    # Each "\u4e00" is 3 UTF-8 bytes; limit//3 chars is *exactly* under the
+    # char-count threshold but well over the byte threshold. Add one more
+    # so the byte count strictly exceeds STDIN_PROMPT_LIMIT.
+    n = server.STDIN_PROMPT_LIMIT // 3 + 1
+    huge = "\u4e00" * n
+    assert len(huge) < server.STDIN_PROMPT_LIMIT, (len(huge), server.STDIN_PROMPT_LIMIT)
+    assert len(huge.encode("utf-8")) > server.STDIN_PROMPT_LIMIT, \
+        (len(huge.encode("utf-8")), server.STDIN_PROMPT_LIMIT)
+
+    argv, stdin_data = server.build_argv(huge, None)
+    assert stdin_data == huge, "oversized CJK prompt must travel on stdin"
+    assert huge not in argv, argv
+    print(f"  {n}-char CJK prompt ({len(huge.encode('utf-8'))} bytes) kept off argv")
+
+
+def test_an_oversized_system_prompt_folds_into_the_stdin_prompt():
+    """OpenCode has no system-prompt flag, so an oversized system block has
+    nowhere to live but the prompt itself -- and the prompt rides stdin.
+
+    fold_system prepends the caller's system to the prompt when the active
+    profile has no system_args key; once both are over STDIN_PROMPT_LIMIT,
+    build_argv must still recognise that and put the combined text on stdin
+    rather than trying to fit it as one argv element (issue #29).
+    """
+    huge_system = "s" * (server.STDIN_PROMPT_LIMIT + 10)
+    # Drive the same path run_cli does for opencode: fold_system prepends the
+    # caller's system text into the prompt and clears it, then build_argv
+    # sees the now-oversized prompt and routes it to stdin.
+    folded_prompt, folded_system = server.fold_system("small", huge_system)
+    argv, stdin_data = server.build_argv(folded_prompt, folded_system)
+    assert stdin_data is not None, "oversized prompt+system must ride stdin"
+    assert stdin_data.startswith(huge_system), \
+        (stdin_data[:40], "...", stdin_data[-40:])
+    # No element of argv may be the system text itself.
+    assert all(huge_system != element for element in argv), argv
+    # The plain prompt also isn't an element (it was folded into stdin).
+    assert "small" not in argv, argv
+    print(f"  {len(huge_system)}-char system prompt folded into {len(stdin_data)}-char stdin payload")
+
+
+def test_a_real_spawn_delivers_an_oversized_prompt_on_stdin():
+    """End-to-end: an oversized prompt must reach the fake CLI intact on stdin.
+
+    The argv/stdin and spawn-guarding fixes are both necessary: this proves
+    the spawn itself does not fail with E2BIG once the prompt is on stdin,
+    which is what the gateway would otherwise 500 on (issue #29).
+    """
+    import asyncio
+
+    fake = tempfile.NamedTemporaryFile(
+        "w", suffix=".py", prefix="clib-over-", delete=False)
+    fake.write(
+        "import json, sys\n"
+        "data = sys.stdin.read()\n"
+        "print(json.dumps({'type':'text','part':{'type':'text','text':"
+        "f'got {len(data)} chars'}}))\n")
+    fake.close()
+    real_cli = server.CLI
+    real_bare = server.BARE
+    real_args = server.PROFILE["args"]
+    huge = "x" * (server.STDIN_PROMPT_LIMIT + 123)
+    try:
+        server.CLI = sys.executable
+        server.BARE = False
+        server.PROFILE["args"] = [fake.name]
+        async def invoke():
+            return await server.run_cli(huge, None, "m")
+        payload = asyncio.run(invoke())
+        assert payload["result"] == f"got {len(huge)} chars", payload
+        print(f"  {len(huge)}-char prompt delivered whole to a real subprocess via stdin")
+    finally:
+        server.CLI = real_cli
+        server.BARE = real_bare
+        server.PROFILE["args"] = real_args
+        os.unlink(fake.name)
+
+
+def test_e2big_from_the_spawn_is_413_and_other_spawn_errors_are_502():
+    """A failed execve must surface the right HTTP status.
+
+    E2BIG ("Argument list too long") means the request is over what argv
+    can carry even after the stdin and file escape hatches -- a 413, not a
+    500, so a client can tell "too large" from "down" (issue #29). Any
+    other spawn-time OSError is this plan's capacity being broken, and must
+    read as 502 so the router cools the plan instead of retrying it.
+    """
+    import asyncio
+    from fastapi import HTTPException
+
+    real_exec = asyncio.create_subprocess_exec
+    captured: list = []
+
+    async def fake_exec(*args, **kwargs):
+        # Capture the call so the test can confirm the spawn was attempted
+        # before the error fired (it failed, but the spawn path was taken).
+        captured.append(args[:1])
+        raise captured_exc
+
+    # Test both errno values; restore after each so one monkeypatch's
+    # tear-down cannot mask the other's setup.
+    for errno_val, expected_status, expected_msg in (
+            (errno.E2BIG, 413, "too large"),
+            (errno.EIO,   502, "could not be spawned")):
+        captured_exc = OSError(errno_val, "Arg list too long"
+                               if errno_val == errno.E2BIG else "I/O error")
+        asyncio.create_subprocess_exec = fake_exec
+        try:
+            async def invoke():
+                return await server._run_cli("hi", None, "m", [])
+            try:
+                asyncio.run(invoke())
+            except HTTPException as exc:
+                assert exc.status_code == expected_status, (exc.status_code, exc.detail)
+                assert expected_msg in str(exc.detail), exc.detail
+                assert captured, "the fake spawn was never called"
+            else:
+                raise AssertionError(
+                    f"expected an HTTPException for errno={errno_val}, got none")
+        finally:
+            asyncio.create_subprocess_exec = real_exec
+    print(f"  E2BIG -> 413, other spawn OSError -> 502 (no 500 leak)")
+
 
 if __name__ == "__main__":
     n = 0
