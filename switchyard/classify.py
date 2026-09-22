@@ -34,6 +34,7 @@ class Outcome(str, Enum):
     CONTEXT = "context"                   # our fault, never cool the plan
     BAD_REQUEST = "bad_request"           # our fault, never cool the plan
     TRANSIENT = "transient"               # retry elsewhere, brief sit-out
+    TEXT_LOST = "text_lost"               # model answered, CLI lost the text
 
 
 LONG = -1          # substitute the caller's default_cooldown
@@ -124,6 +125,20 @@ _CONCURRENCY = re.compile(r"(concurrenc|connection limit|too many connections|ma
 _PLAN_DEAD = re.compile(
     r"(subscription (has )?(expired|ended)|plan expired|package expired"
     r"|no access to model)", re.I)
+# WS1 changes the sidecar to emit "<PROVIDER> cli emitted tokens with no text
+# (prompt_tokens=N, completion_tokens=M)" when the CLI produced tokens but the
+# gateway lost the answer text. A 20-30% instantaneous CLI quirk therefore
+# arrives as a 502 whose real semantics are "model charged us, the wrapper
+# swallowed it" — instant, per-request, not a capacity outage. The cooldown is
+# short and never doubles: the next request is almost certainly fine, and a
+# long streak would just park the plan for minutes over a benign UI race.
+# The two parenthesised counts are required so `extract_no_text_tokens` can
+# book the charged tokens against the plan's ledger without guessing.
+_NO_TEXT = re.compile(
+    r"cli emitted tokens with no text"
+    r"\s*\(\s*prompt_tokens\s*=\s*(\d+)\s*,\s*completion_tokens\s*=\s*(\d+)\s*\)",
+    re.I,
+)
 
 # A vendor code parenthesised in the message, e.g. "insufficient balance (1008)".
 _CODE_IN_TEXT = re.compile(r"\((\d{4,5})\)")
@@ -198,6 +213,23 @@ def extract_vendor_code(message: str, body: Any = None, family: str | None = Non
     return int(m.group(1)) if m else None
 
 
+def extract_no_text_tokens(message: str) -> tuple[int, int] | None:
+    """Pull the charged prompt/completion counts from a TEXT_LOST failure.
+
+    The WS1 contract is "{PROVIDER} cli emitted tokens with no text
+    (prompt_tokens=N, completion_tokens=M)"; the counts are what the
+    provider charged the request for, even though no answer text came back.
+    Returns None when the message does not carry the contract shape, so a
+    hook can decide whether to book tokens without having to share a regex
+    with the classifier — the same regex is used here so the two cannot
+    drift apart.
+    """
+    m = _NO_TEXT.search(message or "")
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
 def classify(
     status: int | None,
     message: str,
@@ -230,6 +262,15 @@ def classify(
         return Verdict(Outcome.QUOTA_EXHAUSTED, secs, "quota exhausted (from message)", code)
     if _CONCURRENCY.search(msg):
         return Verdict(Outcome.CONCURRENCY, 20, "connection limit", code)
+    if _NO_TEXT.search(msg):
+        # The model answered and the CLI swallowed the text — a sidecar quirk,
+        # not a capacity outage. Cool briefly (10s) so a retry lands on a
+        # recovered wrapper, but never feed this into the TRANSIENT doubling
+        # ladder: a 20-30% instantaneous failure rate would otherwise park the
+        # plan for minutes (60 -> 120 -> 240 -> ...). _apply_verdict skips
+        # bump_and_cool for any outcome that is not TRANSIENT, so consecutive
+        # TEXT_LOST failures keep writing 10s and the plan re-admits itself.
+        return Verdict(Outcome.TEXT_LOST, 10, "cli lost the text", code)
 
     # 3. HTTP status.
     if status in (401, 403) or _AUTH.search(msg):

@@ -824,6 +824,53 @@ def iter_json_objects(blob: str):
             yield obj
 
 
+class CliNoTextError(ValueError):
+    """parse_output found no assistant text but did find charged usage.
+
+    Carries the parsed usage so the caller can act on it: _run_cli uses this
+    to drive one in-process retry (issue #64: opencode-ai@1.18.31 occasionally
+    emits a step_finish with nonzero output tokens but no text event, which
+    is roughly 15-30% of glm-5.3-flash calls). On a ValueError parent so the
+    structured-parser catch in mcp_bridge still routes it to its existing
+    502 path without further changes there.
+    """
+
+    def __init__(self, usage: dict) -> None:
+        super().__init__("no assistant text in CLI output (charged tokens present)")
+        self.usage = dict(usage or {})
+
+
+def _sum_usage(target: dict, extra: dict) -> dict:
+    """Add every numeric field of `extra` into `target`; mutate target.
+
+    Two attempts' token counts add exactly: 100 input + 50 input = 150 input.
+    Returns target for chaining. Non-numeric (and bool) fields are left
+    untouched, so an empty extra contributes nothing.
+    """
+    for key, value in (extra or {}).items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            target[key] = target.get(key, 0) + value
+    return target
+
+
+def format_no_text_detail(provider: str, usage: dict) -> str:
+    """Render the WS1/TEXT_LOST contract detail string.
+
+    The gateway's classifier (switchyard.classify._NO_TEXT regex) and the
+    ledger hook (extract_no_text_tokens) match this exact shape: the
+    literal phrase `cli emitted tokens with no text` followed by
+    `prompt_tokens=N, completion_tokens=M`. Both cli_bridge._run_cli and
+    mcp_bridge.run_session call this helper so the contract cannot drift
+    between the two sidecars (issue #64): opencode-go / opencode-go2 plans
+    use mcp_bridge, so the helper is imported by both rather than
+    inlined.
+    """
+    u = usage or {}
+    return (f"{provider} cli emitted tokens with no text "
+            f"(prompt_tokens={int(u.get('input_tokens', 0))}, "
+            f"completion_tokens={int(u.get('output_tokens', 0))})")
+
+
 def parse_output(stdout: str, kind: str | None = None) -> dict:
     """Normalise a CLI's output into {result, usage}.
 
@@ -903,6 +950,15 @@ def parse_output(stdout: str, kind: str | None = None) -> dict:
                     text_parts.append(msg)
 
         if not text_parts:
+            # Issue #64: opencode-ai@1.18.31 sometimes emits a step_finish with
+            # nonzero output tokens but no text event. The provider bills those
+            # tokens regardless, so the parse failure must carry the usage —
+            # not discard it as the original JSONDecodeError did. A zero-usage
+            # no-text stream stays on the old path (no retry, original message).
+            if _int(usage.get("input_tokens")) or _int(usage.get("output_tokens")) \
+                    or (isinstance(usage.get("provider_cost"), (int, float))
+                        and float(usage["provider_cost"]) > 0):
+                raise CliNoTextError(usage)
             raise json.JSONDecodeError("no assistant text in CLI output", stdout, 0)
         return {"result": "".join(text_parts), "usage": usage}
 
@@ -1046,6 +1102,47 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None,
 async def _run_cli(prompt: str, system: str | None, model: str | None,
                    extra_args: list,
                    image_paths: list[Path] | None = None) -> dict:
+    """Spawn the CLI, parse its output, and surface errors as HTTPExceptions.
+
+    Issue #64: opencode-ai@1.18.31 occasionally emits a step_finish with
+    nonzero output tokens but no text event (glm-5.3-flash, ~15-30% of calls).
+    When that happens parse_output raises CliNoTextError, and the caller's
+    retried here exactly once. A successful retry's payload has the first
+    attempt's usage folded into it, so charged tokens are booked exactly
+    once per attempt. A second no-text-with-usage failure raises the
+    contract 502 carrying the COMBINED usage of both attempts.
+    """
+    try:
+        return await _run_cli_attempt(prompt, system, model, extra_args,
+                                      image_paths)
+    except CliNoTextError as exc:
+        try:
+            payload = await _run_cli_attempt(prompt, system, model, extra_args,
+                                              image_paths)
+        except CliNoTextError as exc2:
+            combined = _sum_usage(dict(exc.usage), exc2.usage)
+            raise HTTPException(
+                status_code=502,
+                detail=format_no_text_detail(PROVIDER, combined),
+            ) from exc2
+        # Successful retry: the first attempt's charged tokens are still real,
+        # so fold them into the payload's usage rather than dropping them.
+        payload.setdefault("usage", {})
+        _sum_usage(payload["usage"], exc.usage)
+        return payload
+
+
+async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
+                           extra_args: list,
+                           image_paths: list[Path] | None = None) -> dict:
+    """One end-to-end spawn+parse+post-parse check, without the no-text retry.
+
+    Raises HTTPException for terminal errors (spawn failure, timeout, auth,
+    quota, upstream client errors, structured-parser failure with no usage).
+    Raises CliNoTextError when the structured parser finds no text but does
+    find charged usage; that signals the retriable no-text-with-usage shape
+    to _run_cli, which then performs exactly one in-process retry.
+    """
     cmd, stdin_data = build_argv(prompt, system, model, image_paths)
     cmd = cmd + list(extra_args)
 
@@ -1136,6 +1233,10 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
 
         try:
             payload = parse_output(stdout)
+        except CliNoTextError:
+            # Issue #64 retriable shape -- propagate to _run_cli's retry without
+            # wrapping, so the combined-usage 502 above can name real numbers.
+            raise
         except (json.JSONDecodeError, ValueError) as exc:
             # A structured parser knowing the output shape has nothing left to
             # guess: echoing the raw stream here is how step_start / step_finish

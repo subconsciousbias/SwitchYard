@@ -34,7 +34,7 @@ from litellm.proxy._types import UserAPIKeyAuth
 from redis.asyncio import Redis
 
 from . import caller_env, models
-from .classify import Outcome, classify, escalated_cooldown, inspect_success_payload
+from .classify import Outcome, classify, escalated_cooldown, extract_no_text_tokens, inspect_success_payload
 from .models import Group
 from .picker import LaneSaturated, Picker
 from .policy import CapacityPolicy
@@ -680,28 +680,50 @@ class SwitchyardHandler(CustomLogger):
         # there is no router-level retry to feed it into (num_retries=0), and
         # the caller's retry re-enters through async_pre_call_hook which gets
         # its own fresh pick against the cooldowns this failure just set.
+        #
+        # A TEXT_LOST failure charged the provider for output tokens even
+        # though the sidecar swallowed the answer — book them so the
+        # effective $/Mtok denominator and the burn-rate timer see the real
+        # spend. Other shapes keep the zero-token record they always had.
         if plan:
-            partial = ctx.get("_stream_collected_usage")
-            if isinstance(partial, dict) and partial:
-                # Partial usage means the streaming hook got at least one
-                # message_start or message_delta out before the upstream
-                # failed. Booking those tokens alongside the failure counter
-                # is the bounded partial-loss the design accepts; not
-                # resetting transient_failures is the whole point of moving
-                # the success finalize out of the iterator's exception arm.
-                prompt_tokens, completion_tokens = _prompt_completion_tokens(
-                    None, partial,
-                )
+            # Issue #64: TEXT_LOST shape. The sidecar swallowed the answer
+            # but the provider charged tokens; the contract message names
+            # them so the ledger books the real spend.
+            msg = str(getattr(exception, "message", None) or exception) if exception is not None else ""
+            tokens = extract_no_text_tokens(msg) if msg else None
+            if tokens is not None:
+                prompt_tokens, completion_tokens = tokens
                 await self.ledger.record(
-                    plan,
+                    plan, failed=True,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    cost=0.0,
-                    failed=True,
                     model=ctx["model"],
                 )
             else:
-                await self.ledger.record(plan, failed=True, model=ctx["model"])
+                # Main: streamed /v1/messages that errored mid-stream --
+                # partial usage the iterator stashed on ctx. Booking those
+                # tokens is the bounded partial-loss the design accepts.
+                partial = ctx.get("_stream_collected_usage")
+                if isinstance(partial, dict) and partial:
+                    # Partial usage means the streaming hook got at least one
+                    # message_start or message_delta out before the upstream
+                    # failed. Booking those tokens alongside the failure counter
+                    # is the bounded partial-loss the design accepts; not
+                    # resetting transient_failures is the whole point of moving
+                    # the success finalize out of the iterator's exception arm.
+                    prompt_tokens, completion_tokens = _prompt_completion_tokens(
+                        None, partial,
+                    )
+                    await self.ledger.record(
+                        plan,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        cost=0.0,
+                        failed=True,
+                        model=ctx["model"],
+                    )
+                else:
+                    await self.ledger.record(plan, failed=True, model=ctx["model"])
         await self._handle_failure(ctx, exception)
         return True
 

@@ -13,7 +13,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from switchyard.classify import (Outcome, classify,  # noqa: E402
-                                 escalated_cooldown, inspect_success_payload)
+                                 escalated_cooldown, extract_no_text_tokens,
+                                 inspect_success_payload)
 
 
 def test_minimax_insufficient_balance_arrives_as_http_500():
@@ -167,6 +168,116 @@ def test_capacity_adjacent_provider_prose_does_not_trigger_concurrency():
     body = {"error": {"message": "your account has reached its capacity limit"}}
     v = classify(429, "your account has reached its capacity limit", body=body)
     assert v.outcome is Outcome.RATE_LIMITED, v
+
+
+def test_opencode_text_lost_classifies_as_text_lost_with_ten_second_cooldown():
+    """WS1 changes the sidecar to emit
+    "<PROVIDER> cli emitted tokens with no text (prompt_tokens=N, completion_tokens=M)"
+    when the model charged tokens but the wrapper swallowed the text. The
+    classifier must read this as a sidecar quirk — NOT a generic 5xx — and
+    cool the plan for ten seconds. The generic 5xx rule would otherwise park
+    the plan on the TRANSIENT doubling ladder (60 -> 120 -> 240 -> ...) for a
+    ~20-30% instantaneous CLI failure mode that almost always self-heals on
+    the next call.
+    """
+    msg = ("opencode-go cli emitted tokens with no text "
+           "(prompt_tokens=239, completion_tokens=22)")
+    v = classify(502, msg)
+    assert v.outcome is Outcome.TEXT_LOST, v
+    assert v.cooldown_seconds == 10, v
+    assert v.detail == "cli lost the text", v
+    # Cool briefly, like TRANSIENT, but it is not our fault.
+    assert v.should_cool is True, v
+    assert v.is_our_fault is False, v
+    # The legacy 5xx rule would have said "upstream 502" with cooldown 60 —
+    # the new contract phrase outranks it.
+    assert v.cooldown_seconds < 60, v
+
+
+def test_text_lost_cooldown_does_not_double_across_consecutive_failures():
+    """Consecutive TEXT_LOST failures keep the 10s cooldown unchanged — the
+    verdict never feeds into the TRANSIENT doubling ladder. classify() alone
+    cannot observe streak math, but the contract is visible in two places:
+
+      1. classify() returns Outcome.TEXT_LOST (not TRANSIENT) every time, so
+         _apply_verdict's `verdict.outcome is Outcome.TRANSIENT` branch is
+         skipped and bump_and_cool never runs.
+      2. The cooldown is 10 every call, so even an un-wired caller cannot
+         accidentally double it via Verdict.cooldown_seconds.
+
+    Together these guarantee the plan re-admits itself within ten seconds,
+    regardless of how many text-lost failures stacked up before recovery.
+    """
+    msg = ("opencode-go cli emitted tokens with no text "
+           "(prompt_tokens=239, completion_tokens=22)")
+    cooldowns = []
+    for _ in range(5):
+        v = classify(502, msg)
+        assert v.outcome is Outcome.TEXT_LOST, v
+        assert v.cooldown_seconds == 10, v
+        cooldowns.append(v.cooldown_seconds)
+    assert cooldowns == [10] * 5, cooldowns
+    # And the same input cannot be re-classified as TRANSIENT by accident:
+    # the no-text phrase outranks the generic 5xx rule.
+    assert classify(502, msg).outcome is not Outcome.TRANSIENT
+
+
+def test_ordinary_502_without_contract_phrase_still_classifies_transient():
+    """Regression guard: a vanilla 502 with no contract phrase keeps the
+    today's behaviour. TRANSIENT keeps the 60s base that the breaker ladder
+    doubles, so a real upstream outage still stops getting re-fed every minute.
+    """
+    v = classify(502, "upstream returned an error")
+    assert v.outcome is Outcome.TRANSIENT, v
+    assert v.cooldown_seconds == 60, v
+    # And another 5xx shape the user might mistake for text_lost — no
+    # parenthesised counts, no 'no text' phrasing — stays TRANSIENT.
+    v2 = classify(500, "the model emitted nothing")
+    assert v2.outcome is Outcome.TRANSIENT, v2
+    # And the 'no text' phrase without the parenthesised counts is not the
+    # contract: it would be unsafe to assume the provider charged tokens.
+    v3 = classify(500, "the model emitted no text in this turn")
+    assert v3.outcome is Outcome.TRANSIENT, v3
+
+
+def test_extract_no_text_tokens_returns_counts_for_contract_message():
+    """The hook books the charged prompt/completion counts against the plan's
+    ledger on a TEXT_LOST failure, so the effective $/Mtok denominator and
+    the burn-rate timer see the real spend. extract_no_text_tokens pulls
+    exactly those two counts out of the WS1 contract string.
+    """
+    msg = ("opencode-go cli emitted tokens with no text "
+           "(prompt_tokens=239, completion_tokens=22)")
+    assert extract_no_text_tokens(msg) == (239, 22), msg
+    # Whitespace and case are loose; the contract says "<PROVIDER> ..." so a
+    # real message may carry extra prose before the phrase and odd casing.
+    assert extract_no_text_tokens(
+        "OPENCODE-GO CLI emitted tokens with no text   "
+        "(  prompt_tokens = 0 ,  completion_tokens = 0 )") == (0, 0)
+    # LiteLLM wraps sidecar HTTP errors into exceptions like
+    # `BadGatewayError: ... detail string ...` — the phrase arrives inside
+    # the exception's string form, so the helper matches against full prose.
+    wrapped = ("BadGatewayError: opencode-go cli emitted tokens with no text "
+               "(prompt_tokens=1000, completion_tokens=500)")
+    assert extract_no_text_tokens(wrapped) == (1000, 500), wrapped
+
+
+def test_extract_no_text_tokens_returns_none_for_unrelated_prose():
+    """Anything that does not carry the exact contract phrase returns None —
+    the hook's "book charged tokens" path is gated on this, so a stray match
+    would silently inflate the ledger on a real outage."""
+    assert extract_no_text_tokens("insufficient balance") is None
+    assert extract_no_text_tokens("") is None
+    assert extract_no_text_tokens(
+        "opencode-go cli emitted tokens with no text") is None  # no counts
+    assert extract_no_text_tokens(
+        "opencode-go cli emitted tokens with no text (prompt_tokens=239)"
+    ) is None  # only one of the two counts
+    assert extract_no_text_tokens(
+        "opencode-go cli emitted tokens with no text "
+        "(completion_tokens=22, prompt_tokens=239)") is None  # reversed order
+    # And a status-only path: the upstream did not even produce tokens.
+    assert extract_no_text_tokens("upstream 502 bad gateway") is None
 
 
 if __name__ == "__main__":

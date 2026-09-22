@@ -1033,6 +1033,106 @@ def test_run_session_fails_502_when_structured_parser_finds_no_answer():
           f"({result['detail'][:60]}...)")
 
 
+# ------------------------------------------------- issue #64: TEXT_LOST -----
+def test_run_session_emits_text_lost_contract_detail_for_no_text_with_usage():
+    """Issue #64 (reviewer finding on PR #73): opencode-go and opencode-go2
+    plans run mcp_bridge, NOT cli_bridge, so cli_bridge's contract-string fix
+    was dead code for them. mcp_bridge's run_session calls parse_output
+    directly (no in-process retry of its own — cli_bridge owns that) and was
+    catching CliNoTextError as a plain ValueError, emitting the legacy
+    "yielded no parsed answer" detail. The gateway's _NO_TEXT regex does
+    not match that, so the affected plans kept riding the TRANSIENT doubling
+    ladder while the ledger still lost the charged tokens.
+
+    The mcp_bridge path must now catch CliNoTextError specifically and emit
+    the same contract detail cli_bridge uses (same helper, same string),
+    so classify.TEXT_LOST fires and extract_no_text_tokens books the
+    charged prompt/completion counts.
+    """
+    bad_stream = ('{"type":"step_start","part":{"type":"step-start"}}\n'
+                  '{"type":"step_finish","part":{"type":"step-finish",'
+                  '"tokens":{"input":239,"output":22}}}')
+    fake_cli = _write_fake_cli(
+        "import sys\n"
+        f"sys.stdout.write({bad_stream!r})\n")
+
+    saved_parser = server.PROFILE["parser"]
+    try:
+        # mcp_bridge dispatches on PROFILE["parser"]. The test's default
+        # fixture is the claude provider (claude_json), whose parser does
+        # a bare json.loads and so does not raise CliNoTextError on this
+        # stream — it raises JSONDecodeError. Force the opencode events
+        # parser so the issue #64 path is actually exercised.
+        server.PROFILE["parser"] = "events_json"
+
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            await server.run_session(session, [sys.executable, fake_cli])
+            return session.turn_future.result()
+
+        result = asyncio.run(scenario())
+        assert result["type"] == "error", result
+        assert result["status"] == 502, result
+        detail = result.get("detail", "")
+        # The contract phrase the gateway's _NO_TEXT regex matches. The
+        # provider name comes from mcp_bridge.PROVIDER, not cli_bridge's —
+        # so the test asserts on the structure, not the literal prefix.
+        assert "cli emitted tokens with no text " in detail, detail
+        assert "(prompt_tokens=239, completion_tokens=22)" in detail, detail
+        # And mcp_bridge does NOT reach the legacy "yielded no parsed
+        # answer" branch on this shape — that was the bug.
+        assert "yielded no parsed answer" not in detail, detail
+        # Both sides use the same helper, so the strings must match
+        # byte-for-byte: cli_bridge.format_no_text_detail(PROVIDER, usage).
+        # The PROVIDER value here is whatever the test's os.environ set
+        # ("claude"), so the prefix is provider-specific.
+        expected = server.cli_bridge.format_no_text_detail(
+            server.PROVIDER,
+            {"input_tokens": 239, "output_tokens": 22})
+        assert detail == expected, (detail, expected)
+        print(f"  MCP session: no-text-with-usage -> 502 ({detail!r})")
+    finally:
+        server.PROFILE["parser"] = saved_parser
+
+
+def test_run_session_legacy_no_text_without_usage_still_emits_no_parsed_answer():
+    """Regression guard: a no-text stream with ZERO charged usage must NOT
+    take the new CliNoTextError branch — it has no usage to carry, so the
+    legacy "yielded no parsed answer" 502 stays. cli_bridge._run_cli's
+    gating on nonzero input_tokens / output_tokens / provider_cost applies
+    here too (parse_output is shared), so an empty-stdout / zero-usage
+    failure looks the same as it did before this PR."""
+    bad_stream = ('{"type":"step_start","part":{"type":"step-start"}}\n'
+                  '{"type":"step_finish","part":{"type":"step-finish"}}')
+    fake_cli = _write_fake_cli(
+        "import sys\n"
+        f"sys.stdout.write({bad_stream!r})\n")
+
+    saved_parser = server.PROFILE["parser"]
+    try:
+        server.PROFILE["parser"] = "events_json"
+
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            await server.run_session(session, [sys.executable, fake_cli])
+            return session.turn_future.result()
+
+        result = asyncio.run(scenario())
+        assert result["type"] == "error", result
+        assert result["status"] == 502, result
+        detail = result.get("detail", "")
+        assert "yielded no parsed answer" in detail, detail
+        # And, critically, NOT the new contract shape — there are no
+        # charged tokens to quote, so the contract phrase would be a lie.
+        assert "emitted tokens with no text" not in detail, detail
+        print(f"  MCP session: zero-usage no-text -> legacy 502 "
+              f"({detail[:60]}...)")
+    finally:
+        server.PROFILE["parser"] = saved_parser
+
+
 # ------------------------------------------ issue #13: rebuild churn ----------
 def test_duplicate_delivery_returns_cached_response_without_rebuilding():
     """Regression for issue #13, defect 1.

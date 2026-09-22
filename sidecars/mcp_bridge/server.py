@@ -995,6 +995,20 @@ async def run_session(session: Session, argv: list[str],
 
         try:
             payload = cli_bridge.parse_output(stdout, PROFILE["parser"])
+        except cli_bridge.CliNoTextError as exc:
+            # Issue #64 contract: the CLI charged the provider for tokens
+            # but emitted no text. Mirror cli_bridge._run_cli's contract
+            # detail verbatim (same helper, same string format) so the
+            # gateway's _NO_TEXT regex classifies it as TEXT_LOST and
+            # extract_no_text_tokens books the charged usage. opencode-go
+            # and opencode-go2 plans run mcp_bridge, NOT cli_bridge, so
+            # without this catch the legacy "yielded no parsed answer"
+            # shape falls through and the plan rides the TRANSIENT
+            # doubling ladder while the ledger still loses the tokens.
+            session.resolve_final({"type": "error", "status": 502,
+                                    "detail": cli_bridge.format_no_text_detail(
+                                        PROVIDER, exc.usage)})
+            return
         except (json.JSONDecodeError, ValueError) as exc:
             # Same contract as cli_bridge._run_cli: a structured parser that
             # cannot find the answer must fail the call, not echo its raw

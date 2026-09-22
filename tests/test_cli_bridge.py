@@ -201,9 +201,12 @@ def test_structured_parser_failure_is_a_502_not_a_raw_passthrough():
     import asyncio
     from fastapi import HTTPException
 
+    # Zero-usage no-text: the legacy path that still surfaces "yielded no
+    # parsed answer". PR #64 (issue #64) carves out nonzero-usage no-text
+    # into CliNoTextError + the contract retry; that path is covered by
+    # test_final_502_detail_carries_combined_usage_in_contract_shape below.
     bad_stream = ('{"type":"step_start","part":{"type":"step-start"}}\n'
-                  '{"type":"step_finish","part":{"type":"step-finish",'
-                  '"tokens":{"input":1,"output":1}}}')
+                  '{"type":"step_finish","part":{"type":"step-finish"}}')
 
     fake = tempfile.NamedTemporaryFile(
         "w", suffix=".py", prefix="clib-bad-", delete=False)
@@ -893,6 +896,252 @@ def test_no_image_blocks_means_image_note_is_empty():
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,"
                                               + base64.b64encode(PNG_MAGENTA).decode()}}]}])
     print("  text-only requests skip staging; mixed requests are detected")
+
+
+# ------------------------------------------------- issue #64: no-text + retry ---
+def test_no_text_with_charged_usage_preserves_usage_on_parse():
+    """Issue #64 acceptance (a): a bug-shaped stream (step_start + step_finish
+    with nonzero tokens but no text event) must raise a parse failure that
+    carries the usage, not discard it. The provider bills those tokens; the
+    original JSONDecodeError swallowed them, so the ledger never saw the
+    charge. CliNoTextError exists to carry them forward to the retry path."""
+    stream = ('{"type":"step_start","part":{"type":"step-start"}}\n'
+              '{"type":"step_finish","part":{"type":"step-finish",'
+              '"tokens":{"input":42,"output":7,"reasoning":3,'
+              '"cache":{"read":1280}}}}')
+    try:
+        server.parse_output(stream)
+    except server.CliNoTextError as exc:
+        u = exc.usage
+        assert u["input_tokens"] == 42, u
+        # 7 output + 3 reasoning billed into output_tokens, per the parser's
+        # reasoning-into-output convention (see parse_output comments).
+        assert u["output_tokens"] == 10, u
+        assert u["cache_read_tokens"] == 1280, u
+        print(f"  no-text-with-usage preserves usage on parse: {u}")
+        return
+    raise AssertionError("expected CliNoTextError on no-text-with-usage stream")
+
+
+def test_final_502_detail_carries_combined_usage_in_contract_shape():
+    """Issue #64 acceptance (b): on two consecutive no-text-with-usage
+    failures, the final 502 detail must match the contract exactly:
+        {PROVIDER} cli emitted tokens with no text
+            (prompt_tokens=N, completion_tokens=M)
+    where N/M are the combined charges of both attempts. The gateway's
+    classifier matches the literal phrase and extracts the numbers from the
+    parenthesised fields, so the format is load-bearing, not cosmetic."""
+    import asyncio
+    from fastapi import HTTPException
+
+    bad_stream = ('{"type":"step_start","part":{"type":"step-start"}}\n'
+                  '{"type":"step_finish","part":{"type":"step-finish",'
+                  '"tokens":{"input":100,"output":50}}}')
+    fake = tempfile.NamedTemporaryFile(
+        "w", suffix=".py", prefix="clib-bad-", delete=False)
+    fake.write("import sys\n"
+               f"sys.stdout.write({bad_stream!r})\n")
+    fake.close()
+    real_cli, real_bare, real_args = server.CLI, server.BARE, server.PROFILE["args"]
+    try:
+        server.CLI = sys.executable
+        server.BARE = False
+        server.PROFILE["args"] = [fake.name]
+        async def invoke():
+            return await server._run_cli("hi", None, "xai/grok-4.6", [])
+        try:
+            asyncio.run(invoke())
+        except HTTPException as exc:
+            assert exc.status_code == 502, exc.status_code
+            expected = ("opencode cli emitted tokens with no text "
+                        "(prompt_tokens=200, completion_tokens=100)")
+            assert exc.detail == expected, (exc.detail, expected)
+            print(f"  final 502 detail matches contract: {exc.detail!r}")
+            return
+    finally:
+        server.CLI, server.BARE, server.PROFILE["args"] = real_cli, real_bare, real_args
+        os.unlink(fake.name)
+    raise AssertionError("expected an HTTPException")
+
+
+def test_retry_fires_only_on_no_text_with_usage_and_merges_first_usage():
+    """Issue #64 acceptance (c, part 1): the in-process retry must fire
+    only on the no-text-with-usage shape. Other failure modes — auth,
+    quota, timeout, empty stdout, nonzero exit — keep their existing
+    single-attempt behaviour, so the same upstream blip is not amplified
+    into a double bill.
+
+    Issue #64 acceptance (c, part 2): on a successful retry, the first
+    attempt's tokens must be folded into the payload so the ledger books
+    both attempts exactly once each. A dropped attempt-1 is the bug this
+    retry is here to prevent.
+    """
+    import asyncio
+    from fastapi import HTTPException
+
+    counter_path = tempfile.NamedTemporaryFile(
+        "w", suffix=".counter", prefix="clib-cnt-", delete=False).name
+    open(counter_path, "w").write("0")
+
+    def make_fake(*, on_call_one: str = "", on_call_other: str = "",
+                  stderr: str = "", rc: int = 0) -> str:
+        """Write a tiny Python CLI that increments counter_path each call.
+
+        `on_call_one` is printed on the first call, `on_call_other` on every
+        subsequent call. Used to script the "first attempt bad, second
+        attempt good" retry shape without two separate fake files.
+        """
+        body = (f"import sys\n"
+                f"p = {counter_path!r}\n"
+                f"n = int(open(p).read() or '0') + 1\n"
+                f"open(p, 'w').write(str(n))\n"
+                f"if n == 1:\n"
+                f"  sys.stdout.write({on_call_one!r})\n"
+                f"else:\n"
+                f"  sys.stdout.write({on_call_other!r})\n"
+                f"sys.stderr.write({stderr!r})\n"
+                f"sys.exit({rc})\n")
+        f = tempfile.NamedTemporaryFile(
+            "w", suffix=".py", prefix="clib-rf-", delete=False)
+        f.write(body)
+        f.close()
+        return f.name
+
+    real_cli, real_bare, real_args = server.CLI, server.BARE, server.PROFILE["args"]
+    try:
+        server.CLI = sys.executable
+        server.BARE = False
+
+        # --- auth failure: single attempt, 401 ---
+        open(counter_path, "w").write("0")
+        auth_fake = make_fake(stderr="please run `claude login` to authenticate",
+                              rc=1)
+        server.PROFILE["args"] = [auth_fake]
+        try:
+            asyncio.run(server._run_cli("hi", None, "xai/grok-4.6", []))
+        except HTTPException as exc:
+            assert exc.status_code == 401, (exc.status_code, exc.detail)
+        else:
+            raise AssertionError("expected a 401 HTTPException")
+        calls = int(open(counter_path).read())
+        assert calls == 1, f"auth failure must not retry (calls={calls})"
+        os.unlink(auth_fake)
+
+        # --- quota failure: single attempt, 429 ---
+        open(counter_path, "w").write("0")
+        quota_fake = make_fake(stderr="You've hit your usage limit.", rc=1)
+        server.PROFILE["args"] = [quota_fake]
+        try:
+            asyncio.run(server._run_cli("hi", None, "xai/grok-4.6", []))
+        except HTTPException as exc:
+            assert exc.status_code == 429, (exc.status_code, exc.detail)
+        else:
+            raise AssertionError("expected a 429 HTTPException")
+        calls = int(open(counter_path).read())
+        assert calls == 1, f"quota failure must not retry (calls={calls})"
+        os.unlink(quota_fake)
+
+        # --- empty stdout: single attempt, 502 ---
+        open(counter_path, "w").write("0")
+        empty_fake = make_fake(rc=0, on_call_other="")   # both calls print nothing
+        server.PROFILE["args"] = [empty_fake]
+        try:
+            asyncio.run(server._run_cli("hi", None, "xai/grok-4.6", []))
+        except HTTPException as exc:
+            assert exc.status_code == 502, (exc.status_code, exc.detail)
+        else:
+            raise AssertionError("expected a 502 HTTPException")
+        calls = int(open(counter_path).read())
+        assert calls == 1, f"empty stdout must not retry (calls={calls})"
+        os.unlink(empty_fake)
+
+        # --- successful retry merges first attempt's usage ---
+        # First attempt emits no-text-with-usage; second emits a normal text
+        # event with its own usage. The final payload must include both,
+        # summed, so the ledger books the retry's first attempt too.
+        open(counter_path, "w").write("0")
+        no_text = ('{"type":"step_finish","part":{"type":"step-finish",'
+                   '"tokens":{"input":777,"output":33}}}')
+        good = ('{"type":"text","part":{"type":"text","text":"ANSWER"}}\n'
+                '{"type":"step_finish","part":{"type":"step-finish",'
+                '"tokens":{"input":111,"output":7,"reasoning":2}}}')
+        retry_fake = make_fake(on_call_one=no_text, on_call_other=good)
+        server.PROFILE["args"] = [retry_fake]
+        payload = asyncio.run(server._run_cli("hi", None, "xai/grok-4.6", []))
+        assert payload["result"] == "ANSWER", payload
+        u = payload["usage"]
+        assert u["input_tokens"] == 888, u      # 777 + 111
+        # 33 from attempt 1, 7+2 reasoning from attempt 2; reasoning rolls
+        # into output_tokens, so 33 + 9 = 42.
+        assert u["output_tokens"] == 42, u
+        calls = int(open(counter_path).read())
+        assert calls == 2, f"successful retry must call CLI twice (calls={calls})"
+        os.unlink(retry_fake)
+        print("  auth/quota/empty single-attempt; no-text-with-usage retries "
+              "and folds attempt 1's usage into attempt 2's payload")
+    finally:
+        server.CLI, server.BARE, server.PROFILE["args"] = real_cli, real_bare, real_args
+        if os.path.exists(counter_path):
+            os.unlink(counter_path)
+
+
+def test_zero_usage_no_text_does_not_retry_and_keeps_existing_message():
+    """Issue #64 acceptance (d): a no-text stream with ZERO usage must NOT
+    trigger the retry, and its failure must keep the legacy 502 message
+    shape ('yielded no parsed answer: ...'). Only nonzero charged usage
+    unlocks the retry path — a plain empty-no-text stream is the legacy
+    behaviour, and a silent change to it would alter the gateway's view
+    of every other no-text failure mode."""
+    import asyncio
+    from fastapi import HTTPException
+
+    # (i) parse_output directly: zero usage -> json.JSONDecodeError, NOT
+    # CliNoTextError. CliNoTextError is reserved for nonzero usage, so an
+    # empty stream must never reach _run_cli's retry branch.
+    stream = ('{"type":"step_start","part":{"type":"step-start"}}\n'
+              '{"type":"step_finish","part":{"type":"step-finish"}}')
+    try:
+        server.parse_output(stream)
+    except json.JSONDecodeError as exc:
+        assert "no assistant text" in str(exc), exc
+        assert not isinstance(exc, server.CliNoTextError), \
+            "zero-usage no-text must NOT raise CliNoTextError"
+    else:
+        raise AssertionError("expected json.JSONDecodeError on zero-usage stream")
+
+    # (ii) end-to-end: a no-text no-usage fake CLI is called exactly once,
+    # and the final 502 keeps the legacy "yielded no parsed answer" shape.
+    counter_path = tempfile.NamedTemporaryFile(
+        "w", suffix=".counter", prefix="clib-zu-", delete=False).name
+    open(counter_path, "w").write("0")
+    bad = ('{"type":"step_start","part":{"type":"step-start"}}\n'
+           '{"type":"step_finish","part":{"type":"step-finish"}}')
+    f = tempfile.NamedTemporaryFile(
+        "w", suffix=".py", prefix="clib-zu-", delete=False)
+    f.write(f"import sys\n"
+            f"p = {counter_path!r}\n"
+            f"n = int(open(p).read() or '0') + 1\n"
+            f"open(p, 'w').write(str(n))\n"
+            f"sys.stdout.write({bad!r})\n")
+    f.close()
+    real_cli, real_bare, real_args = server.CLI, server.BARE, server.PROFILE["args"]
+    try:
+        server.CLI = sys.executable
+        server.BARE = False
+        server.PROFILE["args"] = [f.name]
+        try:
+            asyncio.run(server._run_cli("hi", None, "xai/grok-4.6", []))
+        except HTTPException as exc:
+            assert exc.status_code == 502, exc.status_code
+            assert "yielded no parsed answer" in str(exc.detail), exc.detail
+            assert "emitted tokens with no text" not in str(exc.detail), exc.detail
+        calls = int(open(counter_path).read())
+        assert calls == 1, f"zero-usage no-text must NOT retry (calls={calls})"
+    finally:
+        server.CLI, server.BARE, server.PROFILE["args"] = real_cli, real_bare, real_args
+        os.unlink(f.name)
+        os.unlink(counter_path)
+    print("  zero-usage no-text skips the retry and keeps the legacy 502 message")
 
 
 # --------------------------------------- issue #44: caller-env block + first-turn reminder ---
