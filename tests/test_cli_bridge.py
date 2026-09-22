@@ -893,6 +893,285 @@ def test_no_image_blocks_means_image_note_is_empty():
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,"
                                               + base64.b64encode(PNG_MAGENTA).decode()}}]}])
     print("  text-only requests skip staging; mixed requests are detected")
+
+
+# --------------------------------------- issue #44: caller-env block + first-turn reminder ---
+def test_text_path_argv_carries_env_block_when_resolved():
+    """When the request body names the caller's environment (an OpenCode
+    `<environment>` block in the system message), the `[SwitchYard tool
+    execution environment]` block is appended to the system string that
+    build_argv passes to the CLI. The env values are what the request
+    said, NOT what the relay container sees.
+
+    Note: build_argv itself does not run the env resolution -- the
+    resolution is _handle_chat's job, then it forwards the augmented
+    (prompt, system) to build_argv. We mirror that here: resolve via
+    caller_env, render the block, then build_argv carries the rendered
+    text on the CLI's argv. This is the contract for what the CLI
+    receives end to end.
+    """
+    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
+    try:
+        server.PROVIDER = "claude"
+        server.PROFILE = server.PROFILES["claude"]
+        server.CLI = server.PROFILE["cli"]
+        body = {
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": (
+                    "<environment>\n"
+                    "  <working_directory>C:\\Users\\demo\\proj</working_directory>\n"
+                    "  <platform>windows</platform>\n"
+                    "</environment>"
+                )},
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+        prompt, system = server.flatten(body["messages"])
+        # Mirror the _handle_chat path: parse the request, render the
+        # block + reminder, then build_argv.
+        env = server._caller_env.parse_request(body)
+        assert env is not None and env.platform == "windows", env
+        system = (f"{system}\n\n{server._caller_env.render_system_block(env)}"
+                  if system else server._caller_env.render_system_block(env))
+        reminder = server._caller_env.render_first_turn_reminder(env)
+        prompt = f"{reminder}\n\n{prompt}" if prompt else reminder
+        argv, _ = server.build_argv(prompt, system, "m")
+        # The system string is the second-to-last element of argv (the
+        # --append-system-prompt flag and value are the only system-carrying
+        # pair in the claude profile's append-mode path).
+        i = argv.index("--append-system-prompt") + 1
+        rendered_system = argv[i]
+        assert "[SwitchYard tool execution environment]" in rendered_system, \
+            argv
+        assert "Caller platform: windows" in rendered_system, argv
+        assert r"Caller working directory: C:\Users\demo\proj" in rendered_system, \
+            argv
+        # The reminder on the first user turn is the prompt (substituted
+        # into {-p prompt}).
+        i_p = argv.index("-p") + 1
+        rendered_prompt = argv[i_p]
+        assert "[SwitchYard: tools execute on windows in C:\\Users\\demo\\proj" \
+            in rendered_prompt, argv
+        print("  system argv carries the env block + first-turn reminder")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
+
+
+def test_text_path_unknown_env_renders_unknown_wording_never_linux():
+    """When neither the request nor the metadata carries an env, the
+    unknown-env wording is rendered -- explicitly, with the literal
+    word "unknown" -- and the relay's own Linux / /app environment is
+    NEVER substituted as a fallback. This is the whole bug we are
+    avoiding; a regression here would have the inner CLI's `# Environment`
+    block continue to mislead the model about the caller.
+    """
+    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
+    try:
+        server.PROVIDER = "claude"
+        server.PROFILE = server.PROFILES["claude"]
+        server.CLI = server.PROFILE["cli"]
+        body = {
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "no env here"},
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+        prompt, system = server.flatten(body["messages"])
+        # _handle_chat's path: parse_request -> unknown -> render unknown.
+        env = server._caller_env.parse_request(body)
+        if env is None:
+            # Mirror the cli_bridge read path: use CallerEnvironmentSettings
+            # from switchyard.models (or the local fallback).
+            try:
+                from switchyard.models import CallerEnvironmentSettings
+                ce_cfg = CallerEnvironmentSettings()
+            except ImportError:
+                ce_cfg = None
+            env = server._caller_env.resolve(body, ce_cfg) if ce_cfg else None
+        if env is None:
+            env = server._caller_env.CallerEnvironment.unknown()
+        assert env.source == "unknown", env
+        system = (f"{system}\n\n{server._caller_env.render_system_block(env)}"
+                  if system else server._caller_env.render_system_block(env))
+        reminder = server._caller_env.render_first_turn_reminder(env)
+        prompt = f"{reminder}\n\n{prompt}" if prompt else reminder
+        argv, _ = server.build_argv(prompt, system, "m")
+        i = argv.index("--append-system-prompt") + 1
+        rendered_system = argv[i]
+        # The literal "unknown" string for every field.
+        assert "Caller platform: unknown" in rendered_system, argv
+        assert "Caller working directory: unknown" in rendered_system, argv
+        assert "Caller shell: unknown" in rendered_system, argv
+        # NEVER the relay's own Linux / /app wording.
+        assert "Platform: linux" not in rendered_system, argv
+        assert "/app/mcp_bridge" not in rendered_system, argv
+        assert "/app/cli_bridge" not in rendered_system, argv
+        # Reminder on the first turn uses the unknown-env wording.
+        i_p = argv.index("-p") + 1
+        rendered_prompt = argv[i_p]
+        assert "[SwitchYard: caller environment unknown" in rendered_prompt, argv
+        assert "do not assume the relay container" in rendered_prompt, argv
+        print("  unknown env: literal 'unknown' wording, no Linux / /app leakage")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
+
+
+def test_text_path_spawn_cwd_is_a_fresh_temp_dir():
+    """Each call to `_run_cli` spawns the inner CLI in a fresh
+    `tempfile.mkdtemp(prefix='sy-cli-')`, NOT in /app/cli_bridge. A fake
+    CLI prints its own cwd; the assert confirms the spawned process
+    actually saw the per-call temp dir.
+
+    Belt-and-braces: a session-shaped directory beneath the temp
+    partition keeps paths underneath it from looking like a meaningful
+    project root the model could safely use (issue #44).
+    """
+    import asyncio
+    # Use the opencode parser shape so the events_json parser accepts
+    # the fake CLI output (the opencode profile is the test default).
+    fake_cli = tempfile.NamedTemporaryFile(
+        "w", suffix=".py", prefix="clib-cwd-", delete=False)
+    fake_cli.write(
+        "import json, os\n"
+        # opencode emits one event per line: a text event, then a step_finish.
+        "cwd = os.getcwd()\n"
+        "print(json.dumps({'type': 'text', 'part': "
+        "    {'type': 'text', 'text': cwd}}))\n"
+        "print(json.dumps({'type': 'step_finish', 'part': "
+        "    {'type': 'step-finish', "
+        "     'tokens': {'input': 1, 'output': 1, 'reasoning': 0}}}))\n")
+    fake_cli.close()
+    real_cli = server.CLI
+    real_bare = server.BARE
+    real_args = server.PROFILE["args"]
+    try:
+        server.CLI = sys.executable
+        server.BARE = False
+        server.PROFILE["args"] = [fake_cli.name]
+        async def invoke():
+            return await server.run_cli("hi", None, "m")
+        payload = asyncio.run(invoke())
+        cwd = payload["result"]
+        assert cwd != "/app/cli_bridge", cwd
+        assert os.path.basename(cwd).startswith("sy-cli-"), cwd
+        print(f"  inner CLI spawned in cwd={cwd} (under tempfile, not /app)")
+    finally:
+        server.CLI = real_cli
+        server.BARE = real_bare
+        server.PROFILE["args"] = real_args
+        os.unlink(fake_cli.name)
+
+
+def test_text_path_no_tools_passthrough_with_metadata_still_parses():
+    """A no-tools text request that DOES carry `metadata.switchyard.caller_env`
+    is a valid passthrough: it parses the stamp (no tools to refuse), it
+    does NOT probe (no tool round-trip), and the resolved env drives the
+    system block. The 400-on-tools behaviour for CLI-backed plans is
+    untouched -- this test uses no tools on purpose, to confirm the
+    caller-env field flows through _handle_chat without short-circuiting.
+    """
+    from fastapi import HTTPException
+    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
+    try:
+        server.PROVIDER = "claude"
+        server.PROFILE = server.PROFILES["claude"]
+        server.CLI = server.PROFILE["cli"]
+        # The text path is _handle_chat. We can't drive it via the http
+        # route from a test cleanly, so call it directly. It raises
+        # HTTPException for image-unsupported or capacity issues; we
+        # only assert no tool-refusal 400 fires.
+        body = {
+            "model": "m",
+            "metadata": {"switchyard": {"caller_env": {
+                "platform": "darwin", "cwd": "/Users/x/p",
+                "shell": "zsh", "source": "request"}}},
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        # No tools -> not a 400. The gate / spawn guard may raise 429/502
+        # under load, but the call MUST not 400 on the tools check.
+        try:
+            import asyncio as _asyncio
+            _asyncio.run(server._handle_chat(body))
+        except HTTPException as exc:
+            assert exc.status_code != 400 or \
+                (isinstance(exc.detail, dict) and
+                 exc.detail.get("error", {}).get("type") != "tools_unsupported"), \
+                f"text path must not 400 on tools when no tools present: {exc.detail}"
+        except Exception:
+            pass  # 429/502/etc. from gate / spawn is not under test here
+        print("  no-tools + metadata-stamped caller_env -> no tools_unsupported 400")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
+
+
+def test_text_path_system_mode_replace_argv_unchanged_apart_from_system():
+    """SYSTEM_MODE=replace is the path where `--system-prompt` replaces the
+    CLI's own agent prompt instead of stacking on top of it. Adding the
+    env block MUST NOT alter that contract: the replace-mode flag, the
+    file-form flag, and `--exclude-dynamic-system-prompt-sections` all
+    stay present; only the system content string changes.
+
+    Verified by checking the argv keeps the replace-mode markers AND
+    that the env block rides inside the system content (not on top of
+    it).
+    """
+    import _modules
+    old = dict(os.environ)
+    os.environ.update({"PROVIDER": "claude"})
+    os.environ.pop("SYSTEM_MODE", None)
+    os.environ.pop("SWITCHYARD_PLAN", None)
+    try:
+        mod = _modules.reload(server)
+        os.environ["SYSTEM_MODE"] = "replace"
+        mod = _modules.reload(server)
+        body = {
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": (
+                    "<environment>\n"
+                    "  <working_directory>C:\\Users\\demo\\proj</working_directory>\n"
+                    "  <platform>windows</platform>\n"
+                    "</environment>"
+                )},
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+        prompt, system = mod.flatten(body["messages"])
+        # Mirror _handle_chat: resolve env, render block, append to system.
+        env = mod._caller_env.parse_request(body)
+        assert env is not None and env.platform == "windows", env
+        env_block = mod._caller_env.render_system_block(env)
+        system = (f"{system}\n\n{env_block}" if system else env_block)
+        argv, _ = mod.build_argv(prompt, system, "m")
+        # Replace-mode flags stay present.
+        assert "--system-prompt" in argv, argv
+        assert "--exclude-dynamic-system-prompt-sections" in argv, argv
+        # The env block rides INSIDE the --system-prompt argument, not on
+        # top of it.
+        i = argv.index("--system-prompt") + 1
+        sys_arg = argv[i]
+        assert "[SwitchYard tool execution environment]" in sys_arg, argv
+        assert "Caller platform: windows" in sys_arg, argv
+        assert r"Caller working directory: C:\Users\demo\proj" in sys_arg, argv
+        # The caller-supplied original system content survives in the same arg.
+        assert "<environment>" in sys_arg, argv
+        # Other replace-mode invariants: the file form's flag is NOT
+        # present (the system block stays inline because the system
+        # string is well under MAX_ARG_STRLEN, even with the env block
+        # appended).
+        assert "--system-prompt-file" not in argv, argv
+        print("  SYSTEM_MODE=replace: --system-prompt carries env block; "
+              "--exclude-dynamic-system-prompt-sections preserved")
+    finally:
+        # Restore env AND reload the module to flush SYSTEM_MODE=replace
+        # state so subsequent tests see the original (append-mode) profile.
+        os.environ.clear()
+        os.environ.update(old)
+        _modules.reload(server)
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

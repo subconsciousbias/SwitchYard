@@ -32,7 +32,7 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy._types import UserAPIKeyAuth
 from redis.asyncio import Redis
 
-from . import models
+from . import caller_env, models
 from .classify import Outcome, classify, escalated_cooldown, inspect_success_payload
 from .picker import LaneSaturated, Picker
 from .policy import CapacityPolicy
@@ -297,6 +297,24 @@ class SwitchyardHandler(CustomLogger):
             "needs_tools": needs_tools,
             "pinned": pinned,
         }
+        # The caller-environment stamp is best-effort and never fails the
+        # request. Belt-and-braces: hooks.py proves metadata lives on the
+        # request body, but nothing in-tree proves LiteLLM forwards it to
+        # the sidecar (the gateway->sidecar transport is not yet verified
+        # in production). The mcp_bridge / cli_bridge re-resolve the env
+        # from the request itself on their side -- the stamp here is just
+        # the easy path. Wrapped in try/except so a parse hiccup cannot
+        # poison every request that hits this hook.
+        try:
+            ce = caller_env.resolve(data, self.registry.settings.caller_environment)
+            meta[META_KEY]["caller_env"] = {
+                "cwd": ce.cwd,
+                "platform": ce.platform,
+                "shell": ce.shell,
+                "source": ce.source,
+            }
+        except Exception:                       # never fail the request over a label
+            log.debug("caller_env resolution skipped for this request", exc_info=True)
         log.info(
             "lane=%s -> %s [%s]%s%s%s",
             lane, pick.model.ref, pick.cap_reason,

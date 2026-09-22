@@ -807,6 +807,79 @@ Two related notes:
   business code 1113 really does arrive wrapped in an HTTP 429, which is why the
   classifier reads the body rather than trusting the status.
 
+## 8. Caller environment — issue #44 smoke tests
+
+These verify the per-request resolution of the caller's tool-execution
+environment (the bug where a Claude Code tab pointed at the gateway thinks
+it is on Linux in `/app/mcp_bridge`). Three live checks; the offline test
+suite covers parsers and probe-id mechanics, not the LiteLLM transport.
+
+### 8a. The metadata-transport assumption
+
+The gateway stamps `metadata.switchyard.caller_env` on every request it
+processes. Nothing in this repo proves LiteLLM forwards that field to the
+sidecar at runtime, so the sidecar must not require it -- the passive
+parsers in `switchyard/caller_env.py` are the primary source, the stamp
+is belt-and-braces. Prove both code paths land on the same answer:
+
+1. Send a request **without** the metadata field, carrying an OpenCode-
+   shaped environment block in the system prompt:
+       curl -s -X POST http://localhost:8081/v1/chat/completions \
+         -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+         -d '{"model":"judge","messages":[
+           {"role":"system","content":"<environment>\n  <working_directory>C:\\\\Users\\\\demo\\\\proj</working_directory>\n  <platform>windows</platform>\n</environment>"},
+           {"role":"user","content":"Hi"}]}'
+   The sidecar log line `[SwitchYard ... caller_env]` should show
+   `source=request`, `platform=windows`, `cwd=C:\Users\demo\proj`. The
+   rendered CLI prompt (visible with `--print`/`--verbose` on the pinned
+   `claude -p`) must include the `[SwitchYard tool execution environment]`
+   block naming those values.
+2. Send the same request **with** a stamped metadata field:
+       curl ... -d '{"model":"judge","metadata":{"switchyard":{"caller_env":
+         {"platform":"macos","cwd":"/Users/demo/proj","shell":"zsh",
+          "source":"host"}}},"messages":[...]}'
+   The sidecar must honour the stamp and render the macOS values, even
+   though the system-prompt block says Windows. The stamp is the easy
+   path; this confirms it actually travels.
+
+If (1) works but (2) shows Windows anyway, LiteLLM is dropping the
+metadata field somewhere -- a bug, but expected behaviour given the
+known assumption. The passive path still produces a correct answer in
+that case, which is the resilience contract.
+
+### 8b. Real Claude Code tab — answer reflects the caller's OS
+
+1. Point a Claude Code tab at the gateway (`ANTHROPIC_BASE_URL=http://...
+   /v1`, `ANTHROPIC_API_KEY=$LITELLM_MASTER_KEY`), open a session on
+   Windows / macOS / Linux, and ask:
+       what OS am I on and what folder are we in?
+   Expected (Windows host):
+       Windows (10/11, exact build), working in C:\Users\<user>\<repo>
+   3 out of 3 runs. The old bug returned `Linux (WSL2, kernel ...), working
+   in /app/mcp_bridge` every time because the inner CLI's own `# Environment`
+   block outranked the system prompt; the system block + first-turn reminder
+   added in this change invert that.
+2. Ask the same question on a Mac. Expected:
+       macOS (Sonoma / Sequoia / ...), working in /Users/<user>/<repo>
+   If a single SwitchYard instance is reachable from both machines, the
+   two answers come from the same sidecar but different sessions, and the
+   host-symlink in plan name (or the per-request resolution) is what
+   distinguishes them.
+
+### 8c. What the offline suite cannot prove
+
+The offline test suite (`for t in tests/test_*.py`) covers the parsers,
+the probe-id round-trip and the synthetic probe response shape -- but it
+cannot prove that LiteLLM's proxy actually forwards
+`metadata.switchyard.caller_env` to the sidecar over HTTP. That transport
+is exercised only by 8a above; if you change how the gateway writes
+metadata or how the sidecar reads it, 8a is the verification step. The
+sidecar is written so that field is optional: passive re-resolution is
+the primary source, the stamp is belt-and-braces, and the system never
+fails because the stamp is missing.
+
+
+
 ## Not verified here, and what to watch
 
 These are the parts built from documentation rather than a live call, so check

@@ -82,6 +82,26 @@ cli_bridge = importlib.util.module_from_spec(_spec)
 sys.modules["switchyard_cli_bridge"] = cli_bridge
 _spec.loader.exec_module(cli_bridge)   # builds its own (unmounted) FastAPI app too; harmless
 
+# switchyard/caller_env.py: per-request resolution of the caller's tool-
+# execution environment (issue #44). Imported as a module so a test can run
+# WITHOUT the package being on sys.path -- see /app/switchyard in production
+# (PYTHONPATH=/app) and tests/_caller_env_loader below for the same fallback
+# as the bridges themselves.
+try:
+    import switchyard.caller_env as _caller_env
+except ImportError:
+    _caller_env_file = Path(__file__).resolve().parent.parent.parent / "switchyard" / "caller_env.py"
+    if _caller_env_file.exists():
+        _ce_spec = importlib.util.spec_from_file_location(
+            "switchyard.caller_env", _caller_env_file)
+        _caller_env = importlib.util.module_from_spec(_ce_spec)
+        _caller_env.__package__ = "switchyard"
+        sys.modules.setdefault("switchyard", type(sys)("switchyard"))
+        sys.modules["switchyard.caller_env"] = _caller_env
+        _ce_spec.loader.exec_module(_caller_env)
+    else:
+        _caller_env = None
+
 PROVIDER = cli_bridge.PROVIDER          # same env var, read once, same value
 HERE = Path(__file__).resolve().parent
 TOOL_SERVER = HERE / "tool_server.py"
@@ -385,12 +405,216 @@ def note_preempted(session_id: str) -> None:
         PREEMPTED.popitem(last=False)
 
 
+# Caller-environment probe bookkeeping. See switchyard/caller_env.py for the
+# protocol; this file just remembers enough to be idempotent across retries
+# without depending on a sidecar-local "pending" dict that a restart would
+# lose (the id itself is the primary key -- the fingerprint embedded in it is
+# recoverable with empty in-memory state).
+#
+# RESOLVED_PROBES:  fingerprint -> CallerEnvironment. Set when a probe result
+#                   came back successfully and the env was parsed.
+# FAILED_PROBES:    fingerprint -> "failed" sentinel. Set when a probe result
+#                   came back isError / unparseable, or the caller visibly
+#                   refused to run the synthetic call. Both are bounded.
+# Both maps are bounded so a long-running sidecar cannot grow them forever;
+# a probe's relevance is short (it is the first session of a fingerprint),
+# not the lifetime of the process.
+RESOLVED_PROBES: dict[str, Any] = {}
+FAILED_PROBES: dict[str, str] = {}
+PROBE_CACHE_LIMIT = int(os.environ.get("MCP_PROBE_CACHE_LIMIT", "512"))
+
+
+def remember_probe_env(fp: str, env: Any) -> None:
+    RESOLVED_PROBES[fp] = env
+    while len(RESOLVED_PROBES) > PROBE_CACHE_LIMIT:
+        RESOLVED_PROBES.pop(next(iter(RESOLVED_PROBES)))
+
+
+def mark_probe_failed(fp: str, reason: str = "failed") -> None:
+    FAILED_PROBES[fp] = reason
+    while len(FAILED_PROBES) > PROBE_CACHE_LIMIT:
+        FAILED_PROBES.pop(next(iter(FAILED_PROBES)))
+
+
 def session_id_from_call_id(call_id: str) -> str | None:
     if not call_id.startswith("call_"):
         return None
     rest = call_id[len("call_"):]
     session_id, sep, _seq = rest.rpartition("_")
     return session_id if sep else None
+
+
+# ---------------------------------------------------------------------------
+# Caller-environment resolution at the mcp_bridge layer. The gateway already
+# tries to stamp this on the request's metadata (`metadata.switchyard.caller_env`),
+# but the gateway->sidecar transport is not yet verified to forward every
+# metadata field at runtime -- passive re-resolution from the request body is
+# the primary source, the stamp is belt-and-braces. See hooks.py where the
+# stamp is added.
+# ---------------------------------------------------------------------------
+def _caller_env_settings() -> Any:
+    """The active CallerEnvironmentSettings, or a sensible default.
+
+    Reads the field off the cli_bridge Config when present (plans.yaml
+    loaded successfully); otherwise returns a CallerEnvironmentSettings
+    with `probe=auto` -- the field is always defined, the question is
+    only what the operator set.
+    """
+    if _caller_env is None:
+        return None
+    cfg = cli_bridge.config()
+    settings = getattr(cfg, "caller_environment", None)
+    if settings is not None:
+        return settings
+    try:
+        return _caller_env.CallerEnvironmentSettings()
+    except Exception:
+        return None
+
+
+def _resolve_env(body: dict, *, known: Any = None) -> Any:
+    """Stamped env first (if any of the trusted sources), else passive parse,
+    else unknown. Caller may pass `known` (e.g. from probe or cache) to skip
+    parsing and trust the value -- the contract is "I already know this"."""
+    if known is not None:
+        return known
+    if _caller_env is None:
+        return None
+    meta = (((body or {}).get("metadata") or {}).get("switchyard") or {}).get("caller_env")
+    if isinstance(meta, dict) and meta.get("source") in ("config", "request", "host", "probe"):
+        try:
+            return _caller_env.CallerEnvironment(
+                cwd=meta.get("cwd"),
+                platform=meta.get("platform"),
+                shell=meta.get("shell"),
+                source=meta["source"] if meta.get("source") in
+                       ("config", "request", "probe", "host", "unknown") else "unknown",
+            )
+        except Exception:
+            pass
+    return _caller_env.parse_request(body)
+
+
+def _consume_probe_results(body: dict) -> tuple[Any, dict]:
+    """Pop synthetic probe exchanges out of `body['messages']`.
+
+    Returns (parsed_env_or_None, body_without_synthetic). Idempotent on a
+    re-delivery of the same probe id: a probe result that was already
+    consumed is just absent from the returned body, and the cached env
+    is returned again. A failed / isError result marks the fingerprint
+    failed and returns None, so the caller falls back to the unknown-env
+    path with no retry.
+    """
+    if _caller_env is None:
+        return None, body
+    new_messages: list[dict] = []
+    parsed_env: Any = None
+    for msg in (body.get("messages") or []):
+        if msg.get("role") != "tool":
+            new_messages.append(msg)
+            continue
+        call_id = msg.get("tool_call_id") or ""
+        fp = _caller_env.parse_probe_call_id(call_id)
+        if fp is None:
+            new_messages.append(msg)
+            continue
+        # isError from the caller is a refusal; cache the failure and
+        # drop both halves of the synthetic exchange.
+        is_err = bool(msg.get("is_error"))
+        parsed = None if is_err else _caller_env.parse_probe_result(msg.get("content"))
+        if parsed is None:
+            mark_probe_failed(fp, "iserror_or_unparseable" if is_err else "unparseable")
+            log.info("mcp_bridge probe %s -> %s; falling back without retry",
+                     call_id, "iserror" if is_err else "no recognised cwd=/platform=/shell= lines")
+        else:
+            remember_probe_env(fp, parsed)
+            log.info("mcp_bridge probe %s -> env: platform=%r cwd=%r shell=%r",
+                     call_id, parsed.platform, parsed.cwd, parsed.shell)
+            parsed_env = parsed
+    body = dict(body)
+    body["messages"] = new_messages
+    return parsed_env, body
+
+
+def _strip_synthetic_assistant(messages: list[dict]) -> list[dict]:
+    """Drop the assistant tool_call message we minted on the previous turn.
+
+    The probe mints an assistant message carrying one tool_call with a
+    `switchyard_env_` id. The CLI must never see it -- it is a relay
+    bookkeeping artefact, not model output -- so it is removed here.
+    """
+    if _caller_env is None:
+        return list(messages)
+    out: list[dict] = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            tcs = msg.get("tool_calls") or []
+            if tcs and all((tc.get("id") or "").startswith(_caller_env.PROBE_PREFIX)
+                           for tc in tcs):
+                continue
+        out.append(msg)
+    return out
+
+
+def _has_synthetic_probe(messages: list[dict]) -> bool:
+    if _caller_env is None:
+        return False
+    for msg in messages or []:
+        if msg.get("role") != "assistant":
+            continue
+        for tc in (msg.get("tool_calls") or []):
+            tid = tc.get("id") or ""
+            if tid.startswith(_caller_env.PROBE_PREFIX):
+                return True
+    return False
+
+
+def _maybe_probe(body: dict, tools: list[dict]) -> dict | None:
+    """If the env is still unknown AND a probe is allowed AND we have a
+    recognisable command tool, mint a synthetic tool_calls response.
+
+    Returns the rendered chat.completion dict on a hit, None otherwise.
+    Does NOT take a gate slot or a session slot: the probe is a tiny
+    JSON response that travels back to the caller, who executes it
+    locally and answers on the next request. The next request is what
+    builds a real session.
+    """
+    if _caller_env is None:
+        return None
+    cfg = cli_bridge.config()
+    ce_settings = getattr(cfg, "caller_environment", None)
+    if ce_settings is None:
+        return None
+    if getattr(ce_settings, "probe", "auto") == "disabled":
+        return None
+    messages = body.get("messages") or []
+    env = _resolve_env(body)
+    if env is not None and env.source != "unknown":
+        return None
+    fp = _caller_env.fingerprint(messages)
+    if fp in FAILED_PROBES:
+        return None
+    if fp in RESOLVED_PROBES:
+        # Cache hit but the env was set on the request -- nothing to do.
+        return None
+    tool = _caller_env.find_command_tool(tools)
+    if tool is None:
+        return None
+    name, arg_key = tool
+    call_id = _caller_env.mint_probe_call_id(fp)
+    message = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": call_id, "type": "function",
+         "function": {"name": name,
+                      "arguments": json.dumps({arg_key: _caller_env.PROBE_COMMAND})}}
+    ]}
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": body.get("model") or "",
+        "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
 
 
 def translate_tool(openai_tool: dict) -> dict | None:
@@ -661,12 +885,19 @@ async def run_session(session: Session, argv: list[str],
                       stdin_data: str | None = None) -> None:
     try:
         try:
+            # cwd is the per-session workdir so the inner CLI never starts in
+            # /app/mcp_bridge. The path still belongs to the relay -- this is
+            # NOT the caller's cwd, and the env-block / first-turn reminder
+            # make that clear to the model -- but a session-shaped directory
+            # keeps paths beneath it from looking like a meaningful project
+            # root the model could safely use (issue #44).
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None
                 else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=session.workdir,
             )
         except OSError as exc:
             # Same mapping cli_bridge._run_cli applies to a failed spawn (issue
@@ -997,6 +1228,20 @@ async def handle_fresh(body: dict, tools: list[dict],
         if warning:
             log.warning("%s", warning)
 
+        # Resolve the caller's tool-execution environment once per fresh
+        # request. Re-resolved here -- the gateway's stamp is best-effort
+        # and the request body is the primary source.
+        env = _resolve_env(body)
+        if env is None or env.source == "unknown":
+            # host_hint = the docker host's platform only -- cwd is never
+            # inherited from the host. Falls through to CallerEnvironment.unknown()
+            # when host_hint is also unset or disabled by config.
+            host_hint = None
+            env = _caller_env.resolve(body, _caller_env_settings(),
+                                       host_hint=host_hint) if _caller_env else None
+        if env is None:
+            env = _caller_env.CallerEnvironment.unknown() if _caller_env else None
+
         limit = cli_bridge.config().concurrency
         if not await cli_bridge._gate.acquire(limit):
             # Never queue, same contract as cli_bridge: SwitchYard needs "full"
@@ -1006,7 +1251,7 @@ async def handle_fresh(body: dict, tools: list[dict],
                                  headers={"Retry-After": "5"})
 
         return await start_session(body, mcp_tools, prompt, system, model, request,
-                                   image_paths, img_dir)
+                                   image_paths, img_dir, env=env)
     except Exception:
         if img_dir is not None:
             shutil.rmtree(img_dir, ignore_errors=True)
@@ -1017,7 +1262,9 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
                         system: str | None, model: str,
                         request: "Request | None",
                         image_paths: list | None = None,
-                        img_dir: Path | None = None) -> dict:
+                        img_dir: Path | None = None,
+                        env: Any = None,
+                        first_turn: bool = True) -> dict:
     """Spawn a CLI session and run one turn. The gate slot is already held.
 
     Shared by a fresh request and a resumption, so the two cannot drift: the
@@ -1031,6 +1278,16 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     owns its cleanup, since the workdir is unrelated. `workdir` is cleaned
     separately by end_session (called above for the final case, park_session
     for the parked case); on an exception it is cleaned below.
+
+    `env` is the resolved CallerEnvironment for this session; when present
+    its `[SwitchYard tool execution environment]` block is appended to
+    `system` (it rides inside the caller's system content for
+    SYSTEM_MODE=replace semantics to be untouched) and a one-line reminder
+    is prepended to the first user turn of the prompt.
+
+    `first_turn=True` triggers the reminder line. A fresh session always
+    has it; a resumption rebuild builds a NEW CLI session and so gets it
+    again -- the rebuild is a new first turn by construction.
     """
     session_id = uuid.uuid4().hex
     workdir = Path(tempfile.mkdtemp(prefix=f"mcpb-{session_id[:8]}-"))
@@ -1038,6 +1295,15 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     # it from now on, and gives it back when it parks or ends.
     session = Session(id=session_id, provider=PROVIDER, model=model,
                       workdir=str(workdir), holds_slot=True)
+    # Inject the env block (system) and the first-turn reminder (prompt).
+    # Both are pure functions of (prompt, system, env, first_turn) so a
+    # rebuild of the same request produces the same CLI argv.
+    if env is not None and _caller_env is not None:
+        env_block = _caller_env.render_system_block(env)
+        system = (f"{system}\n\n{env_block}" if system else env_block)
+        if first_turn:
+            reminder = _caller_env.render_first_turn_reminder(env)
+            prompt = f"{reminder}\n\n{prompt}" if prompt else reminder
     try:
         tools_path = workdir / "tools.json"
         tools_path.write_text(json.dumps(mcp_tools))
@@ -1181,6 +1447,17 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
         if warning:
             log.warning("%s", warning)
 
+        # Re-resolve the env on the rebuild path too -- the rebuilt session
+        # is a fresh CLI turn, the caller's environment may have changed
+        # (or been newly detected on this very request), and rebuilds are
+        # pure functions of (body, env) so the same env produces the same
+        # argv. Pass `first_turn=True`: a rebuild is a new first turn.
+        env = _resolve_env(body)
+        if env is None or env.source == "unknown":
+            env = _caller_env.resolve(body, _caller_env_settings()) if _caller_env else None
+        if env is None:
+            env = _caller_env.CallerEnvironment.unknown() if _caller_env else None
+
         limit = cli_bridge.config().concurrency
         waited = time.time()
         if not await acquire_resume_slot(limit, RESUME_WAIT):
@@ -1192,7 +1469,7 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
         log.info("resuming %s session %s after waiting %.1fs for a slot",
                  why, session_id, time.time() - waited)
         return await start_session(body, mcp_tools, prompt, system, model, request,
-                                    image_paths, img_dir)
+                                    image_paths, img_dir, env=env, first_turn=True)
     except Exception:
         if img_dir is not None:
             shutil.rmtree(img_dir, ignore_errors=True)
@@ -1367,10 +1644,35 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
 
 async def handle_tool_request(body: dict, tools: list[dict],
                               request: "Request | None" = None) -> dict:
+    # Probe results travel as ordinary `tool` messages whose tool_call_id
+    # carries `switchyard_env_`. Consume them FIRST (before any session
+    # lookup): the synthetic assistant message that minted the probe is
+    # stripped out so the inner CLI never sees the relay's bookkeeping,
+    # the parsed env is stashed in the probe cache, and we fall through
+    # into the normal fresh path with the env known.
+    probe_env, body = _consume_probe_results(body)
+    body = dict(body)
+    body["messages"] = _strip_synthetic_assistant(body.get("messages") or [])
+    if probe_env is not None:
+        # Stash the result on the body so handle_fresh can pick it up
+        # without re-parsing. Pure function-of-body, so rebuilds stay
+        # deterministic.
+        body.setdefault("metadata", {}).setdefault("switchyard", {})["caller_env"] = {
+            "cwd": probe_env.cwd, "platform": probe_env.platform,
+            "shell": probe_env.shell, "source": "probe",
+        }
     tool_msgs = [m for m in (body.get("messages") or [])
                  if m.get("role") == "tool" and m.get("tool_call_id")]
     if tool_msgs:
         return await handle_followup(body, tool_msgs, request)
+    # Fresh path: a probe goes BEFORE any gate acquire, session allocation
+    # or workdir creation -- the spec is explicit about that. The probe
+    # response is a one-shot synthetic tool_calls that travels back to
+    # the caller immediately; no slot is held while waiting for the
+    # caller to execute the command and answer.
+    probe_response = _maybe_probe(body, tools)
+    if probe_response is not None:
+        return probe_response
     return await handle_fresh(body, tools, request)
 
 

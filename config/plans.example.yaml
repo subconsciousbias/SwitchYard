@@ -111,6 +111,57 @@ settings:
     max_seconds: 1800          # half an hour; enough to outlast most blips
     streak_alert: 3            # when the board starts surfacing the failing chip
 
+  # --------------------------------------------------------------------------
+  # CALLER ENVIRONMENT — the caller's tool-execution environment, resolved
+  # per request (issue #44). The inner CLI runs in a SwitchYard relay
+  # container; the caller's tools run on the caller's machine. Without a
+  # signal, the inner CLI's own `# Environment` block — Linux, /app/mcp_bridge
+  # — wins the model's attention, and the model answers a Windows user with
+  # "I am on Linux in /app/mcp_bridge". This block decides what to tell the
+  # inner CLI in its place.
+  #
+  # A single SwitchYard instance can serve Windows, macOS and Linux callers
+  # at once, so resolution is per-request, not per-deployment. Each plan's
+  # connection limit and quota still belong to the plan; this is only about
+  # what to write into the inner CLI's prompt.
+  #
+  # Precedence (see switchyard/caller_env.py for the full contract):
+  #
+  #   1. config forced `platform` / `cwd` / `shell`   -> source=config
+  #   2. environment parsed from the request body      -> source=request
+  #   3. synthetic probe (mcp_bridge tool round-trip)  -> source=probe
+  #   4. `fallback_platform` (PLATFORM ONLY)          -> source=host
+  #   5. otherwise                                     -> source=unknown
+  #
+  # The relay's environment is NEVER a fallback. The Docker host's working
+  # directory has no reliable relationship to the directory a caller later
+  # opens in Claude Code or OpenCode, so cwd is also never inferred from the
+  # host. Only platform is — and only as a last resort.
+  #
+  # `probe: auto` lets the mcp_bridge mint a single read-only synthetic
+  # command tool call on the very first request of a new session when no
+  # environment has been resolved yet. The probe runs once, cannot retry,
+  # and never enumerates environment variables (it only runs `pwd`,
+  # `uname -s` and prints `$SHELL`). Use `disabled` to skip the probe, or
+  # `required` to refuse requests that have neither a passive environment
+  # nor a forced override.
+  # --------------------------------------------------------------------------
+  caller_environment:
+    probe: auto               # auto | disabled | required
+    # Forced values, when set, beat everything else — passive detection and
+    # probing are both skipped. Useful for a kiosk with a single fixed
+    # caller, or for testing the env-block rendering without a real caller.
+    # platform: windows
+    # cwd: C:\Users\demo\project
+    # shell: powershell
+    # Last-resort platform hint when nothing else gave us one. Never a cwd:
+    # the directory `docker compose up` was launched from has no reliable
+    # relationship to the directory a caller opens in their editor an hour
+    # later. Use `macos` if the deployment is known to run on macOS hardware
+    # and a Windows / Linux caller will be detected passively anyway; leave
+    # it unset for a Linux container serving mixed callers.
+    # fallback_platform: macos
+
 # ============================================================================
 # PLANS — what you pay for. Credentials, quota, connection limit, cost, expiry.
 # ============================================================================

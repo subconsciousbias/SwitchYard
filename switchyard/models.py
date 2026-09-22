@@ -151,6 +151,43 @@ class TransientBreaker:
 
 
 @dataclass(frozen=True)
+class CallerEnvironmentSettings:
+    """How to resolve the caller's tool-execution environment per request.
+
+    The caller's tools execute on the caller's machine, but the inner CLI
+    runs in a SwitchYard relay container. Those two environments are not
+    the same, and the model needs to be told so explicitly — otherwise
+    the inner CLI's `# Environment` block (Linux, `/app/mcp_bridge`)
+    outranks anything earlier in the system prompt and the model answers
+    "I am on Linux in /app/mcp_bridge" to a Windows user (issue #44).
+
+    Resolution precedence (see switchyard/caller_env.py for the full
+    contract):
+
+      1. config forced `platform` / `cwd` / `shell` -> source=config
+      2. environment parsed from the request body    -> source=request
+      3. synthetic probe (mcp_bridge tool round-trip)-> source=probe
+      4. `fallback_platform` (PLATFORM ONLY)        -> source=host
+      5. otherwise                                   -> source=unknown
+
+    The relay's environment is never substituted as a fallback: the
+    sidecar is the sidecar, and saying otherwise is the bug.
+
+    `probe` controls whether the mcp_bridge may emit a synthetic
+    environment-discovery tool call when neither (1) nor (2) gave an
+    answer. `auto` is the right default for a permissive caller; a
+    kiosk with no callable shell tool would still leave (4) and (5).
+    `disabled` skips the probe entirely; `required` refuses requests
+    that have neither an explicit override nor a passive environment.
+    """
+    probe: str = "auto"             # auto | disabled | required
+    platform: str | None = None     # forced caller platform
+    cwd: str | None = None          # forced caller working directory
+    shell: str | None = None        # forced caller shell
+    fallback_platform: str | None = None
+
+
+@dataclass(frozen=True)
 class Settings:
     drain_within_days: int = 21
     lease_ttl_seconds: int = 1800
@@ -182,6 +219,7 @@ class Settings:
     concurrency_learning: ConcurrencyLearning = field(default_factory=ConcurrencyLearning)
     pacing: Pacing = field(default_factory=Pacing)
     transient_breaker: TransientBreaker = field(default_factory=TransientBreaker)
+    caller_environment: "CallerEnvironmentSettings" = field(default_factory=CallerEnvironmentSettings)
 
 
 @dataclass(frozen=True)
@@ -526,10 +564,13 @@ def load(path: str | None = None) -> Registry:
     sraw = dict(raw.get("settings") or {})
     settings = Settings(
         **{k: v for k, v in sraw.items() if k not in (
-            "concurrency_learning", "pacing", "transient_breaker")},
+            "concurrency_learning", "pacing", "transient_breaker",
+            "caller_environment")},
         concurrency_learning=ConcurrencyLearning(**(sraw.get("concurrency_learning") or {})),
         pacing=Pacing(**(sraw.get("pacing") or {})),
         transient_breaker=TransientBreaker(**(sraw.get("transient_breaker") or {})),
+        caller_environment=CallerEnvironmentSettings(
+            **(sraw.get("caller_environment") or {})),
     )
 
     plans: dict[str, Plan] = {}

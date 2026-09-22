@@ -56,11 +56,13 @@ import base64
 import binascii
 import contextlib
 import errno
+import importlib.util as _il
 import json
 import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -74,6 +76,24 @@ log = logging.getLogger("cli_bridge")
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+
+# switchyard/caller_env.py: per-request resolution of the caller's tool-
+# execution environment (issue #44). Same import strategy as the mcp_bridge:
+# production has PYTHONPATH=/app + the package on disk; tests fall back to
+# the file path under the repo root.
+try:
+    import switchyard.caller_env as _caller_env
+except ImportError:
+    _ce_path = Path(__file__).resolve().parent.parent.parent / "switchyard" / "caller_env.py"
+    if _ce_path.exists():
+        _spec = _il.spec_from_file_location("switchyard.caller_env", _ce_path)
+        _caller_env = _il.module_from_spec(_spec)
+        _caller_env.__package__ = "switchyard"
+        sys.modules.setdefault("switchyard", type(sys)("switchyard"))
+        sys.modules["switchyard.caller_env"] = _caller_env
+        _spec.loader.exec_module(_caller_env)
+    else:
+        _caller_env = None
 
 app = FastAPI(title="switchyard-cli-bridge")
 
@@ -411,6 +431,10 @@ class Config:
     # still a live CLI process holding memory and a connection pool, so it needs
     # a limit of its own. Defaults to twice the concurrency.
     max_parked: int = 0
+    # Per-deployment caller-environment resolution policy, lifted from
+    # settings.caller_environment in plans.yaml. Drives the inner CLI's
+    # `[SwitchYard tool execution environment]` block (issue #44).
+    caller_environment: Any = None
 
     @property
     def parked_limit(self) -> int:
@@ -440,6 +464,7 @@ def read_config() -> Config:
     parked = 0
     models: set[str] = set()
     default: str | None = None
+    caller_environment = None
     target = PLAN or PROVIDER
 
     try:
@@ -447,6 +472,32 @@ def read_config() -> Config:
             raw = yaml.safe_load(fh) or {}
         seed = int(((raw.get("settings") or {}).get("concurrency_learning")
                     or {}).get("seed_cap", 2))
+        ce_raw = (raw.get("settings") or {}).get("caller_environment") or {}
+        if isinstance(ce_raw, dict):
+            try:
+                from switchyard.models import CallerEnvironmentSettings
+                caller_environment = CallerEnvironmentSettings(**ce_raw)
+            except ImportError:
+                # Tests may load the sidecar modules by path without the
+                # switchyard package on sys.path. The same trick the
+                # bridges use for caller_env works here: load models.py
+                # directly so callers never have to add `switchyard/` to
+                # sys.path. Production has PYTHONPATH=/app + the package
+                # on disk, so this fallback is only a test convenience.
+                _ce_path = Path(__file__).resolve().parent.parent.parent / "switchyard" / "models.py"
+                if _ce_path.exists():
+                    _spec = _il.spec_from_file_location("switchyard.models", _ce_path)
+                    _models_mod = _il.module_from_spec(_spec)
+                    _models_mod.__package__ = "switchyard"
+                    sys.modules.setdefault("switchyard", type(sys)("switchyard"))
+                    sys.modules["switchyard.models"] = _models_mod
+                    _spec.loader.exec_module(_models_mod)
+                    from switchyard.models import CallerEnvironmentSettings
+                    caller_environment = CallerEnvironmentSettings(**ce_raw)
+                else:
+                    caller_environment = None
+            except Exception:
+                caller_environment = None
         plan = (raw.get("plans") or {}).get(target) or {}
         if not plan:
             log.warning("no plan %r in %s; falling back to env", target, PLANS_PATH)
@@ -483,7 +534,8 @@ def read_config() -> Config:
                   target, PLANS_PATH, model)
     return Config(concurrency=max(1, concurrency), model=model,
                   models=models | {model}, source=source,
-                  max_parked=max(0, parked))
+                  max_parked=max(0, parked),
+                  caller_environment=caller_environment)
 
 
 def config() -> Config:
@@ -1001,6 +1053,12 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
     # and would block forever on an inherited descriptor that never closes.
     # communicate() closes the pipe after writing, and the stdin path is only
     # ever taken when an oversized prompt rides there (see build_argv).
+    #
+    # cwd is a fresh per-call temp dir (issue #44): keeps the inner CLI's
+    # session out of /app/cli_bridge, where paths beneath it would look like
+    # a meaningful project root the model could safely use. Cleaned up at
+    # the bottom of this function (success AND failure paths).
+    spawn_cwd = Path(tempfile.mkdtemp(prefix="sy-cli-"))
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1008,8 +1066,10 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
             else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=spawn_cwd,
         )
     except OSError as exc:
+        shutil.rmtree(spawn_cwd, ignore_errors=True)
         # A spawn that never happened is not a broken gateway: E2BIG is the
         # caller's request being too big for argv even after the stdin and
         # file escape hatches (issue #29 asks for 413, so a client can tell
@@ -1033,69 +1093,73 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
             timeout=TIMEOUT)
     except asyncio.TimeoutError:
         proc.kill()
+        shutil.rmtree(spawn_cwd, ignore_errors=True)
         raise HTTPException(status_code=408, detail=f"{PROVIDER} cli timed out")
 
     stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
     blob = normalise(f"{stdout}\n{stderr}")
-
-    if proc.returncode != 0 or not stdout.strip():
-        if _AUTH.search(blob):
-            raise HTTPException(status_code=401,
-                                detail=f"{PROVIDER} cli not authenticated: {stderr[:300]}")
-        up_status, up_message, up_retryable = upstream_error(stdout)
-
-        # A quota message wins over the upstream status, even a non-retryable 403.
-        # xAI answers an exhausted SuperGrok subscription with
-        # "personal-team-blocked:spending-limit: You have run out of credits or
-        # need a Grok subscription" / 403 / isRetryable:false — which reads
-        # terminal but is a plan that refills. Calling it a dead credential would
-        # sideline a healthy subscription.
-        if _LIMIT.search(blob) or seconds_until(blob):
-            raise _limit_error(f"{up_message}\n{blob}" if up_message else blob)
-
-        # Otherwise an explicit upstream client error is the truth: a bad model
-        # id, a blocked account, a rejected credential. Surface it as-is so the
-        # router does not cool a plan down over something waiting cannot fix.
-        if up_status in (401, 402, 403) and up_retryable is not True:
-            raise HTTPException(
-                status_code=up_status,
-                detail={"error": {"message": up_message or blob[:300],
-                                  "type": "entitlement_or_credentials"}})
-        status, detail = error_from_events(stdout)
-        if status and 400 <= status < 500 and status != 429:
-            # A client error is our fault, not the provider's — surface it as-is
-            # so SwitchYard does not cool the plan down over a bad request.
-            raise HTTPException(status_code=status,
-                                detail={"error": {"message": detail or blob[:300],
-                                                  "type": "upstream_client_error"}})
-        raise HTTPException(
-            status_code=502,
-            detail=f"{PROVIDER} cli failed ({proc.returncode}): "
-                   f"{detail or stderr[:300] or stdout[:300]}")
-
     try:
-        payload = parse_output(stdout)
-    except (json.JSONDecodeError, ValueError) as exc:
-        # A structured parser knowing the output shape has nothing left to
-        # guess: echoing the raw stream here is how step_start / step_finish
-        # JSONL leaked through to clients as the "answer" (issue #3). Surface
-        # the failure as a real error so the gateway retries instead.
-        if PROFILE["parser"] in STRUCTURED_PARSERS:
+        if proc.returncode != 0 or not stdout.strip():
+            if _AUTH.search(blob):
+                raise HTTPException(status_code=401,
+                                    detail=f"{PROVIDER} cli not authenticated: {stderr[:300]}")
+            up_status, up_message, up_retryable = upstream_error(stdout)
+
+            # A quota message wins over the upstream status, even a non-retryable 403.
+            # xAI answers an exhausted SuperGrok subscription with
+            # "personal-team-blocked:spending-limit: You have run out of credits or
+            # need a Grok subscription..." / 403 / isRetryable:false — which reads
+            # terminal but is a plan that refills. Calling it a dead credential would
+            # sideline a healthy subscription.
+            if _LIMIT.search(blob) or seconds_until(blob):
+                raise _limit_error(f"{up_message}\n{blob}" if up_message else blob)
+
+            # Otherwise an explicit upstream client error is the truth: a bad model
+            # id, a blocked account, a rejected credential. Surface it as-is so the
+            # router does not cool a plan down over something waiting cannot fix.
+            if up_status in (401, 402, 403) and up_retryable is not True:
+                raise HTTPException(
+                    status_code=up_status,
+                    detail={"error": {"message": up_message or blob[:300],
+                                      "type": "entitlement_or_credentials"}})
+            status, detail = error_from_events(stdout)
+            if status and 400 <= status < 500 and status != 429:
+                # A client error is our fault, not the provider's — surface it as-is
+                # so SwitchYard does not cool the plan down over a bad request.
+                raise HTTPException(status_code=status,
+                                    detail={"error": {"message": detail or blob[:300],
+                                                      "type": "upstream_client_error"}})
             raise HTTPException(
                 status_code=502,
-                detail=f"{PROVIDER} cli yielded no parsed answer: {exc}") from exc
-        payload = {"result": stdout.strip()}
+                detail=f"{PROVIDER} cli failed ({proc.returncode}): "
+                       f"{detail or stderr[:300] or stdout[:300]}")
 
-    # The CLI can exit 0 while reporting a limit inside the JSON envelope.
-    if payload.get("is_error") or payload.get("subtype") in ("error_max_turns", "error_during_execution"):
-        text = json.dumps(payload)
-        if _LIMIT.search(text):
-            raise _limit_error(text)
-        raise HTTPException(status_code=502, detail=f"{PROVIDER} cli error: {text[:300]}")
-    if _LIMIT.search(str(payload.get("result", ""))) and not payload.get("usage"):
-        raise _limit_error(str(payload.get("result")))
+        try:
+            payload = parse_output(stdout)
+        except (json.JSONDecodeError, ValueError) as exc:
+            # A structured parser knowing the output shape has nothing left to
+            # guess: echoing the raw stream here is how step_start / step_finish
+            # JSONL leaked through to clients as the "answer" (issue #3). Surface
+            # the failure as a real error so the gateway retries instead.
+            if PROFILE["parser"] in STRUCTURED_PARSERS:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"{PROVIDER} cli yielded no parsed answer: {exc}") from exc
+            payload = {"result": stdout.strip()}
 
-    return payload
+        # The CLI can exit 0 while reporting a limit inside the JSON envelope.
+        if payload.get("is_error") or payload.get("subtype") in ("error_max_turns", "error_during_execution"):
+            text = json.dumps(payload)
+            if _LIMIT.search(text):
+                raise _limit_error(text)
+            raise HTTPException(status_code=502, detail=f"{PROVIDER} cli error: {text[:300]}")
+        if _LIMIT.search(str(payload.get("result", ""))) and not payload.get("usage"):
+            raise _limit_error(str(payload.get("result")))
+
+        return payload
+    finally:
+        # Reclaim the per-call cwd regardless of how the function exits.
+        shutil.rmtree(spawn_cwd, ignore_errors=True)
 
 
 def upstream_error(stdout: str) -> tuple[int | None, str, bool | None]:
@@ -1491,6 +1555,50 @@ async def _handle_chat(body: dict):
             # Loud, because silently running a weaker model than the lane asked for
             # would make an `apex` escalation quietly indistinguishable from `judge`.
             log.warning("%s", warning)
+
+        # Resolve the caller's tool-execution environment. NO probe on the
+        # text path: there is no tool round-trip, so the only signal is
+        # whatever is in the request itself (stamped metadata or passive
+        # parse), and the configured fallback_platform -- which is platform
+        # only, NEVER a cwd.
+        if _caller_env is not None:
+            ce_cfg = config().caller_environment
+            if ce_cfg is None:
+                try:
+                    from switchyard.models import CallerEnvironmentSettings
+                    ce_cfg = CallerEnvironmentSettings()
+                except Exception:
+                    ce_cfg = None
+            meta = (((body or {}).get("metadata") or {}).get("switchyard") or {}).get("caller_env")
+            env = None
+            if isinstance(meta, dict) and meta.get("source") in ("config", "request", "host"):
+                try:
+                    env = _caller_env.CallerEnvironment(
+                        cwd=meta.get("cwd"), platform=meta.get("platform"),
+                        shell=meta.get("shell"),
+                        source=meta["source"] if meta.get("source") in
+                               ("config", "request", "probe", "host", "unknown")
+                               else "unknown")
+                except Exception:
+                    env = None
+            if env is None and ce_cfg is not None:
+                env = _caller_env.resolve(body, ce_cfg)
+            if env is not None:
+                env_block = _caller_env.render_system_block(env)
+                # Append to the system string BEFORE profile flags so SYSTEM_MODE=replace
+                # semantics are untouched: the block rides inside the caller's system
+                # content, not on top of it. See fold_system and the profile's
+                # system_args_replace in build_argv for why replace mode is the
+                # only way this can fail loudly, not silently.
+                system = (f"{system}\n\n{env_block}" if system else env_block)
+                # Reminder on the first user turn, claude profile only -- the
+                # other profiles have no system-block + first-turn-mismatch
+                # failure mode (their CLI's own Environment block lands at the
+                # end of the prompt, not in the middle of a `# Environment`
+                # trailer). Same first-turn rule as the mcp_bridge rebuild.
+                if PROVIDER == "claude":
+                    reminder = _caller_env.render_first_turn_reminder(env)
+                    prompt = f"{reminder}\n\n{prompt}" if prompt else reminder
 
         limit = config().concurrency
         if not await _gate.acquire(limit):
