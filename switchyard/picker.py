@@ -286,6 +286,20 @@ class Picker:
                 row_cap = model.max_parallel
                 row_cap_reason = f"model limit {model.max_parallel}"
 
+            # True exactly when the row's cap is narrower than the plan's width
+            # solely because of this model's own max_parallel — no external
+            # reason (cooldown, quota spent, pacing tail, or learner) has
+            # further narrowed it. The board uses this to draw the row as its
+            # own N slots with no grey "withheld" square and no "model limit"
+            # tag: the row IS the plan's reach for this model, not a slice of
+            # something the operator could recover.
+            cap_model_owned = (
+                not cooled
+                and cap_reason == "configured"
+                and model.max_parallel is not None
+                and model.max_parallel < cap
+            )
+
             rows.append({
                 "ref": model.ref,
                 "model": model.key,
@@ -295,6 +309,7 @@ class Picker:
                 "cap": row_cap,
                 "cap_configured": plan.max_parallel,
                 "cap_reason": row_cap_reason,
+                "cap_model_owned": cap_model_owned,
                 "in_flight": inflight,
                 "model_in_flight": model_inflight,
                 "model_in_flight_here": model_here,
