@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import errno
 import importlib.util
 import json
 import logging
@@ -141,14 +142,13 @@ PROCESS_TIMEOUT = float(os.environ.get("MCP_PROCESS_TIMEOUT_SECONDS", str(6 * 36
 # separate tools/call frames, and nothing tells us in advance how many are
 # coming, so we wait for the burst to go quiet.
 BATCH_WINDOW = float(os.environ.get("MCP_BATCH_WINDOW_SECONDS", "0.25"))
-# A single argv element may not exceed the kernel's MAX_ARG_STRLEN (128 KiB on
-# Linux); a longer one makes create_subprocess_exec fail with
-# "[Errno 7] Argument list too long" before the CLI even starts -- observed
-# live when a folded system prompt + long history rode along as one argument.
-# At or over this threshold the prompt is handed to the CLI on stdin instead.
-# All three profile CLIs take it there: `claude -p` and `opencode run` read a
-# piped prompt, `codex exec -` reads stdin when its PROMPT argument is `-`.
-STDIN_PROMPT_LIMIT = int(os.environ.get("MCP_STDIN_PROMPT_LIMIT", "100000"))
+# Same argv-limit knob and byte check as cli_bridge, re-exported rather
+# than duplicated: both bridges must agree on what "too big for argv"
+# means (MAX_ARG_STRLEN, ~128 KiB per element -- issue #29), and two
+# copies of either the number or the logic would drift. cli_bridge owns
+# both; the MCP_STDIN_PROMPT_LIMIT env var is documented there.
+STDIN_PROMPT_LIMIT = cli_bridge.STDIN_PROMPT_LIMIT
+over_argv_limit = cli_bridge.over_argv_limit
 
 MCP_PROFILES: dict[str, dict] = {
     "claude": {
@@ -601,7 +601,7 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
     # The {prompt} slot is handled outside fill(): on the argv path it is
     # substituted directly, on the stdin path codex's "-" placeholder stays in
     # the template and claude/opencode drop the element entirely.
-    use_stdin = len(effective_prompt) > STDIN_PROMPT_LIMIT
+    use_stdin = over_argv_limit(effective_prompt)
     argv = [PROFILE["cli"]]
     for element in PROFILE["argv"]:
         if element != "{prompt}":
@@ -611,7 +611,19 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
         elif not use_stdin:
             argv.append(effective_prompt)
     if PROVIDER == "claude" and system:
-        argv += ["--system-prompt", system]
+        if over_argv_limit(system):
+            # Same E2BIG trap as the prompt (issue #29): --system-prompt is
+            # one argv element. The -file form is verified on the pinned CLI
+            # (2.1.278), and the file lives in the session workdir so
+            # cleanup_workdir reclaims it with everything else -- the same
+            # lifecycle codex's instructions.md already has here. Trailing
+            # newline matches cli_bridge's system_prompt_file so both files
+            # have identical content shape regardless of which sidecar wrote.
+            spath = workdir / "system-prompt.md"
+            spath.write_text(system if system.endswith("\n") else system + "\n")
+            argv += ["--system-prompt-file", str(spath)]
+        else:
+            argv += ["--system-prompt", system]
     if instructions is not None:
         argv += ["-c", f"model_instructions_file={instructions}"]
 
@@ -648,13 +660,30 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
 async def run_session(session: Session, argv: list[str],
                       stdin_data: str | None = None) -> None:
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.PIPE if stdin_data is not None
-            else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE if stdin_data is not None
+                else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            # Same mapping cli_bridge._run_cli applies to a failed spawn (issue
+            # #29): E2BIG is the request, not the plan, so it must read as 413;
+            # any other spawn failure is this plan's capacity being broken.
+            if exc.errno == errno.E2BIG:
+                session.resolve_final({
+                    "type": "error", "status": 413,
+                    "detail": {"error": {
+                        "message": (f"request too large for {PROVIDER} cli "
+                                    f"({exc.strerror}); reduce its size"),
+                        "type": "request_too_large"}}})
+            else:
+                session.resolve_final({
+                    "type": "error", "status": 502,
+                    "detail": f"{PROVIDER} cli could not be spawned: {exc}"})
+            return
         session.proc = proc
         try:
             out, err = await asyncio.wait_for(

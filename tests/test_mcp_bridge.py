@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import errno
 import http.server
 import json
 import os
@@ -1387,6 +1388,81 @@ def test_resume_gone_returns_503_quickly_when_gate_is_full():
 
     asyncio.run(scenario())
     print(f"  resume_gone_session bounded to RESUME_WAIT (~{SHORT}s) instead of 300s")
+
+
+# ------------------------------------------ issue #29: argv E2BIG regression ---
+def test_an_oversized_system_prompt_goes_to_a_file_not_argv():
+    """Claude's --system-prompt flag is one argv element, and MAX_ARG_STRLEN
+    caps that at ~128 KiB (issue #29). Over the limit the prompt must move
+    to --system-prompt-file (a file in the session workdir, reclaimed by
+    cleanup_workdir) rather than ride argv and fail execve with E2BIG.
+
+    Mirror of the cli_bridge test for the file-form flag: the same escape
+    hatch used for oversized system prompts in the text-only path. Under
+    the limit the inline --system-prompt flag keeps its old behaviour.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-test-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+
+    # Oversized system prompt routes to a file inside the session workdir.
+    huge = "s" * (server.STDIN_PROMPT_LIMIT + 10)
+    argv, stdin_data = server.build_argv("prompt", huge, "m", workdir, "sess",
+                                         tools_path, "")
+    assert "--system-prompt-file" in argv, argv
+    assert "--system-prompt" not in argv, argv
+    spath = Path(argv[argv.index("--system-prompt-file") + 1])
+    assert spath.parent == workdir, spath
+    assert spath.name == "system-prompt.md", spath
+    assert spath.read_text() == huge + "\n", "the file must contain the caller's system prompt"
+    assert stdin_data is None, "system-prompt-file path does not touch stdin"
+    assert all(huge != element for element in argv), argv
+
+    # A small system prompt still rides inline, as before.
+    argv2, stdin_data2 = server.build_argv("prompt", "be terse", "m", workdir,
+                                            "sess", tools_path, "")
+    assert "--system-prompt" in argv2, argv2
+    assert "be terse" in argv2, argv2
+    assert "--system-prompt-file" not in argv2, argv2
+
+    # The claimed lifecycle, closed: the workdir (and the file in it) must
+    # actually be reclaimed, not merely created.
+    server.cleanup_workdir(workdir)
+    assert not spath.exists(), "cleanup_workdir must reclaim system-prompt.md with the workdir"
+    print(f"  {len(huge)}-char system prompt -> {spath.name}; small system prompt still inline")
+
+
+def test_e2big_from_the_spawn_is_413():
+    """A failed execve with E2BIG must surface as 413, not 500.
+
+    The structured-cli error path keeps the call alive and returns 502 so
+    the gateway retries elsewhere; E2BIG is the caller's request being too
+    big for argv (issue #29), not the plan being broken. Returning 500 here
+    would tell the router this is a transient blip and burn retries on a
+    request that will never fit.
+    """
+    async def scenario():
+        session = _new_session()
+        session.new_turn()
+
+        real_exec = asyncio.create_subprocess_exec
+        captured_exc = OSError(errno.E2BIG, "Argument list too long")
+
+        async def fake_exec(*args, **kwargs):
+            raise captured_exc
+        asyncio.create_subprocess_exec = fake_exec
+        try:
+            await server.run_session(session, ["fake-argv"])
+        finally:
+            asyncio.create_subprocess_exec = real_exec
+        return session.turn_future.result()
+
+    result = asyncio.run(scenario())
+    assert result["type"] == "error" and result["status"] == 413, result
+    detail = result["detail"]
+    assert detail["error"]["type"] == "request_too_large", detail
+    assert "too large" in detail["error"]["message"], detail
+    print(f"  E2BIG from spawn -> HTTP {result['status']} ({detail['error']['message'][:60]}...)")
 
 
 # ----------------------------------------------------------- images (issue #30) ---
