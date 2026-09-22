@@ -1741,6 +1741,73 @@ def test_perishable_one_adjacent_swap_reconciles_added_and_removed_refs():
           f"added+dropped: {added_and_dropped}")
 
 
+def test_a_cached_prompt_is_booked_whole():
+    """A cached Anthropic turn hides almost all of its prompt outside input_tokens.
+
+    Measured on a live gateway: a 48,240-token Claude Code turn arrives as
+    input_tokens=6 with the rest in the two cache counters, and 170 requests
+    booked 472 prompt tokens between them. The capacity planner spends the
+    subscription against that number, so reading input_tokens alone is not a
+    small error -- it is three orders of magnitude of headroom invented.
+    """
+    from switchyard.hooks import _prompt_tokens
+
+    def reader(block):
+        return lambda k: block.get(k, 0)
+
+    anthropic = {"input_tokens": 6, "cache_creation_input_tokens": 6932,
+                 "cache_read_input_tokens": 41302, "output_tokens": 201}
+    assert _prompt_tokens(reader(anthropic)) == 48240
+
+    # The OpenAI pair is already whole -- cli_bridge folds both cache counters
+    # into prompt_tokens before answering -- so it wins outright. Adding the
+    # counters again here would double-count every bridged request.
+    both = {"prompt_tokens": 48240, "input_tokens": 6,
+            "cache_read_input_tokens": 41302,
+            "cache_creation_input_tokens": 6932}
+    assert _prompt_tokens(reader(both)) == 48240
+
+    assert _prompt_tokens(reader({"prompt_tokens": 1200})) == 1200
+    assert _prompt_tokens(reader({})) == 0
+    print("  cached prompt booked whole (48,240), OpenAI pair not double-counted")
+
+
+def test_a_split_stream_keeps_both_halves_of_its_usage():
+    """Anthropic frames put the input and output counts on different chunks.
+
+    message_start carries input_tokens and the cache counters; message_delta
+    carries output_tokens near the end. A reader that keeps only the last
+    usage block it saw keeps the second one and books the entire prompt as
+    zero -- which is what a streamed turn did here for six hours straight.
+    """
+    from switchyard.hooks import _note_usage, _prompt_tokens
+
+    seen: dict = {}
+    _note_usage({"type": "message_start",
+                 "usage": {"input_tokens": 6, "cache_creation_input_tokens": 6932,
+                           "cache_read_input_tokens": 41302, "output_tokens": 1}}, seen)
+    _note_usage({"type": "content_block_delta"}, seen)          # no usage at all
+    _note_usage({"type": "message_delta", "usage": {"output_tokens": 201}}, seen)
+
+    get = lambda k: seen["usage"].get(k, 0)                      # noqa: E731
+    assert _prompt_tokens(get) == 48240, seen
+    assert seen["usage"]["output_tokens"] == 201, seen
+
+    # An object-shaped chunk reads the same way, and a stream that carried
+    # nothing must leave the dict empty so the caller can tell it apart from
+    # a turn that genuinely cost nothing.
+    class Chunk:
+        usage = type("U", (), {"prompt_tokens": 12, "completion_tokens": 3})()
+
+    other: dict = {}
+    _note_usage(Chunk(), other)
+    assert other["usage"]["prompt_tokens"] == 12, other
+    empty: dict = {}
+    _note_usage({"type": "ping"}, empty)
+    assert empty == {}, empty
+    print("  split stream merged: prompt 48,240, completion 201")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):

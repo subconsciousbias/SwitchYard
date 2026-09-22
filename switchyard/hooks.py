@@ -59,18 +59,58 @@ _configure_logging()
 META_KEY = "switchyard"
 
 
-def _note_usage(chunk: Any, into: dict) -> None:
-    """Remember the usage block off a streamed chunk, if this one carries it.
+_USAGE_FIELDS = ("input_tokens", "output_tokens",
+                 "cache_read_input_tokens", "cache_creation_input_tokens",
+                 "prompt_tokens", "completion_tokens")
 
-    Only one chunk in a stream has it, and it is not always the last thing
-    yielded, so the caller keeps whatever it last saw rather than reading the
-    tail.
+
+def _note_usage(chunk: Any, into: dict) -> None:
+    """Fold a streamed chunk's usage block into what the stream has said so far.
+
+    Merged field by field rather than kept whole, because the Anthropic frames
+    split the turn across two chunks: message_start carries the input side
+    (input_tokens plus the two cache counters) and message_delta carries
+    output_tokens near the end. Keeping only the last block seen would keep
+    the second and book the whole prompt as nothing.
     """
     usage = getattr(chunk, "usage", None)
     if usage is None and isinstance(chunk, dict):
         usage = chunk.get("usage")
-    if usage:
-        into["usage"] = usage
+    if not usage:
+        return
+    read = (usage.get if isinstance(usage, dict)
+            else lambda k, default=0: getattr(usage, k, default))
+    merged = into.setdefault("usage", {})
+    for field in _USAGE_FIELDS:
+        try:
+            value = int(read(field, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value:
+            merged[field] = value
+
+
+def _prompt_tokens(get: Any) -> int:
+    """Everything the plan was charged for on the way in, cache included.
+
+    Anthropic reports a cached turn as a tiny input_tokens with the rest
+    sitting in cache_read_input_tokens / cache_creation_input_tokens -- a
+    measured 48,240-token Claude Code turn arrives here as input_tokens=6 --
+    so a reader that takes input_tokens alone books a rounding error. On this
+    gateway that read 170 requests as 472 prompt tokens between them, which is
+    the number the capacity planner then spends the subscription against.
+
+    The OpenAI pair is already whole: cli_bridge folds both cache counters into
+    prompt_tokens before it answers, and prompt_tokens_details.cached_tokens is
+    a subset of it. So prompt_tokens wins outright when it is there, and the
+    cache counters are only added when it is not.
+    """
+    prompt = int(get("prompt_tokens") or 0)
+    if prompt:
+        return prompt
+    return (int(get("input_tokens") or 0)
+            + int(get("cache_read_input_tokens") or 0)
+            + int(get("cache_creation_input_tokens") or 0))
 
 
 class SwitchyardHandler(CustomLogger):
@@ -404,8 +444,8 @@ class SwitchyardHandler(CustomLogger):
 
         usage = getattr(response_obj, "usage", None) or {}
         get = (lambda k: usage.get(k, 0)) if isinstance(usage, dict) else (lambda k: getattr(usage, k, 0) or 0)
-        prompt_tokens = int(get("prompt_tokens") or 0)
-        completion_tokens = int(get("completion_tokens") or 0)
+        prompt_tokens = _prompt_tokens(get)
+        completion_tokens = int(get("completion_tokens") or get("output_tokens") or 0)
         # Only metered providers have a per-request cost. On a subscription the
         # fee is fixed and the marginal cost of a request is zero; recording
         # LiteLLM's notional price would inflate month_cost and corrupt the
@@ -580,11 +620,13 @@ class SwitchyardHandler(CustomLogger):
         if plan is None:
             return
         # Anthropic names its counters input_tokens/output_tokens; a translated
-        # reply may still carry the OpenAI pair, so read either.
+        # reply may still carry the OpenAI pair, so read either. The cache
+        # counters are part of the prompt on the Anthropic side -- see
+        # _prompt_tokens for what taking input_tokens alone cost this ledger.
         usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
         get = ((lambda k: (usage or {}).get(k, 0)) if isinstance(usage, dict)
                else (lambda k: getattr(usage, k, 0) or 0))
-        prompt_tokens = int(get("input_tokens") or get("prompt_tokens") or 0)
+        prompt_tokens = _prompt_tokens(get)
         completion_tokens = int(get("output_tokens") or get("completion_tokens") or 0)
         await self.ledger.record(plan, prompt_tokens=prompt_tokens,
                                  completion_tokens=completion_tokens, cost=0.0)
