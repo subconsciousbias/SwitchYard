@@ -3107,6 +3107,40 @@ def test_backstop_is_an_upper_bound_under_learner_pull_down():
           f"backstop >= picker admit holds (no spurious 429)")
 
 
+def test_anthropic_messages_rides_the_chat_completions_url():
+    """litellm_settings must route /v1/messages through /v1/chat/completions.
+
+    cli_bridge and mcp_bridge serve only /v1/chat/completions. With the pinned
+    litellm v1.101.0, an Anthropic-protocol /v1/messages request for an
+    openai/-prefixed deployment is otherwise translated into POST
+    {api_base}/responses, which 404s at every sidecar (xai-token-proxy
+    also exposes /v1/messages natively, but the flag is safe and uniform
+    there too). Setting `use_chat_completions_url_for_anthropic_messages:
+    True` sends /v1/messages through litellm's own Anthropic->chat-
+    completions adapter onto the path the sidecars serve, so Claude Code
+    reaches them without per-bridge protocol code. The flag is
+    unconditional — every deployment the gateway emits needs it — so it
+    lives in the gateway config rather than plans.yaml.
+    """
+    from switchyard import gen_litellm
+
+    cfg = gen_litellm.build(os.environ["SWITCHYARD_PLANS"])
+    ls = cfg["litellm_settings"]
+    assert ls.get("use_chat_completions_url_for_anthropic_messages") is True, ls
+    # Every deployment an openai/-style sidecar serves must be routed the same
+    # way, and the flag has to be unconditional, so plans.yaml schema does not
+    # get a knob for it.
+    openai_targets = [
+        m["model_name"] for m in cfg["model_list"]
+        if m["litellm_params"].get("model", "").startswith("openai/")
+    ]
+    assert openai_targets, "no openai/-prefixed deployments in the example config"
+    print(f"  use_chat_completions_url_for_anthropic_messages=True; "
+          f"{len(openai_targets)} openai/-prefixed deployments now route "
+          f"/v1/messages -> /v1/chat/completions "
+          f"(first: {openai_targets[0]!r})")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):
