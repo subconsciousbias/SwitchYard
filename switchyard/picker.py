@@ -61,8 +61,8 @@ def _perishable_visit_order(members: list, by_ref: dict,
     With a fresh order the body is re-ranked: every member with a score goes
     first in score-descending order, gate5h members are filtered out (and
     listed in `skipped` so the capacity board can show why), and unscored
-    members are kept in their config order AFTER every scored member so an
-    unknown plan never beats a known one.
+    members are kept in their lane_members order AFTER every scored member
+    so an unknown plan never beats a known one.
     """
     if order is None:
         return members
@@ -73,7 +73,10 @@ def _perishable_visit_order(members: list, by_ref: dict,
             gate5h_refs.add(entry["ref"])
         else:
             score_by_ref[entry["ref"]] = entry["score"]
-    # Original config position per ref, used for unscored members.
+    # Position per ref in the picker's iteration order -- which is the
+    # post-`Registry.lane_members()` list (urgency-sorted body + tail), NOT
+    # the YAML `order:` list. Used to stable-sort the unscored tail so an
+    # unknown plan lands at its pre-perishable slot rather than drifting.
     config_pos = {m.ref: i for i, m in enumerate(members)}
     by_ref_local = {m.ref: m for m in members}
     # Drop gate5h from the iteration list first so the existing fill loop

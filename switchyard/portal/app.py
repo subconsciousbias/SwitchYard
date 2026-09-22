@@ -155,25 +155,24 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
     """Recompute lane order for every `strategy: perishable` lane that uses
     one of this plan's models.
 
-    The rank is perishable score on the TARGET window (room / hours_left), the
-    5-hour constraint window only gates (pct_used > 90 -> skipped for new
-    sessions), and the previous rank is preserved via one adjacent swap per
-    poll to keep the order from thrashing on small scoring changes.
-    """
-    target_label = next(
-        (q.label for q in plan.quotas if q.role == "target"),
-        plan.quotas[0].label if plan.quotas else None)
-    gate_label = next(
-        (q.label for q in plan.quotas if q.period == "rolling_5h"), None)
-    if not target_label:
-        return
-    plan_model_refs = {m.ref for m in plan.live_models}
-    if not plan_model_refs:
-        return
+    Multi-plan perishable lanes are the common shape (`apex`, `judge`,
+    `forge` in the shipped example all mix plans) and they used to lose
+    data: this function is triggered per plan, but the data model and the
+    `set_lane_order` writer are per-lane, and the writer deletes the whole
+    key first. The fix is to score every member of the lane in a single
+    pass, even though only one plan's facts are fresh this poll. Members
+    on THIS plan use fresh facts; members on other plans reuse the score
+    that was last written for them (and which is at most one probe interval
+    old, well inside the staleness window the picker already tolerates).
+    The write then contains every body member that has ever produced a
+    score, so no plan's contribution is dropped on the next plan's poll.
 
-    # A lane is affected when it opted into perishable AND currently has at
-    # least one live member of THIS plan to rank. Dead members and members on
-    # other plans don't contribute to the recompute.
+    The rank is perishable score on the TARGET window (room / hours_left),
+    the 5-hour constraint window only gates (pct_used > 90 -> skipped for
+    new sessions), and the previous rank is preserved via at most one
+    adjacent swap per poll to keep the order from thrashing on small
+    scoring changes.
+    """
     affected_lanes = [
         lane for lane in reg.lanes.values()
         if lane.strategy == "perishable"
@@ -182,91 +181,111 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
     if not affected_lanes:
         return
 
-    # Read the target facts once per affected lane; gating uses the 5-hour
-    # window of THIS plan, since constraints live on the plan, not the member.
-    for lane in affected_lanes:
-        target_facts = await ledger.window_facts(plan.key, target_label)
-        target_pct = _as_float(target_facts.get("reported_pct_used"))
-        target_reset = _as_float(target_facts.get("reset_at"))
-        gate_facts = (await ledger.window_facts(plan.key, gate_label)
-                      if gate_label else {})
-        gate_pct = _as_float(gate_facts.get("reported_pct_used"))
-        gate5h = gate_pct is not None and gate_pct > 90
+    # Read this plan's facts ONCE; every affected lane shares them. A plan
+    # without a target window has nothing to rank with, so skip the whole
+    # trigger.
+    target_label = next(
+        (q.label for q in plan.quotas if q.role == "target"),
+        plan.quotas[0].label if plan.quotas else None)
+    gate_label = next(
+        (q.label for q in plan.quotas if q.period == "rolling_5h"), None)
+    if not target_label:
+        return
 
-        scoped = await ledger.window_facts(plan.key, "weekly_scoped")
-        scoped_pct = _as_float(scoped.get("reported_pct_used")) if scoped else None
+    target_facts = await ledger.window_facts(plan.key, target_label)
+    target_pct = _as_float(target_facts.get("reported_pct_used"))
+    target_reset = _as_float(target_facts.get("reset_at"))
+    gate_facts = (await ledger.window_facts(plan.key, gate_label)
+                  if gate_label else {})
+    gate_pct = _as_float(gate_facts.get("reported_pct_used"))
+    this_plan_gate5h = gate_pct is not None and gate_pct > 90
+    scoped = await ledger.window_facts(plan.key, "weekly_scoped")
+    scoped_pct = (_as_float(scoped.get("reported_pct_used"))
+                  if scoped else None)
+
+    for lane in affected_lanes:
+        # Read the previous lane order once: it carries the OTHER plans'
+        # scores we are about to reuse, AND it feeds the one-swap
+        # hysteresis that keeps the rank from bouncing on small changes.
+        previous = await ledger.get_lane_order(lane.key)
+        previous_by_ref = ({m["ref"]: m for m in previous["members"]}
+                           if previous else {})
 
         scored: list[tuple[str, float, bool]] = []
         unknown: list[str] = []
         for member in reg.lane_members(lane.key):
-            if member.plan_key != plan.key:
-                continue
+            if reg.is_tail(lane.key, member.ref):
+                continue  # tail handled separately, never ranked
             ref = member.ref
-            # A model-scoped reading is a tighter view of the same week than
-            # the plan-wide one, so prefer it when present.
-            member_pct = scoped_pct if scoped_pct is not None else target_pct
-            member_room = (None if member_pct is None
-                           else max(0.0, 100.0 - member_pct))
-            score = perishable_score(member_room, target_reset)
+            if member.plan_key == plan.key:
+                # This plan just probed: use fresh facts.
+                member_pct = (scoped_pct if scoped_pct is not None
+                              else target_pct)
+                member_room = (None if member_pct is None
+                               else max(0.0, 100.0 - member_pct))
+                score = perishable_score(member_room, target_reset)
+                gate_for_member = this_plan_gate5h
+            else:
+                # Another plan in the same lane: reuse the previous score.
+                # Stale by at most one probe interval -- well inside the
+                # `stale_after_ms` window the picker already tolerates.
+                prev = previous_by_ref.get(ref)
+                if prev:
+                    score = float(prev["score"])
+                    gate_for_member = bool(prev["gate5h"])
+                else:
+                    score = None
+                    gate_for_member = False
             if score is None:
                 unknown.append(ref)
             else:
-                scored.append((ref, score, gate5h))
+                scored.append((ref, score, gate_for_member))
 
-        if not scored:
-            # No facts at all: leave whatever was stored alone (or write the
-            # config order if nothing had been written before -- either is fine
-            # for the picker, which falls back to config order on a stale key).
-            current = await ledger.get_lane_order(lane.key)
-            if current is None and not unknown:
-                # Lane has members but no fact surface at all (e.g. every
-                # member's plan has no probe). Drop nothing; picker still uses
-                # config order via the missing-key path.
-                continue
-            if current is None:
-                # Write the config order so a lane with all-unknown members
-                # at least gets *something* ranked: "ranked 0" is misleading.
-                config_refs = [m.ref for m in reg.lane_members(lane.key)
-                               if not reg.is_tail(lane.key, m.ref)]
-                entries = {ref: {"score": 0.0, "gate5h": 0} for ref in config_refs}
-                await ledger.set_lane_order(
-                    lane.key, entries, computed_at=time.time(),
-                    stale_after_ms=_stale_after_ms(plan))
+        if not scored and not unknown:
+            # Lane has no scorable members at all (config drift or every
+            # member's plan has no probe). Drop the key so the picker
+            # falls back to config order via the missing-key path.
             continue
 
         scored.sort(key=lambda r: r[1], reverse=True)
-        desired = [r[0] for r in scored]
         scored_map = {r[0]: (r[1], r[2]) for r in scored}
-        # Append config-order-known but unscored members AFTER every scored
-        # member, so the picker's "unknown sorts last" rule stays a hit.
-        config_position = {m.ref: i for i, m in enumerate(reg.lane_members(lane.key))}
-        unknown_sorted = sorted(unknown, key=lambda r: config_position.get(r, 1e9))
-        desired = desired + unknown_sorted
+        # Unscored refs sort last, in lane_members order. That matches
+        # the picker's "unscored sorts last" rule without an entry in
+        # score_by_ref, so they read as unscored rather than zero-scored.
+        config_position = {m.ref: i for i, m in enumerate(
+            reg.lane_members(lane.key))}
+        unknown_sorted = sorted(unknown,
+                                key=lambda r: config_position.get(r, 1e9))
+        desired = [r[0] for r in scored] + unknown_sorted
 
-        previous = await ledger.get_lane_order(lane.key)
-        previous_refs = ([m["ref"] for m in previous["members"]]
-                         if previous else None)
-        # First poll after config: write the full desired order with no swap
-        # cap, since there is nothing to be gentle with. After that, at most
+        # First poll after config has no `previous`, so write the full
+        # desired order. After that, reconcile toward desired with at most
         # one adjacent swap per poll so the rank drifts rather than swings.
-        if previous_refs is None:
+        if previous is None:
             next_order = desired
         else:
-            next_order = _one_adjacent_swap(previous_refs, desired, scored_map)
+            previous_refs = [m["ref"] for m in previous["members"]]
+            next_order = _one_adjacent_swap(
+                previous_refs, desired, scored_map)
 
-        # Tail members always live at the end -- they are not scored.
+        # Tail refs always live at the end; move them there in case they
+        # appear in `previous_refs` from an older writer. Tail refs are
+        # NOT written to `entries` so the picker treats them as unscored,
+        # matching the contract that tail always sorts last.
         tail_refs = list(lane.tail)
         for ref in reversed(next_order):
             if ref in tail_refs:
                 next_order.remove(ref)
                 next_order.append(ref)
 
-        entries = {ref: {"score": scored_map[ref][0],
-                         "gate5h": 1 if scored_map[ref][1] else 0}
-                   for ref in next_order if ref in scored_map}
+        entries: dict[str, dict] = {}
         for ref in next_order:
-            if ref not in entries:
-                entries[ref] = {"score": 0.0, "gate5h": 0}
+            if ref in scored_map:
+                s, g = scored_map[ref]
+                entries[ref] = {"score": s, "gate5h": 1 if g else 0}
+            # Tail and unknown refs are intentionally NOT in `entries`:
+            # the picker puts refs absent from score_by_ref in the
+            # unscored bucket, which sorts after every scored member.
         await ledger.set_lane_order(
             lane.key, entries, computed_at=time.time(),
             stale_after_ms=_stale_after_ms(plan))
@@ -294,18 +313,32 @@ def _stale_after_ms(plan) -> int:
 
 def _one_adjacent_swap(previous: list[str], desired: list[str],
                        scores: dict[str, tuple[float, bool]]) -> list[str]:
-    """At most one adjacent swap on the way from `previous` toward `desired`.
+    """Reconcile `previous` toward `desired`, applying at most one adjacent swap.
 
-    A lane's traffic is already routed along `previous`; jumping straight to
-    `desired` would flip-flop sessions whose lease had just landed on whichever
-    member is being displaced. Instead, find the first adjacent pair in
-    `previous` whose order disagrees with `desired`, and swap it ONLY when the
-    lower-position member's score beats the higher-position one's by ratio
-    >= ~1.2. That keeps the rank responsive to a real spread (a 95% plan
-    deserves to fall behind a 30% one) while ignoring small noise (a 51% vs
-    49% flip should not bounce).
+    Three steps:
+
+    1. Drop refs from `previous` that are absent from `desired` (config edit
+       removed a ref, a member's plan or model was disabled). They would
+       otherwise be written back as `score: 0.0` zero-scored entries, which
+       the picker reads as "scored" and ranks ahead of true unscored refs.
+    2. Append any refs in `desired` not already present (a member whose
+       plan just probed for the first time, a new perishable lane warming
+       up). Without this step the new ref is silently absent from the
+       stored order and from the hash on the next write.
+    3. Walk the surviving list and swap at most one adjacent pair whose
+       lower-position member beats the one in front by ratio >= ~1.2 AND
+       whose desired order disagrees. A 51/49 split does NOT flip the lane;
+       a real 95/30 spread does. One swap per poll keeps the rank
+       responsive to a real gap without thrashing on noise, and lets sessions
+       whose lease had just landed on the displaced member finish there.
     """
-    out = list(previous)
+    desired_set = set(desired)
+    out = [r for r in previous if r in desired_set]
+    out_set = set(out)
+    for r in desired:
+        if r not in out_set:
+            out.append(r)
+            out_set.add(r)
     for i in range(len(out) - 1):
         a, b = out[i], out[i + 1]
         sa = scores.get(a, (0.0, False))[0]

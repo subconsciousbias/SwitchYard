@@ -1210,6 +1210,199 @@ def test_a_strategy_absent_lane_never_touches_the_lane_order_key():
           f"after={after}); first pick still {p1} in config order")
 
 
+def test_perishable_writer_keeps_both_plans_after_two_polls():
+    """A perishable lane whose body mixes two plans (the common shape: every
+    shipped example lane does) survives the writer running for each plan in
+    turn. The blocker at bfa9ad3 was that `set_lane_order` is delete-then-write
+    and `_recompute_perishable_for_plan` only scored members of THIS plan, so
+    the second plan's write wiped the first plan's entries from the hash.
+
+    The fix scores every lane member in one pass: members on THIS plan use
+    fresh facts; members on OTHER plans reuse the score that was last written
+    for them (and which is at most one probe interval old, well inside the
+    staleness window the picker already tolerates). Driving the writer for
+    both plans in sequence and asserting both refs land in the stored hash
+    with non-zero scores is what catches a regression to the per-plan-only
+    behaviour.
+    """
+    from dataclasses import replace
+    from switchyard.portal.app import _recompute_perishable_for_plan
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        # apex already has one member per plan (claude-max/fable and
+        # openai/astra). Flip it to perishable with no tail, so the test is
+        # just about the body. The registry is rebuilt so the lane order
+        # takes effect; plans are unchanged.
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"],
+            key="perishable-test",
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        reset = time.time() + 7 * 86400
+        # claude-max 80% used (room 20%); openai 10% used (room 90%).
+        # openai/astra should outrank claude-max/fable on score.
+        await ledger.note_reported_percent("claude-max", 80.0, reset,
+                                           window="weekly")
+        await ledger.note_reported_percent("openai", 10.0, reset,
+                                           window="weekly")
+        # Drive the writer for claude-max first. With NO previous, only
+        # this plan's refs get a fresh score; openai/astra has no previous
+        # entry either, so it lands in `unknown` and is NOT written.
+        plan_a = reg2.plans["claude-max"]
+        await _recompute_perishable_for_plan(reg2, ledger, plan_a)
+        after_first = await ledger.get_lane_order("perishable-test")
+        # Drive the writer for openai. Now both plans have facts: openai/
+        # astra is fresh, claude-max/fable is reused from `previous`. Both
+        # refs must survive in the hash.
+        plan_b = reg2.plans["openai"]
+        await _recompute_perishable_for_plan(reg2, ledger, plan_b)
+        after_second = await ledger.get_lane_order("perishable-test")
+        return after_first, after_second
+
+    after_first, after_second = run(go())
+    refs_first = sorted(m["ref"] for m in after_first["members"])
+    refs_second = [m["ref"] for m in after_second["members"]]
+    # First poll: only the just-probed plan's ref is scored; the other
+    # plan's ref has no previous and is unknown, so it is not in the hash.
+    assert refs_first == ["claude-max/fable"], refs_first
+    # Second poll: BOTH plans' refs are scored, in score-descending order
+    # (openai/astra has higher room than claude-max/fable, so it leads).
+    assert refs_second == ["openai/astra", "claude-max/fable"], refs_second
+    # Every score is a real number, not the stale-zero fallback that a
+    # regression would produce (a ref reused from previous carries its
+    # last-written score, which is itself a fresh score from one poll ago).
+    for entry in after_second["members"]:
+        assert entry["score"] > 0, entry
+    print(f"  first poll refs={refs_first}; "
+          f"second poll refs={refs_second} (both plans present)")
+
+
+def test_perishable_writer_preserves_other_plan_score_when_re_polled():
+    """Driving the writer for plan B does not lose plan A's score. Plan A's
+    previous score is reused, so even though the writer is invoked per-plan
+    the per-lane hash stays a complete picture across the probe poll.
+
+    `set_lane_order` deletes the key first to avoid carrying over a stale
+    `score_<ref>` for a ref that left the lane -- so the test asserts that
+    the surviving score comes from THIS recompute (re-reading plan A's
+    facts through `previous`), not from a stale field left over by the
+    delete.
+    """
+    from dataclasses import replace
+    from switchyard.portal.app import _recompute_perishable_for_plan
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"],
+            key="perishable-test",
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent("claude-max", 80.0, reset,
+                                           window="weekly")
+        await ledger.note_reported_percent("openai", 10.0, reset,
+                                           window="weekly")
+        plan_a, plan_b = reg2.plans["claude-max"], reg2.plans["openai"]
+        # Poll 1: claude-max. fable scored, astra unknown (no previous).
+        await _recompute_perishable_for_plan(reg2, ledger, plan_a)
+        # Poll 2: openai. astra fresh; fable reused from previous.
+        await _recompute_perishable_for_plan(reg2, ledger, plan_b)
+        score_fable_pre = next(
+            m["score"] for m in
+            (await ledger.get_lane_order("perishable-test"))["members"]
+            if m["ref"] == "claude-max/fable")
+        # Mutate claude-max's facts OUT OF BAND and re-poll openai again.
+        # The writer must not pick up the new number for fable (it is on
+        # the other plan); fable's score in the hash must stay what it was
+        # at the previous openai poll, since we have not re-polled
+        # claude-max. If the writer were to re-read claude-max's facts on
+        # every recompute, fable's score would change here, which would be
+        # wrong -- openai's poll has no business recomputing claude-max's
+        # number.
+        await ledger.note_reported_percent("claude-max", 99.0, reset,
+                                           window="weekly")
+        await _recompute_perishable_for_plan(reg2, ledger, plan_b)
+        score_fable_post = next(
+            m["score"] for m in
+            (await ledger.get_lane_order("perishable-test"))["members"]
+            if m["ref"] == "claude-max/fable")
+        return score_fable_pre, score_fable_post
+
+    pre, post = run(go())
+    # Fable's score in the hash is unchanged across the second openai poll:
+    # the writer reused `previous` rather than re-reading claude-max's
+    # now-different facts.
+    assert abs(pre - post) < 1e-9, (pre, post)
+    print(f"  fable's score unchanged across openai's second poll "
+          f"(pre={pre:.4f}, post={post:.4f})")
+
+
+def test_perishable_one_adjacent_swap_reconciles_added_and_removed_refs():
+    """`_one_adjacent_swap` drops refs from `previous` that have left the
+    lane (a config edit, a member's plan disabled, etc.) and appends refs
+    in `desired` that are not yet in `previous` (a member whose plan just
+    probed for the first time, a new perishable lane warming up). The
+    one-swap cap still applies on top, so the result is reachable from
+    `previous` via at most one adjacent swap after reconciliation.
+
+    The should-fix at bfa9ad3 was that the implementation never moved
+    toward `desired` -- it only reordered `previous`. A newly probed ref
+    stayed absent from the hash, and a removed ref came back as a stale
+    `score: 0.0` entry.
+    """
+    from switchyard.portal.app import _one_adjacent_swap
+
+    # Drop a removed ref (config edit removed it), add a new ref (first
+    # probe of a different plan's model), with a score ratio that justifies
+    # one swap.
+    added_only = _one_adjacent_swap(
+        ["minimax-ultra/m3"],
+        ["minimax-max/m3", "minimax-ultra/m3"],
+        {"minimax-ultra/m3": (50.0, False), "minimax-max/m3": (100.0, False)},
+    )
+    # out starts as [minimax-ultra/m3]; append minimax-max/m3 (in desired
+    # order).  Loop: pair (minimax-ultra/m3, minimax-max/m3). sb/sa = 2.0
+    # >= 1.2; desired.index(minimax-max/m3) < desired.index(minimax-ultra/m3);
+    # swap. Result: [minimax-max/m3, minimax-ultra/m3].
+    assert added_only == ["minimax-max/m3", "minimax-ultra/m3"], added_only
+
+    # Removed ref is gone, surviving refs unchanged, no swap needed.
+    dropped_only = _one_adjacent_swap(
+        ["a/m", "b/m"],
+        ["b/m"],
+        {"a/m": (10.0, False), "b/m": (10.0, False)},
+    )
+    assert dropped_only == ["b/m"], dropped_only
+
+    # Drop AND add in one call: both reconcile, one swap.
+    added_and_dropped = _one_adjacent_swap(
+        ["a/m", "b/m", "c/m"],
+        ["c/m", "b/m", "d/m"],
+        {"a/m": (10.0, False), "b/m": (50.0, False),
+         "c/m": (100.0, False), "d/m": (50.0, False)},
+    )
+    # Step 1: drop a/m. out = [b/m, c/m].
+    # Step 2: append d/m. out = [b/m, c/m, d/m].
+    # Loop: pair (b/m, c/m). sb/sa = 100/50 = 2.0; desired.index(c/m) <
+    # desired.index(b/m); swap. Result: [c/m, b/m, d/m].
+    assert added_and_dropped == ["c/m", "b/m", "d/m"], added_and_dropped
+
+    print(f"  added: {added_only}; dropped: {dropped_only}; "
+          f"added+dropped: {added_and_dropped}")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):
