@@ -528,6 +528,74 @@ tool-carrying requests around it — but no plan sets it today.
 **A 200 with no `tool_calls` would be the bug**: it would mean the definitions
 were silently dropped rather than either served or refused.
 
+### 4h. Vision through the CLI-backed lanes
+
+Image blocks used to be flattened away by the sidecars: a screenshot came
+back as a confident near-white hex (e.g. `#EDF6EC` for a magenta swatch --
+the model answering from its prior over what such a screenshot "usually"
+shows). The fix stages the bytes to disk and tells each CLI how to carry
+them: `claude -p` gets `--add-dir` + an explicit `Read` allowlist (and Read
+is no longer in its bare-mode disallowed-tools list), `codex exec` gets a
+repeatable `-i FILE`, and `opencode run` gets a repeatable `-f FILE`. None
+of the CLIs accept raw base64 in the prompt, which is why staging is the
+shape they all share.
+
+The test is the magenta-swatch round-trip. Generate the bytes once,
+base64 them, and POST through `forge` (which spills to the CLI-backed
+lanes -- `claude-max`, `opencode-go`, `codex` -- the way a real agent
+would):
+
+```bash
+python3 -c "import base64; print(base64.b64encode(open('/tmp/magenta.png','rb').read()).decode())"
+```
+
+```bash
+read -r B64 < <(python3 -c "import base64; print(base64.b64encode(bytes.fromhex('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c63f8cf1f7f060006000300013fe46dabe90000000049454e44ae426082')).decode())")
+
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H 'Content-Type: application/json' -d "{
+    \"model\":\"forge\",
+    \"messages\":[{\"role\":\"user\",\"content\":[
+      {\"type\":\"text\",\"text\":\"Reply with only the hex colour of the swatch.\"},
+      {\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,$B64\"}}]}],
+    \"max_tokens\":40}" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
+```
+
+**Expect:** a magenta-family hex (`#ff00ff`, `#f0f`, `#cc3399`, ...). A
+near-white hex, a refusal, or an "I cannot see images" message are all
+failures: the bytes are reaching the model, but the model is not reading
+them, which is what the test exists to catch. The same request shape with
+`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`
+is also accepted and should round-trip the same way; the sidecar picks the
+shape apart and stages the bytes either way.
+
+A remote `https://...` URL on the image block is intentionally rejected
+with `400 images_unsupported` -- the sidecar has no way to fetch it, and
+silently dropping it is the bug being fixed.
+
+The per-CLI flag plumbing is verified separately on each sidecar, against
+real installed versions, before each release:
+
+```bash
+docker compose exec -T codex-sidecar codex exec --json --skip-git-repo-check \
+  -i /tmp/magenta.png - <<<'Reply with only the hex colour of the swatch.'
+
+docker compose exec -T opencode-go-sidecar opencode run --format json \
+  --model opencode-go/glm-5.3-flash -f /tmp/magenta.png \
+  'Reply with only the hex colour of the swatch.'
+
+docker compose exec -T claude-max-sidecar claude -p --output-format json \
+  --model opus --max-turns 4 \
+  --disallowed-tools 'Bash,Edit,Write,Glob,Grep,WebFetch,WebSearch,NotebookEdit' \
+  --add-dir /tmp/magenta-stage --allowed-tools 'Read(/tmp/magenta-stage/**)' \
+  'The image is saved as /tmp/magenta-stage/01.png. Read it with your Read tool and reply with only its hex colour.'
+```
+
+**Expect** a magenta-family hex from each. The Claude one proves the
+`bare_args_images` list is the one in use: Read is unrestricted and the
+disallowed list does not contain it.
+
 ## 5. Behaviour tests
 
 ### 5a. Ordered fill and total capacity

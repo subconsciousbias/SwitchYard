@@ -18,6 +18,7 @@ in-process session objects, which is the same code the HTTP routes call.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import http.server
 import json
@@ -593,9 +594,14 @@ def _stub_start_session(recorder: list):
     """
     real = server.start_session
 
-    async def fake(body, mcp_tools, prompt, system, model, request):
+    async def fake(body, mcp_tools, prompt, system, model, request,
+                   image_paths=None, img_dir=None):
         recorder.append({"tools": mcp_tools, "prompt": prompt,
-                         "system": system, "model": model})
+                         "system": system, "model": model,
+                         "image_paths": image_paths})
+        if img_dir is not None:
+            import shutil
+            shutil.rmtree(img_dir, ignore_errors=True)
         await server.cli_bridge._gate.release()
         return {"stubbed": True}
 
@@ -1347,8 +1353,12 @@ def test_resume_gone_returns_503_quickly_when_gate_is_full():
             calls: list = []
             restore_start = server.start_session
 
-            async def fake_start(body, mcp_tools, prompt, system, model, request):
+            async def fake_start(body, mcp_tools, prompt, system, model, request,
+                                  image_paths=None, img_dir=None):
                 calls.append({"prompt": prompt})
+                if img_dir is not None:
+                    import shutil
+                    shutil.rmtree(img_dir, ignore_errors=True)
                 return {"stubbed": True}
             server.start_session = fake_start
 
@@ -1377,6 +1387,226 @@ def test_resume_gone_returns_503_quickly_when_gate_is_full():
 
     asyncio.run(scenario())
     print(f"  resume_gone_session bounded to RESUME_WAIT (~{SHORT}s) instead of 300s")
+
+
+# ----------------------------------------------------------- images (issue #30) ---
+# A 1x1 magenta PNG. Same one used by the cli_bridge test -- issue #30 is
+# the silent drop on the text path, and the same payload shape reaches the
+# MCP bridge through `messages[].content` (the tool side carries image
+# blocks too; see openai_tool_content_to_mcp below).
+PNG_MAGENTA = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+def test_openai_tool_content_to_mcp_passes_through_image_data_urls():
+    """An OpenAI-shaped image_url with a `data:` URL must reach the CLI as a
+    real MCP image content block, not a stringified JSON blob the model
+    cannot see. The decoded bytes are the model's only way to read it.
+    """
+    payload = [{"type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{base64.b64encode(PNG_MAGENTA).decode()}"}}]
+    blocks, is_error = server.openai_tool_content_to_mcp(payload)
+    assert is_error is False, (blocks, is_error)
+    assert blocks == [{"type": "image", "mimeType": "image/png",
+                       "data": base64.b64encode(PNG_MAGENTA).decode()}], blocks
+    print(f"  data: URL -> MCP image block ({len(blocks[0]['data'])} chars of base64)")
+
+
+def test_openai_tool_content_to_mcp_converts_anthropic_shaped_images():
+    """Anthropic's image block (`source.type == "base64"`) arrives on the
+    MCP path too, e.g. when the caller is Anthropic-protocol. The same MCP
+    shape must come out.
+    """
+    payload = [{"type": "image",
+                "source": {"type": "base64", "media_type": "image/png",
+                           "data": base64.b64encode(PNG_MAGENTA).decode()}}]
+    blocks, is_error = server.openai_tool_content_to_mcp(payload)
+    assert not is_error, (blocks, is_error)
+    assert blocks == [{"type": "image", "mimeType": "image/png",
+                       "data": base64.b64encode(PNG_MAGENTA).decode()}], blocks
+    print(f"  Anthropic-shaped image -> MCP image block (mimeType=image/png)")
+
+
+def test_openai_tool_content_to_mcp_marks_remote_url_as_is_error():
+    """A remote http(s) URL on the tool path cannot be fetched from here.
+    The call must surface as isError, with a log line warning about it --
+    otherwise the caller would receive a tool result the model cannot see,
+    and might hallucinate an answer from the missing image.
+    """
+    payload = [{"type": "image_url",
+                "image_url": {"url": "https://example.com/x.png"}}]
+    blocks, is_error = server.openai_tool_content_to_mcp(payload)
+    assert is_error is True, (blocks, is_error)
+    # The block becomes a plain text block so the CLI still has SOMETHING to
+    # feed back -- an empty content list would break the stdio framing.
+    assert blocks and blocks[0]["type"] == "text", blocks
+    print(f"  remote URL -> isError=True text block ({blocks[0]['text'][:30]}...)")
+
+
+def test_openai_tool_content_to_mcp_keeps_text_in_a_list():
+    """A mixed list of text and image blocks must keep both. Otherwise the
+    model's text answer would be stripped alongside the image.
+    """
+    payload = [{"type": "text", "text": "the colour is "},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{base64.b64encode(PNG_MAGENTA).decode()}"}}]
+    blocks, is_error = server.openai_tool_content_to_mcp(payload)
+    assert not is_error, (blocks, is_error)
+    assert blocks[0] == {"type": "text", "text": "the colour is "}, blocks
+    assert blocks[1]["type"] == "image", blocks[1]
+    print(f"  text + image kept in order, image reached the CLI")
+
+
+def test_flatten_with_tool_history_includes_image_markers_after_staging():
+    """Rebuilding a session with an image-bearing tool result must carry the
+    image into the rebuilt CLI's prompt -- not as raw base64 (which would
+    blow past MAX_ARG_STRLEN) and not as nothing (the bug fix). stage_or_fail
+    replaces the image blocks with `[image N: <path>]` markers BEFORE
+    flatten_with_tool_history runs, so the markers survive into narration.
+    """
+    import shutil
+    img_dir = Path(tempfile.mkdtemp(prefix="mcpb-imgtest-"))
+    try:
+        messages = [
+            {"role": "user", "content": "what colour is this?"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_a", "type": "function",
+                 "function": {"name": "look", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_a",
+             "content": [{"type": "image_url", "image_url": {
+                 "url": f"data:image/png;base64,{base64.b64encode(PNG_MAGENTA).decode()}"}}]},
+        ]
+        # Stage images into a temp dir the same way resume_gone_session does.
+        paths, _ = server.cli_bridge.stage_or_fail(messages)
+        assert len(paths) == 1, paths
+        # flatten_with_tool_history renders the tool loop as narration. The
+        # image block has been replaced with a text marker, so the marker
+        # appears inside the result.
+        prompt, _system = server.flatten_with_tool_history(messages)
+        assert "[image 1:" in prompt, prompt
+        assert "look" in prompt, prompt
+        assert "[result of look:" in prompt, prompt
+        print(f"  staged tool-image marker carried into narration: "
+              f"{[l for l in prompt.splitlines() if 'image' in l][0][:80]}")
+    finally:
+        shutil.rmtree(img_dir, ignore_errors=True)
+
+
+def test_mcp_build_argv_passes_images_through_claude_profile():
+    """The claude MCP profile must carry image files the same way the
+    text-path build_argv does: --add-dir <imgdir> + --allowed-tools
+    Read(<imgdir>/**). Without these flags the staged files are
+    unreachable to the CLI's harness, and the model never sees them.
+
+    Images also lift Read out of --disallowed-tools: Claude Code concatenates
+    repeated flag values, so leaving Read in the disallowed list would
+    silently block the model from Reading the staged file (the bug fix in
+    PR #32 review). The MCP-tools --allowed-tools allowlist survives in
+    either path.
+    """
+    import shutil
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-argv-"))
+    tools_path = workdir / "tools.json"
+    # Use a real tool list (not "[]") so the {allowed_tools} substitution has
+    # something to qualify -- the regression we care about is that the MCP
+    # tool qualifiers stay on the argv when images are present.
+    mcp_tools = [{"name": "get_weather", "description": "",
+                  "inputSchema": {"type": "object", "properties": {}}}]
+    tools_path.write_text("[]")
+    img_dir = workdir / "img"
+    img = img_dir / "00.png"
+    img_dir.mkdir(parents=True)
+    img.write_bytes(PNG_MAGENTA)
+    try:
+        allowed = ",".join(server.PROFILE["tool_qualifier"](t["name"])
+                           for t in mcp_tools)
+        argv, stdin_data = server.build_argv("look at this", None, "m", workdir,
+                                              "sess", tools_path, allowed, [img])
+        assert "--add-dir" in argv, argv
+        assert str(img_dir) in argv, argv
+        # The MCP template already uses --allowed-tools for the MCP tools,
+        # then a second one is appended for Read(<imgdir>/**). Match the
+        # second by pattern, not by position.
+        allowed_pairs = [a for a in argv
+                         if a.startswith("Read(") and a.endswith("/**)")]
+        assert allowed_pairs, argv
+        assert allowed_pairs[0] == f"Read({img_dir}/**)", allowed_pairs[0]
+        # The MCP-tools allowlist survives: the {allowed_tools} slot must
+        # still be substituted into argv even when an image request also
+        # appends its own Read(...) entry.
+        assert any("mcp__switchyard__get_weather" in a for a in argv), argv
+        # Read is OUT of --disallowed-tools in the image variant. The
+        # value of the flag lives at argv[idx + 1]; split on "," to assert
+        # the list itself, since the order is not contractual.
+        idx = argv.index("--disallowed-tools")
+        disallowed = argv[idx + 1]
+        for tool in disallowed.split(","):
+            assert tool != "Read", (disallowed, tool)
+        assert stdin_data is None
+        print(f"  mcp_bridge claude build_argv(image) -> --add-dir={img_dir}, "
+              f"--allowed-tools={allowed_pairs[0]}, Read dropped from "
+              f"--disallowed-tools, mcp__switchyard__get_weather still present")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_mcp_build_argv_keeps_full_disallowed_list_when_no_image():
+    """Regression guard for the non-image path: Read stays in
+    --disallowed-tools when the request carries no image. The fix that
+    lifted Read for image sessions must not regress text-only sessions,
+    which still need Read (and Bash/Edit/Write/etc.) blocked.
+    """
+    import shutil
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-argv-noimg-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    try:
+        argv, stdin_data = server.build_argv("just text", None, "m", workdir,
+                                              "sess", tools_path, "")
+        idx = argv.index("--disallowed-tools")
+        disallowed = argv[idx + 1]
+        # The original full list is preserved: Read, Bash, Edit, Write, Glob,
+        # Grep, WebFetch, WebSearch, NotebookEdit -- nine names. The exact
+        # ordering matches MCP_PROFILES["claude"]["disallowed_tools_default"];
+        # asserted as a sorted set so a future re-order in the profile does
+        # not silently fail this guard.
+        assert sorted(disallowed.split(",")) == sorted(
+            "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit".split(",")
+        ), disallowed
+        # And the MCP-tools allowlist is still wired up.
+        assert "--allowed-tools" in argv, argv
+        assert stdin_data is None
+        print(f"  mcp_bridge claude build_argv(text-only) -> "
+              f"--disallowed-tools includes Read; original 9 names preserved")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_write_opencode_dir_enables_read_when_images_passed():
+    """The opencode harness disables every tool by default. For an image
+    session the model needs `read` to look at the staged files via the
+    agent's own Read tool, so the disable list must be opt-out via
+    `images=True`. Without it, image sessions would 200 with no answer.
+    """
+    import shutil
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-op-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    try:
+        server.write_opencode_dir(workdir, "sess", tools_path, images=False)
+        cfg = json.loads((workdir / "opencode.json").read_text())
+        assert cfg["agent"]["switchyard"]["tools"]["read"] is False, cfg
+
+        server.write_opencode_dir(workdir, "sess", tools_path, images=True)
+        cfg = json.loads((workdir / "opencode.json").read_text())
+        assert cfg["agent"]["switchyard"]["tools"]["read"] is True, cfg
+        # Other tools stay disabled.
+        for tool in ("bash", "edit", "write", "grep", "glob"):
+            assert cfg["agent"]["switchyard"]["tools"][tool] is False, tool
+        print("  write_opencode_dir(images=True) -> read enabled, others stay disabled")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
