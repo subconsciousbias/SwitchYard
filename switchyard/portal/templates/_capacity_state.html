@@ -9,23 +9,44 @@
         where the smoke.py grep `tail disabled (pacing)` matches.
      4. otherwise: in_flight / cap + a possible `cap_reason` chip if the
         cap diverged from cap_configured for an external reason (spend,
-        learning), plus a days_left tag if the plan expires soon. #}
+        learning), plus a days_left tag if the plan expires soon.
+
+   Each tag span is wrapped in a div so multiple chips stack vertically
+   instead of fighting for horizontal space in this last column (same
+   precedent as _plans.html:147-153). The diverged chip is dropped only
+   when the divergence is purely the sidecar's gate headroom on a plan
+   whose learner-side reason was just "configured" (i.e. the reason
+   starts with "configured + gate headroom N"): in that case the chip
+   would just repeat the configured cap, and the full reason is
+   available via the withheld-slot tooltip (_capacity_slots.html:61).
+   Learned, paced, and seed divergence reasons are still rendered —
+   they carry information the title alone wouldn't — with visible text
+   truncated to 24 chars and the full reason kept in the `title`
+   attribute. #}
 {% if p.cooled %}
-  <span class="tag bad">{{ p.cooldown_reason.replace('_',' ') }} · {{ (p.cooldown_remaining // 60) }}m</span>
+  <div style="margin-bottom:3px"><span class="tag bad">{{ p.cooldown_reason.replace('_',' ') }} · {{ (p.cooldown_remaining // 60) }}m</span></div>
 {% elif p.transient_streak and p.transient_streak >= (p.streak_alert or 3) %}
   {# Distinct from `cooled`: this plan is on the ladder but still
      accepts work, so its row should not pretend to be unavailable.
      The warn class matches the existing 'paced to 0' chip; the
      title spells out what the ladder is doing. #}
-  <span class="tag warn" title="consecutive transient failures — cooldown doubles each time">failing · {{ p.transient_streak }}x</span>
+  <div style="margin-bottom:3px"><span class="tag warn" title="consecutive transient failures — cooldown doubles each time">failing · {{ p.transient_streak }}x</span></div>
 {% elif p.cap == 0 %}
-  <span class="tag warn">{{ p.cap_reason }}</span>
+  <div style="margin-bottom:3px"><span class="tag warn">{{ p.cap_reason }}</span></div>
 {% else %}
-  <span class="muted">{{ p.in_flight }}/{{ p.cap }}</span>
-  {% if p.cap != p.cap_configured and not p.cap_model_owned|default(false) %}
-    <span class="tag warn" title="configured {{ p.cap_configured }}">{{ p.cap_reason }}</span>
+  <div style="margin-bottom:3px"><span class="muted">{{ p.in_flight }}/{{ p.cap }}</span></div>
+  {# Diverged chip: skip it only when the reason is the exact
+     "configured + gate headroom N" shape produced by policy.py:423 on a
+     plan whose learner-side reason was just "configured" — i.e. the
+     drop matches the exact string composition (configured prefix,
+     gate-headroom suffix) rather than any reason containing the words
+     "+ gate headroom". Learned, paced, and seed divergence reasons
+     still render. The withheld-slot tooltip on the squares below the
+     cap carries the full reason either way. #}
+  {% if p.cap != p.cap_configured and not p.cap_model_owned|default(false) and not p.cap_reason.startswith("configured + gate headroom") %}
+    <div style="margin-bottom:3px"><span class="tag warn" title="{{ p.cap_reason }}">{{ p.cap_reason|truncate(24) }}</span></div>
   {% endif %}
   {% if p.days_left is not none and p.days_left <= 21 %}
-    <span class="tag warn">{{ p.days_left }}d left</span>
+    <div style="margin-bottom:3px"><span class="tag warn">{{ p.days_left }}d left</span></div>
   {% endif %}
 {% endif %}
