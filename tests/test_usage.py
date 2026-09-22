@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -15,10 +16,13 @@ from switchyard.usage import (
     Ledger,
     model_effective_cost_per_mtok,
     effective_cost_per_mtok,
+    reported_is_current,
+    window_headroom,
     K_M_HOUR,
     K_M_DAY,
     K_HOUR,
     K_DAY,
+    K_WINDOW,
 )
 
 # FakeRedis must be imported after conftest patches socket.
@@ -323,6 +327,111 @@ def test_compact_boundary_and_trimming():
     assert _compact(1_000_000) == "1M"
     assert _compact(12_000_000) == "12M"
     assert _compact(999_499) == "999.5K"
+
+
+# ---------------------------------------------------------------------------
+# Tests: reported_is_current staleness gate
+# ---------------------------------------------------------------------------
+
+def test_reported_reading_expires_when_reset_passes():
+    """A `reported_*` row whose `reset_at` is already in the past is stale.
+
+    The provider told us the window resets at T; T has passed without a fresh
+    reading, so the percentage is no longer about any window in force. The
+    picker's `is_spent` and `window_headroom` both gate on this so a plan
+    whose vendor client never writes a new row can still re-enter rotation
+    after the rollover -- the asymmetry is safe because over-admission
+    self-heals via the vendor's next 429.
+    """
+    now = time.time()
+    # One hour ago: reset_at is in the past -> stale even if reported_at is fresh.
+    assert reported_is_current(
+        {"reset_at": now - 3600, "reported_at": now - 1.0}, "week", now=now) is False
+    # "" (the note_exhaustion sentinel) is also stale: it is not a float and
+    # therefore cannot be in the future.
+    assert reported_is_current(
+        {"reset_at": "", "reported_at": now}, "week", now=now) is False
+    # Absent reset_at does not trigger rule (a): only reported_at bounds
+    # freshness. With reported_at from this week, the reading is current.
+    assert reported_is_current(
+        {"reported_at": now}, "week", now=now) is True
+    # Future reset_at + fresh reported_at is current.
+    assert reported_is_current(
+        {"reset_at": now + 3600, "reported_at": now - 1.0}, "week", now=now) is True
+
+
+def test_reported_reading_expires_at_period_rollover():
+    """A reading older than the current period bucket is stale even with no reset.
+
+    `reset_at` may be absent (e.g. the provider's client reports only a
+    percentage), so rule (b) -- `reported_at` within the current period
+    bucket via `period_bounds(period)` -- is the fallback that catches a
+    weekly reading from a previous week. Rule (b) is the only freshness
+    check a row with no `reset_at` ever gets.
+    """
+    now = time.time()
+    # Move `now` to midweek so the bucket start is unambiguous. Pick a Tuesday
+    # so the week starts on Monday regardless of locale.
+    from datetime import datetime, timedelta, timezone
+    tuesday_noon = datetime(2025, 9, 16, 12, 0, 0, tzinfo=timezone.utc)  # a Tuesday
+    now = tuesday_noon.timestamp()
+    week_start = tuesday_noon.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start -= timedelta(days=1)  # Monday 00:00 UTC
+    # One hour before the Monday bucket starts -> previous week -> stale.
+    assert reported_is_current(
+        {"reported_at": week_start.timestamp() - 3600}, "week", now=now) is False
+    # The instant the bucket starts -> still current (>= counts).
+    assert reported_is_current(
+        {"reported_at": week_start.timestamp()}, "week", now=now) is True
+    # Mid-week -> current.
+    assert reported_is_current(
+        {"reported_at": tuesday_noon.timestamp() - 60.0}, "week", now=now) is True
+    # Missing reported_at (any non-float) is stale regardless of period.
+    assert reported_is_current({}, "week", now=now) is False
+    assert reported_is_current({"reported_at": "not-a-float"}, "week", now=now) is False
+    assert reported_is_current({"reported_at": None}, "week", now=now) is False
+
+
+def test_window_headroom_ignores_stale_reported_percent():
+    """`window_headroom` falls back to the ledger basis when the pct is stale.
+
+    A reported_pct_used=100 with a past reset_at would otherwise pin the bar
+    at 100% forever -- exactly the bug at #45 -- so `reported_is_current`
+    gates the early-return. With the gate, `window_headroom` proceeds to the
+    observed-allowance / ledger branch, which is what the board wants to
+    show: an estimate that may still be off, not a stale lock.
+    """
+    from switchyard.usage import window_headroom
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan()  # month allowance = 1_000_000 tokens
+    # A spent reading: 100% reported, reset 1h ago. plan.headroom would
+    # normally pin pct_used to 100 here. With staleness gating, it should
+    # fall through to the ledger basis (consumed=0, limit=1_000_000).
+    past_reset = time.time() - 3600
+    redis.hashes[K_WINDOW.format(plan=plan.key, window=plan.quota.label)] = {
+        "reported_pct_used": "100.0",
+        "reported_at": str(time.time()),
+        "reset_at": str(past_reset),
+    }
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr = run(window_headroom(ledger, plan, plan.quota))
+    # Stale -> not 100; falls back to ledger. 0 / 1_000_000 = 0.0%.
+    assert hr["pct_used"] == 0.0, hr
+    assert "reported by provider" not in hr["basis"], hr
+    assert hr["basis"].startswith("ledger"), hr
+
+    # Sanity check: a CURRENT 100% reading is honoured (gating does not
+    # regress the happy path).
+    redis.hashes[K_WINDOW.format(plan=plan.key, window=plan.quota.label)] = {
+        "reported_pct_used": "100.0",
+        "reported_at": str(time.time()),
+        "reset_at": str(time.time() + 3600),
+    }
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr_current = run(window_headroom(ledger, plan, plan.quota))
+    assert hr_current["pct_used"] == 100.0, hr_current
+    assert hr_current["basis"] == "reported by provider (% only)", hr_current
 
 
 # ---------------------------------------------------------------------------

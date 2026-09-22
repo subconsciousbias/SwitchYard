@@ -778,6 +778,62 @@ def test_a_spent_plan_is_skipped_unless_it_may_use_extra_quota():
     print(f"  {ref} spent -> moved to {moved.ref}; with use_extra_quota it stays")
 
 
+def test_spent_plan_reenters_after_window_rollover():
+    """A 100% reading whose `reset_at` has already passed does NOT keep the plan
+    out of rotation.
+
+    The bug at #45: a plan with no utilization probe (Claude Code / Codex)
+    reports its target window at 100%, the window rolls over, the stale row
+    sits in Redis forever, the picker trusts it, the plan gets zero traffic,
+    and the vendor's client never writes a fresh number -- so the plan stays
+    "spent" permanently even though its weekly allowance just reset. The fix
+    is to gate `is_spent` on `reported_is_current`: a stale reading means
+    UNKNOWN, not spent, so the plan re-enters and the vendor's next response
+    (success or 429) is what settles the truth.
+
+    Mirror of `test_a_spent_plan_is_skipped_unless_it_may_use_extra_quota`,
+    but using `build_with_policy()` and supplying a `reset_at` in the past so
+    the staleness gate fires. A control case with a future reset_at still
+    skips -- the gate does not regress the happy path.
+    """
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        lane = "forge"
+        members = reg.lane_members(lane)
+        target = members[0]
+        plan = reg.plan_of(target)
+        assert not plan.use_extra_quota, "fixture plan should default to not overspending"
+
+        # 100% reported with reset_at already in the past -> reading is stale
+        # about a window that has rolled over. Pre-fix, the picker would see
+        # 100% and refuse; post-fix, it re-admits the plan.
+        past_reset = time.time() - 3600
+        await ledger.note_reported_percent(
+            plan.key, 100.0, past_reset, window=plan.quota.label)
+        pick_stale = await picker.pick(lane, None)
+        await picker.release(pick_stale.plan.key, pick_stale.request_id, pick_stale.ref)
+
+        # Control: same 100% reading, but reset_at in the future. The reading
+        # IS about the window in force, so the plan must still be skipped.
+        future_reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent(
+            plan.key, 100.0, future_reset, window=plan.quota.label)
+        pick_future = await picker.pick(lane, None)
+        await picker.release(pick_future.plan.key, pick_future.request_id, pick_future.ref)
+
+        return target.ref, pick_stale.ref, pick_future.ref
+
+    target_ref, stale_pick, future_pick = run(go())
+    assert stale_pick == target_ref, (
+        f"a stale 100% reading must not keep {target_ref} out of rotation: "
+        f"picked {stale_pick}")
+    assert future_pick != target_ref, (
+        f"a current 100% reading must still skip {target_ref}: "
+        f"picked {future_pick}")
+    print(f"  {target_ref}: stale 100% re-admits ({stale_pick}); "
+          f"future 100% still skips ({future_pick})")
+
+
 def test_a_mid_loop_followup_finishes_on_a_spent_plan():
     """A started tool loop completes where it started, spent or not.
 
