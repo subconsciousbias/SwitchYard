@@ -145,6 +145,11 @@ RESUME_WAIT = float(os.environ.get("MCP_RESUME_WAIT_SECONDS", "15"))
 # nothing happened and the client never learns the session died. Off switches
 # the behaviour back to the old hard 410.
 REBUILD_LOST = os.environ.get("MCP_REBUILD_LOST", "1") not in ("0", "false", "no")
+# Issue #78: one warning per no-text event -- one when the retry is scheduled,
+# one when the contract 502 fires -- so retry-rate vs contract-502-rate is
+# visible in docker logs without touching the gateway. Opt out with
+# LOG_TEXT_LOST=0/false/no (same shape as MCP_REBUILD_LOST above).
+LOG_TEXT_LOST = os.environ.get("LOG_TEXT_LOST", "1") not in ("0", "false", "no")
 # How many preempted session ids to remember, so their follow-ups can be
 # recognised and resumed rather than refused. Ids are cheap; this only needs to
 # outlive the callers' tool execution, not the process.
@@ -913,112 +918,151 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
 # except at the very end (or on error/timeout) -- every tool-call turn is
 # resolved by Session._flush, triggered from register_tool_call below.
 # ---------------------------------------------------------------------------
+async def _run_session_attempt(session: Session, argv: list[str],
+                               stdin_data: str | None = None) -> dict | None:
+    """One spawn+classify+parse for run_session, without the no-text retry.
+
+    Mirrors cli_bridge._run_cli_attempt, but every terminal branch resolves the
+    session's `turn_future` itself and returns None -- mcp_bridge has no
+    HTTPException layer, the session IS the response channel. Raises
+    cli_bridge.CliNoTextError unwrapped for the retriable no-text-with-usage
+    shape (issue #78), and returns the parsed payload dict on success.
+    """
+    try:
+        # cwd is the per-session workdir so the inner CLI never starts in
+        # /app/mcp_bridge. The path still belongs to the relay -- this is
+        # NOT the caller's cwd, and the env-block / first-turn reminder
+        # make that clear to the model -- but a session-shaped directory
+        # keeps paths beneath it from looking like a meaningful project
+        # root the model could safely use (issue #44).
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE if stdin_data is not None
+            else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=session.workdir,
+        )
+    except OSError as exc:
+        # Same mapping cli_bridge._run_cli applies to a failed spawn (issue
+        # #29): E2BIG is the request, not the plan, so it must read as 413;
+        # any other spawn failure is this plan's capacity being broken.
+        if exc.errno == errno.E2BIG:
+            session.resolve_final({
+                "type": "error", "status": 413,
+                "detail": {"error": {
+                    "message": (f"request too large for {PROVIDER} cli "
+                                f"({exc.strerror}); reduce its size"),
+                    "type": "request_too_large"}}})
+        else:
+            session.resolve_final({
+                "type": "error", "status": 502,
+                "detail": f"{PROVIDER} cli could not be spawned: {exc}"})
+        return None
+    session.proc = proc
+    try:
+        out, err = await asyncio.wait_for(
+            proc.communicate(input=stdin_data.encode() if stdin_data is not None
+                             else None),
+            timeout=PROCESS_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        session.resolve_final({"type": "error", "status": 408,
+                                "detail": f"{PROVIDER} cli timed out after "
+                                          f"{PROCESS_TIMEOUT:.0f}s"})
+        return None
+
+    stdout = out.decode(errors="replace")
+    stderr = err.decode(errors="replace")
+    blob = cli_bridge.normalise(f"{stdout}\n{stderr}")
+
+    if proc.returncode != 0 or not stdout.strip():
+        # Same classification cli_bridge._run_cli applies to the text
+        # path, reused rather than re-derived -- see its comments for why
+        # each check comes in this order.
+        if cli_bridge._AUTH.search(blob):
+            session.resolve_final({"type": "error", "status": 401,
+                                    "detail": f"{PROVIDER} cli not authenticated"})
+            return None
+        up_status, up_message, up_retryable = cli_bridge.upstream_error(stdout)
+        if cli_bridge._LIMIT.search(blob) or cli_bridge.seconds_until(blob):
+            exc = cli_bridge._limit_error(
+                f"{up_message}\n{blob}" if up_message else blob,
+                PROFILE["default_retry_after"])
+            session.resolve_final({"type": "error", "status": exc.status_code,
+                                    "detail": exc.detail, "headers": exc.headers})
+            return None
+        if up_status in (401, 402, 403) and up_retryable is not True:
+            session.resolve_final({"type": "error", "status": up_status,
+                                    "detail": up_message or blob[:300]})
+            return None
+        status, detail = cli_bridge.error_from_events(stdout)
+        if status and 400 <= status < 500 and status != 429:
+            session.resolve_final({"type": "error", "status": status, "detail": detail})
+            return None
+        session.resolve_final({"type": "error", "status": 502,
+                                "detail": f"{PROVIDER} cli failed ({proc.returncode}): "
+                                          f"{(detail or stderr[:300] or stdout[:300])}"})
+        return None
+
+    try:
+        payload = cli_bridge.parse_output(stdout, PROFILE["parser"])
+    except cli_bridge.CliNoTextError:
+        # Issue #64 retriable shape -- propagate unwrapped to run_session's
+        # retry driver so the contract 502 can name real numbers, and a
+        # successful retry can fold attempt 1's charged usage into attempt 2.
+        raise
+    except (json.JSONDecodeError, ValueError) as exc:
+        # Same contract as cli_bridge._run_cli: a structured parser that
+        # cannot find the answer must fail the call, not echo its raw
+        # event stream back as the answer (issue #3).
+        if PROFILE["parser"] in cli_bridge.STRUCTURED_PARSERS:
+            session.resolve_final({"type": "error", "status": 502,
+                                    "detail": f"{PROVIDER} cli yielded no "
+                                              f"parsed answer: {exc}"})
+            return None
+        payload = {"result": stdout.strip()}
+    return payload
+
+
 async def run_session(session: Session, argv: list[str],
                       stdin_data: str | None = None) -> None:
+    """Retry-once driver around _run_session_attempt (issue #78).
+
+    opencode-ai@1.18.31 occasionally emits a step_finish with nonzero output
+    tokens but no text event (glm-5.3-flash, ~15-30% of calls on some plans).
+    When parse_output raises CliNoTextError, attempt 1 is re-spawned exactly
+    once with identical argv/stdin. On a successful retry, attempt 1's
+    charged tokens are folded into the payload so the ledger books each
+    attempt exactly once; on a second CliNoTextError the contract 502 names
+    the COMBINED usage of both attempts. Every other failure mode stays
+    single-attempt.
+    """
     try:
         try:
-            # cwd is the per-session workdir so the inner CLI never starts in
-            # /app/mcp_bridge. The path still belongs to the relay -- this is
-            # NOT the caller's cwd, and the env-block / first-turn reminder
-            # make that clear to the model -- but a session-shaped directory
-            # keeps paths beneath it from looking like a meaningful project
-            # root the model could safely use (issue #44).
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE if stdin_data is not None
-                else asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=session.workdir,
-            )
-        except OSError as exc:
-            # Same mapping cli_bridge._run_cli applies to a failed spawn (issue
-            # #29): E2BIG is the request, not the plan, so it must read as 413;
-            # any other spawn failure is this plan's capacity being broken.
-            if exc.errno == errno.E2BIG:
-                session.resolve_final({
-                    "type": "error", "status": 413,
-                    "detail": {"error": {
-                        "message": (f"request too large for {PROVIDER} cli "
-                                    f"({exc.strerror}); reduce its size"),
-                        "type": "request_too_large"}}})
-            else:
+            payload = await _run_session_attempt(session, argv, stdin_data)
+        except cli_bridge.CliNoTextError as exc:
+            if LOG_TEXT_LOST:
+                log.warning("mcp session %s: no text with usage %s; retrying once",
+                            session.id, exc.usage)
+            try:
+                payload = await _run_session_attempt(session, argv, stdin_data)
+            except cli_bridge.CliNoTextError as exc2:
+                combined = cli_bridge._sum_usage(dict(exc.usage), exc2.usage)
+                if LOG_TEXT_LOST:
+                    log.warning("mcp session %s: text lost on both attempts "
+                                "(combined usage=%s); contract 502",
+                                session.id, combined)
                 session.resolve_final({
                     "type": "error", "status": 502,
-                    "detail": f"{PROVIDER} cli could not be spawned: {exc}"})
-            return
-        session.proc = proc
-        try:
-            out, err = await asyncio.wait_for(
-                proc.communicate(input=stdin_data.encode() if stdin_data is not None
-                                 else None),
-                timeout=PROCESS_TIMEOUT)
-        except asyncio.TimeoutError:
-            proc.kill()
-            session.resolve_final({"type": "error", "status": 408,
-                                    "detail": f"{PROVIDER} cli timed out after "
-                                              f"{PROCESS_TIMEOUT:.0f}s"})
-            return
-
-        stdout = out.decode(errors="replace")
-        stderr = err.decode(errors="replace")
-        blob = cli_bridge.normalise(f"{stdout}\n{stderr}")
-
-        if proc.returncode != 0 or not stdout.strip():
-            # Same classification cli_bridge._run_cli applies to the text
-            # path, reused rather than re-derived -- see its comments for why
-            # each check comes in this order.
-            if cli_bridge._AUTH.search(blob):
-                session.resolve_final({"type": "error", "status": 401,
-                                        "detail": f"{PROVIDER} cli not authenticated"})
+                    "detail": cli_bridge.format_no_text_detail(PROVIDER, combined)})
                 return
-            up_status, up_message, up_retryable = cli_bridge.upstream_error(stdout)
-            if cli_bridge._LIMIT.search(blob) or cli_bridge.seconds_until(blob):
-                exc = cli_bridge._limit_error(
-                    f"{up_message}\n{blob}" if up_message else blob,
-                    PROFILE["default_retry_after"])
-                session.resolve_final({"type": "error", "status": exc.status_code,
-                                        "detail": exc.detail, "headers": exc.headers})
-                return
-            if up_status in (401, 402, 403) and up_retryable is not True:
-                session.resolve_final({"type": "error", "status": up_status,
-                                        "detail": up_message or blob[:300]})
-                return
-            status, detail = cli_bridge.error_from_events(stdout)
-            if status and 400 <= status < 500 and status != 429:
-                session.resolve_final({"type": "error", "status": status, "detail": detail})
-                return
-            session.resolve_final({"type": "error", "status": 502,
-                                    "detail": f"{PROVIDER} cli failed ({proc.returncode}): "
-                                              f"{(detail or stderr[:300] or stdout[:300])}"})
-            return
-
-        try:
-            payload = cli_bridge.parse_output(stdout, PROFILE["parser"])
-        except cli_bridge.CliNoTextError as exc:
-            # Issue #64 contract: the CLI charged the provider for tokens
-            # but emitted no text. Mirror cli_bridge._run_cli's contract
-            # detail verbatim (same helper, same string format) so the
-            # gateway's _NO_TEXT regex classifies it as TEXT_LOST and
-            # extract_no_text_tokens books the charged usage. opencode-go
-            # and opencode-go2 plans run mcp_bridge, NOT cli_bridge, so
-            # without this catch the legacy "yielded no parsed answer"
-            # shape falls through and the plan rides the TRANSIENT
-            # doubling ladder while the ledger still loses the tokens.
-            session.resolve_final({"type": "error", "status": 502,
-                                    "detail": cli_bridge.format_no_text_detail(
-                                        PROVIDER, exc.usage)})
-            return
-        except (json.JSONDecodeError, ValueError) as exc:
-            # Same contract as cli_bridge._run_cli: a structured parser that
-            # cannot find the answer must fail the call, not echo its raw
-            # event stream back as the answer (issue #3).
-            if PROFILE["parser"] in cli_bridge.STRUCTURED_PARSERS:
-                session.resolve_final({"type": "error", "status": 502,
-                                        "detail": f"{PROVIDER} cli yielded no "
-                                                  f"parsed answer: {exc}"})
-                return
-            payload = {"result": stdout.strip()}
+            # Successful retry: attempt 1's tokens are still real, fold them
+            # into the payload so the ledger books both attempts exactly once.
+            payload.setdefault("usage", {})
+            cli_bridge._sum_usage(payload["usage"], exc.usage)
+        if payload is None:
+            return                      # a terminal error was already resolved
         session.resolve_final({"type": "final", "payload": payload})
     except Exception as exc:                        # never leave a session parked forever
         log.exception("mcp session %s crashed", session.id)

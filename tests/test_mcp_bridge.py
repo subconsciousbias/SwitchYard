@@ -1048,13 +1048,24 @@ def test_run_session_emits_text_lost_contract_detail_for_no_text_with_usage():
     the same contract detail cli_bridge uses (same helper, same string),
     so classify.TEXT_LOST fires and extract_no_text_tokens books the
     charged prompt/completion counts.
+
+    Issue #78 follow-up: mcp_bridge now retries once on no-text-with-usage
+    (matching cli_bridge._run_cli). The contract 502 only fires when BOTH
+    attempts lose text; the detail must carry the COMBINED usage of both
+    attempts so the ledger books everything that was charged. The fake
+    below emits no-text-with-usage on both calls (different token counts
+    each time) so the combined-usage assertion has both numbers visible.
     """
-    bad_stream = ('{"type":"step_start","part":{"type":"step-start"}}\n'
-                  '{"type":"step_finish","part":{"type":"step-finish",'
-                  '"tokens":{"input":239,"output":22}}}')
-    fake_cli = _write_fake_cli(
-        "import sys\n"
-        f"sys.stdout.write({bad_stream!r})\n")
+    counter_path = _write_fake_cli_counter()
+
+    call_one = ('{"type":"step_start","part":{"type":"step-start"}}\n'
+                '{"type":"step_finish","part":{"type":"step-finish",'
+                '"tokens":{"input":239,"output":22}}}')
+    call_two = ('{"type":"step_start","part":{"type":"step-start"}}\n'
+                '{"type":"step_finish","part":{"type":"step-finish",'
+                '"tokens":{"input":11,"output":3}}}')
+    fake_cli = _write_counter_fake_cli(counter_path, on_call_one=call_one,
+                                       on_call_other=call_two)
 
     saved_parser = server.PROFILE["parser"]
     try:
@@ -1079,7 +1090,8 @@ def test_run_session_emits_text_lost_contract_detail_for_no_text_with_usage():
         # provider name comes from mcp_bridge.PROVIDER, not cli_bridge's —
         # so the test asserts on the structure, not the literal prefix.
         assert "cli emitted tokens with no text " in detail, detail
-        assert "(prompt_tokens=239, completion_tokens=22)" in detail, detail
+        # Both attempts lost text: 239 + 11 prompt, 22 + 3 completion.
+        assert "(prompt_tokens=250, completion_tokens=25)" in detail, detail
         # And mcp_bridge does NOT reach the legacy "yielded no parsed
         # answer" branch on this shape — that was the bug.
         assert "yielded no parsed answer" not in detail, detail
@@ -1089,9 +1101,13 @@ def test_run_session_emits_text_lost_contract_detail_for_no_text_with_usage():
         # ("claude"), so the prefix is provider-specific.
         expected = server.cli_bridge.format_no_text_detail(
             server.PROVIDER,
-            {"input_tokens": 239, "output_tokens": 22})
+            {"input_tokens": 250, "output_tokens": 25})
         assert detail == expected, (detail, expected)
-        print(f"  MCP session: no-text-with-usage -> 502 ({detail!r})")
+        # And the retry actually fired -- two spawns, not one.
+        calls = _read_counter(counter_path)
+        assert calls == 2, f"expected 2 spawns (1st + retry), got {calls}"
+        print(f"  MCP session: no-text-with-usage x2 -> 502 with combined usage "
+              f"({detail!r}, calls={calls})")
     finally:
         server.PROFILE["parser"] = saved_parser
 
@@ -1129,6 +1145,286 @@ def test_run_session_legacy_no_text_without_usage_still_emits_no_parsed_answer()
         assert "emitted tokens with no text" not in detail, detail
         print(f"  MCP session: zero-usage no-text -> legacy 502 "
               f"({detail[:60]}...)")
+    finally:
+        server.PROFILE["parser"] = saved_parser
+
+
+# ---------------------------------------- issue #78: TEXT_LOST retry-once ----
+def _write_fake_cli_counter() -> str:
+    """Return a fresh counter file path initialised to "0".
+
+    Tests below use the counter-file fake-CLI idiom from tests/test_cli_bridge.py
+    (see _write_counter_fake_cli): the fake increments the counter file on every
+    spawn, so the test can assert how many times the CLI was actually invoked.
+    A fresh mkdtemp avoids colliding with any other counter file in flight,
+    and pre-creating the file with "0" sidesteps FileNotFoundError inside the
+    fake CLI's `open(p).read() or '0'` on its very first spawn.
+    """
+    d = tempfile.mkdtemp(prefix="mcpb-cnt-")
+    p = os.path.join(d, "counter")
+    open(p, "w").write("0")
+    return p
+
+
+def _write_counter_fake_cli(counter_path: str, *, on_call_one: str = "",
+                            on_call_other: str = "", stderr: str = "",
+                            rc: int = 0) -> str:
+    """Write a tiny Python CLI that increments `counter_path` each call.
+
+    `on_call_one` is printed on the first call, `on_call_other` on every
+    subsequent call. Same shape as test_cli_bridge.py's make_fake. Mirrors
+    the cli_bridge retry tests (issue #64) so the spawn-count assertion is
+    apples-to-apples against that reference.
+    """
+    body = (f"import sys\n"
+            f"p = {counter_path!r}\n"
+            f"n = int(open(p).read() or '0') + 1\n"
+            f"open(p, 'w').write(str(n))\n"
+            f"if n == 1:\n"
+            f"  sys.stdout.write({on_call_one!r})\n"
+            f"else:\n"
+            f"  sys.stdout.write({on_call_other!r})\n"
+            f"sys.stderr.write({stderr!r})\n"
+            f"sys.exit({rc})\n")
+    f = tempfile.NamedTemporaryFile(
+        "w", suffix=".py", prefix="mcpb-rf-", delete=False)
+    f.write(body)
+    f.close()
+    return f.name
+
+
+def _read_counter(counter_path: str) -> int:
+    return int(open(counter_path).read() or "0")
+
+
+def test_run_session_retries_once_on_text_lost_and_returns_attempt_two_payload():
+    """Issue #78: a single no-text-with-usage attempt is retried in-process
+    exactly once, and on a successful retry the caller sees attempt 2's
+    payload (not the legacy "yielded no parsed answer" 502). The call
+    counter proves the CLI was spawned twice (attempt 1 + retry), and the
+    payload's usage dict carries the merged token counts of both attempts
+    so the ledger books each spawn exactly once.
+
+    The retry semantics here mirror cli_bridge._run_cli, the reference
+    implementation. opencode-go / opencode-go2 plans run mcp_bridge, so
+    without this in-process retry the plan rides the TRANSIENT doubling
+    ladder (issue #64) — the gateway has no way to know the first attempt
+    was a parse-level loss, not a transport-level loss.
+    """
+    counter_path = _write_fake_cli_counter()
+    bad = ('{"type":"step_finish","part":{"type":"step-finish",'
+           '"tokens":{"input":777,"output":33}}}')
+    good = ('{"type":"text","part":{"type":"text","text":"ANSWER"}}\n'
+            '{"type":"step_finish","part":{"type":"step-finish",'
+            '"tokens":{"input":111,"output":7,"reasoning":2}}}')
+    fake_cli = _write_counter_fake_cli(counter_path, on_call_one=bad,
+                                       on_call_other=good)
+
+    saved_parser = server.PROFILE["parser"]
+    try:
+        server.PROFILE["parser"] = "events_json"
+
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            await server.run_session(session, [sys.executable, fake_cli])
+            return session.turn_future.result()
+
+        result = asyncio.run(scenario())
+        assert result["type"] == "final", result
+        assert result["payload"]["result"] == "ANSWER", result
+        u = result["payload"]["usage"]
+        # 777 + 111 = 888 input tokens across both attempts.
+        assert u["input_tokens"] == 888, u
+        # 33 from attempt 1, 7+2 reasoning from attempt 2; reasoning rolls
+        # into output_tokens, so 33 + 9 = 42.
+        assert u["output_tokens"] == 42, u
+        # And exactly two spawns happened -- the retry, not an infinite loop.
+        calls = _read_counter(counter_path)
+        assert calls == 2, f"successful retry must call CLI twice, got {calls}"
+        print(f"  MCP retry-once: bad+good -> ANSWER (input={u['input_tokens']}, "
+              f"output={u['output_tokens']}, calls={calls})")
+    finally:
+        server.PROFILE["parser"] = saved_parser
+
+
+def test_run_session_two_consecutive_text_lost_returns_502_with_combined_usage():
+    """Issue #78 contract path: when both attempts lose text, the final 502
+    detail must match the gateway's contract exactly (same helper as
+    cli_bridge, so the strings cannot drift):
+        {PROVIDER} cli emitted tokens with no text
+            (prompt_tokens=N, completion_tokens=M)
+    where N/M are the COMBINED charges of both attempts. The byte-for-byte
+    detail check is load-bearing -- the gateway's _NO_TEXT regex matches
+    the literal phrase, and extract_no_text_tokens parses the parenthesised
+    numbers, so any drift here would silently change the cooldown class
+    and the ledger.
+    """
+    counter_path = _write_fake_cli_counter()
+    bad_one = ('{"type":"step_finish","part":{"type":"step-finish",'
+               '"tokens":{"input":239,"output":22}}}')
+    bad_two = ('{"type":"step_finish","part":{"type":"step-finish",'
+               '"tokens":{"input":50,"output":5}}}')
+    fake_cli = _write_counter_fake_cli(counter_path, on_call_one=bad_one,
+                                       on_call_other=bad_two)
+
+    saved_parser = server.PROFILE["parser"]
+    try:
+        server.PROFILE["parser"] = "events_json"
+
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            await server.run_session(session, [sys.executable, fake_cli])
+            return session.turn_future.result()
+
+        result = asyncio.run(scenario())
+        assert result["type"] == "error", result
+        assert result["status"] == 502, result
+        detail = result.get("detail", "")
+        # 239 + 50 prompt, 22 + 5 completion — must match the contract shape
+        # via format_no_text_detail (same helper cli_bridge uses), byte-for-byte.
+        expected = server.cli_bridge.format_no_text_detail(
+            server.PROVIDER,
+            {"input_tokens": 289, "output_tokens": 27})
+        assert detail == expected, (detail, expected)
+        # And the legacy "yielded no parsed answer" branch did NOT fire —
+        # there is real charged usage to carry, and it must reach the
+        # contract so the ledger books both attempts.
+        assert "yielded no parsed answer" not in detail, detail
+        # Two spawns -- 1st attempt + retry -- proves the retry fired.
+        calls = _read_counter(counter_path)
+        assert calls == 2, f"two failed attempts must call CLI twice, got {calls}"
+        print(f"  MCP retry-once: bad+bad -> 502 with combined usage "
+              f"({detail!r}, calls={calls})")
+    finally:
+        server.PROFILE["parser"] = saved_parser
+
+
+def test_run_session_only_text_lost_triggers_retry_other_failures_stay_single_attempt():
+    """Issue #78 narrow retry: only CliNoTextError (no-text with nonzero
+    charged usage) triggers the retry. Auth, quota, empty stdout, and
+    generic rc=1 each stay single-attempt — retrying those would either
+    double-bill the caller (limit) or amplify blips into double spawns
+    without improving the outcome. The counter file is the assertion:
+    calls == 1 in every sub-scenario.
+
+    Same shape as tests/test_cli_bridge.py:1015-1056 (the cli_bridge
+    counterpart); the only difference is the mcp_bridge run_session surface
+    (no HTTPException — error info lands in session.turn_future.result()).
+    """
+    counter_path = _write_fake_cli_counter()
+
+    def run(stderr: str, rc: int) -> dict:
+        # A fresh fake per scenario so the counter path is shared and the
+        # branch is determined entirely by the args passed in here.
+        open(counter_path, "w").write("0")
+        fake_cli = _write_counter_fake_cli(counter_path, stderr=stderr, rc=rc)
+
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            await server.run_session(session, [sys.executable, fake_cli])
+            return session.turn_future.result()
+
+        return asyncio.run(scenario())
+
+    try:
+        # --- auth failure: single attempt, 401 ---
+        result = run(stderr="please run `claude login` to authenticate", rc=1)
+        assert result["type"] == "error" and result["status"] == 401, result
+        assert _read_counter(counter_path) == 1, \
+            f"auth failure must not retry (calls={_read_counter(counter_path)})"
+
+        # --- quota failure: single attempt, 429 ---
+        result = run(stderr="You've hit your usage limit. Purchase more credits.",
+                     rc=1)
+        assert result["type"] == "error" and result["status"] == 429, result
+        assert _read_counter(counter_path) == 1, \
+            f"quota failure must not retry (calls={_read_counter(counter_path)})"
+
+        # --- empty stdout: single attempt, 502 ---
+        # rc=0 with no stdout trips the `not stdout.strip()` branch and falls
+        # through to the generic "cli failed (0)" 502 — must NOT retry.
+        result = run(stderr="", rc=0)
+        assert result["type"] == "error" and result["status"] == 502, result
+        assert "cli failed" in result.get("detail", ""), result
+        assert _read_counter(counter_path) == 1, \
+            f"empty stdout must not retry (calls={_read_counter(counter_path)})"
+
+        # --- generic rc=1 with no recognisable shape: 502 "cli failed", 1 call ---
+        result = run(stderr="some unrecognised failure prose", rc=1)
+        assert result["type"] == "error" and result["status"] == 502, result
+        assert _read_counter(counter_path) == 1, \
+            f"generic rc=1 must not retry (calls={_read_counter(counter_path)})"
+
+        print(f"  MCP retry-once: auth/quota/empty/generic each spawn once; "
+              f"no-text-with-usage is the ONLY retried shape")
+    finally:
+        try:
+            os.unlink(counter_path)
+        except OSError:
+            pass
+
+
+def test_run_session_successful_retry_merges_attempt_one_usage_into_payload():
+    """Issue #78 ledger invariant: a successful retry must fold attempt 1's
+    charged tokens into attempt 2's payload so the ledger books BOTH
+    attempts exactly once. `_sum_usage` adds numeric fields and leaves
+    non-numeric (and bool) fields untouched — so the final usage dict is
+    attempt 2's payload usage with attempt 1's numeric counts summed in,
+    and any non-numeric fields attempt 1 happened to carry are not
+    retroactively created on attempt 2's dict.
+
+    This pins the exact dict the gateway's record() sees on a retry — if
+    a future change dropped the merge (or summed into the wrong dict),
+    the ledger would silently lose attempt 1's tokens.
+    """
+    counter_path = _write_fake_cli_counter()
+    bad = ('{"type":"step_finish","part":{"type":"step-finish",'
+           '"tokens":{"input":777,"output":33}}}')
+    good = ('{"type":"text","part":{"type":"text","text":"ANSWER"}}\n'
+            '{"type":"step_finish","part":{"type":"step-finish",'
+            '"tokens":{"input":111,"output":7,"reasoning":2}}}')
+    fake_cli = _write_counter_fake_cli(counter_path, on_call_one=bad,
+                                       on_call_other=good)
+
+    saved_parser = server.PROFILE["parser"]
+    try:
+        server.PROFILE["parser"] = "events_json"
+
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            await server.run_session(session, [sys.executable, fake_cli])
+            return session.turn_future.result()
+
+        result = asyncio.run(scenario())
+        assert result["type"] == "final", result
+        payload = result["payload"]
+        assert payload["result"] == "ANSWER", payload
+        u = payload["usage"]
+        # Numeric fields: both attempts' counts must be summed.
+        # 777 + 111 = 888 input, 33 + (7+2 reasoning) = 42 output.
+        assert u["input_tokens"] == 888, u
+        assert u["output_tokens"] == 42, u
+        # _sum_usage only touches numeric (and not-bool) fields, so the
+        # dict shape stays exactly what attempt 2 produced — just with
+        # attempt 1's numeric counts folded in. The events_json parser
+        # also emits cache_read_tokens (zero when no cache field), so it
+        # carries through attempt 2 untouched (attempt 1 had no entry to
+        # fold in). No spurious keys appear beyond what attempt 2's
+        # parser produced.
+        assert set(u.keys()) == {"input_tokens", "output_tokens",
+                                  "cache_read_tokens"}, \
+            f"unexpected keys in merged usage: {sorted(u.keys())}"
+        assert u["cache_read_tokens"] == 0, u
+        # And exactly two spawns happened — the retry, not an infinite loop.
+        calls = _read_counter(counter_path)
+        assert calls == 2, f"successful retry must call CLI twice, got {calls}"
+        print(f"  MCP retry-once merged usage: keys={sorted(u.keys())}, "
+              f"input={u['input_tokens']}, output={u['output_tokens']}, "
+              f"calls={calls}")
     finally:
         server.PROFILE["parser"] = saved_parser
 
