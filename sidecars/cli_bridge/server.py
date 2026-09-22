@@ -1068,6 +1068,13 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
             raise HTTPException(status_code=status,
                                 detail={"error": {"message": detail or blob[:300],
                                                   "type": "upstream_client_error"}})
+        # Nothing above recognised this one, and the caller only ever sees
+        # the first 300 characters of it. Say the whole thing here, where
+        # the CLI's own output still exists: an unclassified failure is
+        # exactly the case someone has to read a log to understand, and
+        # this branch used to leave no trace of itself at all.
+        log.warning("%s cli exited %s unclassified; stdout=%r stderr=%r",
+                    PROVIDER, proc.returncode, stdout[:2000], stderr[:2000])
         raise HTTPException(
             status_code=502,
             detail=f"{PROVIDER} cli failed ({proc.returncode}): "

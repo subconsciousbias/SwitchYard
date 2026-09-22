@@ -725,6 +725,13 @@ async def run_session(session: Session, argv: list[str],
             if status and 400 <= status < 500 and status != 429:
                 session.resolve_final({"type": "error", "status": status, "detail": detail})
                 return
+            # Nothing above recognised this one, and the caller only ever sees
+            # the first 300 characters of it. Say the whole thing here, where
+            # the CLI's own output still exists: an unclassified failure is
+            # exactly the case someone has to read a log to understand, and
+            # this branch used to leave no trace of itself at all.
+            log.warning("%s cli exited %s unclassified; stdout=%r stderr=%r",
+                        PROVIDER, proc.returncode, stdout[:2000], stderr[:2000])
             session.resolve_final({"type": "error", "status": 502,
                                     "detail": f"{PROVIDER} cli failed ({proc.returncode}): "
                                               f"{(detail or stderr[:300] or stdout[:300])}"})
