@@ -100,7 +100,8 @@ the 20 its plans' limits sum to, because several members cap themselves lower.
 |---|---|---|---|
 | `apex` | Judgement — Heavy | `claude-max/fable` → `openai/astra` | `local-box/qwen` |
 | `judge` | Judgement — Regular | `claude-max/opus` → `openai/sol` → `glm/glm-5.3` | `local-box/qwen` |
-| `forge` | Coding Workhorse | Minimax Ultra → Minimax Max → Grok → GLM Flash → OpenCode Go → OpenRouter | `local-box/qwen` |
+| `forge` | Coding Workhorse | `round_robin:[Minimax Ultra, Minimax Max]` → `weighted:{Minimax Ultra:5, Minimax Max:2}` → `perishable:[Minimax Ultra, Minimax Max]` → Grok → OpenCode Go → OpenRouter | `local-box/qwen` |
+| `nest-demo` | Strategy Nesting (demo) | `round_robin:[ lowest_utilization:[Claude Opus, GPT Sol], lowest_utilization:[Claude Fable, GPT Astra] ]` | `local-box/qwen` |
 | `local` | Local Only | `local-box/qwen` → `local-box/gemma` | *(none, on purpose)* |
 | `bulk` | Basic | `local-box/gemma` → `local-box/qwen` | *(none — already local)* |
 
@@ -146,6 +147,56 @@ Only models that declare `context_window` take part, so an undeclared window
 never becomes a wrong routing decision — and if nothing declares a larger window
 than the one that was picked, there is no fallback and the request fails
 honestly rather than being silently truncated.
+
+## Balancing strategies
+
+A lane's body is a list of entries. Each entry is EITHER a bare `plan/model` ref
+OR a single-key mapping `{strategy_name: body}` — a **group** that produces a
+visit order on each new-session placement. Ordinary spill-and-fill then runs
+through that visit order, so affinity, gating, per-member caps and the
+`5h`/target windows all keep working unchanged. The `tail` stays a lane-level
+key and is always last under every strategy.
+
+Five strategies are available (see [issue #43](https://github.com/Fledgewing/SwitchYard/issues/43)):
+
+- **`fill`** *(default)* — config order, pure spill-and-fill. The picker never
+  reads or writes a Redis key, so flat configs parse bit-for-bit identically to
+  the pre-strategy lane format. A lane whose body is only bare refs is
+  implicitly a `fill` lane.
+- **`round_robin`** — visit the group's members in strict alternation:
+  `round_robin: [claude-max/opus, openai/sol]` puts `opus` and `sol` on
+  consecutive sessions in turn.
+- **`weighted`** — visit by `{ref: weight}` ratio. Weights are integers;
+  `weighted: {minimax-ultra/m3: 5, minimax-max/m3: 2}` visits Ultra five times
+  for every two visits to Max when neither is full.
+- **`lowest_utilization`** — visit the member with the lowest current load
+  first. `lowest_utilization` is `perishable` without the hours-to-reset
+  signal, so it is the right choice when probes are absent or unreliable
+  (e.g. plans whose provider does not publish quota headroom).
+- **`perishable`** — headroom-aware ordering. The portal re-ranks each member
+  after every successful probe and writes the visit order to
+  `sy:group-order:{gid}`; the picker reads that key on each new session.
+  Built for lanes that mix weekly subscriptions whose budget is racing the
+  reset.
+
+Groups nest recursively up to depth 4, so an outer strategy can dispatch to
+inner strategies:
+
+```yaml
+order:
+  - round_robin:
+      - lowest_utilization: [claude-max/opus, openai/sol]
+      - lowest_utilization: [claude-max/fable, openai/astra]
+```
+
+The outer `round_robin` alternates between the two inner
+`lowest_utilization` groups; each inner group visits whichever member is
+lighter-loaded at placement time. The picker recurses through the outer
+strategy, then the inner one, producing a single visit order per new session.
+
+The cross-cutting rules — affinity wins, per-member gates unchanged,
+drain-promotion inside the group, no new model identifiers, hot path cheap,
+tail stays last under pacing — apply across every strategy.
 
 ## The three behaviours
 
@@ -1071,3 +1122,10 @@ back to ledger estimates.
   — `/coding_plan/remains` requires a cookie session, not an API key.
 - [Z.AI error codes](https://docs.z.ai/api-reference/api-code)
   — the full 429 business-code table.
+
+## References
+
+- Issue [#43 — Balancing strategies](https://github.com/Fledgewing/SwitchYard/issues/43)
+  — design of the nestable strategy groups documented in *Balancing strategies*
+  above; covers the four named strategies, nesting depth ≤ 4, and the
+  flat-config bit-for-bit invariant.

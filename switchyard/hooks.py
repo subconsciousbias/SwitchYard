@@ -34,6 +34,7 @@ from redis.asyncio import Redis
 
 from . import models
 from .classify import Outcome, classify, escalated_cooldown, inspect_success_payload
+from .models import Group
 from .picker import LaneSaturated, Picker
 from .policy import CapacityPolicy
 from .reasoning import ReasoningSplitter
@@ -296,10 +297,17 @@ class SwitchyardHandler(CustomLogger):
             "direct": bool(direct),
             "needs_tools": needs_tools,
             "pinned": pinned,
+            # Group that produced the pick, when the lane walked one. Affinity
+            # pins (picked_group is None) leave the field blank so a pinned
+            # follow-up does not look like a group selection.
+            "picked_group_gid": (pick.picked_group.gid
+                                 if pick.picked_group is not None else ""),
+            "picked_group_strategy": (pick.picked_group.strategy
+                                      if pick.picked_group is not None else ""),
         }
         log.info(
             "lane=%s -> %s [%s]%s%s%s",
-            lane, pick.model.ref, pick.cap_reason,
+            lane, pick.model.ref, _reason_with_group(pick),
             " tools" if needs_tools else "",
             " (sticky)" if pick.sticky else "",
             f" skipped={','.join(pick.considered)}" if pick.considered else "",
@@ -643,6 +651,29 @@ class SwitchyardHandler(CustomLogger):
             if remaining is not None or reset is not None or limit is not None:
                 await self.ledger.note_reported(plan.key, remaining, reset,
                                                 window=q.label, limit=limit)
+
+
+def _reason_with_group(pick) -> str:
+    """The bracketed reason in the gateway log line.
+
+    The base string is the picker's own cap_reason ("configured",
+    "quota spent", "paced 2 of 4", ...). When the lane walked a group to
+    reach this pick, the group's gid (and strategy, when distinct from the
+    plain per-lane shape) is appended INSIDE the brackets, so a script that
+    grep'd the previous `\[(\w+)\]` regex still extracts the FIRST token —
+    the original cap_reason — and now also gets the routing context.
+
+    A flat lane (no group walk) produces the same bracketed reason it always
+    did, so the smoke.py grep pattern `lane=<lane> ->` and the existing
+    per-row test parsing keep working bit-for-bit.
+    """
+    reason = pick.cap_reason or "configured"
+    group = pick.picked_group
+    if group is None:
+        return reason
+    if isinstance(group, Group) and group.strategy:
+        return f"{reason} group={group.gid},strategy={group.strategy}"
+    return f"{reason} group={group.gid}"
 
 
 def _carries_tool_results(messages: Any) -> bool:

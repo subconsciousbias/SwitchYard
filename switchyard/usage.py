@@ -50,10 +50,24 @@ K_M_DAY = "sy:usage:{plan}:m:{model}:d:{day}"
 K_QUOTA = "sy:quota:{plan}"                 # plan-level facts
 K_WINDOW = "sy:qwin:{plan}:{window}"        # per-window facts (observed allowance)
 # Per-lane ordering written by the portal's probe poller and read on the pick
-# path. Only present for a lane whose `strategy: perishable` produced at least
-# one ranked member in its last poll; absent everywhere else, so a default lane
-# is bit-for-bit unchanged.
+# path. Kept as the canonical key for the legacy `strategy: perishable` sugar
+# — when a lane has no explicit groups and `strategy: perishable`, the picker
+# boundary wraps the order in an implicit `{perishable: order}` group and reads
+# THIS key (not a group-scoped one), so a flat config is bit-for-bit unchanged.
 K_LANE_ORDER = "sy:lane-order:{lane}"
+# Per-group ordering written by the probe poller and read on the pick path for
+# groups that need a score (perishable and lowest_utilization). Keyed by the
+# group's gid AND the lane that contains it, so the same group config appearing
+# in two lanes does not collide. The legacy lane-level key stays in place for
+# backward compatibility — the picker reads the per-group key only when an
+# explicit group of these strategies is in play.
+K_GROUP_ORDER = "sy:group-order:{gid}:{lane}"
+# Per-group rotation pointer. Incremented atomically each time the group picks
+# a real placement; round_robin / weighted use it to choose the start index,
+# skipping paced-to-0 and unavailable members without burning the counter on a
+# spill that returned empty. Stored under the gid so two groups in the same
+# lane can rotate independently.
+K_GROUP_ROT = "sy:group-rot:{gid}:{lane}"
 
 FIELDS = ("requests", "prompt_tokens", "completion_tokens", "cost", "failures")
 
@@ -345,11 +359,7 @@ class Ledger:
         a ref that left the lane.
         """
         key = K_LANE_ORDER.format(lane=lane)
-        mapping: dict[str, str] = {"computed_at": str(computed_at),
-                                   "stale_after_ms": str(stale_after_ms)}
-        for ref, fields in entries.items():
-            for k, v in fields.items():
-                mapping[f"{k}_{ref}"] = str(v)
+        mapping = _order_mapping(entries, computed_at, stale_after_ms)
         await self.redis.delete(key)
         await self.redis.hset(key, mapping=mapping)
 
@@ -361,7 +371,52 @@ class Ledger:
         fields are read and checked here so the picker does one hash read and
         falls back to config order on a missing/stale key without further work.
         """
-        raw = await self.redis.hgetall(K_LANE_ORDER.format(lane=lane))
+        return await self._read_order(K_LANE_ORDER.format(lane=lane))
+
+    async def set_group_order(self, gid: str, lane: str,
+                              entries: dict[str, float | str], *,
+                              computed_at: float, stale_after_ms: int) -> None:
+        """Per-group score hash. Same shape as `set_lane_order`; the key
+        carries `gid` so two groups with the same member set still get
+        independent rankings."""
+        key = K_GROUP_ORDER.format(gid=gid, lane=lane)
+        mapping = _order_mapping(entries, computed_at, stale_after_ms)
+        await self.redis.delete(key)
+        await self.redis.hset(key, mapping=mapping)
+
+    async def get_group_order(self, gid: str, lane: str) -> dict | None:
+        """Per-group rank read. Same return shape as `get_lane_order`."""
+        return await self._read_order(K_GROUP_ORDER.format(gid=gid, lane=lane))
+
+    async def bump_group_rot(self, gid: str, lane: str) -> int:
+        """Increment and return the group's rotation pointer.
+
+        Called once per group `_visit` that returns a real placement; a group
+        that spills past every member leaves the counter alone so the next
+        attempt starts at the same member. The key has a generous TTL so an
+        idle group decays its counter (a fresh attempt on a quiet config
+        starts at member 0, not "wherever the pointer was a week ago").
+        """
+        key = K_GROUP_ROT.format(gid=gid, lane=lane)
+        pipe = self.redis.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, 86400)         # a day: a quiet group's pointer decays
+        results = await pipe.execute()
+        return int(results[0])
+
+    async def group_rot(self, gid: str, lane: str) -> int:
+        """Current rotation pointer without advancing it."""
+        raw = await self.redis.get(K_GROUP_ROT.format(gid=gid, lane=lane))
+        if raw is None:
+            return 0
+        raw = raw.decode() if isinstance(raw, bytes) else raw
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    async def _read_order(self, key: str) -> dict | None:
+        raw = await self.redis.hgetall(key)
         if not raw:
             return None
         decoded: dict[str, str] = {}
@@ -376,14 +431,11 @@ class Ledger:
         age_ms = (time.time() - computed_at) * 1000.0
         if age_ms >= stale_after_ms:
             return None
-        # Group fields per ref: score_<ref>, gate5h_<ref>.
         members: list[dict] = []
-        seen: set[str] = set()
-        for key, value in decoded.items():
-            if not key.startswith("score_"):
+        for key_name, value in decoded.items():
+            if not key_name.startswith("score_"):
                 continue
-            ref = key[len("score_"):]
-            seen.add(ref)
+            ref = key_name[len("score_"):]
             try:
                 score = float(value)
             except (TypeError, ValueError):
@@ -399,6 +451,16 @@ class Ledger:
         members.sort(key=lambda m: m["score"], reverse=True)
         return {"members": members, "computed_at": computed_at,
                 "stale_after_ms": stale_after_ms}
+
+
+def _order_mapping(entries: dict[str, float | str], computed_at: float,
+                   stale_after_ms: int) -> dict[str, str]:
+    mapping: dict[str, str] = {"computed_at": str(computed_at),
+                               "stale_after_ms": str(stale_after_ms)}
+    for ref, fields in entries.items():
+        for k, v in fields.items():
+            mapping[f"{k}_{ref}"] = str(v)
+    return mapping
 
 
 def reported_is_current(facts: dict, period: str | None,
@@ -470,6 +532,33 @@ def perishable_score(room_pct: float | None, reset_at: float | None,
     """
     if room_pct is None or reset_at is None:
         return None
+    if now is None:
+        now = time.time()
+    hours = max(1.0, (float(reset_at) - float(now)) / 3600.0)
+    return float(room_pct) / hours
+
+
+def utilization_score(room_pct: float | None, reset_at: float | None = None,
+                      now: float | None = None) -> float | None:
+    """Lowest-utilization score: how much room there is, period.
+
+    The `lowest_utilization` strategy is like `perishable` but the divisor is
+    dropped — a subscription's "5h constraint full" plan is more saturated
+    than its "weekly half used" plan, but a `lowest_utilization` group should
+    rank the saturated one FIRST so it does not get hammered into the wall.
+    That is the opposite of perishable: drain the emptiest, leave the
+    fullest alone, keep every member well inside its allowance.
+
+    Higher = more saturated (drain sooner). With reset_at=None the divisor
+    drops entirely, so the score is just `room_pct` and is stable across
+    members regardless of when their respective windows roll over. Returns
+    None when room is missing — same contract as perishable_score, so the
+    picker can reuse its "unknown sorts last" path.
+    """
+    if room_pct is None:
+        return None
+    if reset_at is None:
+        return float(room_pct)
     if now is None:
         now = time.time()
     hours = max(1.0, (float(reset_at) - float(now)) / 3600.0)

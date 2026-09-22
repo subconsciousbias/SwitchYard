@@ -1,0 +1,31 @@
+{# State badge cell for a single row. Expects `p` (a per-model dict).
+
+   The chip ladder, in priority order:
+     1. `cooled` -- the plan is under an active cooldown (red `bad` tag).
+     2. transient streak >= streak_alert -- escalated-cooldown ladder
+        tripped, but the plan still accepts work (yellow `warn` tag).
+     3. cap == 0 -- the row advertises no slots; the chip shows WHY
+        (e.g. "tail disabled (pacing)" or "paced to 0 of 4"). This is
+        where the smoke.py grep `tail disabled (pacing)` matches.
+     4. otherwise: in_flight / cap + a possible `cap_reason` chip if the
+        cap diverged from cap_configured for an external reason (spend,
+        learning), plus a days_left tag if the plan expires soon. #}
+{% if p.cooled %}
+  <span class="tag bad">{{ p.cooldown_reason.replace('_',' ') }} · {{ (p.cooldown_remaining // 60) }}m</span>
+{% elif p.transient_streak and p.transient_streak >= (p.streak_alert or 3) %}
+  {# Distinct from `cooled`: this plan is on the ladder but still
+     accepts work, so its row should not pretend to be unavailable.
+     The warn class matches the existing 'paced to 0' chip; the
+     title spells out what the ladder is doing. #}
+  <span class="tag warn" title="consecutive transient failures — cooldown doubles each time">failing · {{ p.transient_streak }}x</span>
+{% elif p.cap == 0 %}
+  <span class="tag warn">{{ p.cap_reason }}</span>
+{% else %}
+  <span class="muted">{{ p.in_flight }}/{{ p.cap }}</span>
+  {% if p.cap != p.cap_configured and not p.cap_model_owned|default(false) %}
+    <span class="tag warn" title="configured {{ p.cap_configured }}">{{ p.cap_reason }}</span>
+  {% endif %}
+  {% if p.days_left is not none and p.days_left <= 21 %}
+    <span class="tag warn">{{ p.days_left }}d left</span>
+  {% endif %}
+{% endif %}

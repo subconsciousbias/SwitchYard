@@ -1,0 +1,65 @@
+{# Slot row cell. Expects `p` (a per-model dict) and a `style` var if any.
+   The same markup is shared between the flat-config path, the group-walk
+   path and the tail path; centralising it here means a regression to the
+   slot rendering only needs fixing in one place. #}
+<div class="slots">
+  {# Slots the effective cap allows, then the ones it has withheld. #}
+  {#
+    Busy slots, in attribution order: this lane's own requests first,
+    then the same model busy on *another* lane, then a sibling model
+    on the same plan. All three cost real capacity — which is why they
+    fill the same row — but only the first is this lane's traffic, and
+    conflating them made a quiet lane look busy.
+  #}
+  {% set spent = ' spent' if (p.quota.pct_used or 0) >= 100 else '' %}
+  {% set here = p.model_in_flight_here %}
+  {% set elsewhere = p.model_in_flight_elsewhere + p.model_in_flight_direct %}
+  {% for i in range(p.cap) %}
+    {# Past cap_configured means the learner probed above plans.yaml,
+       which max_parallel_ceiling had to permit. Marked so an extra
+       slot can never read as ordinary configured capacity. #}
+    {% set probed = ' probed' if i >= p.cap_configured else '' %}
+    {% if p.cooled %}
+      <span class="slot gone"></span>
+    {% elif i < here %}
+      <span class="slot used{{ probed }}{{ spent }}" title="in use by this lane{{ ' (learner probed above the configured ' ~ p.cap_configured ~ ')' if probed }}"></span>
+    {% elif i < here + elsewhere %}
+      <span class="slot elsewhere"
+            title="{{ p.model }} in use by {{ p.lanes_sharing|join(', ') or 'another lane' }} — occupied, but not this lane's traffic"></span>
+    {% elif i < p.in_flight %}
+      <span class="slot sibling"
+            title="another model on {{ p.plan }} is using this connection"></span>
+    {% else %}
+      <span class="slot{{ probed }}{{ spent }}"
+            {% if spent %}title="{{ p.plan }} has no {{ p.quota.window }} quota left ({{ p.quota.pct_used }}% used) — this slot is free but the plan cannot serve"
+            {% elif probed %}title="learner probed above the configured {{ p.cap_configured }}, allowed by max_parallel_ceiling"{% endif %}></span>
+    {% endif %}
+  {% endfor %}
+  {# Slots the effective cap withholds. A spent plan's cap is 0, so
+     ALL of its slots land here — they must still read as "out of
+     quota" rather than as generic withheld capacity, or the red
+     outline disappears at exactly the moment it matters.
+
+     A row whose cap is narrower than the plan's width solely
+     because of the model's own max_parallel gets no withheld
+     squares: the slots above its cap are not withheld from
+     *this* model, they belong to siblings on the same plan, and
+     labelling them "slot gone" would read as a problem the lane
+     has. The cap_model_owned signal gates the loop. #}
+  {% if not p.cap_model_owned|default(false) %}
+  {% for i in range(p.cap, p.cap_configured) %}
+    {% if spent %}
+      <span class="slot spent"
+            title="{{ p.plan }} has no {{ p.quota.window }} quota left ({{ p.quota.pct_used }}% used) — not routed to until the window resets"></span>
+    {% elif p.model_cap is not none and p.model_cap < p.cap_configured %}
+      {# The plan has more slots than this model can reach. They are
+         reachable by sibling models on the same plan, not withheld
+         from this one — a model of 1 on a plan of 2 draws one
+         bright slot for itself and one muted slot for the sibling. #}
+      <span class="slot gone" title="model limit {{ p.model_cap }} — sibling on {{ p.plan }} can use this slot"></span>
+    {% else %}
+      <span class="slot gone" title="withheld: {{ p.cap_reason }}"></span>
+    {% endif %}
+  {% endfor %}
+  {% endif %}
+</div>

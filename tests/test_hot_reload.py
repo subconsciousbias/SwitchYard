@@ -272,9 +272,21 @@ def test_a_policy_edit_swaps_the_registry_in_place():
         with _config_path(path):
             h = _bare_handler(path)
             old_reg, old_picker, old_policy = h.registry, h._picker, h._policy
-            old_refs = [m.ref for m in old_reg.lane_members("forge")]
-            # Rotate the body; the tail stays last, as the lane rewrites it.
-            expected = old_refs[1:-1] + [old_refs[0], old_refs[-1]]
+            # Rotate the body at the node level (handles Group entries too):
+            # the YAML edit is `order[1:] + order[:1]` over a list that now
+            # contains both bare refs and Group instances, and the expected
+            # routing has to walk the same node sequence — flat-ref math
+            # no longer applies because forge has groups. Tail stays last
+            # because the lane-level tail list is rotated independently of
+            # the body.
+            old_body = old_reg.lane_nodes()["forge"]
+            rotated_body = old_body[1:] + old_body[:1]
+            expected_body: list[str] = []
+            for node in rotated_body:
+                models.Registry._flatten(node, expected_body)
+            tail_refs = [r for r in old_reg.lanes["forge"].tail
+                         if old_reg.model(r) is not None]
+            expected = expected_body + tail_refs
 
             def edit(raw):
                 _bump_parallel(raw)

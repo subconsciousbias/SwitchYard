@@ -16,7 +16,7 @@ import hashlib
 import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Union
 
 import yaml
 
@@ -335,21 +335,53 @@ class Plan:
 
 
 @dataclass(frozen=True)
-class Lane:
-    key: str
-    label: str
-    order: list[str]                 # `plan/model` refs
-    tail: list[str] = field(default_factory=list)
-    description: str = ""
-    # "fill" (default) routes in config order, pure spill-and-fill. "perishable"
-    # ranks members by perishable score (headroom/hours-to-reset), gated on the
-    # 5h window's spare room, and sticks that order into a Redis hash the portal
-    # rewrites after every successful probe. Absent == "fill", and the picker
-    # never reads the lane-order key on a lane that did not opt in.
-    strategy: str = "fill"
+class Group:
+    """A balancing strategy applied to a list of refs or nested groups.
+
+    Groups are how a lane says "rotate through these", "weight these", "drain
+    the emptiest of these", or "drain the one whose quota expires soonest".
+    Members may themselves be `Group`s (recursive; depth limit ≤ 4) so a lane
+    can rotate across inner `lowest_utilization` clusters, etc. The `gid` is a
+    stable id derived from (lane, strategy, sorted-leaf-refs) so the picker
+    can read and write a per-group Redis key without anyone having to mint one
+    in config.
+    """
+    strategy: str                       # round_robin | weighted | lowest_utilization | perishable
+    members: list[Any]                  # recursive: list[Ref | Group]
+    weights: dict[str, int] | None = None   # weighted only: ref -> weight
+    gid: str = ""
+
+
+# A `Node` is one entry of `Lane.order`: either a bare `plan/model` ref string,
+# or a `Group`. Recursive shape; not exposed as a separate dataclass so the
+# type checker can keep treating the union as a flat thing.
+Node = Union[str, Group]
 
 
 _VALID_STRATEGIES = ("fill", "perishable")
+_VALID_GROUP_STRATEGIES = ("round_robin", "weighted",
+                           "lowest_utilization", "perishable")
+_MAX_GROUP_DEPTH = 4
+
+
+@dataclass(frozen=True)
+class Lane:
+    key: str
+    label: str
+    # Each entry is a `plan/model` ref (a bare string) or a `Group`. Flat
+    # configs (refs only) parse unchanged so callers that only know about refs
+    # keep working bit-for-bit; groups are added when the operator wants a
+    # balancing strategy inside the lane. Tail stays a flat list of refs at
+    # lane level — see the picker for how it is treated as the final stage.
+    order: list[Any]
+    tail: list[str] = field(default_factory=list)
+    description: str = ""
+    # "fill" (default) routes in config order, pure spill-and-fill. "perishable"
+    # is sugar: when no explicit group is present, the picker wraps the order
+    # in an implicit `{perishable: order}` group at the pick boundary. With
+    # explicit groups in `order`, the lane-level strategy is ignored — the
+    # groups already say how to order their members.
+    strategy: str = "fill"
 
 
 @dataclass
@@ -382,6 +414,43 @@ class Registry:
         return [m for m in self.plan_of(model).live_models if m.key != model.key]
 
     # -- lanes -------------------------------------------------------------
+    def lane_nodes(self) -> dict[str, list[Any]]:
+        """Parsed `Lane.order` for every lane: each entry is a `Ref` (bare
+        `plan/model` string) or a `Group`. Tail is NOT included — the picker
+        treats tail as the final stage on its own, not part of the body tree.
+
+        This is the tree the picker walks; everything else that needs to
+        enumerate a lane's refs (`routing_order`, `lane_members`,
+        `_recompute_perishable_for_plan`) reads through this.
+        """
+        return {key: list(lane.order) for key, lane in self.lanes.items()}
+
+    def routing_order(self, lane_key: str) -> list[str]:
+        """Flat list of refs in the lane's declared order.
+
+        Groups are flattened — `round_robin: [a, b]` walks a, b; `weighted:
+        {a: 5, b: 2}` walks a, b in insertion order; nested groups recurse
+        depth-first. A single-fill group around the body would also flatten
+        bit-for-bit, but flat configs produce the same flat output as before:
+        the lane-level `strategy: fill` is just config order, and a bare
+        ref-list `order` is exactly the legacy shape.
+        """
+        out: list[str] = []
+        for node in self.lanes[lane_key].order:
+            self._flatten(node, out)
+        return out
+
+    @staticmethod
+    def _flatten(node: Any, out: list[str]) -> None:
+        if isinstance(node, Group):
+            if node.weights:
+                out.extend(node.weights.keys())
+            else:
+                for m in node.members:
+                    Registry._flatten(m, out)
+            return
+        out.append(node)
+
     def lane_members(self, lane_key: str) -> list[Model]:
         """Effective routing order for a lane.
 
@@ -390,13 +459,18 @@ class Registry:
         expires within `drain_within_days` is promoted ahead of members on plans
         that are not expiring, soonest death first, so cancelled capacity gets
         used before it vanishes. Tail members always stay last.
+
+        Group structure is collapsed before filtering: a `{round_robin: [a,
+        b]}` and the flat `[a, b]` produce the same effective ordering, and a
+        `{weighted: {a: 5, b: 2}}` walks a then b in declaration order — the
+        weighting is the picker's job, not the body's.
         """
-        lane = self.lanes[lane_key]
+        refs = self.routing_order(lane_key)
         window = self.settings.drain_within_days
 
-        def live(refs: list[str]) -> list[Model]:
+        def live(ref_list: list[str]) -> list[Model]:
             out: list[Model] = []
-            for ref in refs:
+            for ref in ref_list:
                 model = self.model(ref)
                 if model is None:
                     continue
@@ -405,21 +479,24 @@ class Registry:
                     out.append(model)
             return out
 
-        body = live(lane.order)
+        body = live(refs)
 
         def urgency(model: Model) -> tuple[int, int]:
             days = self.plans[model.plan_key].days_left
             return (0, days) if (days is not None and days <= window) else (1, 0)
 
         body.sort(key=urgency)
-        return body + live(lane.tail)
+        return body + live(self.lanes[lane_key].tail)
 
     def is_tail(self, lane_key: str, ref: str) -> bool:
         return ref in self.lanes[lane_key].tail
 
     def lanes_using(self, model: Model) -> list[str]:
+        """Every lane that names `model`, in body or tail. Group flattening is
+        implicit — `routing_order` walks the tree and `is_tail` checks the
+        lane-level tail list, so a `Ref` nested inside a `Group` is found."""
         return [k for k, lane in self.lanes.items()
-                if model.ref in lane.order or model.ref in lane.tail]
+                if model.ref in self.routing_order(k) or model.ref in lane.tail]
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +596,120 @@ def _parse_models(plan_key: str, raw: Any) -> dict[str, Model]:
     return out
 
 
+def _group_id(lane_key: str, strategy: str, leaf_refs: list[str]) -> str:
+    """A stable id for a group, derived from lane + strategy + sorted leaves.
+
+    Same config -> same id; a config edit that changes the leaves produces a
+    different id, which is exactly the property the picker needs to write and
+    read per-group Redis keys without anyone having to invent an id in YAML.
+    """
+    blob = f"{lane_key}|{strategy}|{','.join(sorted(leaf_refs))}".encode()
+    return "g_" + hashlib.sha1(blob).hexdigest()[:12]
+
+
+def _leaf_refs(node: Any) -> list[str]:
+    """Refs reachable from `node`, recursively, in declaration order.
+
+    Used both for gid computation and for ref-existence validation, so a ref
+    buried inside a `{weighted: {a: 5, b: 2}}` inside a `{round_robin: [...]}`
+    is still checked.
+    """
+    if isinstance(node, Group):
+        if node.weights is not None:
+            return list(node.weights.keys())
+        out: list[str] = []
+        for m in node.members:
+            out.extend(_leaf_refs(m))
+        return out
+    return [node]
+
+
+def _parse_lane_order(lane_key: str, raw: list, known: set[str],
+                      depth: int = 1) -> list:
+    """Parse the raw `order:` list into a list of `Ref` strings or `Group`s.
+
+    Each entry is either a bare string (treated as a `plan/model` ref) or a
+    mapping with exactly one key naming a group strategy
+    (`round_robin | weighted | lowest_utilization | perishable`). The recursive
+    depth limit (`_MAX_GROUP_DEPTH`) is checked here so a malformed YAML
+    cannot make the picker walk forever.
+
+    `known` may be empty during a partial parse; ref-existence is enforced
+    there separately.
+    """
+    parsed: list = []
+    for idx, entry in enumerate(raw):
+        path = f"order[{idx}]"
+        if isinstance(entry, str):
+            if entry not in known and known:
+                raise ValueError(
+                    f"lane {lane_key!r} {path} references unknown model "
+                    f"{entry!r}; known models: {sorted(known)}")
+            parsed.append(entry)
+            continue
+        if not isinstance(entry, dict) or not entry:
+            raise ValueError(
+                f"lane {lane_key!r} {path} must be a 'plan/model' string or a "
+                f"single-key strategy mapping, got {entry!r}")
+        if len(entry) != 1:
+            raise ValueError(
+                f"lane {lane_key!r} {path} must have exactly one strategy key, "
+                f"got {sorted(entry.keys())}")
+        strategy, value = next(iter(entry.items()))
+        if strategy not in _VALID_GROUP_STRATEGIES:
+            raise ValueError(
+                f"lane {lane_key!r} {path} uses unknown strategy {strategy!r}; "
+                f"must be one of {_VALID_GROUP_STRATEGIES}")
+        if depth > _MAX_GROUP_DEPTH:
+            raise ValueError(
+                f"lane {lane_key!r} {path} exceeds max group nesting depth "
+                f"{_MAX_GROUP_DEPTH}")
+        if strategy == "weighted":
+            if not isinstance(value, dict) or not value:
+                raise ValueError(
+                    f"lane {lane_key!r} {path} weighted group must be a "
+                    f"non-empty mapping of ref -> weight, got {value!r}")
+            weights: dict[str, int] = {}
+            for ref, w in value.items():
+                if not isinstance(ref, str):
+                    raise ValueError(
+                        f"lane {lane_key!r} {path} weighted group key must be "
+                        f"a 'plan/model' string, got {ref!r}")
+                if not isinstance(w, int) or isinstance(w, bool):
+                    raise ValueError(
+                        f"lane {lane_key!r} {path} weight for {ref!r} must be "
+                        f"a positive integer, got {w!r}")
+                if w <= 0:
+                    raise ValueError(
+                        f"lane {lane_key!r} {path} weight for {ref!r} must be "
+                        f"positive, got {w}")
+                weights[ref] = w
+            leaves = list(weights.keys())
+            for ref in leaves:
+                if known and ref not in known:
+                    raise ValueError(
+                        f"lane {lane_key!r} {path} weighted member references "
+                        f"unknown model {ref!r}; known models: {sorted(known)}")
+            parsed.append(Group(strategy=strategy, members=[],
+                               weights=weights, gid=_group_id(lane_key, strategy, leaves)))
+            continue
+        # The other three strategies take a list of nodes (refs or nested groups).
+        if not isinstance(value, list):
+            raise ValueError(
+                f"lane {lane_key!r} {path} {strategy!r} group must be a list, "
+                f"got {value!r}")
+        if not value:
+            raise ValueError(
+                f"lane {lane_key!r} {path} {strategy!r} group must not be empty")
+        members = _parse_lane_order(lane_key, value, known, depth=depth + 1)
+        leaves: list[str] = []
+        for m in members:
+            leaves.extend(_leaf_refs(m))
+        parsed.append(Group(strategy=strategy, members=members,
+                            weights=None, gid=_group_id(lane_key, strategy, leaves)))
+    return parsed
+
+
 def load(path: str | None = None) -> Registry:
     with open(path or CONFIG_PATH) as fh:
         raw = yaml.safe_load(fh)
@@ -567,16 +758,22 @@ def load(path: str | None = None) -> Registry:
         )
 
     lanes: dict[str, Lane] = {}
+    # The set the parser checks refs against is derived from the parsed plans
+    # so a `Group` nested in another `Group` still resolves — refs must point
+    # at something that exists before the Registry object exists.
+    known = {m.ref for p in plans.values() for m in p.models.values()}
+
     for key, body in (raw.get("lanes") or {}).items():
         strategy = str(body.get("strategy", "fill"))
         if strategy not in _VALID_STRATEGIES:
             raise ValueError(
                 f"lane {key!r} strategy must be one of {_VALID_STRATEGIES}, "
                 f"got {strategy!r}")
+        order = _parse_lane_order(key, list(body.get("order") or []), known)
         lanes[key] = Lane(
             key=key,
             label=body.get("label", key),
-            order=list(body.get("order") or []),
+            order=order,
             tail=list(body.get("tail") or []),
             description=body.get("description", ""),
             strategy=strategy,
@@ -584,11 +781,10 @@ def load(path: str | None = None) -> Registry:
 
     registry = Registry(settings=settings, plans=plans, lanes=lanes)
 
-    # Fail loudly on a lane naming something that does not exist: a silent drop
-    # would look like a routing bug much later.
-    known = set(registry.models)
+    # Tail is a flat list of refs at lane level — it is NOT walked by
+    # `_parse_lane_order`, so check it here against the now-built registry.
     for lane in lanes.values():
-        for ref in list(lane.order) + list(lane.tail):
+        for ref in lane.tail:
             if ref not in known:
                 raise ValueError(
                     f"lane {lane.key!r} references unknown model {ref!r}; "

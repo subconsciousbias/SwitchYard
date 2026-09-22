@@ -693,7 +693,7 @@ def test_a_row_signals_when_its_narrowing_is_the_models_own():
 
     Per the pinned example fixture:
       - local-box/gemma: model 1, plan 2 → True (narrowed by the model)
-      - glm/glm-5.3-flash: model 2, plan 2 → False (model = plan, no narrowing)
+      - grok/grok-4.6: model 2, plan 2 → False (model = plan, no narrowing)
       - minimax-ultra/m3: model None, plan 4 → False (no model cap at all)
     """
     async def go():
@@ -705,26 +705,26 @@ def test_a_row_signals_when_its_narrowing_is_the_models_own():
             return next(r for r in cap["plans"] if r["ref"] == ref)
 
         gemma = row(local, "local-box/gemma")
-        glm = row(forge, "glm/glm-5.3-flash")
+        grok = row(forge, "grok/grok-4.6")
         m3 = row(forge, "minimax-ultra/m3")
 
         # The signal tracks the picker's own narrowing step, not a reroll
         # over the plan's nominal ceiling. It is True exactly when the row's
         # effective cap is below the plan's cap AND nothing else can claim
         # credit — the model's own ceiling IS the reason.
-        return gemma, glm, m3
+        return gemma, grok, m3
 
-    gemma, glm, m3 = run(go())
+    gemma, grok, m3 = run(go())
     assert gemma["cap_model_owned"] is True, gemma
-    assert glm["cap_model_owned"] is False, glm
+    assert grok["cap_model_owned"] is False, grok
     assert m3["cap_model_owned"] is False, m3
     # And the cap_reason tells the same story from the other direction: the
     # model-owned row carries "model limit 1", the others carry their own
     # reasons or no reason at all.
     assert gemma["cap_reason"] == "model limit 1", gemma
     print(f"  local-box/gemma -> cap_model_owned={gemma['cap_model_owned']} "
-          f"(\"{gemma['cap_reason']}\"); glm/glm-5.3-flash -> "
-          f"{glm['cap_model_owned']}; minimax-ultra/m3 -> "
+          f"(\"{gemma['cap_reason']}\"); grok/grok-4.6 -> "
+          f"{grok['cap_model_owned']}; minimax-ultra/m3 -> "
           f"{m3['cap_model_owned']}")
 
 
@@ -1746,6 +1746,1090 @@ def test_perishable_one_adjacent_swap_reconciles_added_and_removed_refs():
 
     print(f"  added: {added_only}; dropped: {dropped_only}; "
           f"added+dropped: {added_and_dropped}")
+
+
+# ============================================================================
+# Issue #43 — nestable balancing strategies inside `Lane.order`.
+#
+# Each test below was a regression bar in the planner's design contract. They
+# are inserted BEFORE the `if __name__ == "__main__":` block so the runner's
+# `globals()` discovery picks them up — anything appended below the runner is
+# defined too late to be collected and silently does not run.
+# ============================================================================
+
+
+def _build_lane(reg, slots, *, key, order, tail=None, strategy="fill"):
+    """Helper: a fresh registry with one lane configured to the test's shape.
+
+    Keeps each test's lane config local and avoids the `apex`/`forge` shared
+    fixtures, which already carry perishable/round_robin sugar in the
+    example config and would make a regression here ambiguous.
+
+    The order goes through `_parse_lane_order` so a dict-shaped entry
+    (e.g. `{"round_robin": [...]}`) becomes a real `Group` instance with
+    a computed gid, exactly the way the loader produces it. Without this,
+    the picker would receive raw dicts and crash.
+    """
+    from dataclasses import replace
+    from switchyard.models import _parse_lane_order
+    lanes = dict(reg.lanes)
+    base = reg.lanes[key] if key in reg.lanes else reg.lanes["apex"]
+    known = {m.ref for p in reg.plans.values() for m in p.models.values()}
+    parsed = _parse_lane_order(key, list(order), known)
+    lanes[key] = replace(base, key=key, order=parsed, tail=list(tail or []),
+                         strategy=strategy, description="")
+    return models.Registry(settings=reg.settings, plans=reg.plans, lanes=lanes)
+
+
+def test_round_robin_rotates_one_to_one_while_affinity_holds():
+    """A round_robin group of two members sees the picker place successive
+    new sessions strictly in alternation, and an existing session lease
+    still wins over the rotation pointer.
+
+    Affinity is a separate concern from rotation: the lease check happens
+    FIRST in the picker, before the body walk reaches the group, so a
+    session that already has a plan stays there until its lease is dropped
+    even when the rotation pointer has moved past it.
+    """
+    from dataclasses import replace
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+    picker = Picker(reg, slots, policy)
+
+    new_reg = _build_lane(reg, slots,
+                          key="rr-test",
+                          order=[{"round_robin": ["minimax-ultra/m3",
+                                                  "minimax-max/m3"]}],
+                          tail=[], strategy="fill")
+    picker2 = Picker(new_reg, slots, policy)
+
+    async def go():
+        # First four new sessions: alternation, ultra -> max -> ultra -> max.
+        picks = [(await picker2.pick("rr-test", None)).ref for _ in range(4)]
+        # Affinity check: a session pinned to ultra stays on ultra across
+        # multiple requests, even after the rotation pointer has moved on.
+        lease_sess = "rr-sess"
+        first = await picker2.pick("rr-test", lease_sess)
+        await picker2.release(first.plan.key, first.request_id, first.ref)
+        second = await picker2.pick("rr-test", lease_sess)
+        await picker2.release(second.plan.key, second.request_id, second.ref)
+        return picks, first.ref, second.ref
+
+    picks, first, second = run(go())
+    assert picks == ["minimax-ultra/m3", "minimax-max/m3",
+                     "minimax-ultra/m3", "minimax-max/m3"], picks
+    assert first == second, f"affinity broke: {first} vs {second}"
+    print(f"  rotation: {' -> '.join(picks)}; "
+          f"affinity: {first} stayed across two picks")
+
+
+def test_round_robin_skips_a_full_member_without_advancing():
+    """A member whose plan is full is skipped within the group; the rotation
+    pointer advances ONLY when this group returns a real placement, so the
+    skipped member does not eat the next member's turn.
+
+    Two members, ultra capped at 4. Fill ultra with 4 fillers (its own
+    capacity), then pick. The picker should walk past ultra (full) and land
+    on max; max is the second member, so the rotation pointer (start=0)
+    walked one offset. Next pick with ultra still full: walks past ultra,
+    wraps around to max again — but the rotation pointer is now at 1, so
+    the second pick is also max. After ultra frees (one slot): the pointer
+    is at 1, but the walk from start=1 reaches max first (still full on
+    ultra so it's the only candidate), advances to start=2 — wait, start
+    is `counter % n` where counter is incremented after a real placement.
+    So counter goes 0 -> 1 -> 2 across the three successful picks. The
+    third pick's start = 2 % 2 = 0 = ultra. With ultra now free, ultra
+    wins.
+    """
+    from dataclasses import replace
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+    picker = Picker(reg, slots, policy)
+
+    new_reg = _build_lane(reg, slots,
+                          key="rr-full-test",
+                          order=[{"round_robin": ["minimax-ultra/m3",
+                                                  "minimax-max/m3"]}],
+                          tail=[], strategy="fill")
+    picker2 = Picker(new_reg, slots, policy)
+
+    async def go():
+        ultra_plan = reg.plans["minimax-ultra"]
+        # Saturate ultra at its cap. The plan's cap is 4.
+        fillers = []
+        for n in range(ultra_plan.max_parallel):
+            rid = f"rr-fill-{n}"
+            ok = await slots.try_claim(
+                ultra_plan.key, ultra_plan.max_parallel, rid,
+                "minimax-ultra/m3", None, lane="rr-full-test")
+            assert ok == 1
+            fillers.append(rid)
+        # First pick: start = counter 0 % 2 = 0 = ultra; ultra full, walk to
+        # max (offset 1). Max wins. Counter increments to 1.
+        p1 = await picker2.pick("rr-full-test", None)
+        await picker2.release(p1.plan.key, p1.request_id, p1.ref)
+        # Second pick: start = 1 % 2 = 1 = max; max now also has a slot
+        # taken (from p1) but the plan cap is 4 too, so still room. Max
+        # wins. Counter increments to 2.
+        p2 = await picker2.pick("rr-full-test", None)
+        await picker2.release(p2.plan.key, p2.request_id, p2.ref)
+        # Free one ultra slot. Counter is still 2.
+        await slots.release(ultra_plan.key, fillers[-1], "minimax-ultra/m3")
+        # Third pick: start = 2 % 2 = 0 = ultra. Ultra has room now (3/4
+        # taken). Ultra wins. Counter increments to 3.
+        p3 = await picker2.pick("rr-full-test", None)
+        for rid in fillers[:-1]:
+            await slots.release(ultra_plan.key, rid, "minimax-ultra/m3")
+        await picker2.release(p3.plan.key, p3.request_id, p3.ref)
+        return p1.ref, p2.ref, p3.ref
+
+    p1, p2, p3 = run(go())
+    assert p1 == "minimax-max/m3", p1
+    assert p2 == "minimax-max/m3", p2
+    assert p3 == "minimax-ultra/m3", p3
+    print(f"  ultra full: {p1} -> {p2} -> {p3} (ultra frees -> next pick)")
+
+
+def test_round_robin_pointer_not_advanced_when_group_spills():
+    """A group that spills past every member leaves the rotation pointer
+    alone, so the next attempt starts at the same member and the first one
+    to free lands the next request.
+
+    Set up two members and cool BOTH plans so every member in the group
+    spills. The picker should fall through to tail. The next pick, after
+    un-cooling the FIRST member only, must start at member 0 — the
+    rotation pointer did not advance because the group returned no Pick.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+    picker = Picker(reg, slots, policy)
+
+    new_reg = _build_lane(reg, slots,
+                          key="rr-spill-test",
+                          order=[{"round_robin": ["minimax-ultra/m3",
+                                                  "minimax-max/m3"]}],
+                          tail=[], strategy="fill")
+    picker2 = Picker(new_reg, slots, policy)
+
+    async def go():
+        # Cool both members' plans. Group cannot pick anyone.
+        await slots.cool_down("minimax-ultra", 60, "test")
+        await slots.cool_down("minimax-max", 60, "test")
+        # Lane has no tail. Pick should fail (no tail either).
+        try:
+            await picker2.pick("rr-spill-test", None)
+            spill = None
+        except Exception as exc:
+            spill = str(exc)
+        # Read the rotation pointer: must still be 0 (no real placement).
+        counter_before = await policy.ledger.group_rot(
+            new_reg.lanes["rr-spill-test"].order[0].gid, "rr-spill-test")
+        # Free member 0 by un-cooling its plan. The next pick should land
+        # on member 0 — counter is still 0, so start = 0 = minimax-ultra.
+        await slots.clear_cooldown("minimax-ultra")
+        # Leave member 1 (minimax-max) cooled, so the only option IS
+        # member 0.
+        p = await picker2.pick("rr-spill-test", None)
+        await picker2.release(p.plan.key, p.request_id, p.ref)
+        await slots.clear_cooldown("minimax-max")
+        return spill, counter_before, p.ref
+
+    spill, counter, picked = run(go())
+    assert spill is not None and "no capacity" in spill, spill
+    assert counter == 0, f"rotation pointer advanced on a spill: {counter}"
+    assert picked == "minimax-ultra/m3", picked
+    print(f"  spill: {spill.split(': ', 1)[1][:40]}...; "
+          f"counter stayed at {counter}; next pick -> {picked}")
+
+
+def test_weighted_distribution_matches_ratios_within_tolerance():
+    """A weighted group {a: 5, b: 2} visits a roughly five times for every
+    two of b across many placements. Affinity still wins: a session leased
+    to b picks b next, regardless of the wheel.
+
+    Tolerance is loose because the rotation pointer's wrap can land the
+    first pick on either member — over a window of 70 placements the ratio
+    is 50/20 = 2.5, but the spec says "~5:2 within tolerance".
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+    picker = Picker(reg, slots, policy)
+
+    new_reg = _build_lane(reg, slots,
+                          key="w-test",
+                          order=[{"weighted": {"minimax-ultra/m3": 5,
+                                               "minimax-max/m3": 2}}],
+                          tail=[], strategy="fill")
+    picker2 = Picker(new_reg, slots, policy)
+
+    async def go():
+        # Each pick must release before the next or we'd fill the plan.
+        # The plan caps are 4 each, so 70 picks in series is fine.
+        picks = []
+        for _ in range(70):
+            p = await picker2.pick("w-test", None)
+            picks.append(p.ref)
+            await picker2.release(p.plan.key, p.request_id, p.ref)
+        # Affinity check: pin a session to b and confirm it sticks.
+        sess = "w-sess"
+        await slots.set_lease(sess, "minimax-max/m3",
+                              reg.settings.lease_ttl_seconds)
+        s1 = await picker2.pick("w-test", sess)
+        await picker2.release(s1.plan.key, s1.request_id, s1.ref)
+        s2 = await picker2.pick("w-test", sess)
+        await picker2.release(s2.plan.key, s2.request_id, s2.ref)
+        return picks, s1.ref, s2.ref
+
+    picks, s1, s2 = run(go())
+    n_ultra = sum(1 for p in picks if p == "minimax-ultra/m3")
+    n_max = sum(1 for p in picks if p == "minimax-max/m3")
+    # ~5:2 over 70 placements: ultra ~50, max ~20. Allow +/- 8 on each.
+    assert abs(n_ultra - 50) <= 8, (n_ultra, n_max)
+    assert abs(n_max - 20) <= 8, (n_max, n_ultra)
+    assert s1 == s2 == "minimax-max/m3", (s1, s2)
+    print(f"  weighted: {n_ultra} ultra / {n_max} max "
+          f"(target ~50/20); affinity pinned {s1} -> {s2}")
+
+
+def test_group_exhaustion_falls_through_to_next_stage():
+    """Every member of a group is full / paced / cooled → the next lane
+    stage takes over. Capacity never shrinks; a group that returns None
+    just leaves the lane's other stages to do their job.
+
+    Forge has bare refs after the explicit groups. We replace it with a
+    single round_robin group over three members, then saturate them all
+    and confirm the picker falls through to the lane's tail (local-box).
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+    picker = Picker(reg, slots, policy)
+
+    new_reg = _build_lane(reg, slots,
+                          key="exhaust-test",
+                          order=[{"round_robin": [
+                              "minimax-ultra/m3",
+                              "minimax-max/m3",
+                              "openrouter/mimo",
+                          ]}],
+                          tail=["local-box/qwen"], strategy="fill")
+    picker2 = Picker(new_reg, slots, policy)
+
+    async def go():
+        # Saturate each body plan to its cap.
+        for plan_key, ref in [("minimax-ultra", "minimax-ultra/m3"),
+                              ("minimax-max", "minimax-max/m3"),
+                              ("openrouter", "openrouter/mimo")]:
+            plan = reg.plans[plan_key]
+            for n in range(plan.max_parallel):
+                rid = f"ex-fill-{plan_key}-{n}"
+                await slots.try_claim(
+                    plan.key, plan.max_parallel, rid, ref, None,
+                    lane="exhaust-test")
+        # Pick: every body member is full. Falls through to tail.
+        # Tail is local-box/qwen with cap=1 on a plan of 2.
+        pick = await picker2.pick("exhaust-test", None)
+        # Free everything for the assertion phase.
+        return pick.ref, pick.considered
+
+    picked, considered = run(go())
+    assert picked == "local-box/qwen", picked
+    assert any("plan full" in c or "model full" in c
+               for c in considered), considered
+    print(f"  exhausted body -> tail {picked}; "
+          f"skipped: {', '.join(considered)}")
+
+
+def test_nested_groups_outer_rotates_inner_picks_lowest_util():
+    """A nested group tree resolves recursively: the outer round_robin
+    walks its inner groups in turn, and each inner lowest_utilization
+    group ranks its members by current room.
+
+    Built as a two-deep tree with the test fixtures' existing plans.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+    picker = Picker(reg, slots, policy)
+
+    inner_a = {"lowest_utilization": ["claude-max/opus", "openai/sol"]}
+    inner_b = {"lowest_utilization": ["claude-max/fable", "openai/astra"]}
+    new_reg = _build_lane(reg, slots,
+                          key="nest-test",
+                          order=[{"round_robin": [inner_a, inner_b]}],
+                          tail=[], strategy="fill")
+    picker2 = Picker(new_reg, slots, policy)
+    inner_a_gid = new_reg.lane_nodes()["nest-test"][0].members[0].gid
+    inner_b_gid = new_reg.lane_nodes()["nest-test"][0].members[1].gid
+
+    async def go():
+        # Set inner A's ranking: sol (openai) is emptier than opus
+        # (claude-max). Inner B: fable emptier than astra.
+        await policy.ledger.set_group_order(
+            inner_a_gid, "nest-test",
+            {"claude-max/opus": {"score": 20.0, "gate5h": 0},
+             "openai/sol": {"score": 90.0, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+        await policy.ledger.set_group_order(
+            inner_b_gid, "nest-test",
+            {"claude-max/fable": {"score": 90.0, "gate5h": 0},
+             "openai/astra": {"score": 20.0, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+        # First pick: outer counter=0, inner A walks: sol first (high
+        # score). Sol wins.
+        p1 = await picker2.pick("nest-test", None)
+        await picker2.release(p1.plan.key, p1.request_id, p1.ref)
+        # Second pick: outer counter advanced to 1 (real placement), so
+        # start=1 -> inner B. Inner B ranks fable first. Fable wins.
+        p2 = await picker2.pick("nest-test", None)
+        await picker2.release(p2.plan.key, p2.request_id, p2.ref)
+        # Third pick: counter=2, start=0 again -> inner A. Sol wins.
+        p3 = await picker2.pick("nest-test", None)
+        await picker2.release(p3.plan.key, p3.request_id, p3.ref)
+        return p1.ref, p2.ref, p3.ref
+
+    p1, p2, p3 = run(go())
+    assert p1 == "openai/sol", p1
+    assert p2 == "claude-max/fable", p2
+    assert p3 == "openai/sol", p3
+    print(f"  nested: {p1} -> {p2} -> {p3} "
+          f"(outer rotated, inner lowest-util led)")
+
+
+def test_stale_or_missing_group_order_falls_back_to_config_order():
+    """A perishable group whose stored ranking is past staleness OR is
+    missing entirely walks its members in declared order, not in whatever
+    the writer last wrote.
+
+    Two flavours of the same contract: missing key (never written) and
+    stale key (written long ago, past stale_after_ms). Both fall back.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+    picker = Picker(reg, slots, policy)
+
+    new_reg = _build_lane(reg, slots,
+                          key="stale-test",
+                          order=[{"perishable": ["claude-max/fable",
+                                                 "openai/sol"]}],
+                          tail=[], strategy="fill")
+    picker2 = Picker(new_reg, slots, policy)
+    gid = new_reg.lane_nodes()["stale-test"][0].gid
+
+    async def go():
+        # Stale case: ranking says sol first (deliberately wrong per
+        # the absence of facts), but stale_after_ms is 1ms.
+        await policy.ledger.set_group_order(
+            gid, "stale-test",
+            {"openai/sol": {"score": 1.0, "gate5h": 0},
+             "claude-max/fable": {"score": 0.0, "gate5h": 0}},
+            computed_at=time.time() - 9999, stale_after_ms=1)
+        p_stale = await picker2.pick("stale-test", None)
+        await picker2.release(p_stale.plan.key, p_stale.request_id, p_stale.ref)
+        # Missing case: clear the hash so the next read returns None.
+        await redis.delete(f"sy:group-order:{gid}:stale-test")
+        p_missing = await picker2.pick("stale-test", None)
+        await picker2.release(p_missing.plan.key, p_missing.request_id,
+                              p_missing.ref)
+        return p_stale.ref, p_missing.ref
+
+    p_stale, p_missing = run(go())
+    # Config order = [claude-max/fable, openai/sol] -> fable first.
+    assert p_stale == "claude-max/fable", p_stale
+    assert p_missing == "claude-max/fable", p_missing
+    print(f"  stale -> {p_stale}; missing -> {p_missing} "
+          f"(both fell back to config order)")
+
+
+def test_lane_level_perishable_matches_explicit_perishable_group():
+    """A lane with `strategy: perishable` and only bare refs behaves
+    bit-for-bit like a single `{perishable: refs}` group around the same
+    refs — same member ordering in both cases for the same stored hash.
+
+    The test seeds the SAME perishable ranking hash through both paths and
+    asserts both picks land on the same member. The implicit sugar at the
+    picker boundary must therefore produce the same visited order as the
+    explicit group would have, which is the regression bar that keeps
+    flat configs unchanged.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+    picker = Picker(reg, slots, policy)
+
+    # Implicit: lane.strategy = "perishable", refs only.
+    implicit_reg = _build_lane(reg, slots,
+                               key="impl-per",
+                               order=["claude-max/fable", "openai/sol"],
+                               tail=[], strategy="perishable")
+    picker_impl = Picker(implicit_reg, slots, policy)
+    # Explicit: same refs wrapped in a perishable group.
+    explicit_reg = _build_lane(reg, slots,
+                               key="expl-per",
+                               order=[{"perishable": [
+                                   "claude-max/fable", "openai/sol"]}],
+                               tail=[], strategy="fill")
+    picker_expl = Picker(explicit_reg, slots, policy)
+
+    # Reset is in 7d, so both windows have ample room for scoring.
+    reset = time.time() + 7 * 86400
+    async def go():
+        await policy.ledger.note_reported_percent(
+            "claude-max", 10.0, reset, window="weekly")
+        await policy.ledger.note_reported_percent(
+            "openai", 60.0, reset, window="weekly")
+        # Same ranking, different paths.
+        await policy.ledger.set_lane_order(
+            "impl-per",
+            {"claude-max/fable": {"score": 0.9, "gate5h": 0},
+             "openai/sol": {"score": 0.4, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+        gid = explicit_reg.lane_nodes()["expl-per"][0].gid
+        await policy.ledger.set_group_order(
+            gid, "expl-per",
+            {"claude-max/fable": {"score": 0.9, "gate5h": 0},
+             "openai/sol": {"score": 0.4, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+
+        async def two_picks(picker, lane):
+            out = []
+            claims = []
+            for _ in range(2):
+                p = await picker.pick(lane, None)
+                out.append(p.ref)
+                claims.append((p.plan.key, p.request_id, p.ref))
+            for k, rid, r in claims:
+                await picker.release(k, rid, r)
+            return out
+
+        impl = await two_picks(picker_impl, "impl-per")
+        expl = await two_picks(picker_expl, "expl-per")
+        return impl, expl
+
+    impl, expl = run(go())
+    assert impl == expl, f"implicit/explicit differ: {impl} vs {expl}"
+    # Both should be fable (high score) first, sol second (model cap=1
+    # forces the spill).
+    assert impl == ["claude-max/fable", "openai/sol"], impl
+    print(f"  implicit sugar: {' -> '.join(impl)}; "
+          f"explicit group: {' -> '.join(expl)} (bit-for-bit)")
+
+
+def test_per_member_gate_skipped_inside_group_without_advancing():
+    """A non-cooperative member inside a round_robin group (e.g. one whose
+    plan cannot serve a tools-bearing request) is skipped WITHIN the group
+    and the rotation pointer does not advance past it on that skip — the
+    member gets its turn again next session.
+
+    Rotation pointer advances ONLY when the group selects a real placement.
+    Skipping a non-cooperative member is a walk past it, not a pick.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+    picker = Picker(reg, slots, policy)
+
+    new_reg = _build_lane(reg, slots,
+                          key="gate-test",
+                          order=[{"round_robin": ["minimax-ultra/m3",
+                                                  "minimax-max/m3"]}],
+                          tail=[], strategy="fill")
+    # Mark ultra's plan as cannot serve tools.
+    from dataclasses import replace
+    plans = dict(new_reg.plans)
+    plans["minimax-ultra"] = replace(
+        plans["minimax-ultra"], supports_tools=False)
+    new_reg = models.Registry(settings=new_reg.settings, plans=plans,
+                              lanes=new_reg.lanes)
+    picker2 = Picker(new_reg, slots, policy)
+
+    async def go():
+        # First pick with tools: ultra skipped (cannot serve), max wins.
+        p1 = await picker2.pick("gate-test", None, needs_tools=True)
+        await picker2.release(p1.plan.key, p1.request_id, p1.ref)
+        # Read counter: must be 1 (one real placement advanced it once).
+        counter = await policy.ledger.group_rot(
+            new_reg.lane_nodes()["gate-test"][0].gid, "gate-test")
+        # Second pick: counter=1, start = 1 % 2 = 1 = max. Max serves
+        # tools. Max wins. Counter advances to 2.
+        p2 = await picker2.pick("gate-test", None, needs_tools=True)
+        await picker2.release(p2.plan.key, p2.request_id, p2.ref)
+        # Third pick: counter=2, start = 0 = ultra. Ultra is skipped
+        # (cannot serve tools); walk to max. Max wins. Counter 3.
+        p3 = await picker2.pick("gate-test", None, needs_tools=True)
+        await picker2.release(p3.plan.key, p3.request_id, p3.ref)
+        counter_after = await policy.ledger.group_rot(
+            new_reg.lane_nodes()["gate-test"][0].gid, "gate-test")
+        return p1.ref, counter, p2.ref, p3.ref, counter_after
+
+    p1, c1, p2, p3, c3 = run(go())
+    # Every pick lands on max because ultra can never serve tools. The
+    # counter advances ONLY when a real placement happens (3 times).
+    assert p1 == "minimax-max/m3", p1
+    assert p2 == "minimax-max/m3", p2
+    assert p3 == "minimax-max/m3", p3
+    assert c1 == 1, c1
+    assert c3 == 3, c3
+    print(f"  ultra cannot serve tools: every pick -> max "
+          f"({p1}, {p2}, {p3}); counter went 0 -> {c3}")
+
+
+def test_paced_to_zero_member_skipped_without_advancing_rotation():
+    """A member whose plan is paced to 0 (cap returns 0 from _cap) is
+    skipped inside the group, and the rotation pointer does not advance
+    on the skip. The next attempt starts at the SAME member — and lands
+    there the moment pacing opens up a slot.
+
+    Distinct from "full" because paced-to-0 means cap=0 in `_cap`, not a
+    try_claim refusal. The group's rotation logic must not conflate the
+    two: a paced member is just another member whose gate closed.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+    picker = Picker(reg, slots, policy)
+
+    new_reg = _build_lane(reg, slots,
+                          key="paced-test",
+                          order=[{"round_robin": ["minimax-ultra/m3",
+                                                  "minimax-max/m3"]}],
+                          tail=[], strategy="fill")
+    picker2 = Picker(new_reg, slots, policy)
+
+    async def go():
+        # Force ultra to pace to 0: a `paced 0 of N` reason means cap=0
+        # in `_cap`. We can't easily simulate the pacer here, so we patch
+        # `_cap` to return 0 for ultra. This stands in for the live
+        # behaviour.
+        orig_cap = picker2._cap
+        async def capped(model, allow_spent=False):
+            cap, reason = await orig_cap(model, allow_spent)
+            if model.ref == "minimax-ultra/m3":
+                return 0, "paced 0 of 4"
+            return cap, reason
+        picker2._cap = capped
+        # First pick: start=0=ultra, ultra paced to 0, skip to max. Max
+        # wins. Counter advances to 1.
+        p1 = await picker2.pick("paced-test", None)
+        await picker2.release(p1.plan.key, p1.request_id, p1.ref)
+        c1 = await policy.ledger.group_rot(
+            new_reg.lane_nodes()["paced-test"][0].gid, "paced-test")
+        # Second pick: counter=1, start=1=max. Max wins. Counter=2.
+        p2 = await picker2.pick("paced-test", None)
+        await picker2.release(p2.plan.key, p2.request_id, p2.ref)
+        # Restore ultra's cap. Third pick: counter=2, start=0=ultra.
+        # Ultra now serves. Ultra wins.
+        picker2._cap = orig_cap
+        p3 = await picker2.pick("paced-test", None)
+        await picker2.release(p3.plan.key, p3.request_id, p3.ref)
+        return p1.ref, c1, p2.ref, p3.ref
+
+    p1, c1, p2, p3 = run(go())
+    assert p1 == "minimax-max/m3", p1
+    assert c1 == 1, f"counter advanced more than expected: {c1}"
+    assert p2 == "minimax-max/m3", p2
+    assert p3 == "minimax-ultra/m3", p3
+    print(f"  ultra paced: {p1} (counter -> {c1}); {p2}; "
+          f"ultra frees -> {p3}")
+
+
+def test_flat_config_bit_for_bit_invariant():
+    """The shipped example config: flat lanes produce bit-for-bit output,
+    group-bearing lanes produce the expected flattened order.
+
+    For a flat lane (no Groups in the parsed body) `routing_order()` and
+    `lane_members()` produce the same flat output they did before the
+    groups landed — bit-for-bit, not just semantically equivalent. For a
+    group-bearing lane the snapshot pins the new shape: a `round_robin:
+    [a, b]` over the same pair in three sibling groups walks a, b three
+    times in declaration order, and `weighted: {a: 5, b: 2}` walks its
+    keys in insertion order.
+
+    The expected values are a snapshot of the order the legacy code would
+    have produced for flat lanes and the order the new code produces for
+    group-bearing ones. Any drift (e.g. routing_order dropping a tail
+    ref, lane_members re-ordering expiry-priority refs, a group's weights
+    keys going out of declaration order) fails this test.
+    """
+    reg = models.load()
+    expected = {
+        "apex": (["claude-max/fable", "openai/astra"],
+                 ["claude-max/fable", "openai/astra", "local-box/qwen"]),
+        "judge": (["claude-max/opus", "openai/sol", "glm/glm-5.3"],
+                  ["claude-max/opus", "openai/sol", "glm/glm-5.3",
+                   "local-box/qwen"]),
+        # forge has three sibling groups over the same Minimax pair, so the
+        # flat walk visits each ref three times — that is the declaration
+        # order of the body, not a duplicate dedup bug. The bare refs
+        # `grok/grok-4.6`, `opencode-go/glm-5.3-flash`, `openrouter/mimo`
+        # sit at the end as before; the old `glm/glm-5.3-flash` ref is
+        # gone from forge (it lives on a separate plan now and was never
+        # wired into the lane).
+        "forge": (["minimax-ultra/m3", "minimax-max/m3",
+                   "minimax-ultra/m3", "minimax-max/m3",
+                   "minimax-ultra/m3", "minimax-max/m3",
+                   "grok/grok-4.6", "opencode-go/glm-5.3-flash",
+                   "openrouter/mimo"],
+                  ["minimax-ultra/m3", "minimax-max/m3",
+                   "minimax-ultra/m3", "minimax-max/m3",
+                   "minimax-ultra/m3", "minimax-max/m3",
+                   "grok/grok-4.6", "opencode-go/glm-5.3-flash",
+                   "openrouter/mimo", "local-box/qwen"]),
+        "nest-demo": (["claude-max/opus", "openai/sol",
+                       "claude-max/fable", "openai/astra"],
+                      ["claude-max/opus", "openai/sol",
+                       "claude-max/fable", "openai/astra",
+                       "local-box/qwen"]),
+        "local": (["local-box/qwen", "local-box/gemma"],
+                  ["local-box/qwen", "local-box/gemma"]),
+        "bulk": (["local-box/gemma", "local-box/qwen"],
+                 ["local-box/gemma", "local-box/qwen"]),
+    }
+    failures = []
+    for lane_key, (exp_routing, exp_members) in expected.items():
+        got_routing = reg.routing_order(lane_key)
+        got_members = [m.ref for m in reg.lane_members(lane_key)]
+        if got_routing != exp_routing:
+            failures.append(f"routing_order({lane_key}): "
+                            f"got {got_routing}, expected {exp_routing}")
+        if got_members != exp_members:
+            failures.append(f"lane_members({lane_key}): "
+                            f"got {got_members}, expected {exp_members}")
+    assert not failures, "\n  ".join(failures)
+    # The parsed tree: flat lanes' body is all bare refs, no Groups
+    # snuck in. forge and nest-demo carry Groups by design; that is
+    # exercised by their own regression tests below.
+    flat_lanes = {"apex", "judge", "local", "bulk"}
+    for lane_key, nodes in reg.lane_nodes().items():
+        if lane_key in flat_lanes:
+            for node in nodes:
+                from switchyard.models import Group
+                assert not isinstance(node, Group), (
+                    f"{lane_key} body unexpectedly contains a group: {node}")
+        else:
+            assert any(
+                hasattr(n, "strategy") for n in nodes), (
+                f"{lane_key} is registered as group-bearing but its parsed "
+                f"body has no Group: {nodes}")
+    print("  bit-for-bit snapshot: flat lanes unchanged; forge + nest-demo "
+          "flatten to their declared refs (incl. group-key dedup)")
+
+
+def test_routing_order_flatten_for_groups_matches_declared_member_order():
+    """A nested group flattens to its declared refs in declaration order.
+
+    The flat `routing_order` is the contract every caller that does not
+    know about groups sees: it must walk every ref the group can reach
+    in declaration order, regardless of strategy. This is the test that
+    proves a group-aware lane does not break a caller that only knows
+    refs.
+    """
+    reg = models.load()
+    inner = {"lowest_utilization": ["claude-max/opus", "openai/sol"]}
+    new_reg = _build_lane(reg, slots=None,
+                          key="flat-test",
+                          order=[{"round_robin": [inner, "claude-max/fable"]},
+                                 "openrouter/mimo"],
+                          tail=[], strategy="fill")
+    got = new_reg.routing_order("flat-test")
+    expected = ["claude-max/opus", "openai/sol",
+                "claude-max/fable", "openrouter/mimo"]
+    assert got == expected, got
+    print(f"  nested flatten: {' -> '.join(got)}")
+
+
+def test_lane_nodes_returns_parsed_tree():
+    """`Registry.lane_nodes()` returns the parsed `Lane.order` for every
+    lane — each entry a bare string or a `Group`. Tail is excluded (it is
+    a flat lane-level list, not part of the body tree).
+
+    This is the contract the picker reads; without it the walker would
+    have to re-parse the YAML on every pick.
+    """
+    reg = models.load()
+    nodes = reg.lane_nodes()
+    # Every lane returns a list.
+    assert set(nodes) == set(reg.lanes), set(nodes)
+    # Body types match the parsed shape: bare strings for flat configs,
+    # Group instances are not present in the shipped example.
+    for key, body in nodes.items():
+        assert isinstance(body, list)
+        for node in body:
+            assert isinstance(node, str) or hasattr(node, "strategy"), node
+    print(f"  lane_nodes: {len(nodes)} lanes parsed, "
+          f"{sum(len(v) for v in nodes.values())} total body entries")
+
+
+def test_group_with_unknown_strategy_is_rejected_at_load_time():
+    """An unknown group strategy is a refuse-to-load error: a typo in
+    config must not silently degrade to plain fill.
+
+    The error names lane + path so the operator sees exactly which entry
+    is wrong.
+    """
+    import yaml as _yaml, tempfile
+    bad = {
+        "settings": {},
+        "plans": {
+            "p1": {"label": "P1",
+                   "models": {"m1": {"model": "x/m1"}}},
+        },
+        "lanes": {"test": {"order": [{"not_a_real_strategy": ["p1/m1"]}]}},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml",
+                                     delete=False) as f:
+        _yaml.safe_dump(bad, f)
+        path = f.name
+    try:
+        models.load(path)
+    except ValueError as exc:
+        msg = str(exc)
+        assert "lane 'test' order[0]" in msg, msg
+        assert "unknown strategy" in msg, msg
+        print(f"  unknown strategy rejected at load: {msg[:80]}")
+        return
+    raise AssertionError("unknown strategy must be a load-time error")
+
+
+def test_weight_with_nonpositive_or_float_or_unknown_member_rejected():
+    """Three refuse-to-load cases for weighted groups, exercised together
+    so a single regression to weight validation fails this test:
+
+    - weight must be a positive integer (catches `-2`, `0`, `1.5`, `true`);
+    - every key in a weighted mapping must name a real model.
+
+    The test asserts the path-and-key shape of each error so an operator
+    reading the message knows exactly which entry and weight to fix.
+    """
+    import yaml as _yaml, tempfile
+    plans = {
+        "p1": {"label": "P1",
+               "models": {"m1": {"model": "x/m1"},
+                          "m2": {"model": "x/m2"}}},
+    }
+    cases = [
+        ([{"weighted": {"p1/m1": -2}}], "must be positive"),
+        ([{"weighted": {"p1/m1": 0}}], "must be positive"),
+        ([{"weighted": {"p1/m1": 1.5}}], "must be a positive integer"),
+        ([{"weighted": {"p1/m1": True}}], "must be a positive integer"),
+        ([{"weighted": {"p1/ghost": 1}}], "unknown model"),
+        ([{"weighted": {}}], "must be a non-empty mapping"),
+        ([{"round_robin": []}], "must not be empty"),
+    ]
+    for order, expected in cases:
+        bad = {"settings": {}, "plans": plans,
+               "lanes": {"test": {"order": order}}}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml",
+                                         delete=False) as f:
+            _yaml.safe_dump(bad, f); path = f.name
+        try:
+            models.load(path)
+        except ValueError as exc:
+            msg = str(exc)
+            assert "lane 'test' order[0]" in msg, msg
+            assert expected in msg, f"{expected!r} missing in: {msg}"
+            continue
+        raise AssertionError(f"weight validation missed: {order}")
+
+
+def test_nesting_depth_over_four_is_rejected():
+    """A nested group five levels deep fails load with the depth-limit
+    error and the path to the offender. Catches a runaway nesting that
+    would otherwise have the picker walk forever.
+    """
+    import yaml as _yaml, tempfile
+    plans = {"p1": {"label": "P1",
+                    "models": {"m1": {"model": "x/m1"}}}}
+    inner = "p1/m1"
+    for _ in range(5):
+        inner = {"round_robin": [inner]}
+    bad = {"settings": {}, "plans": plans,
+           "lanes": {"test": {"order": [inner]}}}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml",
+                                     delete=False) as f:
+        _yaml.safe_dump(bad, f); path = f.name
+    try:
+        models.load(path)
+    except ValueError as exc:
+        msg = str(exc)
+        assert "exceeds max group nesting depth" in msg, msg
+        assert "lane 'test' order[0]" in msg, msg
+        print(f"  depth>4 rejected at load: {msg[:80]}")
+        return
+    raise AssertionError("depth>4 must be a load-time error")
+
+
+def test_routing_order_with_weighed_group_walks_weights_keys_in_order():
+    """`routing_order` for a weighted group walks the keys in insertion
+    order. The picker uses a cumulative weight grid for placement
+    ordering; the flat `routing_order` is the caller's flat view.
+    """
+    reg = models.load()
+    from dataclasses import replace
+    from switchyard.models import Group, _group_id
+    new_reg = _build_lane(reg, slots=None,
+                          key="w-order-test",
+                          order=[{"weighted": {"minimax-ultra/m3": 5,
+                                               "minimax-max/m3": 2,
+                                               "openrouter/mimo": 1}}],
+                          tail=[], strategy="fill")
+    got = new_reg.routing_order("w-order-test")
+    assert got == ["minimax-ultra/m3", "minimax-max/m3", "openrouter/mimo"], got
+    print(f"  weighted routing_order: {' -> '.join(got)}")
+
+
+def test_log_line_keeps_first_word_inside_brackets_when_group_lands():
+    """The gateway log line's `[reason]` regex `\[(\w+)\]` must continue
+    to extract the FIRST token even after the change adds `group=<gid>`
+    inside the brackets. The test rebuilds the bracketed reason the same
+    way hooks.py does and asserts the first word is the cap_reason, not
+    the group tag.
+
+    This is the regression bar for the spec's "first token still extracts"
+    requirement: any future change that puts `group=` first would break
+    scripts/smoke.py and similar greps.
+    """
+    from switchyard.hooks import _reason_with_group
+    from switchyard.models import Group
+    from dataclasses import replace
+
+    reg = models.load()
+    # A flat pick: no group, no metadata. Reason is the bare cap_reason.
+    flat_pick = replace(
+        reg.lane_members("local")[0].ref and (
+            # synthesize a flat pick with the bare-minimum surface
+            type("FakePick", (), {
+                "cap_reason": "configured",
+                "picked_group": None,
+            })()),
+        cap_reason="configured", picked_group=None) if False else None
+
+    # Easier: construct the Pick directly.
+    from switchyard.picker import Pick
+    bare_pick = Pick(
+        lane="local", model=reg.lane_members("local")[0],
+        plan=reg.plans["local-box"], request_id="x", session=None,
+        sticky=False, considered=[], cap=1, cap_reason="configured",
+        picked_group=None)
+    assert _reason_with_group(bare_pick) == "configured", bare_pick
+
+    # A group pick: reason is "configured" plus " group=...,strategy=..."
+    grp = Group(strategy="round_robin", members=["a", "b"], weights=None,
+                gid="g_abc123")
+    grouped_pick = replace(bare_pick, picked_group=grp)
+    reason = _reason_with_group(grouped_pick)
+    assert reason.startswith("configured"), reason
+    assert " group=g_abc123,strategy=round_robin" in reason, reason
+    # First whitespace-separated word is the cap_reason, not the group tag.
+    first = reason.split()[0]
+    assert first == "configured", first
+    print(f"  log reason (flat): '{_reason_with_group(bare_pick)}'; "
+          f"log reason (group): '{reason}' "
+          f"(first token still '{first}')")
+
+
+def test_gate5h_is_enforced_for_refs_inside_scored_groups_under_rotation():
+    """Reviewer fix #1: a `gate5h` flag published by a scored group nested
+    INSIDE a rotation group must be honoured on every pick.
+
+    Path: outer `round_robin` walks its inner scored groups in turn; each
+    inner `lowest_utilization` ranks its members by score. The leaf gate
+    check at `_visit_ref` reads from `picked_group`'s hash and only fires
+    when the picked group is itself scored — so a leaf reached via
+    `[rotation -> scored -> ref]` used to bypass the gate, and the gated
+    ref (with the highest score) was served every time. The fix filters
+    gated scored members OUT of the inner walk before `_visit` ever sees
+    them, so the gate is honoured at every nesting depth.
+
+    Two assertions pin the fix:
+
+    1. The gated ref (opus, highest inner-A score) is NEVER picked, even
+       though `_visit_order_ranked` sorts it to the front.
+    2. Across several rotation cycles (outer counter advances past inner
+       A and back), the picked refs cycle between inner A and inner B
+       members, and the gated ref stays out of every cycle.
+
+    The eager `gate5h` recording on `ctx.skipped` (preserved by the fix)
+    still surfaces the gate on the board.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+
+    inner_a = {"lowest_utilization": ["claude-max/opus", "openai/sol"]}
+    inner_b = {"lowest_utilization": ["claude-max/fable", "openai/astra"]}
+    new_reg = _build_lane(reg, slots,
+                          key="nest-gate",
+                          order=[{"round_robin": [inner_a, inner_b]}],
+                          tail=[], strategy="fill")
+    picker = Picker(new_reg, slots, policy)
+    inner_a_gid = new_reg.lane_nodes()["nest-gate"][0].members[0].gid
+    inner_b_gid = new_reg.lane_nodes()["nest-gate"][0].members[1].gid
+    gated_ref = "claude-max/opus"
+
+    async def go():
+        # Inner A: opus is gated (gate5h=1) AND has the highest score, so the
+        # sort places it first; the fix must skip it anyway.
+        await policy.ledger.set_group_order(
+            inner_a_gid, "nest-gate",
+            {"claude-max/opus": {"score": 90.0, "gate5h": 1},
+             "openai/sol": {"score": 20.0, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+        # Inner B: no gated member; fable is the pick.
+        await policy.ledger.set_group_order(
+            inner_b_gid, "nest-gate",
+            {"claude-max/fable": {"score": 90.0, "gate5h": 0},
+             "openai/astra": {"score": 20.0, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+        picks = []
+        # Walk enough picks that the outer counter has cycled back into
+        # inner A more than once. Inner A on the second pass is the gate
+        # assertion that catches a fix that only filters on the first walk.
+        for _ in range(4):
+            p = await picker.pick("nest-gate", None)
+            picks.append((p.ref, p.considered))
+            await picker.release(p.plan.key, p.request_id, p.ref)
+        return picks
+
+    cycles = run(go())
+    # Across all four cycles, the gated opus must NEVER appear as a pick.
+    # Inner A's only ungated member is openai/sol; inner B's pick is
+    # claude-max/fable. So every pick should be sol or fable.
+    for ref, considered in cycles:
+        assert ref != gated_ref, (
+            f"gated ref {gated_ref} was picked: cycle={ref} considered={considered}"
+        )
+    refs = [ref for ref, _ in cycles]
+    # Two-pass sanity: with two inner groups and one pick per group per
+    # outer cycle, four picks cover two full outer rotations, so each
+    # inner group is visited twice. Each visit picks its sole ungated
+    # member (sol for inner A, fable for inner B), in the order the
+    # outer rotation walks them.
+    assert refs == ["openai/sol", "claude-max/fable",
+                    "openai/sol", "claude-max/fable"], refs
+    # The gate must be recorded on the board for every pick that lands
+    # on the same lane (the eager `gate5h` recording survives the fix).
+    assert any("gate5h" in c for cycle in cycles for c in cycle[1]), cycles
+    print(f"  gated ref skipped under nesting: {' -> '.join(refs)} "
+          f"(opus gate5h=1; never picked)")
+
+
+def test_gate5h_filter_in_top_level_scored_group_still_works():
+    """Sanity: the fix in `_visit_order_ranked` does not regress the
+    TOP-LEVEL scored-group case that the existing gate5h test covers.
+
+    A top-level `perishable` group with one gated member picks the
+    ungated peer; the gate is recorded in `considered`. This pins the
+    behaviour the regression bar already had, and confirms the filter
+    in `_visit_order_ranked` is equivalent to the previous
+    `_visit_ref`-level check when the gate-owning group IS the picked
+    group (no nesting).
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+
+    new_reg = _build_lane(reg, slots,
+                          key="perishable-test",
+                          order=[{"perishable": ["claude-max/fable",
+                                                 "openai/sol"]}],
+                          tail=[], strategy="fill")
+    picker = Picker(new_reg, slots, policy)
+    gid = new_reg.lane_nodes()["perishable-test"][0].gid
+
+    async def go():
+        reset = time.time() + 7 * 86400
+        await policy.ledger.note_reported_percent(
+            "claude-max", 10.0, reset, window="weekly")
+        await policy.ledger.note_reported_percent(
+            "openai", 10.0, reset, window="weekly")
+        # Fable is gated AND highest-scored; fix must skip it.
+        await policy.ledger.set_group_order(
+            gid, "perishable-test",
+            {"claude-max/fable": {"score": 0.9, "gate5h": 1},
+             "openai/sol": {"score": 0.5, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+        p = await picker.pick("perishable-test", None)
+        return p.ref, p.considered
+
+    picked, considered = run(go())
+    assert picked == "openai/sol", picked
+    assert any("gate5h" in c for c in considered), considered
+    print(f"  top-level gated: picked {picked} (fable gate5h=1, skipped)")
+
+
+def test_nesting_depth_at_limit_four_is_accepted():
+    """Reviewer fix #2: the parser must accept depth 4 (the limit promised
+    by README, TESTING.md, and the commit message body for issue #43).
+
+    Before the fix the parser used `if depth >= _MAX_GROUP_DEPTH` which
+    refused depth 4 (only depths 1, 2, 3 were allowed — off-by-one). After
+    the fix it uses `>` so depth 4 parses and depth 5 is rejected with a
+    clear error naming lane + path. The boundary test pins both sides.
+    """
+    import yaml as _yaml, tempfile
+    plans = {"p1": {"label": "P1",
+                    "models": {"m1": {"model": "x/m1"}}}}
+
+    def at_depth(d: int) -> dict:
+        inner = "p1/m1"
+        for _ in range(d):
+            inner = {"round_robin": [inner]}
+        return {"settings": {}, "plans": plans,
+                "lanes": {"test": {"order": [inner]}}}
+
+    def _try_load(raw: dict) -> str:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml",
+                                         delete=False) as f:
+            _yaml.safe_dump(raw, f); path = f.name
+        try:
+            models.load(path)
+            return "ALLOWED"
+        except ValueError as exc:
+            return str(exc)
+        finally:
+            os.unlink(path)
+
+    # Depth 1, 2, 3, 4 must all parse: the spec and docs promise ≤ 4.
+    for d in (1, 2, 3, 4):
+        result = _try_load(at_depth(d))
+        assert result == "ALLOWED", (
+            f"depth={d} must parse per issue #43 (≤ 4), got: {result[:100]}")
+
+    # Depth 5 must be refused with the depth-limit error.
+    msg = _try_load(at_depth(5))
+    assert "exceeds max group nesting depth 4" in msg, msg
+    assert "lane 'test' order[0]" in msg, msg
+    print("  depth 1..4 accepted; depth 5 rejected at lane 'test' order[0]")
 
 
 def test_selfcheck_static_audit_runs_against_installed_litellm():
