@@ -2590,6 +2590,185 @@ def test_log_line_keeps_first_word_inside_brackets_when_group_lands():
           f"(first token still '{first}')")
 
 
+def test_gate5h_is_enforced_for_refs_inside_scored_groups_under_rotation():
+    """Reviewer fix #1: a `gate5h` flag published by a scored group nested
+    INSIDE a rotation group must be honoured on every pick.
+
+    Path: outer `round_robin` walks its inner scored groups in turn; each
+    inner `lowest_utilization` ranks its members by score. The leaf gate
+    check at `_visit_ref` reads from `picked_group`'s hash and only fires
+    when the picked group is itself scored — so a leaf reached via
+    `[rotation -> scored -> ref]` used to bypass the gate, and the gated
+    ref (with the highest score) was served every time. The fix filters
+    gated scored members OUT of the inner walk before `_visit` ever sees
+    them, so the gate is honoured at every nesting depth.
+
+    Two assertions pin the fix:
+
+    1. The gated ref (opus, highest inner-A score) is NEVER picked, even
+       though `_visit_order_ranked` sorts it to the front.
+    2. Across several rotation cycles (outer counter advances past inner
+       A and back), the picked refs cycle between inner A and inner B
+       members, and the gated ref stays out of every cycle.
+
+    The eager `gate5h` recording on `ctx.skipped` (preserved by the fix)
+    still surfaces the gate on the board.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+
+    inner_a = {"lowest_utilization": ["claude-max/opus", "openai/sol"]}
+    inner_b = {"lowest_utilization": ["claude-max/fable", "openai/astra"]}
+    new_reg = _build_lane(reg, slots,
+                          key="nest-gate",
+                          order=[{"round_robin": [inner_a, inner_b]}],
+                          tail=[], strategy="fill")
+    picker = Picker(new_reg, slots, policy)
+    inner_a_gid = new_reg.lane_nodes()["nest-gate"][0].members[0].gid
+    inner_b_gid = new_reg.lane_nodes()["nest-gate"][0].members[1].gid
+    gated_ref = "claude-max/opus"
+
+    async def go():
+        # Inner A: opus is gated (gate5h=1) AND has the highest score, so the
+        # sort places it first; the fix must skip it anyway.
+        await policy.ledger.set_group_order(
+            inner_a_gid, "nest-gate",
+            {"claude-max/opus": {"score": 90.0, "gate5h": 1},
+             "openai/sol": {"score": 20.0, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+        # Inner B: no gated member; fable is the pick.
+        await policy.ledger.set_group_order(
+            inner_b_gid, "nest-gate",
+            {"claude-max/fable": {"score": 90.0, "gate5h": 0},
+             "openai/astra": {"score": 20.0, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+        picks = []
+        # Walk enough picks that the outer counter has cycled back into
+        # inner A more than once. Inner A on the second pass is the gate
+        # assertion that catches a fix that only filters on the first walk.
+        for _ in range(4):
+            p = await picker.pick("nest-gate", None)
+            picks.append((p.ref, p.considered))
+            await picker.release(p.plan.key, p.request_id, p.ref)
+        return picks
+
+    cycles = run(go())
+    # Across all four cycles, the gated opus must NEVER appear as a pick.
+    # Inner A's only ungated member is openai/sol; inner B's pick is
+    # claude-max/fable. So every pick should be sol or fable.
+    for ref, considered in cycles:
+        assert ref != gated_ref, (
+            f"gated ref {gated_ref} was picked: cycle={ref} considered={considered}"
+        )
+    refs = [ref for ref, _ in cycles]
+    # Two-pass sanity: with two inner groups and one pick per group per
+    # outer cycle, four picks cover two full outer rotations, so each
+    # inner group is visited twice. Each visit picks its sole ungated
+    # member (sol for inner A, fable for inner B), in the order the
+    # outer rotation walks them.
+    assert refs == ["openai/sol", "claude-max/fable",
+                    "openai/sol", "claude-max/fable"], refs
+    # The gate must be recorded on the board for every pick that lands
+    # on the same lane (the eager `gate5h` recording survives the fix).
+    assert any("gate5h" in c for cycle in cycles for c in cycle[1]), cycles
+    print(f"  gated ref skipped under nesting: {' -> '.join(refs)} "
+          f"(opus gate5h=1; never picked)")
+
+
+def test_gate5h_filter_in_top_level_scored_group_still_works():
+    """Sanity: the fix in `_visit_order_ranked` does not regress the
+    TOP-LEVEL scored-group case that the existing gate5h test covers.
+
+    A top-level `perishable` group with one gated member picks the
+    ungated peer; the gate is recorded in `considered`. This pins the
+    behaviour the regression bar already had, and confirms the filter
+    in `_visit_order_ranked` is equivalent to the previous
+    `_visit_ref`-level check when the gate-owning group IS the picked
+    group (no nesting).
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+
+    new_reg = _build_lane(reg, slots,
+                          key="perishable-test",
+                          order=[{"perishable": ["claude-max/fable",
+                                                 "openai/sol"]}],
+                          tail=[], strategy="fill")
+    picker = Picker(new_reg, slots, policy)
+    gid = new_reg.lane_nodes()["perishable-test"][0].gid
+
+    async def go():
+        reset = time.time() + 7 * 86400
+        await policy.ledger.note_reported_percent(
+            "claude-max", 10.0, reset, window="weekly")
+        await policy.ledger.note_reported_percent(
+            "openai", 10.0, reset, window="weekly")
+        # Fable is gated AND highest-scored; fix must skip it.
+        await policy.ledger.set_group_order(
+            gid, "perishable-test",
+            {"claude-max/fable": {"score": 0.9, "gate5h": 1},
+             "openai/sol": {"score": 0.5, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+        p = await picker.pick("perishable-test", None)
+        return p.ref, p.considered
+
+    picked, considered = run(go())
+    assert picked == "openai/sol", picked
+    assert any("gate5h" in c for c in considered), considered
+    print(f"  top-level gated: picked {picked} (fable gate5h=1, skipped)")
+
+
+def test_nesting_depth_at_limit_four_is_accepted():
+    """Reviewer fix #2: the parser must accept depth 4 (the limit promised
+    by README, TESTING.md, and the commit message body for issue #43).
+
+    Before the fix the parser used `if depth >= _MAX_GROUP_DEPTH` which
+    refused depth 4 (only depths 1, 2, 3 were allowed — off-by-one). After
+    the fix it uses `>` so depth 4 parses and depth 5 is rejected with a
+    clear error naming lane + path. The boundary test pins both sides.
+    """
+    import yaml as _yaml, tempfile
+    plans = {"p1": {"label": "P1",
+                    "models": {"m1": {"model": "x/m1"}}}}
+
+    def at_depth(d: int) -> dict:
+        inner = "p1/m1"
+        for _ in range(d):
+            inner = {"round_robin": [inner]}
+        return {"settings": {}, "plans": plans,
+                "lanes": {"test": {"order": [inner]}}}
+
+    def _try_load(raw: dict) -> str:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml",
+                                         delete=False) as f:
+            _yaml.safe_dump(raw, f); path = f.name
+        try:
+            models.load(path)
+            return "ALLOWED"
+        except ValueError as exc:
+            return str(exc)
+        finally:
+            os.unlink(path)
+
+    # Depth 1, 2, 3, 4 must all parse: the spec and docs promise ≤ 4.
+    for d in (1, 2, 3, 4):
+        result = _try_load(at_depth(d))
+        assert result == "ALLOWED", (
+            f"depth={d} must parse per issue #43 (≤ 4), got: {result[:100]}")
+
+    # Depth 5 must be refused with the depth-limit error.
+    msg = _try_load(at_depth(5))
+    assert "exceeds max group nesting depth 4" in msg, msg
+    assert "lane 'test' order[0]" in msg, msg
+    print("  depth 1..4 accepted; depth 5 rejected at lane 'test' order[0]")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):

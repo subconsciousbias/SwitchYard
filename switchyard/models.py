@@ -635,7 +635,7 @@ def _parse_lane_order(lane_key: str, raw: list, known: set[str],
             raise ValueError(
                 f"lane {lane_key!r} {path} uses unknown strategy {strategy!r}; "
                 f"must be one of {_VALID_GROUP_STRATEGIES}")
-        if depth >= _MAX_GROUP_DEPTH:
+        if depth > _MAX_GROUP_DEPTH:
             raise ValueError(
                 f"lane {lane_key!r} {path} exceeds max group nesting depth "
                 f"{_MAX_GROUP_DEPTH}")

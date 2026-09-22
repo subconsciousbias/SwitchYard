@@ -429,9 +429,20 @@ class Picker:
                 else:
                     unscored.append(node)
             scored.sort(key=lambda rs: rs[1][0], reverse=True)
-            ranked = [n for n, _ in scored] + unscored
+            # Filter gated scored members OUT of the walk. The gate check at
+            # `_visit_ref` reads from `picked_group`'s hash and only fires when
+            # the picked group is itself a scored group; for a leaf reached
+            # via `[rotation -> scored -> ref]` the picked_group is the outer
+            # rotation group, the gate check is bypassed, and the gated ref
+            # would otherwise be served. Filtering here (where the gate is
+            # actually owned) is the smallest fix that honours the contract
+            # the eager `gate5h` recording below already promises the board:
+            # a gated ref never lands on the wire, regardless of nesting.
+            ranked = [n for n, (_s, gated) in scored if not gated] + unscored
             # Eagerly record gated refs before the walk so a higher-ranked
-            # peer's success does not hide the gate on the board.
+            # peer's success does not hide the gate on the board. The walk
+            # itself now skips them (see the filter above), so this is purely
+            # for the board's `considered` list.
             for node, (_score, gated) in scored:
                 if gated:
                     for ref in _all_leaves(node):
