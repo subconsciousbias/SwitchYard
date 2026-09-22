@@ -1403,7 +1403,7 @@ def test_an_oversized_system_prompt_goes_to_a_file_not_argv():
     spath = Path(argv[argv.index("--system-prompt-file") + 1])
     assert spath.parent == workdir, spath
     assert spath.name == "system-prompt.md", spath
-    assert spath.read_text() == huge, "the file must contain the caller's system prompt"
+    assert spath.read_text() == huge + "\n", "the file must contain the caller's system prompt"
     assert stdin_data is None, "system-prompt-file path does not touch stdin"
     assert all(huge != element for element in argv), argv
 
@@ -1445,8 +1445,10 @@ def test_e2big_from_the_spawn_is_413():
 
     result = asyncio.run(scenario())
     assert result["type"] == "error" and result["status"] == 413, result
-    assert "too large" in result.get("detail", ""), result
-    print(f"  E2BIG from spawn -> HTTP {result['status']} ({result['detail'][:60]}...)")
+    detail = result["detail"]
+    assert detail["error"]["type"] == "request_too_large", detail
+    assert "too large" in detail["error"]["message"], detail
+    print(f"  E2BIG from spawn -> HTTP {result['status']} ({detail['error']['message'][:60]}...)")
 
 
 if __name__ == "__main__":

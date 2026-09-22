@@ -142,26 +142,13 @@ PROCESS_TIMEOUT = float(os.environ.get("MCP_PROCESS_TIMEOUT_SECONDS", str(6 * 36
 # separate tools/call frames, and nothing tells us in advance how many are
 # coming, so we wait for the burst to go quiet.
 BATCH_WINDOW = float(os.environ.get("MCP_BATCH_WINDOW_SECONDS", "0.25"))
-# A single argv element may not exceed the kernel's MAX_ARG_STRLEN (128 KiB on
-# Linux); a longer one makes create_subprocess_exec fail with
-# "[Errno 7] Argument list too long" before the CLI even starts -- observed
-# live when a folded system prompt + long history rode along as one argument.
-# At or over this threshold the prompt is handed to the CLI on stdin instead.
-# All three profile CLIs take it there: `claude -p` and `opencode run` read a
-# piped prompt, `codex exec -` reads stdin when its PROMPT argument is `-`.
-STDIN_PROMPT_LIMIT = int(os.environ.get("MCP_STDIN_PROMPT_LIMIT", "100000"))
-
-
-def over_argv_limit(text: str) -> bool:
-    """True when `text` is too big to ride argv as a single element.
-
-    Mirrors cli_bridge's helper of the same name (issue #29): the limit must
-    be measured in UTF-8 bytes, because that is what MAX_ARG_STRLEN caps and
-    what communicate() writes to the pipe. len() counts characters and a
-    CJK block of 40k characters is 120k bytes, easily past the kernel's
-    line while looking comfortably under a character count.
-    """
-    return len(text.encode("utf-8")) > STDIN_PROMPT_LIMIT
+# Same argv-limit knob and byte check as cli_bridge, re-exported rather
+# than duplicated: both bridges must agree on what "too big for argv"
+# means (MAX_ARG_STRLEN, ~128 KiB per element -- issue #29), and two
+# copies of either the number or the logic would drift. cli_bridge owns
+# both; the MCP_STDIN_PROMPT_LIMIT env var is documented there.
+STDIN_PROMPT_LIMIT = cli_bridge.STDIN_PROMPT_LIMIT
+over_argv_limit = cli_bridge.over_argv_limit
 
 MCP_PROFILES: dict[str, dict] = {
     "claude": {
@@ -540,9 +527,11 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
             # one argv element. The -file form is verified on the pinned CLI
             # (2.1.278), and the file lives in the session workdir so
             # cleanup_workdir reclaims it with everything else -- the same
-            # lifecycle codex's instructions.md already has here.
+            # lifecycle codex's instructions.md already has here. Trailing
+            # newline matches cli_bridge's system_prompt_file so both files
+            # have identical content shape regardless of which sidecar wrote.
             spath = workdir / "system-prompt.md"
-            spath.write_text(system)
+            spath.write_text(system if system.endswith("\n") else system + "\n")
             argv += ["--system-prompt-file", str(spath)]
         else:
             argv += ["--system-prompt", system]
@@ -575,8 +564,10 @@ async def run_session(session: Session, argv: list[str],
             if exc.errno == errno.E2BIG:
                 session.resolve_final({
                     "type": "error", "status": 413,
-                    "detail": (f"request too large for {PROVIDER} cli "
-                               f"({exc.strerror}); reduce its size")})
+                    "detail": {"error": {
+                        "message": (f"request too large for {PROVIDER} cli "
+                                    f"({exc.strerror}); reduce its size"),
+                        "type": "request_too_large"}}})
             else:
                 session.resolve_final({
                     "type": "error", "status": 502,

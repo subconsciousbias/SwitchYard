@@ -751,9 +751,19 @@ def system_prompt_file(system: str | None):
     stdin prompt, codex overrides via instructions_file, so neither ever
     needs this).
     """
-    key = ("system_file_args_replace" if SYSTEM_MODE == "replace"
-           and PROFILE.get("system_file_args_replace") else "system_file_args")
-    if not system or not PROFILE.get(key) or not over_argv_limit(system):
+    key: str | None
+    if SYSTEM_MODE == "replace":
+        # Replace mode must replace or do nothing: falling back to the append
+        # form here would quietly turn an override into a stack-up. A profile
+        # with inline system_args_replace but no file form gets build_argv's
+        # inline path (and, oversized, the spawn guard's 413) instead. That
+        # inline path keeps its own looser fallback -- pre-existing behaviour
+        # this deliberately does not change.
+        key = ("system_file_args_replace"
+               if PROFILE.get("system_file_args_replace") else None)
+    else:
+        key = "system_file_args" if PROFILE.get("system_file_args") else None
+    if not system or key is None or not over_argv_limit(system):
         yield [], system
         return
     tmp = None
