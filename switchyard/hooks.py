@@ -627,6 +627,11 @@ class SwitchyardHandler(CustomLogger):
         if rid:
             ctx["_verdict_applied"] = rid
 
+        # How long this plan sits out, before the TRANSIENT ladder gets a say.
+        # Every branch below reads it and the breaker escalates from it, so it
+        # has to be bound whatever the outcome class turns out to be.
+        cooldown = int(verdict.cooldown_seconds)
+
         if verdict.outcome is Outcome.QUOTA_EXHAUSTED:
             # Which window did we hit? The reset time tells us, and attributing
             # it correctly keeps a 5-hour wall out of the weekly figures.
