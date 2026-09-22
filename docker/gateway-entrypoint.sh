@@ -7,4 +7,10 @@ if [ ! -f "$PLANS" ]; then
 fi
 echo "switchyard: generating LiteLLM config from ${PLANS}"
 python3 -m switchyard.gen_litellm "$PLANS" /tmp/litellm.generated.yaml
+# Fail-loud startup gate: a gateway that will not start is better than one
+# that silently mis-routes. The check prints its result on every start, so
+# `docker logs` is the audit trail. A CRITICAL exit here is the container's
+# way of saying "stop restarting me, the proxy would lie about every request".
+echo "switchyard: running litellm self-check"
+python3 -m switchyard.selfcheck
 exec litellm --config /tmp/litellm.generated.yaml --port 4000 --num_workers "${GATEWAY_WORKERS:-2}"

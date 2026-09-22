@@ -10,7 +10,16 @@
 #
 # Switchyard lives in /switchyard, not /app: /app is the image's own application
 # directory and copying into it risks clobbering LiteLLM's files.
-FROM ghcr.io/berriai/litellm:main-stable
+#
+# PIN POLICY: litellm is pinned by tag AND digest together. The tag is what
+# humans read; the digest is what `docker pull` actually fetches. They MUST
+# move together — bumping the tag without the digest silently pulls whatever
+# the registry has at that tag today, and switching the digest (which is
+# content-addressed) without the tag is impossible. Upgrading litellm is a
+# deliberate commit: re-pin both, then `python -m switchyard.selfcheck` on a
+# running image to confirm the pre-routing-hook is still internal-only, the
+# pre-call-hook still fires, and num_retries=0 still produces one attempt.
+FROM ghcr.io/berriai/litellm:v1.101.0@sha256:d295634e09c648dcdb72c4cc2dd226f5fb87823a73e88cbbed6f205e4deb044b
 
 RUN python3 - <<'PY'
 import importlib, sys

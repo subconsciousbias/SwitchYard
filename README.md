@@ -538,6 +538,18 @@ sent at all. `_check_served_deployment` logs loudly whenever the deployment that
 answered is not the one that was picked, and books the usage to the plan that
 actually spent it.
 
+`num_retries: 0` is non-negotiable in the pinned litellm build. Router's
+`async_pre_routing_hook` is the *internal* auto-router hook, dispatched only
+inside `async_get_available_deployment` for routing-strategy strategies; it
+never iterates registered `CustomLogger` callbacks, so a Switchyard re-pick
+there was never going to fire even with `num_retries=1`. A blind router retry
+would have re-routed to the same single-member deployment the picker just
+chose — exactly the deployment that just 5xx'd — which is why the litellm
+version is pinned by tag AND digest and the gateway runs a startup self-check
+that catches any future upgrade that moves the self-check to
+`async_pre_call_hook`-class dispatch. See the [Litellm pin and self-check](#litellm-pin-and-self-check)
+section below.
+
 ### Which plan served the request
 
 The response body's `model` echoes what was asked for — usually a lane name
@@ -553,6 +565,51 @@ that a strict client will ignore:
 LiteLLM also puts it in response headers (`x-litellm-model-group`,
 `x-litellm-model-name`, `x-litellm-attempted-fallbacks`), which is easy to miss
 and lost by any client that keeps only the JSON.
+
+### Litellm pin and self-check
+
+`Dockerfile.gateway` pins the base image by tag AND digest, e.g.
+`ghcr.io/berriai/litellm:v1.101.0@sha256:<manifest-digest>`. The tag is what
+humans read; the digest is what `docker pull` actually fetches. They MUST move
+together — bumping the tag without the digest silently pulls whatever the
+registry has at that tag today, and switching the digest (content-addressed)
+without the tag is impossible. Upgrading litellm is a deliberate commit that
+re-runs the startup self-check on a running image to confirm the contract is
+still intact.
+
+Between `gen_litellm` and `exec litellm`, `docker/gateway-entrypoint.sh` runs
+`python3 -m switchyard.selfcheck`. The check has two halves:
+
+- **Static AST audit** against the installed litellm source:
+  - `Router.async_pre_routing_hook` source contains no reference to any
+    `CustomLogger` callback registry (`litellm.callbacks`,
+    `litellm._async_success_callback`, etc.). If a future version starts
+    dispatching user callbacks here, `num_retries=0` is no longer the whole
+    story and the audit fails loudly.
+  - `Router.acompletion` reaches `async_function_with_fallbacks`. If the
+    retry path stops going through that function, `num_retries` has no
+    effect.
+  - `async_function_with_retries` short-circuits on `num_retries<=0` with an
+    early `raise` BEFORE the retry loop, not via an empty `range(0)` that
+    silently re-runs the loop. A regression that gates the whole loop on
+    `num_retries > 0` with a fall-through is caught here.
+  - `litellm/proxy` references `async_pre_call_hook` somewhere on disk — the
+    one hook Switchyard depends on for picker placement.
+- **Dynamic loopback probe**: two `http.server` stubs on `127.0.0.1` (one 200,
+  one 429 with body `{"detail": "sidecar at capacity (1)"}`); a minimal
+  `litellm.Router` (`num_retries=0`, `disable_cooldowns=True`, one deployment
+  per stub) and a probe `CustomLogger` registered via
+  `litellm.logging_callback_manager`; the success case must reach
+  `async_log_success_event` exactly once, the 429 case must reach
+  `async_log_failure_event` exactly once, the stub must have received exactly
+  one HTTP call (the proof there was no blind retry), and the call must have
+  raised `litellm.RateLimitError`.
+
+Any failed check logs `CRITICAL` and exits 1, which the container restart
+policy turns into a visible outage rather than a silently broken proxy. There
+is no env-var escape hatch: this is a deliberate "fail-loud" gate, run once
+per gateway start, whose output is the audit trail in `docker logs`. The
+`selfcheck PASSED` line is what a healthy startup looks like.
 
 Where a plan still cannot serve tools — because its path hasn't been fixed yet,
 or because it genuinely never will — set `supports_tools: false` on it and the

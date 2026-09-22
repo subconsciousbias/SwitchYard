@@ -22,7 +22,14 @@ def build(plans_path: str) -> dict:
     model. The per-deployment `max_parallel_requests` is a backstop only —
     SwitchYard's slot table is the real gate, keyed by plan so a plan's models
     share it — but it stops a caller who names a deployment directly from
-    exceeding the plan's connection limit.
+    exceeding the plan's connection limit. The number it carries has to MATCH
+    what the picker would have admitted via lane routing: for CLI-backed
+    plans that is `min(cap, max(1, max_parallel - gate_headroom_slots))`,
+    not the raw `max_parallel`. Without the alignment, a direct-name caller
+    races the physical sidecar gate for the headroom slot the picker
+    deliberately leaves empty, which is exactly the spurious-429 race
+    issue #47 complains about. Pass `reg.settings` so `cap_for` applies the
+    headroom; API plans are unaffected.
     """
     reg = load(plans_path)
 
@@ -34,7 +41,7 @@ def build(plans_path: str) -> dict:
                 params["api_base"] = plan.api_base
             if plan.api_key:
                 params["api_key"] = plan.api_key
-            params["max_parallel_requests"] = plan.cap_for(model)
+            params["max_parallel_requests"] = plan.cap_for(model, reg.settings)
 
             info = {
                 "switchyard_plan": plan.key,
@@ -128,28 +135,38 @@ def build(plans_path: str) -> dict:
             "callbacks": ["switchyard.hooks.switchyard_handler"],
             "drop_params": True,
             "request_timeout": 600,
-            # One router-level retry, and that one retry is the ONLY place we
-            # let litellm re-route: SwitchYard's async_pre_routing_hook swaps
-            # in a different member of the lane on transient failure, so the
-            # retry delivers a real second attempt instead of the same broken
-            # deployment. Mid-stream failures are not retried by litellm and
-            # are not affected. Two is wrong: it would silently double our
-            # upstream calls without buying us anything.
-            "num_retries": 1,
+            # num_retries: 0 is the README-documented contract: a failed request
+            # returns to the caller immediately, and the caller's retry re-enters
+            # the proxy through async_pre_call_hook. The picker then places against
+            # the fresh cooldowns the failure just set — which is strictly better
+            # placement than any in-router retry could give.
+            #
+            # This is non-negotiable in the pinned litellm build. Router's
+            # `async_pre_routing_hook` is the *internal* auto-router hook,
+            # dispatched only inside `async_get_available_deployment` for
+            # `routing_strategy`-based strategies; it never iterates registered
+            # CustomLogger callbacks, so `SwitchyardHandler.async_pre_routing_hook`
+            # has never fired. A blind router retry (num_retries >= 1) re-routes
+            # to the same single-member deployment the picker just chose, which
+            # is exactly the deployment that just 5xx'd. The retry cannot recover.
+            #
+            # Whole-lane-full already returns a clean 429 + Retry-After: 20
+            # (hooks.py LaneSaturated), so the caller's well-behaved retry lands
+            # against the fresh cooldowns the picker sees on re-entry.
+            "num_retries": 0,
         },
         "router_settings": {
             "enable_pre_call_checks": True,
             "routing_strategy": "simple-shuffle",
             "fallbacks": fallbacks,
             "context_window_fallbacks": context_fallbacks,
-            # `disable_cooldowns: True` is the only setting that keeps the
-            # router from cooling the single-deployment group between attempts
-            # (so the re-pick in async_pre_routing_hook actually fires), and
-            # SwitchYard's own cooldowns — via Redis — are the only state
-            # that outlives this process and the only state the portal can
-            # see. With this on, cooldown_time and allowed_fails do not need
-            # to be set; cooldowns live in K_COOL/{plan}, and the breaker's
-            # escalating ladder lives in K_TFAIL/{plan}.
+            # `disable_cooldowns: True` is still required. Without it, even at
+            # num_retries=0 the router cools the deployment group between
+            # calls and prevents fresh traffic from landing on the one plan
+            # the picker just chose. With it on, cooldown_time and
+            # allowed_fails are unused and SwitchYard's own Redis cooldowns
+            # (K_COOL/{plan}, K_TFAIL/{plan}) are the only state the system
+            # consults — and the only state the portal can see.
             "disable_cooldowns": True,
             "redis_host": "os.environ/REDIS_HOST",
             "redis_port": "os.environ/REDIS_PORT",

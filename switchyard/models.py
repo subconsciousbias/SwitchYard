@@ -168,6 +168,17 @@ class Settings:
     inflight_max_age_seconds: int = 120
     heartbeat_seconds: int = 30
     default_cooldown_seconds: int = 900
+    # Slots the gateway keeps free for CLI-backed plans, so the gateway's slot
+    # table and the sidecar's own gate stop racing on the same number. The
+    # physical gate (the sidecar reads `max_parallel` from this same file) stays
+    # at the configured value; the gateway's effective cap is reduced by this
+    # many slots, so an ordinary claim/release race or a release the gateway
+    # makes (client abort) while the sidecar CLI turn is still finishing no
+    # longer produces a spurious 429. API plans are unaffected: their provider
+    # rejects on its own, the learner backs off, and the headroom would just
+    # sit unused. Floor at 1 in the application so a single-connection plan
+    # never drops to 0.
+    gate_headroom_slots: int = 1
     concurrency_learning: ConcurrencyLearning = field(default_factory=ConcurrencyLearning)
     pacing: Pacing = field(default_factory=Pacing)
     transient_breaker: TransientBreaker = field(default_factory=TransientBreaker)
@@ -215,11 +226,25 @@ class Plan:
         """The plan's connection limit, or the seed when it is being learned."""
         return self.configured_parallel if self.configured_parallel is not None else SEED_CAP
 
-    def cap_for(self, model: Model) -> int:
-        """A model may narrow the plan's limit, never widen it."""
-        if model.max_parallel is None:
-            return self.max_parallel
-        return min(self.max_parallel, model.max_parallel)
+    def cap_for(self, model: Model, settings: Settings | None = None) -> int:
+        """A model may narrow the plan's limit, never widen it.
+
+        For CLI-backed plans, the gateway-side effective cap is one slot of
+        headroom below the plan's configured limit, so the sidecar's own gate
+        (which reads the same `max_parallel` from this file) has room to absorb
+        a claim/release race or a gateway release the sidecar CLI turn has not
+        yet noticed. API plans keep the full configured cap — their provider
+        enforces the limit, and a free headroom slot would just sit unused.
+        Settings is passed in for the headroom value; the property stays a
+        plain method so callers without a Registry (notably the LiteLLM
+        config generator) can supply their own.
+        """
+        cap = self.max_parallel
+        if model.max_parallel is not None:
+            cap = min(cap, model.max_parallel)
+        if settings is not None and self.is_cli_backed:
+            cap = min(cap, max(1, self.max_parallel - settings.gate_headroom_slots))
+        return cap
 
     # -- lifecycle ---------------------------------------------------------
     @property

@@ -463,6 +463,57 @@ def _order_mapping(entries: dict[str, float | str], computed_at: float,
     return mapping
 
 
+def reported_is_current(facts: dict, period: str | None,
+                        now: float | None = None) -> bool:
+    """Whether a `reported_*` reading still describes the window that's in force.
+
+    A reading is current iff:
+
+      (a) `reset_at`, when present as a float, is still in the future
+          (`now < reset_at`). The provider's own reset hint is the strongest
+          signal we have that the percentage is still meaningful, and it MUST be
+          absent or a future float. `note_exhaustion` writes `""` into the hash
+          when there is no hint -- a non-float sentinel that has to read as
+          stale so a quota_exhausted cooldown does not leak into a fresh
+          window.
+      (b) `reported_at` is a float, and is within the current period bucket
+          via `period_bounds(period)`. The bucket is the fallback when there
+          is no `reset_at`: a weekly reading older than this week is not a
+          reading about this week, however fresh the number looks. The pacer and
+          `note_exhaustion` already use this same rollover as the source of
+          truth for "which window is in force".
+
+    `now` is injectable for tests, the same pattern as `perishable_score`;
+    absent means `time.time()`.
+
+    Anything undatable -- missing/non-float `reported_at`, `reset_at == ""`,
+    or a `reset_at` already in the past -- returns False. Stale means
+    UNKNOWN, not spent: callers fall back to the ledger/observed-allowance
+    basis (the board shows the estimate), and the picker re-admits the plan
+    so over-admission self-heals via the vendor's next 429 -> cooldown path
+    rather than getting stuck in the permanent over-exclusion state the
+    stale read was producing.
+    """
+    if now is None:
+        now = time.time()
+    reset_at = facts.get("reset_at")
+    if reset_at is not None:
+        # Present and non-empty: it must be a float that hasn't passed yet.
+        # An empty string (the `note_exhaustion` sentinel) is not a float,
+        # so the first clause is False -- but the empty-string check above
+        # already covers the documented case. Other non-float values fall
+        # through the same way: stale.
+        if not isinstance(reset_at, float) or now >= reset_at:
+            return False
+    reported_at = facts.get("reported_at")
+    if not isinstance(reported_at, float):
+        return False
+    start, _ = period_bounds(period, datetime.fromtimestamp(now, tz=timezone.utc))
+    if reported_at < start.timestamp():
+        return False
+    return True
+
+
 def perishable_score(room_pct: float | None, reset_at: float | None,
                      now: float | None = None) -> float | None:
     """Perishable score: how much room each hour of remaining window buys us.
@@ -553,17 +604,26 @@ async def window_headroom(ledger: Ledger, plan: Plan, q: Quota) -> dict:
         consumed = tokens
         basis = "ledger (tokens this window)"
 
-    if isinstance(facts.get("reported_pct_used"), float):
+    if (isinstance(facts.get("reported_pct_used"), float)
+            and reported_is_current(facts, q.period)):
         # The provider gave a percentage and no counts. It is the best number
         # available, so it wins outright — but there is no limit to report, and
         # inventing one from our own tally would be a guess dressed as a fact.
+        # Gated on freshness: a stale reading (reset_at gone, reported_at from
+        # a previous period bucket) would lock the bar at 100% forever once the
+        # window rolls over and no probe updates it, which is the bug at #45.
         return {**meta, "kind": q.kind, "pct_used": round(float(facts["reported_pct_used"]), 1),
                 "limit": None, "consumed": consumed,
                 "basis": "reported by provider (% only)",
                 "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
 
-    if facts.get("reported_remaining") is not None and isinstance(facts.get("reported_remaining"), float):
-        # A number the provider gave us always beats our own estimate.
+    if (facts.get("reported_remaining") is not None
+            and isinstance(facts.get("reported_remaining"), float)
+            and reported_is_current(facts, q.period)):
+        # A number the provider gave us always beats our own estimate -- when it
+        # is still about the window in force. The same staleness rule as above:
+        # a leftover `reported_remaining: 0` from a spent window would otherwise
+        # pin the bar at 100% for a fresh week.
         rem = float(facts["reported_remaining"])
         # A stated limit beats reconstructing one from our own consumption.
         total = (float(facts["reported_limit"])

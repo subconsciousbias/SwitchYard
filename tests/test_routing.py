@@ -60,8 +60,10 @@ def test_ordered_fill_then_spill():
         first, second = members[0], members[1]
         # How many of THIS member can run at once: its plan's limit, narrowed by
         # its own. The first forge member caps itself at 1 even though its plan
-        # allows 2, so "fill" means filling that, not the plan.
-        cap_first = reg.plan_of(first).cap_for(first)
+        # allows 2, so "fill" means filling that, not the plan. Settings are
+        # passed so the CLI-backhead headroom (when the plan is cli-backed) is
+        # applied here too, matching the picker and the litellm backstop.
+        cap_first = reg.plan_of(first).cap_for(first, reg.settings)
         assert picked[:cap_first] == [first.ref] * cap_first, picked
         assert picked[cap_first] == second.ref, picked
         return picked
@@ -104,8 +106,9 @@ def test_quota_exhaustion_removes_capacity():
         victim = reg.lane_members("forge")[0]
         victim_plan = reg.plan_of(victim)
         # What this member actually contributed: its plan's limit, narrowed by
-        # its own. Cooling the plan removes that, not the plan's nominal limit.
-        contributed = victim_plan.cap_for(victim)
+        # its own, with the same gate-headroom adjustment the picker applies.
+        # Cooling the plan removes that, not the plan's nominal limit.
+        contributed = victim_plan.cap_for(victim, reg.settings)
         await slots.cool_down(victim_plan.key, 900, "quota_exhausted")
         after = (await picker.capacity("forge"))["slots_available_now"]
         nxt = (await picker.pick("forge", None)).ref
@@ -563,19 +566,23 @@ def test_the_generated_config_declares_no_general_fallbacks():
     Context-window fallbacks are the allowed exception: a prompt bigger than the
     window cannot be served where it was sent at all.
 
-    The one router retry IS allowed: it routes through the picker via
-    `async_pre_routing_hook`, which swaps in a different member of the lane on
-    transient failure, so the retry delivers a real second attempt instead of
-    the same broken deployment. `disable_cooldowns: true` is the only thing
-    keeping the router from cooling the single-deployment group between
-    attempts, where the re-pick would never fire.
+    num_retries=0 is the spill contract: a failed request returns to the
+    caller fast, the caller's 429 retry re-enters through async_pre_call_hook
+    and gets a fresh pick against the cooldowns the failure just set. The
+    pinned litellm's Router.async_pre_routing_hook is the internal auto-
+    router hook and never iterates registered CustomLogger callbacks, so a
+    Switchyard re-pick there was never going to fire. A blind router retry
+    would have re-routed to the same single-member deployment the picker
+    just chose -- exactly the deployment that just 5xx'd.
+    disable_cooldowns: True is still required so the picker is not blocked
+    by a router-side cooldown on a single-deployment group.
     """
     from switchyard import gen_litellm
 
     cfg = gen_litellm.build(os.environ["SWITCHYARD_PLANS"])
     rs = cfg["router_settings"]
     assert rs["fallbacks"] == [], rs["fallbacks"]
-    assert cfg["litellm_settings"]["num_retries"] == 1, cfg["litellm_settings"]["num_retries"]
+    assert cfg["litellm_settings"]["num_retries"] == 0, cfg["litellm_settings"]["num_retries"]
     assert rs["disable_cooldowns"] is True, rs.get("disable_cooldowns")
     assert "context_window_fallbacks" in rs
 
@@ -588,8 +595,8 @@ def test_the_generated_config_declares_no_general_fallbacks():
                 assert t in names, (src, t, sorted(names)[:5])
     print(f"  no general fallbacks; {len(rs['context_window_fallbacks'])} "
           f"context-window entries, all naming real deployments; "
-          f"num_retries=1 + disable_cooldowns=True so the router's one retry "
-          f"re-routes through the picker")
+          f"num_retries=0 + disable_cooldowns=True: the caller's 429 retry "
+          f"re-enters through async_pre_call_hook, not via a router retry")
 
 
 def test_a_lane_board_separates_its_own_traffic_from_a_sibling_lanes():
@@ -776,6 +783,62 @@ def test_a_spent_plan_is_skipped_unless_it_may_use_extra_quota():
     assert moved.ref != ref, f"a spent plan must not keep the lease: {moved.ref}"
     assert allowed.ref == ref, f"use_extra_quota should keep using it: {allowed.ref}"
     print(f"  {ref} spent -> moved to {moved.ref}; with use_extra_quota it stays")
+
+
+def test_spent_plan_reenters_after_window_rollover():
+    """A 100% reading whose `reset_at` has already passed does NOT keep the plan
+    out of rotation.
+
+    The bug at #45: a plan with no utilization probe (Claude Code / Codex)
+    reports its target window at 100%, the window rolls over, the stale row
+    sits in Redis forever, the picker trusts it, the plan gets zero traffic,
+    and the vendor's client never writes a fresh number -- so the plan stays
+    "spent" permanently even though its weekly allowance just reset. The fix
+    is to gate `is_spent` on `reported_is_current`: a stale reading means
+    UNKNOWN, not spent, so the plan re-enters and the vendor's next response
+    (success or 429) is what settles the truth.
+
+    Mirror of `test_a_spent_plan_is_skipped_unless_it_may_use_extra_quota`,
+    but using `build_with_policy()` and supplying a `reset_at` in the past so
+    the staleness gate fires. A control case with a future reset_at still
+    skips -- the gate does not regress the happy path.
+    """
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        lane = "forge"
+        members = reg.lane_members(lane)
+        target = members[0]
+        plan = reg.plan_of(target)
+        assert not plan.use_extra_quota, "fixture plan should default to not overspending"
+
+        # 100% reported with reset_at already in the past -> reading is stale
+        # about a window that has rolled over. Pre-fix, the picker would see
+        # 100% and refuse; post-fix, it re-admits the plan.
+        past_reset = time.time() - 3600
+        await ledger.note_reported_percent(
+            plan.key, 100.0, past_reset, window=plan.quota.label)
+        pick_stale = await picker.pick(lane, None)
+        await picker.release(pick_stale.plan.key, pick_stale.request_id, pick_stale.ref)
+
+        # Control: same 100% reading, but reset_at in the future. The reading
+        # IS about the window in force, so the plan must still be skipped.
+        future_reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent(
+            plan.key, 100.0, future_reset, window=plan.quota.label)
+        pick_future = await picker.pick(lane, None)
+        await picker.release(pick_future.plan.key, pick_future.request_id, pick_future.ref)
+
+        return target.ref, pick_stale.ref, pick_future.ref
+
+    target_ref, stale_pick, future_pick = run(go())
+    assert stale_pick == target_ref, (
+        f"a stale 100% reading must not keep {target_ref} out of rotation: "
+        f"picked {stale_pick}")
+    assert future_pick != target_ref, (
+        f"a current 100% reading must still skip {target_ref}: "
+        f"picked {future_pick}")
+    print(f"  {target_ref}: stale 100% re-admits ({stale_pick}); "
+          f"future 100% still skips ({future_pick})")
 
 
 def test_a_mid_loop_followup_finishes_on_a_spent_plan():
@@ -2767,6 +2830,281 @@ def test_nesting_depth_at_limit_four_is_accepted():
     assert "exceeds max group nesting depth 4" in msg, msg
     assert "lane 'test' order[0]" in msg, msg
     print("  depth 1..4 accepted; depth 5 rejected at lane 'test' order[0]")
+
+
+def test_selfcheck_static_audit_runs_against_installed_litellm():
+    """The startup self-check must keep passing against whatever litellm is
+    installed in the image the gateway is built on.
+
+    Reuses the AST-audit half of switchyard.selfcheck (the static checks
+    only - the dynamic loopback probe runs inside the image at startup, not
+    in the offline suite). If litellm is not importable here, the test
+    prints a note and skips, the same way test_hot_reload.py handles its
+    litellm import. hooks.py is not safe to import offline (it pulls in
+    the real Redis client); selfcheck.py is safe because it touches
+    litellm only inside the audit functions.
+    """
+    import importlib
+    try:
+        litellm_pkg = importlib.import_module("litellm")
+        router_module = importlib.import_module("litellm.router")
+    except Exception as exc:
+        print(f"  skipped: litellm not importable ({type(exc).__name__}: {exc})")
+        return
+
+    from switchyard import selfcheck as sc
+
+    # Each audit function raises sc._CheckFailed(SystemExit) on failure; a
+    # regression that made any of them pass while it shouldn't would be
+    # caught here, on every checkout that has litellm installed. The
+    # functions read the installed source directly, so a selfcheck test
+    # is by definition a test against the actual shipped image.
+    import inspect
+    router_src = inspect.getsource(router_module)
+    try:
+        sc._audit_router_pre_routing_hook(router_src)
+        sc._audit_acompletion_through_fallbacks(router_src)
+        sc._audit_num_retries_early_raise(router_src)
+        sc._audit_proxy_pre_call_hook_present()
+    except sc._CheckFailed as exc:
+        raise AssertionError(
+            f"installed litellm {litellm_pkg.__name__} failed a self-check "
+            f"audit: {exc}"
+        )
+    print(f"  installed litellm: all four static audits (pre-routing-hook "
+          f"isolated, acompletion->fallbacks, num_retries<=0 short-circuit, "
+          f"proxy pre-call-hook present) pass")
+
+
+def test_the_generated_backstop_matches_what_the_picker_admits():
+    """The litellm per-deployment `max_parallel_requests` backstop a
+    direct-name caller races against is an UPPER BOUND on what the picker
+    admits through lane routing. Two distinct knobs compose:
+
+      backstop  = plan.cap_for(model, settings)
+                   - the configured ceiling, headroom-reduced for CLI-backed
+                     plans, narrowed further by any model.max_parallel.
+                   - written into the generated litellm config; what
+                     litellm's own per-deployment semaphore will enforce.
+
+      picker admit for the model =
+                  min(policy.effective(plan).cap,
+                      model.max_parallel or effective_plan_cap)
+                   - the plan's learned/headroom cap further clamped by
+                     the model's own max_parallel; what the picker's
+                     `try_claim` checks atomically in slots.lua.
+
+    The invariant we want is `backstop >= picker_admit_for_model`:
+      * for both API and CLI-backed plans, `cap_for()` is the configured
+        ceiling (or narrower model cap), and `effective()` is the plan
+        cap the learner has seen; the configured ceiling is the seed for
+        the learner, so the inequality holds by construction once the
+        learner has anything to say.
+      * for CLI-backed plans, `cap_for()` is `min(max_parallel,
+        model_cap, max(1, max_parallel - headroom))` and `effective()`
+        is the same `headroom_cap` further clamped by the learner.
+        The learner can pull `effective()` below the headroom-reduced
+        ceiling, in which case the backstop exceeds the picker admit
+        and that is FINE: the picker rejects on its own (a 429 the
+        caller has to retry into fresh cooldowns), and the litellm
+        backstop just stays where the operator put it.
+
+    Mis-alignment in the OTHER direction — backstop below picker admit —
+    would be the spurious-429 race issue #47 complains about: the
+    sidecar's gate is the limiter, the picker claims a slot the sidecar
+    already gave away, the sidecar answers 429. We never want that, so
+    the test asserts `backstop >= picker_admit_for_model` and emits
+    one violation per divergence.
+
+    Coincidentally, on the example config the picker admit and the
+    backstop coincide for every plan and model: the configured ceiling
+    is the seed, the learner is at the seed (no rejections have come in
+    yet for this run), and the model cap already narrows to the headroom
+    floor. A future config that bumps a CLI plan past 2 connections and
+    then sees the learner pull down would diverge, and that's exactly
+    the regression `test_backstop_is_an_upper_bound_under_learner_pull_
+    down` exercises.
+    """
+    from switchyard import gen_litellm
+    from switchyard.picker import Picker
+    from switchyard.policy import CapacityPolicy
+    from switchyard.slots import SlotTable
+    from switchyard.usage import Ledger
+    from tests.fake_redis import FakeRedis
+
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    ledger = Ledger(redis)
+    policy = CapacityPolicy(redis, reg.settings, ledger)
+    picker = Picker(reg, slots, policy)
+
+    cfg = gen_litellm.build(os.environ["SWITCHYARD_PLANS"])
+
+    async def picker_admits():
+        return {
+            (plan.key, model.key): (
+                # Picker admit for this model: the plan's effective cap
+                # intersected with the model's own max_parallel (when set).
+                # try_claim in slots.lua enforces exactly this pair.
+                await picker._cap(model, allow_spent=False)
+            )[0] if model.max_parallel is None else
+                min((await picker._cap(model, allow_spent=False))[0], model.max_parallel)
+            for plan in reg.plans.values()
+            for model in plan.models.values()
+        }
+
+    admits = run(picker_admits())
+
+    violations = []
+    for plan in reg.plans.values():
+        for model in plan.models.values():
+            backstop = plan.cap_for(model, reg.settings)
+            picker_admit = admits[(plan.key, model.key)]
+            for cfg_model in cfg["model_list"]:
+                if (cfg_model["model_info"].get("switchyard_plan") == plan.key
+                        and cfg_model["model_info"].get("switchyard_model") == model.key):
+                    emitted = cfg_model["litellm_params"]["max_parallel_requests"]
+                    break
+            else:
+                emitted = None
+            assert emitted is not None, (plan.key, model.key)
+            if emitted != backstop:
+                violations.append(
+                    f"{plan.key}/{model.key}: emitted backstop={emitted}, "
+                    f"cap_for says {backstop} - gen_litellm is out of sync "
+                    f"with the cap_for contract"
+                )
+            if backstop < picker_admit:
+                violations.append(
+                    f"{plan.key}/{model.key}: backstop={backstop} below "
+                    f"picker admit={picker_admit} - direct-name caller "
+                    f"races the sidecar for the headroom slot"
+                )
+    assert violations == [], violations
+
+    # Specifically: the Claude Max plan's opus model is CLI-backed with
+    # max_parallel=2; the picker admits 1 (headroom-reduced) and the
+    # backstop MUST be 1 too. Regression guard for the mis-alignment WS-3
+    # flagged (cap_for says 1, gen_litellm must emit 1).
+    opus_backstop = next(
+        m["litellm_params"]["max_parallel_requests"] for m in cfg["model_list"]
+        if m["model_info"].get("switchyard_plan") == "claude-max"
+        and m["model_info"].get("switchyard_model") == "opus"
+    )
+    assert opus_backstop == 1, opus_backstop
+
+    # And a 1-connection CLI plan must not be floored below 1 (would lock
+    # the operator out of a slot they own). claude-max/fable is exactly
+    # that case: model max_parallel=1, plan is_cli_backed, so the floor
+    # `max(1, max_parallel - headroom)` gives 1.
+    fable_backstop = next(
+        m["litellm_params"]["max_parallel_requests"] for m in cfg["model_list"]
+        if m["model_info"].get("switchyard_plan") == "claude-max"
+        and m["model_info"].get("switchyard_model") == "fable"
+    )
+    assert fable_backstop == 1, fable_backstop
+
+    print(f"  generated backstop is an upper bound on picker admit for all "
+          f"{len(reg.models)} models; opus backstop=1 (headroom applied), "
+          f"fable backstop=1 (model cap already at floor)")
+
+
+def test_backstop_is_an_upper_bound_under_learner_pull_down():
+    """The litellm backstop is an upper bound, NOT a tight match.
+
+    Build a CLI-backed plan whose `max_parallel` is large enough that the
+    headroom-reduced backstop is HIGHER than the picker's admitted cap.
+    With max_parallel=4, headroom=1, the backstop is 3. Pull the learner
+    down to 2 with two consecutive connection-limit refusals and the
+    picker admit drops to 2. The backstop stays at 3 - direct-name
+    traffic still sees three concurrent slots available, the picker
+    admits two, and the headroom slot between them stays empty so the
+    sidecar's claim/release race keeps being absorbed.
+
+    The reverse direction would be the bug: a backstop below the picker
+    admit puts the sidecar's gate ahead of the gateway's slot table, so
+    a direct-name caller races the picker for the headroom slot and the
+    sidecar answers 429. The invariant `backstop >= picker_admit` rules
+    that out and is exercised explicitly here.
+
+    A model whose own `max_parallel` is wider than the headroom ceiling
+    is what makes the divergence observable: if the model narrows first
+    (the example config does that for every claude-max model), the
+    headroom never enters cap_for at all and the backstop already
+    matches the model-level cap, leaving no room for the learner to
+    diverge from the backstop on this plan.
+    """
+    from dataclasses import replace
+    from switchyard.models import Model, Quota
+    from switchyard.picker import Picker
+    from switchyard.policy import CapacityPolicy
+    from switchyard.slots import SlotTable
+    from switchyard.usage import Ledger
+    from tests.fake_redis import FakeRedis
+
+    reg = models.load()
+    # Synthetic CLI-backed plan with a single model whose own max_parallel
+    # is wider than the headroom ceiling; the headroom floor must do the
+    # narrowing or we never see backstop > picker admit when the learner
+    # pulls down. Existing example plans all narrow at the model level.
+    unbounded = Model(key="anything", plan_key="claude-max",
+                      model="openai/anthropic-selfcheck", label="anything")
+    plan = replace(
+        reg.plans["claude-max"],
+        configured_parallel=4,
+        max_parallel_ceiling=4,
+        models={"anything": unbounded},
+    )
+    plans = {**reg.plans, plan.key: plan}
+    reg = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    ledger = Ledger(redis)
+    policy = CapacityPolicy(redis, reg.settings, ledger)
+    picker = Picker(reg, slots, policy)
+
+    async def go():
+        # Two consecutive refusals at concurrency 4 leave the learned
+        # cap at 2. The learner applies `min(new, current)` on each call
+        # (policy.py:note_rejection), so the second halving at the same
+        # at_concurrency is a no-op: new=int(4*0.5)=2 and current=2
+        # already, so stored stays 2. An additive probe-up would still
+        # be bounded by the explicit `max_parallel_ceiling=4`, so the
+        # floor we care about (`learned == 2`) holds when effective()
+        # runs.
+        await policy.learner.note_rejection(plan, at_concurrency=4)
+        await policy.learner.note_rejection(plan, at_concurrency=4)
+        await policy.learner.note_rejection(plan, at_concurrency=4)
+        # Effective is what the picker uses in _cap; it MUST be below
+        # the headroom ceiling once the learner has seen enough.
+        eff = await policy.effective(plan)
+        # Build the per-model backstop the way gen_litellm does.
+        first_model = next(iter(plan.models.values()))
+        backstop = plan.cap_for(first_model, reg.settings)
+        # And the picker admit, the floor traffic lands on via lane routing.
+        picker_admit = eff.cap
+        # And the slot-table side the picker uses directly.
+        _, picker_cap_reason = await picker._cap(first_model, allow_spent=False)
+        return backstop, picker_admit, picker_cap_reason, eff
+
+    backstop, picker_admit, picker_reason, eff = run(go())
+
+    # The configured ceiling, narrowed by headroom, is what cap_for emits.
+    assert backstop == 3, backstop
+    # The learner has pulled the picker admit below the backstop; this is
+    # the divergence case the original test missed (the example config
+    # never tripped it because claude-max's configured=2 is already at the
+    # headroom ceiling for headroom=1, so the backstop and the admit
+    # always coincided).
+    assert picker_admit < backstop, (picker_admit, backstop)
+    # And the invariant the contract promises.
+    assert backstop >= picker_admit, (backstop, picker_admit)
+    # The learner's floor is what the picker is reading.
+    assert picker_reason.startswith("learned") or "learned" in picker_reason, picker_reason
+    print(f"  cli plan configured=4 model-no-narrow -> backstop={backstop} "
+          f"(headroom=1), picker admit={picker_admit} ({picker_reason}); "
+          f"backstop >= picker admit holds (no spurious 429)")
 
 
 if __name__ == "__main__":

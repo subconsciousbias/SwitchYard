@@ -136,6 +136,39 @@ def test_escalated_cooldown_uses_supplied_base():
     assert escalated_cooldown(15, 2) == 30
 
 
+def test_sidecar_at_capacity_is_concurrency_with_twenty_second_sit_out():
+    """SwitchYard's bridges return {"detail": "sidecar at capacity (N)"} when the
+    gate is full — a real concurrency refusal, not a provider rate limit. The
+    CONCURRENCY outcome feeds the concurrency learner (ledger + hooks) and
+    gives the standard 20s sit-out, matching MiniMax code 1041.
+    """
+    body = {"detail": "sidecar at capacity (4)"}
+    v = classify(429, "sidecar at capacity (4)", body=body)
+    assert v.outcome is Outcome.CONCURRENCY, v
+    assert v.cooldown_seconds == 20, v
+
+
+def test_provider_rate_limit_is_unaffected_by_the_new_pattern():
+    """A Z.AI-flavoured 429 carrying code 1302 — and prose with no 'sidecar'
+    in it — must still classify RATE_LIMITED. The new alternative does not
+    pull genuine provider rate limits into CONCURRENCY.
+    """
+    v = classify(429, "rate limit exceeded", family="zai",
+                 body={"error": {"code": "1302", "message": "rate limit exceeded"}})
+    assert v.outcome is Outcome.RATE_LIMITED, v
+
+
+def test_capacity_adjacent_provider_prose_does_not_trigger_concurrency():
+    """A 429 whose body merely mentions 'capacity' in provider prose must not
+    match — the regex requires the exact 'sidecar at capacity' phrase that only
+    our own bridges emit. A loose 'at capacity' would collide with provider
+    error messages and is intentionally absent from the pattern.
+    """
+    body = {"error": {"message": "your account has reached its capacity limit"}}
+    v = classify(429, "your account has reached its capacity limit", body=body)
+    assert v.outcome is Outcome.RATE_LIMITED, v
+
+
 if __name__ == "__main__":
     passed = 0
     for name, fn in sorted(globals().items()):

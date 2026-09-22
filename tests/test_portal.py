@@ -775,6 +775,78 @@ def test_per_group_writer_drops_unknown_refs_from_hash():
         assert refs == ["minimax-ultra/m3"], refs
 
 
+def test_perishable_writer_treats_stale_target_and_gate_as_unknown():
+    """Stale probe facts must not score a member or trip its 5h gate.
+
+    A plan whose vendor client never re-polls leaves a row like
+    `reported_pct_used: 95, reset_at: <past>` in Redis. Before the
+    `reported_is_current` gate, the writer happily read the 95% as
+    `target_pct` and used it to compute room=5 (low perishable score), AND
+    the matching 5h row was a `gate5h=1` flag that filtered the member out
+    of new-session picks. Both consequences are wrong: the plan re-enters
+    rotation only by accident, never by design, and a probe that has gone
+    silent can suppress the plan forever -- the same over-exclusion the
+    picker's `is_spent` fix addresses on the routing side.
+
+    The writer now gates `target_pct`, `target_reset` and `gate_pct` on
+    `reported_is_current`. Stale target -> room=None -> perishable_score
+    returns None -> the picker puts the member in the unscored bucket.
+    Stale gate -> `this_plan_gate5h` is False -> the member is not flagged
+    gate5h. Both `unknown` and unscored entries are absent from the
+    `entries` map the writer commits, so the picker treats them the same:
+    sorted last, never blocked.
+    """
+    import asyncio
+    from dataclasses import replace
+    from switchyard import models
+    from switchyard.policy import CapacityPolicy
+    from switchyard.usage import Ledger
+    from switchyard.portal.app import _recompute_perishable_for_plan
+    from switchyard.slots import SlotTable
+
+    async def go():
+        # Same fixture pattern as the perishable tests in test_routing.py:
+        # an apex-shaped perishable lane with two plans, only one of which
+        # has any probe facts at all. claude-max/fable carries the stale
+        # rows; openai/sol has no rows and stays the unknown baseline.
+        reg = models.load()
+        redis = FakeRedis()
+        slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+        ledger = Ledger(redis)
+        CapacityPolicy(redis, reg.settings, ledger)
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"], key="perishable-test", tail=[],
+            strategy="perishable", description="")
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+
+        plan = reg2.plans["claude-max"]
+        # Stale target (weekly) and stale gate (5h): reset_at in the past.
+        # Without the gate, `target_pct = 95` -> room = 5 -> a low perishable
+        # score, AND `gate_pct = 95 > 90` -> this_plan_gate5h = True. With
+        # the gate, both reads are treated as unknown. use `time.time() -
+        # 8 * 86400` (8 days ago) for weekly, which is well outside the
+        # current week bucket even by the period_bounds rule.
+        import time as _time
+        past_reset = _time.time() - 8 * 86400
+        await ledger.note_reported_percent("claude-max", 95.0, past_reset,
+                                           window="weekly")
+        await ledger.note_reported_percent("claude-max", 95.0, past_reset,
+                                           window="5h")
+        await _recompute_perishable_for_plan(reg2, ledger, plan)
+        stored = await ledger.get_lane_order("perishable-test")
+        return stored
+
+    stored = asyncio.run(go())
+    # The writer wrote nothing -- every member's ratio is unknown, so neither
+    # is in the scored set. `get_lane_order` returns None for a missing key,
+    # which is the "fall back to config order" signal the picker reads.
+    assert stored is None, stored
+    print("  stale target + stale gate: writer drops the entry, "
+          "picker falls back to config order")
+
+
 if __name__ == "__main__":
     # Plain-script runner: discovers tests from globals(), like the rest of
     # tests/*.py. See CLAUDE.md — appending below this block would silently

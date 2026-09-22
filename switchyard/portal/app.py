@@ -29,6 +29,7 @@ from ..usage import (
     headroom,
     model_effective_cost_per_mtok,
     perishable_score,
+    reported_is_current,
 )
 
 import logging
@@ -199,24 +200,42 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
     # Read this plan's facts ONCE; every affected lane shares them. A plan
     # without a target window has nothing to rank with, so skip the whole
     # trigger.
-    target_label = next(
-        (q.label for q in plan.quotas if q.role == "target"),
-        plan.quotas[0].label if plan.quotas else None)
-    gate_label = next(
-        (q.label for q in plan.quotas if q.period == "rolling_5h"), None)
+    target_quota = next(
+        (q for q in plan.quotas if q.role == "target"),
+        plan.quotas[0] if plan.quotas else None)
+    target_label = target_quota.label if target_quota else None
+    gate_quota = next(
+        (q for q in plan.quotas if q.period == "rolling_5h"), None)
+    gate_label = gate_quota.label if gate_quota else None
     if not target_label:
         return
 
     target_facts = await ledger.window_facts(plan.key, target_label)
-    target_pct = _as_float(target_facts.get("reported_pct_used"))
-    target_reset = _as_float(target_facts.get("reset_at"))
+    # Gating each reading on `reported_is_current` keeps a stale probe row
+    # from poisoning the perishable rank. The bug at #45 is that the writer
+    # leaves `nvt_stats:100` in Redis for a plan whose vendor client never
+    # polls (Claude Code, Codex); the stale pct would otherwise pin this
+    # plan at zero room forever, or keep its 5h gate tripped even after the
+    # burst window has rolled over. Stale means UNKNOWN, not zero.
+    target_current = reported_is_current(target_facts, target_quota.period)
+    target_pct = (_as_float(target_facts.get("reported_pct_used"))
+                  if target_current else None)
+    target_reset = (_as_float(target_facts.get("reset_at"))
+                    if target_current else None)
     gate_facts = (await ledger.window_facts(plan.key, gate_label)
                   if gate_label else {})
-    gate_pct = _as_float(gate_facts.get("reported_pct_used"))
+    gate_current = (reported_is_current(gate_facts, gate_quota.period)
+                    if gate_quota else False)
+    gate_pct = (_as_float(gate_facts.get("reported_pct_used"))
+                if gate_current else None)
+    # Stale gate stops filtering members out of perishable lanes: the picker
+    # only trusts `gate5h` as a gate, and an old `>90%` row is the kind of
+    # false positive that quietly suppresses a plan until its next poll.
     this_plan_gate5h = gate_pct is not None and gate_pct > 90
     scoped = await ledger.window_facts(plan.key, "weekly_scoped")
+    scoped_current = reported_is_current(scoped, "week")
     scoped_pct = (_as_float(scoped.get("reported_pct_used"))
-                  if scoped else None)
+                  if scoped_current else None)
 
     for lane in affected_lanes:
         # Read the previous lane order once: it carries the OTHER plans'
@@ -463,7 +482,14 @@ async def collect_plans() -> list[dict]:
                 "label": m.display,
                 "provider_model": m.model,
                 "enabled": m.enabled,
-                "cap": plan.cap_for(m),
+                # Pass `reg.settings` so CLI-backed plans get the same
+                # headroom-reduced cap the litellm per-deployment
+                # backstop and the live picker admit both use; otherwise
+                # the board draws the plan's nominal max_parallel while
+                # the lane actually admits headroom fewer, and the row's
+                # "cap" disagrees with the row's `capacity` block above
+                # by exactly the headroom value.
+                "cap": plan.cap_for(m, reg.settings),
                 "narrowed": m.max_parallel is not None,
                 "context_window": m.context_window,
                 "lanes": reg.lanes_using(m),

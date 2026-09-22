@@ -1,0 +1,8 @@
+# Per-workspace disposable Docker containers via the global orca-tasks
+# scaffold (~/.local/share/orca-tasks). The scripts live OUTSIDE the repo on
+# purpose — do not copy them in. Panes render natively with this recipe.
+environmentRecipes:
+  - id: docker-task
+    name: Docker Task Container
+    create: /Users/temporalis/.local/share/orca-tasks/recipe-create.sh
+    destroy: /Users/temporalis/.local/share/orca-tasks/recipe-destroy.sh
