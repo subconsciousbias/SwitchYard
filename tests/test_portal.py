@@ -142,6 +142,49 @@ def test_pacing_fragment_carries_runtime_override_banner():
         assert "plans.yaml says" in html, html
 
 
+def test_capacity_row_shows_failing_chip_when_streak_meets_alert():
+    """A plan with a transient-failure streak at the alert threshold shows the
+    'failing · Nx' chip. Below the threshold it stays absent.
+
+    The chip is the operator's only signal that the escalated-cooldown
+    ladder has tripped: a working picker would otherwise quietly bounce
+    traffic off the plan with no warning on the board.
+    """
+    with TestClient(portal_app.app) as client:
+        # plans.example.yaml ships with transient_breaker.streak_alert: 3,
+        # so a streak of 3 is exactly the alert threshold.
+        settings = portal_app.state["registry"].settings
+        assert settings.transient_breaker.streak_alert == 3, \
+            settings.transient_breaker
+
+        # Pick any plan that is on a lane the capacity fragment renders.
+        plan = portal_app.state["registry"].plans["minimax-ultra"]
+        # The fragment reads transient_streak via the FakeRedis the slot
+        # table was built against. Set the string directly on its store —
+        # `(value, expiry)` — so we don't have to await an async set from a
+        # sync test.
+        fake = portal_app.state["slots"].redis
+
+        # Streak 1 — below the threshold, chip absent.
+        fake.strings[f"sy:tfail:{plan.key}"] = ("1", None)
+        html = client.get("/fragments/capacity").text
+        assert "failing" not in html, html
+
+        # Streak 3 — at the threshold, chip present, marked warn, not bad.
+        fake.strings[f"sy:tfail:{plan.key}"] = ("3", None)
+        html = client.get("/fragments/capacity").text
+        assert "failing · 3x" in html, html
+        # The chip is warn (not bad): the plan is still accepting work, just
+        # sitting on the ladder.
+        assert 'class="tag warn"' in html, html
+        assert 'title="consecutive transient failures' in html, html
+
+        # Streak 7 — chip carries the actual streak, not the threshold.
+        fake.strings[f"sy:tfail:{plan.key}"] = ("7", None)
+        html = client.get("/fragments/capacity").text
+        assert "failing · 7x" in html, html
+
+
 if __name__ == "__main__":
     # Plain-script runner: discovers tests from globals(), like the rest of
     # tests/*.py. See CLAUDE.md — appending below this block would silently

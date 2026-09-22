@@ -82,6 +82,7 @@ def fixture(reg):
                 "model_in_flight_elsewhere": min(cap, 1) if i == 3 else 0,
                 "model_in_flight_direct": 0,
                 "model_cap": model.max_parallel,
+                "transient_streak": 3 if i == 0 else 0,
                 "lanes_sharing": ["judge"] if i == 3 else [],
             })
         lanes.append({

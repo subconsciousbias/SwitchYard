@@ -543,13 +543,21 @@ def test_the_generated_config_declares_no_general_fallbacks():
 
     Context-window fallbacks are the allowed exception: a prompt bigger than the
     window cannot be served where it was sent at all.
+
+    The one router retry IS allowed: it routes through the picker via
+    `async_pre_routing_hook`, which swaps in a different member of the lane on
+    transient failure, so the retry delivers a real second attempt instead of
+    the same broken deployment. `disable_cooldowns: true` is load-bearing: with
+    `allowed_fails=1` the router would otherwise cool the single-deployment
+    group between attempts and the re-pick would never fire.
     """
     from switchyard import gen_litellm
 
     cfg = gen_litellm.build(os.environ["SWITCHYARD_PLANS"])
     rs = cfg["router_settings"]
     assert rs["fallbacks"] == [], rs["fallbacks"]
-    assert rs.get("num_retries", 0) == 0 or cfg["litellm_settings"]["num_retries"] == 0
+    assert cfg["litellm_settings"]["num_retries"] == 1, cfg["litellm_settings"]["num_retries"]
+    assert rs["disable_cooldowns"] is True, rs.get("disable_cooldowns")
     assert "context_window_fallbacks" in rs
 
     # Every deployment a context fallback names must be a real one, or LiteLLM
@@ -560,7 +568,9 @@ def test_the_generated_config_declares_no_general_fallbacks():
             for t in targets:
                 assert t in names, (src, t, sorted(names)[:5])
     print(f"  no general fallbacks; {len(rs['context_window_fallbacks'])} "
-          f"context-window entries, all naming real deployments")
+          f"context-window entries, all naming real deployments; "
+          f"num_retries=1 + disable_cooldowns=True so the router's one retry "
+          f"re-routes through the picker")
 
 
 def test_a_lane_board_separates_its_own_traffic_from_a_sibling_lanes():
@@ -901,6 +911,116 @@ def test_a_pinned_followup_waits_then_spills_to_a_peer():
     print(f"  pinned to {pinned} (wait=3s): a free slot in <3s lands here; "
           f"a held plan spills to {spilled_to} after the deadline; a cooled "
           f"plan spills to {cooled_to} without waiting")
+
+
+def test_pick_honours_exclusions():
+    """A failed member is excluded from the candidate set on a re-pick.
+
+    The pre-routing hook gets the same lane / session / tools / pin as the
+    failed attempt, but skips the broken member. The remaining members are
+    tried in order; the lease is NOT honoured when the held plan is the one
+    excluded, so the session follows capacity rather than getting stranded on
+    a broken plan.
+    """
+    async def go():
+        reg, slots, picker = build()
+        lane = "forge"
+        members = reg.lane_members(lane)
+        assert len(members) >= 2, "need at least two members for an exclusion"
+
+        first = members[0]
+        second = members[1]
+        assert first.ref != second.ref
+
+        # Excluding only the first member must pick the second, in order.
+        picked = await picker.pick(lane, None, exclude=frozenset({first.ref}))
+        assert picked.ref == second.ref, (picked.ref, second.ref)
+        await picker.release(picked.plan.key, picked.request_id, picked.ref)
+
+        # Excluding every member must surface LaneSaturated — a re-pick that
+        # returns a member would be the wrong answer (the failure would just
+        # happen again), and 429 is the only honest thing to send back.
+        all_refs = frozenset(m.ref for m in members)
+        try:
+            await picker.pick(lane, None, exclude=all_refs)
+        except LaneSaturated as exc:
+            return first.ref, second.ref, str(exc)
+        raise AssertionError("excluding every member must raise LaneSaturated")
+
+    first, second, msg = run(go())
+    print(f"  excluded {first} -> picked {second}; "
+          f"excluding all -> LaneSaturated ({msg.split(': ', 1)[1]})")
+
+
+def test_repick_moves_the_session_lease_and_returns_not_sticky():
+    """A re-pick on a broken lease moves the session to the new plan.
+
+    The transient-failure path must NOT drop_lease — that would strand the
+    session on a peer mid-loop and break tool-call id provenance — but it
+    must NOT honour the held lease either. The successful re-pick's
+    `set_lease` moves the session to its new plan, and the returned Pick
+    reads as not-sticky because the held plan was the one that just failed.
+    """
+    async def go():
+        reg, slots, picker = build()
+        lane = "forge"
+        session = "sess-repick"
+        members = reg.lane_members(lane)
+        assert len(members) >= 2, "need two members to make a re-pick meaningful"
+        first = members[0]
+        second = members[1]
+        assert first.ref != second.ref
+
+        # Lease the session to the first member, the way a live conversation
+        # would have done before the broken call.
+        await slots.set_lease(session, first.ref, reg.settings.lease_ttl_seconds)
+        held_before = await slots.get_lease(session)
+        assert held_before == first.ref, held_before
+
+        # Re-pick excluding the failed member. The lease must NOT be honoured
+        # (the held plan is the broken one), but it must NOT be dropped
+        # either — the successful pick will re-lease to its new plan.
+        picked = await picker.pick(lane, session, exclude=frozenset({first.ref}))
+        assert picked.ref == second.ref, (picked.ref, second.ref)
+        assert not picked.sticky, "a re-pick past the held plan is not sticky"
+
+        # The successful pick moved the session lease.
+        held_after = await slots.get_lease(session)
+        assert held_after == picked.ref, (held_after, picked.ref)
+        assert held_after != first.ref
+
+        await picker.release(picked.plan.key, picked.request_id, picked.ref)
+        return first.ref, second.ref, picked.ref, held_before, held_after
+
+    failed, _, new_ref, before, after = run(go())
+    assert before == failed, before
+    assert after == new_ref, (after, new_ref)
+    print(f"  lease moved from {before} (failed) to {after} (new pick); "
+          f"re-pick returned not-sticky")
+
+
+def test_pick_raises_lane_saturated_when_every_member_is_excluded():
+    """The narrowest exclusion — every member — must still surface a 429.
+
+    Whatever the picked shape, the pre-routing hook has to be honest with the
+    caller when the re-pick cannot place a request. `LaneSaturated` is the
+    pre-call hook's signal to convert that into a 429, so this test confirms
+    the same exception survives the exclude path.
+    """
+    async def go():
+        reg, slots, picker = build()
+        lane = "local"
+        members = reg.lane_members(lane)
+        all_refs = frozenset(m.ref for m in members)
+        try:
+            await picker.pick(lane, None, exclude=all_refs)
+        except LaneSaturated as exc:
+            return all_refs, str(exc)
+        raise AssertionError("local lane must refuse an all-excluded pick")
+
+    refs, msg = run(go())
+    print(f"  excluding every member of `local` ({sorted(refs)}) -> "
+          f"LaneSaturated ({msg.split(': ', 1)[1]})")
 
 
 if __name__ == "__main__":

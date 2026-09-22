@@ -23,6 +23,12 @@ K_LEASE = "sy:lease:{session}"
 # confused. Written inside the claim script so it cannot disagree with the
 # counters, and dropped on release.
 K_INFLIGHT_LANE = "sy:inflight:lane:{plan}"
+# Consecutive transient-failure counter, per plan. Drives the escalated
+# cooldown ladder (60s, 120s, 240s, …) and the portal's "failing · Nx" chip.
+# TTL 7200s sliding, so a plan that goes silent long enough for its streak to
+# fall out of memory resets to zero — the next failure starts at streak 1,
+# not at "what it was 90 minutes ago".
+K_TFAIL = "sy:tfail:{plan}"
 
 # Two counters, claimed atomically. The PLAN's limit caps total concurrency; a
 # MODEL's optional limit caps how much of that one model may take. Checking a
@@ -190,3 +196,33 @@ class SlotTable:
 
     async def drop_lease(self, session: str) -> None:
         await self.redis.delete(K_LEASE.format(session=session))
+
+    # -- transient-failure streak -----------------------------------------
+    # The escalated-cooldown ladder and the board's failing chip both need to
+    # know how many TRANSIENT failures in a row a plan has produced. We track
+    # that here so the hook does not have to invent a counter, and so a plan
+    # that was merely quiet for two hours does not look like it has been
+    # failing this whole time.
+    async def note_transient_failure(self, plan: str) -> int:
+        """Increment the streak and refresh its TTL. Returns the new value."""
+        key = K_TFAIL.format(plan=plan)
+        # INCR is atomic; the trailing EXPIRE refreshes the TTL so a quiet
+        # gap of TTL seconds drops the counter entirely instead of carrying
+        # the streak forward forever.
+        value = await self.redis.incr(key)
+        await self.redis.expire(key, 7200)
+        return int(value)
+
+    async def transient_failure_streak(self, plan: str) -> int:
+        """0 when the plan is healthy or its counter has expired."""
+        raw = await self.redis.get(K_TFAIL.format(plan=plan))
+        if raw is None:
+            return 0
+        raw = raw.decode() if isinstance(raw, bytes) else raw
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    async def reset_transient_failures(self, plan: str) -> None:
+        await self.redis.delete(K_TFAIL.format(plan=plan))
