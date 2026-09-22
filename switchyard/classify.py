@@ -274,3 +274,21 @@ def inspect_success_payload(family: str | None, payload: Any) -> Verdict | None:
     if isinstance(err, dict) and (err.get("message") or err.get("code")):
         return classify(200, str(err.get("message") or ""), family=family, body=doc)
     return None
+
+
+def escalated_cooldown(base: int, streak: int, cap: int = 1800) -> int:
+    """Double the sit-out each consecutive transient failure, capped at `cap`.
+
+    First failure is exactly `base` (so today's behaviour is preserved: a 5xx
+    still cools for 60s on its first appearance). Each subsequent failure in
+    a row doubles — 60, 120, 240, 480, 960, … — until the cap is hit. The
+    cap stops a long outage from parking a plan for an entire afternoon; the
+    ladder is what makes a broken seat stop getting re-fed every 60s.
+
+    The streak itself is reset by the first successful call against the plan,
+    so the cooldown returns to `base` after recovery — no manual un-cool
+    required.
+    """
+    if streak <= 1:
+        return base
+    return min(base * (2 ** (streak - 1)), cap)

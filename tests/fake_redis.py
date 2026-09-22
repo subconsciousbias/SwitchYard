@@ -158,7 +158,37 @@ class FakeRedis:
         return True
 
     # -- the claim script --------------------------------------------------
-    def register_script(self, _src):
+    def register_script(self, src):
+        # Dispatch on the Lua source so the fake can shadow both the original
+        # claim script and the two added in slots.py (atomic INCR+EXPIRE, and
+        # the atomic INCR+EXPIRE+SET-cooldown pair that backs the escalating
+        # ladder). Real Redis compiles each script once; the fake has to
+        # match by hand.
+        if "BUMP_AND_COOL" in src:
+            async def bump_and_cool(keys, args):
+                streak_key, cool_key = keys
+                streak_ttl, base, cap, reason, now = args
+                v = await self.incr(streak_key)
+                await self.expire(streak_key, int(streak_ttl))
+                # Mirror the Lua ladder: base * 2**(streak-1), capped.
+                cooldown = int(base)
+                if v > 1:
+                    doubled = int(base) * (2 ** (v - 1))
+                    cooldown = cap if doubled > cap else doubled
+                # Match cool_down's "{reason}|{until}" shape and TTL.
+                until = int(now) + cooldown
+                await self.set(cool_key, f"{reason}|{until}",
+                               ex=max(1, int(cooldown)))
+                return v
+            return bump_and_cool
+        if "BUMP_STREAK" in src:
+            async def bump_streak(keys, args):
+                streak_key = keys[0]
+                v = await self.incr(streak_key)
+                await self.expire(streak_key, int(args[0]))
+                return v
+            return bump_streak
+
         async def claim(keys, args):
             inflight_key, cool_key, model_key, lane_key = keys
             rid, now, plan_cap, stale_before, _ttl, model_cap, lane = args

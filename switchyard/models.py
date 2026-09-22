@@ -132,6 +132,25 @@ class Pacing:
 
 
 @dataclass(frozen=True)
+class TransientBreaker:
+    """Per-plan circuit-breaker ladder for transient (5xx/timeout) failures.
+
+    A plan that has just produced one 5xx still cools for the configured base
+    (60s by default — see classify.Outcome.TRANSIENT); on the second in a row
+    the ladder doubles the sit-out, then doubles again on the third, capped
+    at `max_seconds` so a multi-hour outage cannot park the plan for the rest
+    of the day. The streak is reset by the first successful call against the
+    plan, so recovery is automatic. The board surfaces a 'failing · Nx' chip
+    once the streak reaches `streak_alert`, which is the operator's cue that
+    the re-pick-and-cool loop is doing its job but the plan itself needs a
+    look.
+    """
+    enabled: bool = True
+    max_seconds: int = 1800
+    streak_alert: int = 3
+
+
+@dataclass(frozen=True)
 class Settings:
     drain_within_days: int = 21
     lease_ttl_seconds: int = 1800
@@ -151,6 +170,7 @@ class Settings:
     default_cooldown_seconds: int = 900
     concurrency_learning: ConcurrencyLearning = field(default_factory=ConcurrencyLearning)
     pacing: Pacing = field(default_factory=Pacing)
+    transient_breaker: TransientBreaker = field(default_factory=TransientBreaker)
 
 
 @dataclass(frozen=True)
@@ -480,9 +500,11 @@ def load(path: str | None = None) -> Registry:
 
     sraw = dict(raw.get("settings") or {})
     settings = Settings(
-        **{k: v for k, v in sraw.items() if k not in ("concurrency_learning", "pacing")},
+        **{k: v for k, v in sraw.items() if k not in (
+            "concurrency_learning", "pacing", "transient_breaker")},
         concurrency_learning=ConcurrencyLearning(**(sraw.get("concurrency_learning") or {})),
         pacing=Pacing(**(sraw.get("pacing") or {})),
+        transient_breaker=TransientBreaker(**(sraw.get("transient_breaker") or {})),
     )
 
     plans: dict[str, Plan] = {}

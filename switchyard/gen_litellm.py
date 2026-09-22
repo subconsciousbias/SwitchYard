@@ -128,15 +128,29 @@ def build(plans_path: str) -> dict:
             "callbacks": ["switchyard.hooks.switchyard_handler"],
             "drop_params": True,
             "request_timeout": 600,
-            "num_retries": 0,   # SwitchYard owns retry placement, not LiteLLM
+            # One router-level retry, and that one retry is the ONLY place we
+            # let litellm re-route: SwitchYard's async_pre_routing_hook swaps
+            # in a different member of the lane on transient failure, so the
+            # retry delivers a real second attempt instead of the same broken
+            # deployment. Mid-stream failures are not retried by litellm and
+            # are not affected. Two is wrong: it would silently double our
+            # upstream calls without buying us anything.
+            "num_retries": 1,
         },
         "router_settings": {
             "enable_pre_call_checks": True,
             "routing_strategy": "simple-shuffle",
             "fallbacks": fallbacks,
             "context_window_fallbacks": context_fallbacks,
-            "allowed_fails": 1,
-            "cooldown_time": 60,   # short: the real cooldowns live in Redis
+            # `disable_cooldowns: True` is the only setting that keeps the
+            # router from cooling the single-deployment group between attempts
+            # (so the re-pick in async_pre_routing_hook actually fires), and
+            # SwitchYard's own cooldowns — via Redis — are the only state
+            # that outlives this process and the only state the portal can
+            # see. With this on, cooldown_time and allowed_fails do not need
+            # to be set; cooldowns live in K_COOL/{plan}, and the breaker's
+            # escalating ladder lives in K_TFAIL/{plan}.
+            "disable_cooldowns": True,
             "redis_host": "os.environ/REDIS_HOST",
             "redis_port": "os.environ/REDIS_PORT",
         },

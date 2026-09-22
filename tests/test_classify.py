@@ -13,7 +13,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from switchyard.classify import (Outcome, classify,  # noqa: E402
-                                 inspect_success_payload)
+                                 escalated_cooldown, inspect_success_payload)
 
 
 def test_minimax_insufficient_balance_arrives_as_http_500():
@@ -94,6 +94,46 @@ def test_unknown_provider_falls_back_to_prose_and_status():
 def test_a_500_that_means_exhaustion_beats_the_5xx_rule_even_without_a_family():
     v = classify(500, "insufficient balance")
     assert v.outcome is Outcome.QUOTA_EXHAUSTED, v
+
+
+def test_escalated_cooldown_first_failure_keeps_base():
+    """Streak 1 returns base verbatim — today's behaviour preserved."""
+    assert escalated_cooldown(60, 1) == 60
+    assert escalated_cooldown(60, 0) == 60    # zero counts as "no failures yet"
+
+
+def test_escalated_cooldown_doubles_each_consecutive_failure():
+    """60 -> 120 -> 240 -> 480 -> 960 — a broken seat stops getting re-fed every minute."""
+    base = 60
+    assert escalated_cooldown(base, 2) == 120
+    assert escalated_cooldown(base, 3) == 240
+    assert escalated_cooldown(base, 4) == 480
+    assert escalated_cooldown(base, 5) == 960
+
+
+def test_escalated_cooldown_caps_at_max_seconds():
+    """The ladder stops doubling once the configured cap is hit.
+
+    Without a cap a long outage would park the plan for an entire afternoon;
+    1800 (30 minutes) is enough to outlast most provider blips without
+    pretending a broken seat is going to recover on its own.
+    """
+    base = 60
+    cap = 1800
+    # 60 * 2**(5-1) = 960 — still under the cap
+    assert escalated_cooldown(base, 5, cap=cap) == 960
+    # 60 * 2**(6-1) = 1920 — first trip over the cap
+    assert escalated_cooldown(base, 6, cap=cap) == 1800
+    # And anything past that stays pinned at the cap.
+    assert escalated_cooldown(base, 10, cap=cap) == 1800
+    assert escalated_cooldown(base, 20, cap=cap) == 1800
+
+
+def test_escalated_cooldown_uses_supplied_base():
+    """The base is whatever classify() returned, so a TRANSIENT with a non-default
+    base (e.g. an unclassified 30s) escalates from 30, not from 60."""
+    assert escalated_cooldown(30, 2) == 60
+    assert escalated_cooldown(15, 2) == 30
 
 
 if __name__ == "__main__":

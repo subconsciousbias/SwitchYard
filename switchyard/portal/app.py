@@ -486,6 +486,15 @@ async def collect_plans() -> list[dict]:
                 f"refused on connection limit {int(rejections)}x"
                 + (f" at cap {int(at_cap)} — lower it" if isinstance(at_cap, float) else "")
             )
+        # Transient-failure ladder: the escalated cooldown doubles each
+        # consecutive failure. Once it has tripped the alert threshold the
+        # board treats the plan as actively broken and says so on the plan
+        # row, so the operator can intervene without watching the counter
+        # climb silently in Redis.
+        streak = await state["slots"].transient_failure_streak(plan.key)
+        threshold = reg.settings.transient_breaker.streak_alert
+        if streak >= threshold:
+            alerting.append(f"{streak} consecutive upstream failures")
 
         # A plan appears in a lane through its models.
         lanes_used_in = sorted({lane for m in plan.models.values()

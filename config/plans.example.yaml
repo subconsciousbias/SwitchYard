@@ -86,6 +86,20 @@ settings:
     disable_tail: true
     include_metered: false
 
+  # --------------------------------------------------------------------------
+  # TRANSIENT CIRCUIT BREAKER — the escalated-cooldown ladder for transient
+  # upstream failures (5xx, timeout). One 5xx still sits the plan out for the
+  # configured base (60s); each subsequent 5xx in a row doubles the sit-out
+  # (120, 240, 480, …) capped at `max_seconds`. The streak is reset by the
+  # first successful call against the plan, so recovery is automatic. The
+  # board shows a 'failing · Nx' chip on the plan's row once the streak
+  # reaches `streak_alert`. Disable only if you want the legacy flat cooldown.
+  # --------------------------------------------------------------------------
+  transient_breaker:
+    enabled: true
+    max_seconds: 1800          # half an hour; enough to outlast most blips
+    streak_alert: 3            # when the board starts surfacing the failing chip
+
 # ============================================================================
 # PLANS — what you pay for. Credentials, quota, connection limit, cost, expiry.
 # ============================================================================

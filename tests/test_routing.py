@@ -562,13 +562,21 @@ def test_the_generated_config_declares_no_general_fallbacks():
 
     Context-window fallbacks are the allowed exception: a prompt bigger than the
     window cannot be served where it was sent at all.
+
+    The one router retry IS allowed: it routes through the picker via
+    `async_pre_routing_hook`, which swaps in a different member of the lane on
+    transient failure, so the retry delivers a real second attempt instead of
+    the same broken deployment. `disable_cooldowns: true` is the only thing
+    keeping the router from cooling the single-deployment group between
+    attempts, where the re-pick would never fire.
     """
     from switchyard import gen_litellm
 
     cfg = gen_litellm.build(os.environ["SWITCHYARD_PLANS"])
     rs = cfg["router_settings"]
     assert rs["fallbacks"] == [], rs["fallbacks"]
-    assert rs.get("num_retries", 0) == 0 or cfg["litellm_settings"]["num_retries"] == 0
+    assert cfg["litellm_settings"]["num_retries"] == 1, cfg["litellm_settings"]["num_retries"]
+    assert rs["disable_cooldowns"] is True, rs.get("disable_cooldowns")
     assert "context_window_fallbacks" in rs
 
     # Every deployment a context fallback names must be a real one, or LiteLLM
@@ -579,7 +587,9 @@ def test_the_generated_config_declares_no_general_fallbacks():
             for t in targets:
                 assert t in names, (src, t, sorted(names)[:5])
     print(f"  no general fallbacks; {len(rs['context_window_fallbacks'])} "
-          f"context-window entries, all naming real deployments")
+          f"context-window entries, all naming real deployments; "
+          f"num_retries=1 + disable_cooldowns=True so the router's one retry "
+          f"re-routes through the picker")
 
 
 def test_a_lane_board_separates_its_own_traffic_from_a_sibling_lanes():
@@ -970,6 +980,228 @@ def test_a_pinned_followup_waits_then_spills_to_a_peer():
     print(f"  pinned to {pinned} (wait=3s): a free slot in <3s lands here; "
           f"a held plan spills to {spilled_to} after the deadline; a cooled "
           f"plan spills to {cooled_to} without waiting")
+
+
+def test_pick_honours_exclusions():
+    """A failed member is excluded from the candidate set on a re-pick.
+
+    The pre-routing hook gets the same lane / session / tools / pin as the
+    failed attempt, but skips the broken member. The remaining members are
+    tried in order; the lease is NOT honoured when the held plan is the one
+    excluded, so the session follows capacity rather than getting stranded on
+    a broken plan.
+    """
+    async def go():
+        reg, slots, picker = build()
+        lane = "forge"
+        members = reg.lane_members(lane)
+        assert len(members) >= 2, "need at least two members for an exclusion"
+
+        first = members[0]
+        second = members[1]
+        assert first.ref != second.ref
+
+        # Excluding only the first member must pick the second, in order.
+        picked = await picker.pick(lane, None, exclude=frozenset({first.ref}))
+        assert picked.ref == second.ref, (picked.ref, second.ref)
+        await picker.release(picked.plan.key, picked.request_id, picked.ref)
+
+        # Excluding every member must surface LaneSaturated — a re-pick that
+        # returns a member would be the wrong answer (the failure would just
+        # happen again), and 429 is the only honest thing to send back.
+        all_refs = frozenset(m.ref for m in members)
+        try:
+            await picker.pick(lane, None, exclude=all_refs)
+        except LaneSaturated as exc:
+            return first.ref, second.ref, str(exc)
+        raise AssertionError("excluding every member must raise LaneSaturated")
+
+    first, second, msg = run(go())
+    print(f"  excluded {first} -> picked {second}; "
+          f"excluding all -> LaneSaturated ({msg.split(': ', 1)[1]})")
+
+
+def test_repick_moves_the_session_lease_and_returns_not_sticky():
+    """A re-pick on a broken lease moves the session to the new plan.
+
+    The transient-failure path must NOT drop_lease — that would strand the
+    session on a peer mid-loop and break tool-call id provenance — but it
+    must NOT honour the held lease either. The successful re-pick's
+    `set_lease` moves the session to its new plan, and the returned Pick
+    reads as not-sticky because the held plan was the one that just failed.
+    """
+    async def go():
+        reg, slots, picker = build()
+        lane = "forge"
+        session = "sess-repick"
+        members = reg.lane_members(lane)
+        assert len(members) >= 2, "need two members to make a re-pick meaningful"
+        first = members[0]
+        second = members[1]
+        assert first.ref != second.ref
+
+        # Lease the session to the first member, the way a live conversation
+        # would have done before the broken call.
+        await slots.set_lease(session, first.ref, reg.settings.lease_ttl_seconds)
+        held_before = await slots.get_lease(session)
+        assert held_before == first.ref, held_before
+
+        # Re-pick excluding the failed member. The lease must NOT be honoured
+        # (the held plan is the broken one), but it must NOT be dropped
+        # either — the successful pick will re-lease to its new plan.
+        picked = await picker.pick(lane, session, exclude=frozenset({first.ref}))
+        assert picked.ref == second.ref, (picked.ref, second.ref)
+        assert not picked.sticky, "a re-pick past the held plan is not sticky"
+
+        # The successful pick moved the session lease.
+        held_after = await slots.get_lease(session)
+        assert held_after == picked.ref, (held_after, picked.ref)
+        assert held_after != first.ref
+
+        await picker.release(picked.plan.key, picked.request_id, picked.ref)
+        return first.ref, second.ref, picked.ref, held_before, held_after
+
+    failed, _, new_ref, before, after = run(go())
+    assert before == failed, before
+    assert after == new_ref, (after, new_ref)
+    print(f"  lease moved from {before} (failed) to {after} (new pick); "
+          f"re-pick returned not-sticky")
+
+
+def test_pick_raises_lane_saturated_when_every_member_is_excluded():
+    """The narrowest exclusion — every member — must still surface a 429.
+
+    Whatever the picked shape, the pre-routing hook has to be honest with the
+    caller when the re-pick cannot place a request. `LaneSaturated` is the
+    pre-call hook's signal to convert that into a 429, so this test confirms
+    the same exception survives the exclude path.
+    """
+    async def go():
+        reg, slots, picker = build()
+        lane = "local"
+        members = reg.lane_members(lane)
+        all_refs = frozenset(m.ref for m in members)
+        try:
+            await picker.pick(lane, None, exclude=all_refs)
+        except LaneSaturated as exc:
+            return all_refs, str(exc)
+        raise AssertionError("local lane must refuse an all-excluded pick")
+
+    refs, msg = run(go())
+    print(f"  excluding every member of `local` ({sorted(refs)}) -> "
+          f"LaneSaturated ({msg.split(': ', 1)[1]})")
+
+
+def test_bump_and_cool_atomic_streak_and_cooldown_agree():
+    """Atomic INCR + EXPIRE + SET cooldown keeps streak and cooldown in lock-step.
+
+    Concurrent TRANSIENT failures used to race: the last `cool_down` write
+    won, but it could have been computed against an earlier (smaller) streak
+    than the final INCR value. `bump_and_cool` does INCR + EXPIRE + the
+    cooldown math + SET in one Lua, so the cooldown stored in Redis is
+    always the cooldown for the streak the caller observes.
+    """
+    async def go():
+        reg, slots, _picker = build()
+        plan = next(iter(reg.plans.values())).key
+
+        # First failure: streak 1, base cooldown, 60s.
+        s1 = await slots.bump_and_cool(plan, base=60, cap=1800,
+                                       reason="transient")
+        assert s1 == 1
+        cooled, ttl, reason = await slots.cooldown_state(plan)
+        assert cooled and reason == "transient", (cooled, reason)
+        # Cooldown is the base (60s) on the first failure.
+        assert 55 <= ttl <= 60, ttl
+        streak = await slots.transient_failure_streak(plan)
+        assert streak == 1
+
+        # Second failure: streak 2, doubled to 120s.
+        s2 = await slots.bump_and_cool(plan, base=60, cap=1800,
+                                       reason="transient")
+        assert s2 == 2
+        _, ttl2, _ = await slots.cooldown_state(plan)
+        assert 115 <= ttl2 <= 120, ttl2
+
+        # Third failure: streak 3, doubled to 240s.
+        s3 = await slots.bump_and_cool(plan, base=60, cap=1800,
+                                       reason="transient")
+        assert s3 == 3
+        _, ttl3, _ = await slots.cooldown_state(plan)
+        assert 235 <= ttl3 <= 240, ttl3
+
+        # Sixth failure: streak 6, base * 2**5 = 1920 > cap -> cap (1800s).
+        for _ in range(3):
+            await slots.bump_and_cool(plan, base=60, cap=1800,
+                                      reason="transient")
+        _, ttl6, _ = await slots.cooldown_state(plan)
+        assert 1795 <= ttl6 <= 1800, ttl6
+
+        return streak, ttl, ttl2, ttl3, ttl6
+
+    streak, ttl1, ttl2, ttl3, ttl6 = run(go())
+    print(f"  streak grew 1->3 then capped; cooldowns: "
+          f"{ttl1}s, {ttl2}s, {ttl3}s, {ttl6}s (cap hit)")
+
+
+def test_note_transient_failure_sets_ttl_atomically():
+    """A worker killed between INCR and EXPIRE used to leave a key with no TTL,
+    so the streak would carry forward past 7200s of quiet. The Lua wrapper
+    closes that window: every INCR refreshes the TTL on the same call.
+    """
+    async def go():
+        reg, slots, _picker = build()
+        plan = next(iter(reg.plans.values())).key
+
+        # First failure: the new key gets a TTL right away.
+        await slots.note_transient_failure(plan)
+        ttl = await slots.redis.ttl(f"sy:tfail:{plan}")
+        assert 7100 <= ttl <= 7200, ttl
+
+        # Second failure: TTL is refreshed, not kept — the property that lets
+        # a quiet gap of 7200s drop the counter entirely.
+        # FakeRedis stores absolute expiry, so we nudge a couple of seconds
+        # off the stored value before the second bump and confirm it lands
+        # back near 7200.
+        await slots.redis.expire(f"sy:tfail:{plan}", 7100)
+        await slots.note_transient_failure(plan)
+        ttl_after = await slots.redis.ttl(f"sy:tfail:{plan}")
+        assert 7100 <= ttl_after <= 7200, ttl_after
+
+        return ttl, ttl_after
+
+    ttl_first, ttl_second = run(go())
+    print(f"  TTL after first bump: {ttl_first}s; "
+          f"after refresh: {ttl_second}s — both at the 7200 ceiling")
+
+
+def test_concurrent_bump_and_cool_keep_cooldown_consistent_with_streak():
+    """Under concurrent failures, the cooldown the picker reads matches the
+    cooldown for the FINAL streak value, not for some earlier one. Without
+    atomicity the two could diverge (last SET wins, but stale streak).
+    """
+    async def go():
+        reg, slots, _picker = build()
+        plan = next(iter(reg.plans.values())).key
+
+        # 5 concurrent bumps. The fake's Lua impl runs them sequentially in
+        # asyncio scheduling order, but each call still goes through its own
+        # atomic INCR-then-SET path. The final cooldown must equal the
+        # cooldown for streak=5 (= 60 * 2**4 = 960).
+        await asyncio.gather(*(slots.bump_and_cool(
+            plan, base=60, cap=1800, reason="transient") for _ in range(5)))
+
+        final_streak = await slots.transient_failure_streak(plan)
+        _, final_ttl, _ = await slots.cooldown_state(plan)
+        # 60 * 2**(5-1) = 960. Allow a second of slack for the integer now.
+        assert final_streak == 5, final_streak
+        assert 955 <= final_ttl <= 960, (final_streak, final_ttl)
+
+        return final_streak, final_ttl
+
+    streak, ttl = run(go())
+    print(f"  5 concurrent bumps: streak={streak}, cooldown={ttl}s "
+          f"(expected 960 for streak=5)")
 
 
 def test_perishable_lane_routes_higher_room_first():

@@ -150,9 +150,16 @@ class Picker:
         return members
 
     async def pick(self, lane: str, session: str | None,
-                   needs_tools: bool = False, pinned: bool = False) -> Pick:
+                   needs_tools: bool = False, pinned: bool = False,
+                   exclude: frozenset[str] | None = None) -> Pick:
         rid = uuid.uuid4().hex
         members = await self._members(lane, needs_tools)
+        # A failed member of this attempt is excluded from the re-pick so the
+        # router's one-shot retry sees a different candidate rather than the same
+        # broken one. Refs, not plans, because that is what a candidate carries,
+        # and what `held` below compares against.
+        if exclude:
+            members = [m for m in members if m.ref not in exclude]
         if not members:
             detail = ("nothing in this lane can serve tool calls — every "
                       "candidate plan is marked supports_tools: false" if needs_tools
@@ -166,9 +173,16 @@ class Picker:
 
         # 1. Affinity. A session that already has a provider stays on it as
         #    long as that provider is still in the lane and has a free slot.
+        #    On a re-pick the held lease may be the member that just failed;
+        #    skip the pin in that case. The elif below drops the lease so
+        #    the next, non-excluded pick doesn't try to honour a stale lease
+        #    to the broken plan — the successful re-pick's set_lease
+        #    immediately overwrites the dropped value, so the session isn't
+        #    stranded on a peer (and the held plan having left the lane is
+        #    handled the same way: drop, then let ordered fill land fresh).
         if session:
             held = await self.slots.get_lease(session)
-            if held and held in by_ref:
+            if held and held in by_ref and (not exclude or held not in exclude):
                 model = by_ref[held]
                 plan = self.registry.plan_of(model)
                 # A mid-tool-loop follow-up inside the lease window finishes
@@ -318,6 +332,18 @@ class Picker:
             tail = self.registry.is_tail(lane, model.ref)
             cap, cap_reason = await self._cap(model)
             model_inflight = await self.slots.in_flight_model(model.ref)
+            # The plan's consecutive-transient-failure streak: read from Redis
+            # so the board can show a 'failing' chip on its row. A streak is
+            # per-plan (siblings share its quota and deserve to share the
+            # warning), and one row per model on the plan reads the same value
+            # — the chip is intentionally duplicated rather than reconciled.
+            transient_streak = await self.slots.transient_failure_streak(plan.key)
+            # The chip's alert threshold is operator-configurable, not a literal
+            # — `TransientBreaker.streak_alert` is the single source of truth,
+            # and the plans-table alert in collect_plans uses the same value.
+            # Carrying it onto each row keeps the two surfaces in lock-step
+            # when an operator raises the threshold.
+            streak_alert = self.registry.settings.transient_breaker.streak_alert
             # A model in several lanes is busy for all of them, but the traffic
             # belongs to whichever lane claimed it. Splitting the two is what
             # stops a sibling lane's work reading as this lane's consumption.
@@ -377,6 +403,8 @@ class Picker:
                 "cooled": cooled,
                 "cooldown_remaining": ttl,
                 "cooldown_reason": reason,
+                "transient_streak": transient_streak,
+                "streak_alert": streak_alert,
                 "tail": tail,
                 "days_left": plan.days_left,
                 "shares_plan_with": [m.key for m in self.registry.siblings(model)],

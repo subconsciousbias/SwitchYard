@@ -25,7 +25,7 @@ from litellm.proxy._types import UserAPIKeyAuth
 from redis.asyncio import Redis
 
 from . import models
-from .classify import Outcome, classify, inspect_success_payload
+from .classify import Outcome, classify, escalated_cooldown, inspect_success_payload
 from .picker import LaneSaturated, Picker
 from .policy import CapacityPolicy
 from .reasoning import ReasoningSplitter
@@ -279,6 +279,13 @@ class SwitchyardHandler(CustomLogger):
             "sticky": pick.sticky,
             "claimed_at": time.time(),
             "cap": pick.cap,
+            # Carried so async_pre_routing_hook can re-pick on the same lane /
+            # session with the same tool/pin rules as the first attempt — the
+            # router reuses this dict across retries, and we want the re-pick
+            # to honour exactly what the caller asked for.
+            "direct": bool(direct),
+            "needs_tools": needs_tools,
+            "pinned": pinned,
         }
         log.info(
             "lane=%s -> %s [%s]%s%s%s",
@@ -392,6 +399,13 @@ class SwitchyardHandler(CustomLogger):
             model=served_ref,
         )
 
+        # A genuine 200 against this plan resets its transient-failure
+        # streak: the plan is talking to us again, so the next 5xx starts at
+        # base (60s) rather than at the top of the ladder. Reset on the
+        # SERVING plan (the one whose quota we just spent), not the picked
+        # one — the served plan is the one whose streak actually moved.
+        await self.slots.reset_transient_failures(plan.key)
+
         # Per-slot throughput drives the pacer: one busy slot delivered this
         # many units in this many seconds.
         try:
@@ -410,9 +424,92 @@ class SwitchyardHandler(CustomLogger):
         self._stop_heartbeat(ctx["request_id"])
         await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
         plan = self.registry.plans.get(ctx["plan"])
+        # Mark which member of the lane failed this attempt, so the router's
+        # single retry (see async_pre_routing_hook) re-picks against the
+        # excluded set instead of trying the same broken deployment again.
+        # The same dict object is reused across attempts, so the marker
+        # survives into the next pre-routing-hook call naturally.
+        ctx["failed_ref"] = ctx["model"]
         if plan:
             await self.ledger.record(plan, failed=True, model=ctx["model"])
         await self._handle_failure(ctx, kwargs.get("exception") or kwargs.get("original_exception"))
+
+    async def async_pre_routing_hook(
+        self, model: str, request_kwargs: dict, messages=None, input=None,
+        specific_deployment: bool = False,
+    ):
+        """Re-pick on transient failure before the router's only retry.
+
+        LiteLLM's router retry loop re-invokes this hook per attempt with the
+        SAME kwargs dict, and each attempt re-runs deployment selection. The
+        pre-call hook has already claimed a slot for the first attempt; the
+        failure path has set `ctx['failed_ref']` to the member that just
+        5xx'd. On a re-pick we ask the picker for the same lane / session /
+        tools / pin, but excluding that one broken member. If the lane has any
+        other live candidate it goes there; if the lane is now empty for this
+        attempt we surface the same 429 the pre-call hook would have raised.
+
+        Operates BEFORE any bytes are streamed: the router only enters the
+        retry loop around the upstream call itself, so a re-pick here cannot
+        leak half a response to the caller. Mid-stream failures are NOT
+        retried by litellm at all and so are not affected.
+
+        Skipped when the caller named a deployment directly: there is nothing
+        to spill to by design (pick_direct refuses rather than substitutes),
+        and the operator asked for that specific model.
+        """
+        from litellm.types.router import PreRoutingHookResponse
+        ctx = self._ctx(request_kwargs)
+        if not ctx or not ctx.get("failed_ref"):
+            return None
+        if ctx.get("direct"):
+            return None
+        lane = ctx.get("lane")
+        if not lane or lane not in self.registry.lanes:
+            return None
+        try:
+            pick = await self.picker.pick(
+                lane,
+                ctx.get("session"),
+                needs_tools=bool(ctx.get("needs_tools")),
+                pinned=bool(ctx.get("pinned")),
+                exclude=frozenset({ctx["failed_ref"]}),
+            )
+        except LaneSaturated as exc:
+            # The re-pick found no candidate: the lane is genuinely out of
+            # service or full. Propagate as 429 the same way the pre-call hook
+            # does; the router will surface it to the caller after retries
+            # exhaust. Num_retries=1 means at most 2 attempts in total — a
+            # lane-wide outage cannot storm.
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=429,
+                detail={"error": str(exc), "lane": lane,
+                        "switchyard": "lane_saturated"},
+                headers={"Retry-After": "20"},
+            ) from exc
+        # The previous attempt's heartbeat is already stopped and slot
+        # released by async_log_failure_event; start a heartbeat for the new
+        # pick so the live claim survives past the staleness sweep.
+        self._start_heartbeat(pick.plan.key, pick.model.ref, pick.request_id)
+        # Mutate the metadata IN PLACE — the router holds the same dict
+        # object across attempts, so writing back into it rewires the
+        # upstream call (which reads `metadata[switchyard][model]`) without
+        # any other consumer needing to know we re-picked.
+        ctx["plan"] = pick.plan.key
+        ctx["model"] = pick.model.ref
+        ctx["request_id"] = pick.request_id
+        ctx["sticky"] = pick.sticky
+        ctx["claimed_at"] = time.time()
+        ctx["cap"] = pick.cap
+        # The retry is no longer "this attempt's failure to fix".
+        ctx.pop("failed_ref", None)
+        log.info(
+            "lane=%s re-picked after transient -> %s [%s]%s",
+            lane, pick.model.ref, pick.cap_reason,
+            " (sticky)" if pick.sticky else "",
+        )
+        return PreRoutingHookResponse(model=pick.model.deployment)
 
     async def async_post_call_success_hook(
         self, data: dict, user_api_key_dict: UserAPIKeyAuth, response, **_: Any
@@ -516,6 +613,20 @@ class SwitchyardHandler(CustomLogger):
         if verdict.is_our_fault:
             return  # a bad prompt is not the provider's problem
 
+        # CRITICAL double-count guard. async_log_failure_event fires PER
+        # ATTEMPT and async_post_call_failure_hook fires once more after the
+        # router's retries exhaust — both call _apply_verdict with the same
+        # ctx object, because the router reuses the kwargs dict across
+        # attempts. Without a per-attempt marker, a single 5xx would look
+        # like two, doubling the streak and the cooldown ladder. The new
+        # request_id minted for the re-pick is the natural key.
+        marker = ctx.get("_verdict_applied")
+        rid = ctx.get("request_id")
+        if marker and marker == rid:
+            return  # already applied for this attempt
+        if rid:
+            ctx["_verdict_applied"] = rid
+
         if verdict.outcome is Outcome.QUOTA_EXHAUSTED:
             # Which window did we hit? The reset time tells us, and attributing
             # it correctly keeps a 5-hour wall out of the weekly figures.
@@ -543,8 +654,36 @@ class SwitchyardHandler(CustomLogger):
                 plan.key, at_cap, learned,
             )
 
-        if verdict.should_cool:
-            await self.slots.cool_down(plan.key, verdict.cooldown_seconds, verdict.outcome.value)
+        # Apply the cooldown. TRANSIENT uses the escalated ladder so a broken
+        # seat stops getting re-fed every 60s; every other outcome keeps the
+        # verdict's own cooldown (a quota wall already knows how long it
+        # should last).
+        did_cool_atomic = False
+        if verdict.outcome is Outcome.TRANSIENT:
+            breaker = self.registry.settings.transient_breaker
+            if breaker.enabled:
+                # Atomic: INCR + EXPIRE streak, compute cooldown from new
+                # streak, SET cooldown key. The Lua uses the same formula as
+                # `escalated_cooldown`, so the cooldown stored in Redis and
+                # the one Python computes below for the log line always
+                # agree. Returns the post-INCR streak. Concurrent TRANSIENT
+                # failures on the same plan can no longer leave the picker
+                # observing a cooldown that undershoots the final streak.
+                streak = await self.slots.bump_and_cool(
+                    plan.key,
+                    base=cooldown,
+                    cap=breaker.max_seconds,
+                    reason=verdict.outcome.value,
+                )
+                cooldown = escalated_cooldown(
+                    cooldown, streak, cap=breaker.max_seconds)
+                log.warning(
+                    "plan=%s transient failure streak=%d -> cooldown %ds",
+                    plan.key, streak, cooldown,
+                )
+                did_cool_atomic = True
+        if verdict.should_cool and not did_cool_atomic:
+            await self.slots.cool_down(plan.key, cooldown, verdict.outcome.value)
         if verdict.outcome in (Outcome.QUOTA_EXHAUSTED, Outcome.PLAN_DEAD, Outcome.AUTH) and ctx.get("session"):
             # Do not strand the session on dead capacity; let it re-lease.
             await self.slots.drop_lease(ctx["session"])
