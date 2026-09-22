@@ -116,7 +116,11 @@ _EXHAUSTED = re.compile(
 )
 _CONTEXT = re.compile(r"(context (length|window)|too many tokens|maximum context|prompt is too long)", re.I)
 _AUTH = re.compile(r"(invalid api key|unauthorized|authentication|invalid token|expired token)", re.I)
-_CONCURRENCY = re.compile(r"(concurrenc|connection limit|too many connections|max_parallel)", re.I)
+# "sidecar at capacity" is the exact phrase SwitchYard's own bridges emit on a
+# full gate (mcp_bridge/server.py, cli_bridge/server.py) — the number after it
+# is the configured concurrency cap, not a vendor code, so this never collides
+# with the OpenAI/MiniMax-style "(NNNN)" patterns that _CODE_IN_TEXT reads.
+_CONCURRENCY = re.compile(r"(concurrenc|connection limit|too many connections|max_parallel|sidecar at capacity)", re.I)
 _PLAN_DEAD = re.compile(
     r"(subscription (has )?(expired|ended)|plan expired|package expired"
     r"|no access to model)", re.I)

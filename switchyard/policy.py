@@ -375,18 +375,52 @@ class CapacityPolicy:
                        configured=plan.configured_parallel)
 
         if not await self.plan_is_paced(plan):
-            return cap
+            return self._apply_gate_headroom(plan, cap)
 
         paced, reason, _ = await self.pacer.desired_slots(plan, True, now)
         if paced is None:
             cap.reason = f"{source} (pacing: {reason})"
-            return cap
+            return self._apply_gate_headroom(plan, cap)
 
         cap.paced = paced
         # Pacing can only ever *reduce* concurrency below what the provider
         # tolerates; it must never talk us into exceeding a learned limit.
         cap.cap = min(learned, paced)
         cap.reason = f"paced {paced} of {learned} ({reason})"
+        return self._apply_gate_headroom(plan, cap)
+
+    def _apply_gate_headroom(self, plan: Plan, cap: Capacity) -> Capacity:
+        """For CLI-backed plans, keep one slot of headroom below the physical gate.
+
+        The sidecar gate reads `max_parallel` from the same plans.yaml and
+        stays at the configured limit (it is the physical truth — the vendor
+        CLI is the one enforcing it). The gateway's slot table, by contrast,
+        is the one that decides whether SwitchYard lets a request through. If
+        the two caps agree exactly, an ordinary claim/release race — or a
+        release the gateway makes when the client aborts while the sidecar's
+        CLI turn is still finishing — briefly sees the gateway count the slot
+        as free a moment before the sidecar has, and the sidecar responds
+        "sidecar at capacity" with HTTP 429. The headroom slot absorbs that
+        race instead of being usable capacity, so the sidecar gate is no
+        longer the limiting factor: the gateway slot table is, and it cannot
+        be racing the sidecar.
+
+        API plans are unaffected: their provider refuses on its own, the
+        learner backs off, and the headroom slot would just sit unused.
+        """
+        if not plan.is_cli_backed:
+            return cap
+        headroom = max(0, self.settings.gate_headroom_slots)
+        if headroom == 0:
+            return cap
+        physical = plan.max_parallel
+        # Floor at 1 so a single-connection plan never collapses to 0 — that
+        # would lock the plan while the operator still owns one usable slot.
+        capped = min(cap.cap, max(1, physical - headroom))
+        if capped == cap.cap:
+            return cap
+        cap.cap = capped
+        cap.reason = f"{cap.reason} + gate headroom {headroom}"
         return cap
 
     async def pace_state(self, plan: Plan, now: datetime | None = None) -> dict:

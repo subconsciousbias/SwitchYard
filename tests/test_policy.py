@@ -457,6 +457,119 @@ def test_a_plan_can_opt_out_of_learning_entirely():
     print(f"  local-box pinned at {cap} ({reason}); minimax-ultra still moved to {moved}")
 
 
+# ----------------------------------------------------- gate headroom ------
+# The gateway-side effective cap for a CLI-backed plan sits one slot below the
+# plan's physical gate (which the sidecar reads directly from plans.yaml). The
+# headroom absorbs a claim/release race instead of producing a spurious 429.
+# API plans are unaffected: their provider enforces the limit and the headroom
+# would just sit unused.
+def test_gate_headroom_applied_for_cli_backed_plan():
+    """A 4-slot CLI plan yields an effective cap of 3; the sidecar still sees 4.
+
+    Built here rather than read from the config so the test survives an
+    operator deciding to bump headroom: it is about the feature, not today's
+    number. The reason string must mention the headroom so the portal board
+    explains why the lane draws one fewer slot than plans.yaml declares.
+    """
+    async def go():
+        reg, _, _, policy, _ = build()
+        plan = replace(reg.plans["claude-max"], configured_parallel=4,
+                       max_parallel_ceiling=4)
+        cap = await policy.effective(plan)
+        return plan, cap
+    plan, cap = run(go())
+    assert plan.max_parallel == 4
+    assert cap.cap == 3, cap.cap
+    assert "gate headroom" in cap.reason, cap.reason
+    print(f"  cli plan max_parallel={plan.max_parallel} -> cap {cap.cap} "
+          f"(reason: {cap.reason})")
+
+
+def test_gate_headroom_floored_at_one():
+    """A single-connection CLI plan must stay usable: cap 1, never 0.
+
+    The configured headroom is 1, but `max(1, 1 - 1) == 1`, so the application
+    floor catches what arithmetic alone would collapse to zero — locking a
+    one-slot plan would be worse than the race it was meant to absorb.
+    """
+    async def go():
+        reg, _, _, policy, _ = build()
+        plan = replace(reg.plans["claude-max"], configured_parallel=1,
+                       max_parallel_ceiling=1)
+        return plan, await policy.effective(plan)
+    plan, cap = run(go())
+    assert plan.max_parallel == 1
+    assert cap.cap == 1, cap.cap
+    print(f"  cli plan max_parallel={plan.max_parallel} -> cap {cap.cap} "
+          f"(floor held against headroom=1)")
+
+
+def test_gate_headroom_not_applied_for_api_plan():
+    """An API plan keeps its full configured cap — the learner manages its limit.
+
+    The provider rejects on its own, the learner backs off, and a headroom
+    slot would sit unused. So the cap is exactly what plans.yaml declares, and
+    the reason is the plain learner/seed one with no headroom tag.
+    """
+    async def go():
+        reg, _, _, policy, _ = build()
+        plan = reg.plans["minimax-ultra"]
+        assert not plan.is_cli_backed
+        cap = await policy.effective(plan)
+        return plan, cap
+    plan, cap = run(go())
+    assert cap.cap == plan.max_parallel, (cap.cap, plan.max_parallel)
+    assert "gate headroom" not in cap.reason, cap.reason
+    print(f"  api plan max_parallel={plan.max_parallel} -> cap {cap.cap} "
+          f"(no headroom applied)")
+
+
+def test_learner_can_still_pull_cap_below_headroom():
+    """A learned cap below (configured - headroom) wins: the learner is the floor.
+
+    The learner lowers the cap on a provider-side refusal. With a CLI plan of
+    4 and headroom 1, the configured-minus-headroom ceiling is 3, but the
+    learner halves a rejection at concurrency 3 down to 1 — and 1 is what the
+    picker should hand out. The min still wins; the reason is the learner's,
+    not headroom's, because the learner was the binding constraint this time.
+    """
+    async def go():
+        reg, _, _, policy, _ = build()
+        plan = replace(reg.plans["claude-max"], configured_parallel=4,
+                       max_parallel_ceiling=4)
+        # Provider refused us at concurrency 3 — cap halves to floor 1.
+        await policy.learner.note_rejection(plan, at_concurrency=3)
+        return plan, await policy.effective(plan)
+    plan, cap = run(go())
+    # Learned cap is 1, headroom-applied ceiling is 3; min wins.
+    assert cap.cap == 1, cap.cap
+    assert cap.learned == 1, cap.learned
+    # The cap_reason is the learner's, not the headroom's: the learner was the
+    # binding constraint, so headroom did not further reduce the cap.
+    assert "learned" in cap.reason, cap.reason
+    print(f"  learner pulled cap to {cap.learned} below headroom ceiling 3 -> "
+          f"effective {cap.cap} (reason: {cap.reason})")
+
+
+def test_cap_reason_mentions_gate_headroom():
+    """The portal board reads cap_reason to explain the gap from the declared cap.
+
+    A 4-slot CLI plan should print "configured + gate headroom 1" so the lane
+    board can show that the gap to plans.yaml is headroom, not a learner or
+    pacing decision. Without this the row would look like an unexplained
+    mystery of one missing slot.
+    """
+    async def go():
+        reg, _, _, policy, _ = build()
+        plan = replace(reg.plans["claude-max"], configured_parallel=4,
+                       max_parallel_ceiling=4)
+        return await policy.effective(plan)
+    cap = run(go())
+    assert "gate headroom" in cap.reason
+    assert cap.reason.endswith("1") or cap.reason.endswith(" 1"), cap.reason
+    print(f"  cap_reason: {cap.reason!r}")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

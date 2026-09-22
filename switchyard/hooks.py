@@ -8,6 +8,14 @@ rather than the beta custom-routing-strategy API, so a LiteLLM upgrade cannot
 silently change how capacity is allocated. The pre-call hook rewrites a lane
 name into a concrete deployment; from LiteLLM's point of view every request
 names exactly one provider and it never has to make a routing decision.
+
+A failed request returns to the caller fast (num_retries=0 in the generated
+config). The caller's 429 retry re-enters the proxy through this pre-call
+hook, and the picker places against the fresh cooldowns the failure just set
+- which is strictly better placement than any in-router retry could give.
+The pinned litellm's `async_pre_routing_hook` is the internal auto-router
+hook and never iterates registered CustomLogger callbacks, so a Switchyard
+re-pick there was never going to fire even with num_retries=1.
 """
 from __future__ import annotations
 
@@ -279,10 +287,12 @@ class SwitchyardHandler(CustomLogger):
             "sticky": pick.sticky,
             "claimed_at": time.time(),
             "cap": pick.cap,
-            # Carried so async_pre_routing_hook can re-pick on the same lane /
-            # session with the same tool/pin rules as the first attempt — the
-            # router reuses this dict across retries, and we want the re-pick
-            # to honour exactly what the caller asked for.
+            # direct / needs_tools / pinned are stamped so any downstream
+            # failure path can tell why the picker picked what it picked and
+            # so the post-call hooks can decide which plan to book the call
+            # against. The caller's retry re-enters through this hook, not
+            # through a router-level retry, so the picker gets a fresh
+            # pick against whatever cooldowns the previous attempt set.
             "direct": bool(direct),
             "needs_tools": needs_tools,
             "pinned": pinned,
@@ -424,92 +434,13 @@ class SwitchyardHandler(CustomLogger):
         self._stop_heartbeat(ctx["request_id"])
         await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
         plan = self.registry.plans.get(ctx["plan"])
-        # Mark which member of the lane failed this attempt, so the router's
-        # single retry (see async_pre_routing_hook) re-picks against the
-        # excluded set instead of trying the same broken deployment again.
-        # The same dict object is reused across attempts, so the marker
-        # survives into the next pre-routing-hook call naturally.
-        ctx["failed_ref"] = ctx["model"]
+        # No failed_ref marker: the routed-to deployment IS the served one,
+        # there is no router-level retry to feed it into (num_retries=0), and
+        # the caller's retry re-enters through async_pre_call_hook which gets
+        # its own fresh pick against the cooldowns this failure just set.
         if plan:
             await self.ledger.record(plan, failed=True, model=ctx["model"])
         await self._handle_failure(ctx, kwargs.get("exception") or kwargs.get("original_exception"))
-
-    async def async_pre_routing_hook(
-        self, model: str, request_kwargs: dict, messages=None, input=None,
-        specific_deployment: bool = False,
-    ):
-        """Re-pick on transient failure before the router's only retry.
-
-        LiteLLM's router retry loop re-invokes this hook per attempt with the
-        SAME kwargs dict, and each attempt re-runs deployment selection. The
-        pre-call hook has already claimed a slot for the first attempt; the
-        failure path has set `ctx['failed_ref']` to the member that just
-        5xx'd. On a re-pick we ask the picker for the same lane / session /
-        tools / pin, but excluding that one broken member. If the lane has any
-        other live candidate it goes there; if the lane is now empty for this
-        attempt we surface the same 429 the pre-call hook would have raised.
-
-        Operates BEFORE any bytes are streamed: the router only enters the
-        retry loop around the upstream call itself, so a re-pick here cannot
-        leak half a response to the caller. Mid-stream failures are NOT
-        retried by litellm at all and so are not affected.
-
-        Skipped when the caller named a deployment directly: there is nothing
-        to spill to by design (pick_direct refuses rather than substitutes),
-        and the operator asked for that specific model.
-        """
-        from litellm.types.router import PreRoutingHookResponse
-        ctx = self._ctx(request_kwargs)
-        if not ctx or not ctx.get("failed_ref"):
-            return None
-        if ctx.get("direct"):
-            return None
-        lane = ctx.get("lane")
-        if not lane or lane not in self.registry.lanes:
-            return None
-        try:
-            pick = await self.picker.pick(
-                lane,
-                ctx.get("session"),
-                needs_tools=bool(ctx.get("needs_tools")),
-                pinned=bool(ctx.get("pinned")),
-                exclude=frozenset({ctx["failed_ref"]}),
-            )
-        except LaneSaturated as exc:
-            # The re-pick found no candidate: the lane is genuinely out of
-            # service or full. Propagate as 429 the same way the pre-call hook
-            # does; the router will surface it to the caller after retries
-            # exhaust. Num_retries=1 means at most 2 attempts in total — a
-            # lane-wide outage cannot storm.
-            from fastapi import HTTPException
-            raise HTTPException(
-                status_code=429,
-                detail={"error": str(exc), "lane": lane,
-                        "switchyard": "lane_saturated"},
-                headers={"Retry-After": "20"},
-            ) from exc
-        # The previous attempt's heartbeat is already stopped and slot
-        # released by async_log_failure_event; start a heartbeat for the new
-        # pick so the live claim survives past the staleness sweep.
-        self._start_heartbeat(pick.plan.key, pick.model.ref, pick.request_id)
-        # Mutate the metadata IN PLACE — the router holds the same dict
-        # object across attempts, so writing back into it rewires the
-        # upstream call (which reads `metadata[switchyard][model]`) without
-        # any other consumer needing to know we re-picked.
-        ctx["plan"] = pick.plan.key
-        ctx["model"] = pick.model.ref
-        ctx["request_id"] = pick.request_id
-        ctx["sticky"] = pick.sticky
-        ctx["claimed_at"] = time.time()
-        ctx["cap"] = pick.cap
-        # The retry is no longer "this attempt's failure to fix".
-        ctx.pop("failed_ref", None)
-        log.info(
-            "lane=%s re-picked after transient -> %s [%s]%s",
-            lane, pick.model.ref, pick.cap_reason,
-            " (sticky)" if pick.sticky else "",
-        )
-        return PreRoutingHookResponse(model=pick.model.deployment)
 
     async def async_post_call_success_hook(
         self, data: dict, user_api_key_dict: UserAPIKeyAuth, response, **_: Any
@@ -658,6 +589,7 @@ class SwitchyardHandler(CustomLogger):
         # seat stops getting re-fed every 60s; every other outcome keeps the
         # verdict's own cooldown (a quota wall already knows how long it
         # should last).
+        cooldown = verdict.cooldown_seconds
         did_cool_atomic = False
         if verdict.outcome is Outcome.TRANSIENT:
             breaker = self.registry.settings.transient_breaker

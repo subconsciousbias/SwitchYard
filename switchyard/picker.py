@@ -164,10 +164,16 @@ class Picker:
                    exclude: frozenset[str] | None = None) -> Pick:
         rid = uuid.uuid4().hex
         members = await self._members(lane, needs_tools)
-        # A failed member of this attempt is excluded from the re-pick so the
-        # router's one-shot retry sees a different candidate rather than the same
-        # broken one. Refs, not plans, because that is what a candidate carries,
-        # and what `held` below compares against.
+        # The `exclude` argument exists for the caller's retry re-entering
+        # through async_pre_call_hook: when a previous attempt's failure
+        # left a transient breaker streak or a learned cap on one member
+        # of the lane, the picker can be told to skip that one member so
+        # the retry lands on a peer instead of re-paying for the same
+        # broken deployment. (With num_retries=0 there is no router-level
+        # retry to feed this; the spill IS the caller's retry.) Refs,
+        # not plans, because that is what a candidate carries and what
+        # `held` below compares against. Tests also use the parameter
+        # directly to drive LaneSaturated paths.
         if exclude:
             members = [m for m in members if m.ref not in exclude]
         if not members:

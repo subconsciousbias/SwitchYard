@@ -49,6 +49,17 @@ settings:
   # Default sit-out after a hard quota rejection, when the provider gives us
   # no Retry-After to go on.
   default_cooldown_seconds: 900
+  # Slots the gateway keeps free for CLI-backed plans, so the gateway's slot
+  # table and the sidecar's own gate stop racing on the same number. The
+  # physical gate (the sidecar reads `max_parallel` from this same file) stays
+  # at the configured value; the gateway's effective cap is reduced by this
+  # many slots, so an ordinary claim/release race or a release the gateway
+  # makes (client abort) while the sidecar CLI turn is still finishing no
+  # longer produces a spurious 429. API plans are unaffected: their provider
+  # rejects on its own, the learner backs off, and the headroom would just sit
+  # unused. Floor at 1 in the application so a single-connection plan never
+  # collapses to 0.
+  gate_headroom_slots: 1
 
   # --------------------------------------------------------------------------
   # Learn the parallelism each plan really tolerates instead of trusting a

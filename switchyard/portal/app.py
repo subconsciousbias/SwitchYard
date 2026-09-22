@@ -459,7 +459,14 @@ async def collect_plans() -> list[dict]:
                 "label": m.display,
                 "provider_model": m.model,
                 "enabled": m.enabled,
-                "cap": plan.cap_for(m),
+                # Pass `reg.settings` so CLI-backed plans get the same
+                # headroom-reduced cap the litellm per-deployment
+                # backstop and the live picker admit both use; otherwise
+                # the board draws the plan's nominal max_parallel while
+                # the lane actually admits headroom fewer, and the row's
+                # "cap" disagrees with the row's `capacity` block above
+                # by exactly the headroom value.
+                "cap": plan.cap_for(m, reg.settings),
                 "narrowed": m.max_parallel is not None,
                 "context_window": m.context_window,
                 "lanes": reg.lanes_using(m),
