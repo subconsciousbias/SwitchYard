@@ -596,10 +596,22 @@ def _stub_start_session(recorder: list):
     real = server.start_session
 
     async def fake(body, mcp_tools, prompt, system, model, request,
-                   image_paths=None, img_dir=None):
+                   image_paths=None, img_dir=None, env=None, first_turn=True):
+        # Mirror the env-injection + first-turn-reminder logic the real
+        # start_session runs before build_argv. Without this the captured
+        # `system`/`prompt` would reflect what handle_fresh passed, not
+        # what the CLI actually saw -- and the issue #44 contract is
+        # specifically about what the CLI sees.
+        if env is not None and server._caller_env is not None:
+            env_block = server._caller_env.render_system_block(env)
+            system = (f"{system}\n\n{env_block}" if system else env_block)
+            if first_turn:
+                reminder = server._caller_env.render_first_turn_reminder(env)
+                prompt = f"{reminder}\n\n{prompt}" if prompt else reminder
         recorder.append({"tools": mcp_tools, "prompt": prompt,
                          "system": system, "model": model,
-                         "image_paths": image_paths})
+                         "image_paths": image_paths,
+                         "env": env, "first_turn": first_turn})
         if img_dir is not None:
             import shutil
             shutil.rmtree(img_dir, ignore_errors=True)
@@ -1683,6 +1695,750 @@ def test_write_opencode_dir_enables_read_when_images_passed():
         print("  write_opencode_dir(images=True) -> read enabled, others stay disabled")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ----------------------------------------- issue #44: caller-env probe + render ---
+def test_fresh_with_unknown_env_emits_synthetic_probe_tool_call():
+    """A fresh request whose env is unknown AND whose tools include a
+    recognised command tool MUST get a synthetic `switchyard_env_` tool_call
+    back, NOT a session allocation. No gate slot is taken, no SESSIONS entry
+    is created -- the probe travels back to the caller for local execution.
+
+    The probe happens BEFORE any gate acquire / workdir creation, exactly as
+    the spec requires -- otherwise a caller whose tool needed permission
+    would block the entire sidecar slot table for the duration of a human
+    approval flow.
+
+    We stub start_session anyway, so that any "should-have-probed-but-didn't"
+    regression fails as a 502 from a real spawn rather than as a silent
+    pass-through.
+    """
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        body = {
+            "model": "m",
+            "tools": [{"type": "function", "function": {
+                "name": "Bash", "description": "Run shell commands",
+                "parameters": {"type": "object",
+                               "properties": {"command": {"type": "string"}},
+                                "required": ["command"]}}}],
+            "messages": [
+                {"role": "system", "content": "no env here"},
+                {"role": "user", "content": "What OS am I on?"},
+            ],
+        }
+        response = asyncio.run(server.handle_tool_request(body, body["tools"], None))
+        # The probe is a chat.completion with finish_reason=tool_calls.
+        # If the stub was called instead, start_session was incorrectly
+        # invoked on the probe path -- a regression.
+        assert "choices" in response, \
+            f"expected a probe response, got {response!r}"
+        assert response["choices"][0]["finish_reason"] == "tool_calls", response
+        tc = response["choices"][0]["message"]["tool_calls"][0]
+        assert tc["id"].startswith(caller_env_module.PROBE_PREFIX), tc["id"]
+        # The synthetic call's arguments are the probe command on the right key.
+        args = json.loads(tc["function"]["arguments"])
+        assert args.get("command"), args
+        assert "pwd" in args["command"] and "uname" in args["command"]
+        assert "$SHELL" in args["command"]
+        # CRITICAL: no slot taken, no session allocated.
+        assert server.cli_bridge._gate.in_flight == 0, \
+            f"probe must not hold a slot: in_flight={server.cli_bridge._gate.in_flight}"
+        assert server.SESSIONS == {}, f"probe must not allocate a session: {server.SESSIONS}"
+        # start_session was NOT called for the probe path.
+        assert captured == [], captured
+        print(f"  probe emitted: {tc['id']} -> args has pwd+uname+$SHELL; "
+              f"no slot taken (in_flight=0)")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_probe_follow_up_strips_synthetic_exchange_and_starts_session():
+    """The follow-up request carrying the probe result must: parse the env,
+    strip the synthetic assistant+tool exchange, then proceed into the
+    normal fresh path with the env known. The system the CLI finally sees
+    contains the `[SwitchYard tool execution environment]` block; the
+    prompt's first user turn carries the one-line reminder.
+    """
+    saved_gate_count = server.cli_bridge._gate.in_flight
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        messages = [
+            {"role": "system", "content": "no env"},
+            {"role": "user", "content": "What OS am I on?"},
+        ]
+        # First request: env unknown -> synthetic probe emitted.
+        first = asyncio.run(server.handle_tool_request(
+            {"model": "m", "tools": [{
+                "type": "function", "function": {
+                    "name": "Bash", "description": "",
+                    "parameters": {"type": "object",
+                                   "properties": {"command": {"type": "string"}},
+                                   "required": ["command"]}}}],
+             "messages": messages}, [{
+                "type": "function", "function": {
+                    "name": "Bash", "description": "",
+                    "parameters": {"type": "object",
+                                   "properties": {"command": {"type": "string"}},
+                                   "required": ["command"]}}}], None))
+        probe_id = first["choices"][0]["message"]["tool_calls"][0]["id"]
+
+        # Second request: caller executed the probe, replies with a tool
+        # message whose tool_call_id is the probe id and content is the
+        # three labelled lines from PROBE_COMMAND. The synthetic assistant
+        # message that minted the probe MUST be stripped out before the
+        # CLI sees it.
+        followup_messages = messages + [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": probe_id, "type": "function",
+                 "function": {"name": "Bash",
+                              "arguments": json.dumps({"command": "pwd"})}}]},
+            {"role": "tool", "tool_call_id": probe_id, "content": (
+                "cwd=/home/u/dir\n"
+                "platform=Linux\n"
+                "shell=/bin/zsh\n")},
+            {"role": "user", "content": "ok thanks"},
+        ]
+        body2 = {"model": "m",
+                 "tools": [{"type": "function", "function": {
+                     "name": "Bash", "description": "",
+                     "parameters": {"type": "object",
+                                    "properties": {"command": {"type": "string"}},
+                                    "required": ["command"]}}}],
+                 "messages": followup_messages}
+        asyncio.run(server.handle_tool_request(body2, body2["tools"], None))
+
+        assert len(captured) == 1, captured
+        seen = captured[0]
+        # The CLI's system prompt has the env block.
+        assert "[SwitchYard tool execution environment]" in seen["system"], \
+            seen["system"]
+        assert "Caller platform: Linux" in seen["system"], seen["system"]
+        assert "Caller working directory: /home/u/dir" in seen["system"], seen["system"]
+        assert "Caller shell: /bin/zsh" in seen["system"], seen["system"]
+        # The synthetic assistant+tool exchange is gone from what the CLI sees:
+        # the rendered prompt has the first real user turn + reminder, but no
+        # "[called Bash" narration of the probe and no Human: cwd=... block.
+        assert "cwd=/home/u/dir" not in seen["prompt"], \
+            "probe-result text must not leak into the rebuilt prompt"
+        assert "[SwitchYard: tools execute on Linux in /home/u/dir" in seen["prompt"], \
+            seen["prompt"]
+        print(f"  follow-up: env parsed, synthetic exchange stripped, system has env block")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_probe_iserror_marks_failed_and_no_retry_on_second_attempt():
+    """An isError / unparseable probe result marks the fingerprint failed
+    and the next attempt with the same fingerprint MUST NOT re-emit the
+    probe. Falling back to the unknown-env path is the only allowed
+    behaviour; no retry loop, no escalation, just the env-block with the
+    'unknown' wording."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        messages = [
+            {"role": "system", "content": "no env"},
+            {"role": "user", "content": "What OS am I on?"},
+        ]
+        # 1. First call: probe emitted.
+        first = asyncio.run(server.handle_tool_request(
+            {"model": "m", "tools": tools, "messages": messages}, tools, None))
+        probe_id = first["choices"][0]["message"]["tool_calls"][0]["id"]
+
+        # 2. Second call: caller REFUSED the probe (isError=true).
+        followup_messages = messages + [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": probe_id, "type": "function",
+                 "function": {"name": "Bash",
+                              "arguments": json.dumps({"command": "pwd"})}}]},
+            {"role": "tool", "tool_call_id": probe_id, "is_error": True,
+             "content": "permission denied"},
+            {"role": "user", "content": "ok thanks anyway"},
+        ]
+        body2 = {"model": "m", "tools": tools, "messages": followup_messages}
+        asyncio.run(server.handle_tool_request(body2, tools, None))
+
+        # Now the third call with the SAME fingerprint MUST NOT probe again.
+        # Reset the message prefix back to the first two turns to keep the
+        # fingerprint stable.
+        messages3 = list(messages) + [
+            {"role": "user", "content": "next question"},
+        ]
+        body3 = {"model": "m", "tools": tools, "messages": messages3}
+        third = asyncio.run(server.handle_tool_request(body3, tools, None))
+
+        # The fingerprint must be in FAILED_PROBES now.
+        assert len(server.FAILED_PROBES) >= 1, dict(server.FAILED_PROBES)
+        # The third call's response is NOT a synthetic probe -- it is the
+        # stubbed start_session result (a normal session with the unknown
+        # env block in its system).
+        if "choices" in third:
+            # Got a real completion; it must NOT be a probe.
+            tcs = third["choices"][0]["message"].get("tool_calls") or []
+            assert not any((tc.get("id") or "").startswith(caller_env_module.PROBE_PREFIX)
+                           for tc in tcs), tcs
+        else:
+            # Stubbed {"stubbed": True} response from start_session.
+            assert third == {"stubbed": True}, third
+        # The system the CLI sees has the unknown-env wording.
+        if captured:
+            seen = captured[-1]
+            assert "Caller platform: unknown" in seen["system"], seen["system"]
+            assert "Caller working directory: unknown" in seen["system"], seen["system"]
+        print(f"  isError probe -> FAILED_PROBES populated, "
+              f"no retry on second attempt, env rendered as 'unknown'")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_passive_env_skips_probe_and_renders_request_values():
+    """A request that already carries its own environment (an OpenCode-
+    shaped system block, say) MUST be parsed passively and the probe
+    skipped entirely. The system the CLI sees has the resolved values."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        body = {"model": "m", "tools": tools, "messages": [
+            {"role": "system", "content": (
+                "<environment>\n"
+                "  <working_directory>C:\\Users\\demo\\p</working_directory>\n"
+                "  <platform>windows</platform>\n"
+                "</environment>"
+            )},
+            {"role": "user", "content": "hi"},
+        ]}
+        response = asyncio.run(server.handle_tool_request(body, tools, None))
+        # It went straight to the stubbed start_session (no probe emitted).
+        assert response == {"stubbed": True}, response
+        # No probe was emitted; FAILED_PROBES / RESOLVED_PROBES empty.
+        assert server.FAILED_PROBES == {}, dict(server.FAILED_PROBES)
+        assert server.RESOLVED_PROBES == {}, dict(server.RESOLVED_PROBES)
+        # The system the CLI sees has the request-derived env.
+        seen = captured[-1]
+        assert "[SwitchYard tool execution environment]" in seen["system"], seen["system"]
+        assert r"Caller working directory: C:\Users\demo\p" in seen["system"]
+        assert "Caller platform: windows" in seen["system"]
+        # Reminder on the first turn.
+        assert "[SwitchYard: tools execute on windows in C:\\Users\\demo\\p" in seen["prompt"]
+        print("  request-carries-env: passive parse, no probe, env block rendered")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_metadata_caller_env_is_honored_when_present():
+    """metadata.switchyard.caller_env stamped on the request body MUST be
+    honoured as the resolved env (source=request). The stamp is the easy
+    path; the passive parsers are the belt-and-braces backup."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        body = {"model": "m", "tools": tools,
+                "metadata": {"switchyard": {"caller_env": {
+                    "platform": "macos", "cwd": "/Users/x/p",
+                    "shell": "zsh", "source": "request"}}},
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                ]}
+        response = asyncio.run(server.handle_tool_request(body, tools, None))
+        assert response == {"stubbed": True}, response
+        seen = captured[-1]
+        assert "Caller platform: macos" in seen["system"]
+        assert "Caller working directory: /Users/x/p" in seen["system"]
+        assert "Caller shell: zsh" in seen["system"]
+        print("  metadata-stamped caller_env honored -> system reflects macos values")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_run_session_subprocess_cwd_is_session_workdir():
+    """run_session must spawn the inner CLI with cwd == session.workdir,
+    NOT /app/mcp_bridge. The fake CLI prints its own cwd, so we can
+    assert the spawned process actually saw the per-session directory.
+    """
+    import shutil as _shutil
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-cwdsess-"))
+    session = server.Session(id=uuid.uuid4().hex, provider="claude", model="m",
+                              workdir=str(workdir))
+    server.SESSIONS[session.id] = session
+    fake_cli = _write_fake_cli(
+        "import json, os\n"
+        "print(json.dumps({'result': os.getcwd(), 'usage': "
+        "{'input_tokens': 1, 'output_tokens': 0}}))\n")
+    try:
+        async def scenario():
+            session.new_turn()
+            await server.run_session(session, [sys.executable, fake_cli])
+            return session.turn_future.result()
+
+        result = asyncio.run(scenario())
+        assert result["type"] == "final", result
+        assert result["payload"]["result"] == str(workdir), (
+            f"expected inner CLI cwd == session.workdir {workdir!r}, "
+            f"got {result['payload']['result']!r}"
+        )
+        print(f"  inner CLI spawned with cwd={result['payload']['result']}")
+    finally:
+        server.SESSIONS.pop(session.id, None)
+        try:
+            os.unlink(fake_cli)
+        except OSError:
+            pass
+        try:
+            os.unlink(os.path.dirname(fake_cli))
+        except OSError:
+            pass
+        _shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------- PR #66 review fixes ----------------
+def _set_caller_environment_probe(probe: str):
+    """Replace cli_bridge._config with one whose caller_environment.probe
+    is `probe`. The probe mode determines how the mcp_bridge handles
+    unresolvable envs (auto=fallback unknown, required=503, disabled=skip
+    probe entirely). Returns a restore callable."""
+    from dataclasses import replace as _replace
+    saved = server.cli_bridge._config
+    ce = server.cli_bridge.config().caller_environment
+    new_ce = _replace(ce, probe=probe) if ce is not None else None
+    server.cli_bridge._config = _replace(saved, caller_environment=new_ce)
+    def restore():
+        server.cli_bridge._config = saved
+    return restore
+
+
+def test_probe_required_unresolvable_returns_400_no_unknown_wording():
+    """PR #66 blocker (round 2 update): probe=required + an unresolvable
+    env must refuse the request with HTTP 400 (type=caller_environment_required)
+    and NO Retry-After header, NOT silently fall through to the unknown-env
+    wording. The round-1 status was 503 + Retry-After:5; round 2 changed
+    it to 400 because the failure is not transient -- nothing about the
+    request, the caller, or the operator's plans.yaml can change in 5
+    seconds, so a Retry-After actively misleads the caller. The file's
+    503 + Retry-After convention is reserved for transient-capacity
+    conditions.
+
+    The scenario: a caller has tools (so a probe is minted), but refuses
+    the probe on the second turn (is_error=true). The second turn has no
+    passive env in the request body and the probe was refused -- the env
+    cannot be resolved. With probe=required, handle_fresh must raise
+    400 instead of falling through to `unknown`."""
+    from fastapi import HTTPException
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    restore_cfg = _set_caller_environment_probe("required")
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        messages = [
+            {"role": "system", "content": "no env"},
+            {"role": "user", "content": "What OS am I on?"},
+        ]
+        # 1. First request: env unknown, probe minted.
+        first = asyncio.run(server.handle_tool_request(
+            {"model": "m", "tools": tools, "messages": messages}, tools, None))
+        probe_id = first["choices"][0]["message"]["tool_calls"][0]["id"]
+
+        # 2. Second request: caller REFUSED the probe (is_error=true).
+        # With probe=required, the env is now unresolvable and the
+        # sidecar MUST refuse -- not silently fall through to the
+        # unknown-env wording.
+        refusal = messages + [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": probe_id, "type": "function",
+                 "function": {"name": "Bash",
+                              "arguments": json.dumps({"command": "pwd"})}}]},
+            {"role": "tool", "tool_call_id": probe_id, "is_error": True,
+             "content": "permission denied"},
+            {"role": "user", "content": "ok thanks anyway"},
+        ]
+        try:
+            response = asyncio.run(server.handle_tool_request(
+                {"model": "m", "tools": tools, "messages": refusal},
+                tools, None))
+        except HTTPException as exc:
+            # 400 (Bad Request) -- not 503. The failure is a config /
+            # request mismatch, not transient capacity.
+            assert exc.status_code == 400, \
+                f"probe=required must 400, got {exc.status_code}: {exc.detail}"
+            assert isinstance(exc.detail, dict), exc.detail
+            assert exc.detail.get("error", {}).get("type") == \
+                "caller_environment_required", exc.detail
+            # NO Retry-After: the failure is not transient. A 5-second
+            # Retry-After would actively mislead the caller -- the env
+            # will still be unresolvable on retry (the operator's
+            # plans.yaml still has no fallback_platform, the body still
+            # has no passive env, the CLI still refuses the probe).
+            assert not (exc.headers and "retry-after" in {k.lower() for k in exc.headers}), \
+                f"probe=required must NOT carry Retry-After (failure is not " \
+                f"transient), got headers={exc.headers!r}"
+            print(f"  probe=required + refused probe -> HTTP 400 "
+                  f"type=caller_environment_required, no Retry-After")
+            return
+        raise AssertionError(
+            f"probe=required must raise 400, but handle_tool_request returned "
+            f"{response!r} (silent fallback to unknown is the regression)")
+    finally:
+        restore_cfg()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_metadata_source_config_is_relabeled_to_request():
+    """PR #66 should-fix: a metadata stamp claiming source=config must
+    be re-labeled to source=request. The values still flow through (we
+    do not want to lose data), but at the request tier of the
+    precedence chain, not the config tier. The invariant: the ONLY
+    path that produces source=config is the operator's plans.yaml
+    settings; anything arriving over the wire cannot.
+
+    A caller that stamps `source=config` to bypass the precedence chain
+    -- say, to force the sidecar to honor a fake Linux /app env as the
+    caller's environment, exactly the bug #44 is meant to prevent --
+    gets the request tier instead. The relay-env-as-caller-env
+    invariant stays intact."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        body = {"model": "m", "tools": tools,
+                "metadata": {"switchyard": {"caller_env": {
+                    # The classic bug attempt: claim config-tier so
+                    # the precedence chain skips the passive parse
+                    # AND uses these values as operator-forced.
+                    "platform": "linux", "cwd": "/app/mcp_bridge",
+                    "shell": "/bin/sh", "source": "config"}}},
+                "messages": [
+                    {"role": "system", "content": (
+                        "<environment>\n"
+                        "  <working_directory>C:\\Users\\demo</working_directory>\n"
+                        "  <platform>windows</platform>\n"
+                        "</environment>"
+                    )},
+                    {"role": "user", "content": "hi"},
+                ]}
+        response = asyncio.run(server.handle_tool_request(body, tools, None))
+        # The CLI sees the env block; the values are honored (we don't
+        # drop data) but at the REQUEST tier, not the config tier.
+        seen = captured[-1]
+        env = seen["env"]
+        assert env.source == "request", \
+            f"metadata-stamped source=config must be re-labeled to request, " \
+            f"got {env.source!r}"
+        assert env.platform == "linux"
+        assert env.cwd == "/app/mcp_bridge"
+        # The metadata-stamped values WON, not the passive parse's
+        # windows values, because metadata is consulted first and both
+        # are at the request tier. Either is consistent with the
+        # invariant; the point is the source label.
+        print(f"  metadata claims source=config -> re-labeled to "
+              f"{env.source!r}, values still flow through")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_metadata_source_host_is_relabeled_to_request():
+    """Round-2 should-fix: `source=host` is also plans.yaml-derived
+    (the `fallback_platform` branch of `resolve()` produces it), so a
+    caller who stamps `source=host` to bypass the precedence chain
+    must get the request tier instead. Same defensive re-labeling as
+    `source=config`."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        body = {"model": "m", "tools": tools,
+                "metadata": {"switchyard": {"caller_env": {
+                    "platform": "macos", "cwd": "/Users/x",
+                    "shell": "zsh", "source": "host"}}},
+                "messages": [{"role": "user", "content": "hi"}]}
+        asyncio.run(server.handle_tool_request(body, tools, None))
+        seen = captured[-1]
+        env = seen["env"]
+        assert env.source == "request", \
+            f"metadata-stamped source=host must be re-labeled to request, " \
+            f"got {env.source!r}"
+        assert env.platform == "macos"
+        assert env.cwd == "/Users/x"
+        print(f"  metadata claims source=host -> re-labeled to "
+              f"{env.source!r}, values still flow through")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_metadata_stamp_without_source_falls_through_to_passive_parse():
+    """Round-2 should-fix: a wire stamp without an explicit source
+    marker must NOT preempt passive detection. The round-1 helper
+    returned a CallerEnvironment for any stamp with at least one field
+    (even without a source), so a stamp like `{"platform": "linux"}`
+    would win over a passive-parseable body. Restore the pre-round-1
+    strictness: only honored sources yield a CallerEnvironment;
+    everything else falls through to `parse_request(body)`.
+
+    The end-to-end check: stamp values without source + passive-
+    parseable system prompt -> the passive parse wins, not the
+    stamp values."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        body = {"model": "m", "tools": tools,
+                # Stamp WITHOUT a source field, with values that would
+                # win if from_wire_metadata were permissive. The body
+                # ALSO carries a passive OpenCode-shaped env block.
+                "metadata": {"switchyard": {"caller_env": {
+                    "platform": "linux", "cwd": "/app/mcp_bridge",
+                    "shell": "/bin/sh"}}},
+                "messages": [
+                    {"role": "system", "content": (
+                        "<environment>\n"
+                        "  <working_directory>C:\\Users\\demo\\p</working_directory>\n"
+                        "  <platform>windows</platform>\n"
+                        "</environment>"
+                    )},
+                    {"role": "user", "content": "hi"},
+                ]}
+        asyncio.run(server.handle_tool_request(body, tools, None))
+        seen = captured[-1]
+        env = seen["env"]
+        # The stamp's `linux / /app/mcp_bridge` did NOT win. The
+        # passive parse's `windows / C:\Users\demo\p` did.
+        assert env.platform == "windows", \
+            f"stamp-without-source must fall through to passive parse, " \
+            f"got platform={env.platform!r} (stamp won)"
+        assert env.cwd == "C:\\Users\\demo\\p", \
+            f"stamp-without-source must fall through to passive parse, " \
+            f"got cwd={env.cwd!r} (stamp won)"
+        assert env.source == "request", env.source
+        # Critically: the relay's /app/mcp_bridge is NOT in the
+        # rendered env -- the bug we're avoiding.
+        assert env.cwd != "/app/mcp_bridge", env.cwd
+        print(f"  stamp without source -> passive parse wins "
+              f"(platform={env.platform!r}, cwd={env.cwd!r})")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_concurrent_same_fingerprint_mints_only_one_probe():
+    """PR #66 should-fix: _maybe_probe's check+mint pair is atomic under
+    asyncio.gather. Without the lock, two (or three) concurrent calls
+    with the same fingerprint would all pass the `fp not in caches`
+    check and all mint duplicate probes -- one would carry through and
+    the others would be silently dropped at consume-time, polluting
+    the caller's history with extra synthetic tool_calls and wasting
+    work. With PROBE_LOCK + the _PROBE_PENDING sentinel published
+    before releasing the lock, exactly one mints and the others see
+    fp already-taken and fall through to handle_fresh.
+
+    Stubbed start_session so the handle_fresh path does not actually
+    spawn a CLI; the test asserts the count distribution: 1 probe
+    response + (N-1) stubbed sessions."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        body = {"model": "m", "tools": tools, "messages": [
+            {"role": "system", "content": "no env"},
+            {"role": "user", "content": "What OS am I on?"},
+        ]}
+
+        async def scenario():
+            return await asyncio.gather(
+                server.handle_tool_request(dict(body), tools, None),
+                server.handle_tool_request(dict(body), tools, None),
+                server.handle_tool_request(dict(body), tools, None),
+            )
+
+        responses = asyncio.run(scenario())
+        # Exactly one probe response was emitted.
+        probes = [r for r in responses
+                  if "choices" in r
+                  and r["choices"][0].get("finish_reason") == "tool_calls"
+                  and any((tc.get("id") or "").startswith(
+                          caller_env_module.PROBE_PREFIX)
+                          for tc in (r["choices"][0]["message"]
+                                      .get("tool_calls") or []))]
+        assert len(probes) == 1, \
+            f"asyncio.gather(3x same-fingerprint) must mint exactly 1 probe, " \
+            f"got {len(probes)} (duplicate probes is the regression)"
+        # The other two went through start_session (stubbed).
+        stubbed = [r for r in responses if r == {"stubbed": True}]
+        assert len(stubbed) == 2, \
+            f"expected 2 stubbed sessions, got {len(stubbed)}"
+        # The PENDING sentinel is in RESOLVED_PROBES; only the probe
+        # result can overwrite it with a real env (or FAILED_PROBES).
+        assert len(server.RESOLVED_PROBES) == 1, dict(server.RESOLVED_PROBES)
+        assert next(iter(server.RESOLVED_PROBES.values())) is \
+            server._PROBE_PENDING, dict(server.RESOLVED_PROBES)
+        print(f"  asyncio.gather(3x same-fingerprint) -> 1 probe + 2 stubbed; "
+              f"PENDING sentinel in RESOLVED_PROBES")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+# Module-level alias for tests that want the probe prefix string.
+caller_env_module = sys.modules.get("switchyard.caller_env")
+if caller_env_module is None:
+    import importlib.util as _il
+    _path = os.path.join(os.path.dirname(HERE), "switchyard", "caller_env.py")
+    _spec = _il.spec_from_file_location("switchyard.caller_env", _path)
+    caller_env_module = _il.module_from_spec(_spec)
+    caller_env_module.__package__ = "switchyard"
+    sys.modules.setdefault("switchyard", type(sys)("switchyard"))
+    sys.modules["switchyard.caller_env"] = caller_env_module
+    _spec.loader.exec_module(caller_env_module)
 
 
 if __name__ == "__main__":

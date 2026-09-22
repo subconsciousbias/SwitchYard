@@ -30,6 +30,14 @@ WORKDIR /app
 # classification rather than duplicating them.
 COPY sidecars/cli_bridge/server.py /app/cli_bridge/server.py
 COPY sidecars/mcp_bridge /app/mcp_bridge
+# Both bridges need switchyard/caller_env.py: it owns the per-request
+# resolution of the caller's tool-execution environment (issue #44) and
+# the rendering of the [SwitchYard tool execution environment] block the
+# inner CLI sees. Mirrors Dockerfile.token_proxy's switchyard/ copy:
+# PYTHONPATH=/app + the package on disk makes `import switchyard.caller_env`
+# work the same way `import switchyard.oauth` does in the token-proxy image.
+COPY switchyard/__init__.py /app/switchyard/__init__.py
+COPY switchyard/caller_env.py /app/switchyard/caller_env.py
 # Minimal harness configs. opencode.json is read as the project config from the
 # working directory and defines the `switchyard` agent (one-line prompt, every
 # tool disabled); codex-instructions.md is the default base-instruction override.
@@ -51,6 +59,6 @@ ENV HOME=/home/node \
     XDG_CONFIG_HOME=/home/node/.config \
     XDG_CACHE_HOME=/home/node/.cache
 
-ENV PROVIDER=claude SWITCHYARD_PLANS=/app/config/plans.yaml
+ENV PROVIDER=claude SWITCHYARD_PLANS=/app/config/plans.yaml PYTHONPATH=/app
 EXPOSE 8081 8082 8083 8084
 CMD ["sh", "-c", "cd /app/${BRIDGE:-cli}_bridge && uvicorn server:app --host 0.0.0.0 --port ${SIDECAR_PORT:-8081}"]
