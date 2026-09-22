@@ -2084,18 +2084,22 @@ def _set_caller_environment_probe(probe: str):
     return restore
 
 
-def test_probe_required_unresolvable_returns_503_no_unknown_wording():
-    """PR #66 blocker: probe=required + an unresolvable env must refuse
-    the request with a clear HTTP 503 (type=caller_environment_required),
-    NOT silently fall through to the unknown-env wording. The 503 is
-    what the operator opted in to; the unknown-env rendering is the bug
-    the option exists to prevent.
+def test_probe_required_unresolvable_returns_400_no_unknown_wording():
+    """PR #66 blocker (round 2 update): probe=required + an unresolvable
+    env must refuse the request with HTTP 400 (type=caller_environment_required)
+    and NO Retry-After header, NOT silently fall through to the unknown-env
+    wording. The round-1 status was 503 + Retry-After:5; round 2 changed
+    it to 400 because the failure is not transient -- nothing about the
+    request, the caller, or the operator's plans.yaml can change in 5
+    seconds, so a Retry-After actively misleads the caller. The file's
+    503 + Retry-After convention is reserved for transient-capacity
+    conditions.
 
     The scenario: a caller has tools (so a probe is minted), but refuses
     the probe on the second turn (is_error=true). The second turn has no
     passive env in the request body and the probe was refused -- the env
-    cannot be resolved. With probe=required, handle_fresh must raise the
-    503 instead of falling through to `unknown`."""
+    cannot be resolved. With probe=required, handle_fresh must raise
+    400 instead of falling through to `unknown`."""
     from fastapi import HTTPException
     saved_sessions = dict(server.SESSIONS)
     saved_failed = dict(server.FAILED_PROBES)
@@ -2137,19 +2141,26 @@ def test_probe_required_unresolvable_returns_503_no_unknown_wording():
                 {"model": "m", "tools": tools, "messages": refusal},
                 tools, None))
         except HTTPException as exc:
-            assert exc.status_code == 503, \
-                f"probe=required must 503, got {exc.status_code}: {exc.detail}"
+            # 400 (Bad Request) -- not 503. The failure is a config /
+            # request mismatch, not transient capacity.
+            assert exc.status_code == 400, \
+                f"probe=required must 400, got {exc.status_code}: {exc.detail}"
             assert isinstance(exc.detail, dict), exc.detail
             assert exc.detail.get("error", {}).get("type") == \
                 "caller_environment_required", exc.detail
-            # Retry-After matches the file's existing capacity/resume-gone
-            # conventions. fastapi preserves the header name case verbatim.
-            assert exc.headers and exc.headers.get("Retry-After") == "5", exc.headers
-            print(f"  probe=required + refused probe -> HTTP 503 "
-                  f"type=caller_environment_required, Retry-After: 5")
+            # NO Retry-After: the failure is not transient. A 5-second
+            # Retry-After would actively mislead the caller -- the env
+            # will still be unresolvable on retry (the operator's
+            # plans.yaml still has no fallback_platform, the body still
+            # has no passive env, the CLI still refuses the probe).
+            assert not (exc.headers and "retry-after" in {k.lower() for k in exc.headers}), \
+                f"probe=required must NOT carry Retry-After (failure is not " \
+                f"transient), got headers={exc.headers!r}"
+            print(f"  probe=required + refused probe -> HTTP 400 "
+                  f"type=caller_environment_required, no Retry-After")
             return
         raise AssertionError(
-            f"probe=required must raise 503, but handle_tool_request returned "
+            f"probe=required must raise 400, but handle_tool_request returned "
             f"{response!r} (silent fallback to unknown is the regression)")
     finally:
         restore_cfg()
@@ -2220,6 +2231,120 @@ def test_metadata_source_config_is_relabeled_to_request():
         # invariant; the point is the source label.
         print(f"  metadata claims source=config -> re-labeled to "
               f"{env.source!r}, values still flow through")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_metadata_source_host_is_relabeled_to_request():
+    """Round-2 should-fix: `source=host` is also plans.yaml-derived
+    (the `fallback_platform` branch of `resolve()` produces it), so a
+    caller who stamps `source=host` to bypass the precedence chain
+    must get the request tier instead. Same defensive re-labeling as
+    `source=config`."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        body = {"model": "m", "tools": tools,
+                "metadata": {"switchyard": {"caller_env": {
+                    "platform": "macos", "cwd": "/Users/x",
+                    "shell": "zsh", "source": "host"}}},
+                "messages": [{"role": "user", "content": "hi"}]}
+        asyncio.run(server.handle_tool_request(body, tools, None))
+        seen = captured[-1]
+        env = seen["env"]
+        assert env.source == "request", \
+            f"metadata-stamped source=host must be re-labeled to request, " \
+            f"got {env.source!r}"
+        assert env.platform == "macos"
+        assert env.cwd == "/Users/x"
+        print(f"  metadata claims source=host -> re-labeled to "
+              f"{env.source!r}, values still flow through")
+    finally:
+        restore()
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_metadata_stamp_without_source_falls_through_to_passive_parse():
+    """Round-2 should-fix: a wire stamp without an explicit source
+    marker must NOT preempt passive detection. The round-1 helper
+    returned a CallerEnvironment for any stamp with at least one field
+    (even without a source), so a stamp like `{"platform": "linux"}`
+    would win over a passive-parseable body. Restore the pre-round-1
+    strictness: only honored sources yield a CallerEnvironment;
+    everything else falls through to `parse_request(body)`.
+
+    The end-to-end check: stamp values without source + passive-
+    parseable system prompt -> the passive parse wins, not the
+    stamp values."""
+    saved_sessions = dict(server.SESSIONS)
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    server.SESSIONS.clear()
+    server.FAILED_PROBES.clear()
+    server.RESOLVED_PROBES.clear()
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        tools = [{"type": "function", "function": {
+            "name": "Bash", "description": "",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]}}}]
+        body = {"model": "m", "tools": tools,
+                # Stamp WITHOUT a source field, with values that would
+                # win if from_wire_metadata were permissive. The body
+                # ALSO carries a passive OpenCode-shaped env block.
+                "metadata": {"switchyard": {"caller_env": {
+                    "platform": "linux", "cwd": "/app/mcp_bridge",
+                    "shell": "/bin/sh"}}},
+                "messages": [
+                    {"role": "system", "content": (
+                        "<environment>\n"
+                        "  <working_directory>C:\\Users\\demo\\p</working_directory>\n"
+                        "  <platform>windows</platform>\n"
+                        "</environment>"
+                    )},
+                    {"role": "user", "content": "hi"},
+                ]}
+        asyncio.run(server.handle_tool_request(body, tools, None))
+        seen = captured[-1]
+        env = seen["env"]
+        # The stamp's `linux / /app/mcp_bridge` did NOT win. The
+        # passive parse's `windows / C:\Users\demo\p` did.
+        assert env.platform == "windows", \
+            f"stamp-without-source must fall through to passive parse, " \
+            f"got platform={env.platform!r} (stamp won)"
+        assert env.cwd == "C:\\Users\\demo\\p", \
+            f"stamp-without-source must fall through to passive parse, " \
+            f"got cwd={env.cwd!r} (stamp won)"
+        assert env.source == "request", env.source
+        # Critically: the relay's /app/mcp_bridge is NOT in the
+        # rendered env -- the bug we're avoiding.
+        assert env.cwd != "/app/mcp_bridge", env.cwd
+        print(f"  stamp without source -> passive parse wins "
+              f"(platform={env.platform!r}, cwd={env.cwd!r})")
     finally:
         restore()
         server.SESSIONS.clear()

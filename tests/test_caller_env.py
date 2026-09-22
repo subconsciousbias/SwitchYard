@@ -339,20 +339,65 @@ def test_from_wire_metadata_passes_through_non_config_sources():
 
 
 def test_from_wire_metadata_rejects_malformed_input():
-    """Non-dicts, empty dicts, and dicts with no usable fields all return
-    None -- the caller falls back to passive parse."""
+    """Non-dicts, empty dicts, dicts with no usable fields, and dicts with
+    no usable source marker all return None -- the caller falls back to
+    `parse_request(body)`. This matches the pre-round-1 strictness: a
+    stamp without an explicit source label does NOT preempt passive
+    detection."""
     assert caller_env.from_wire_metadata(None) is None
     assert caller_env.from_wire_metadata("not a dict") is None
     assert caller_env.from_wire_metadata([]) is None
     assert caller_env.from_wire_metadata({}) is None
     assert caller_env.from_wire_metadata({"source": "request"}) is None
-    # A dict with both an unknown label AND a real field still parses:
-    # the field drives presence, the unknown label becomes source=unknown.
-    parsed = caller_env.from_wire_metadata(
-        {"source": "made_up", "platform": "linux"})
-    assert parsed is not None and parsed.source == "unknown" \
-        and parsed.platform == "linux", parsed
-    print("  malformed/empty metadata -> None; real fields drive presence")
+    # No source field at all: falls through to passive parse.
+    assert caller_env.from_wire_metadata({"platform": "linux", "cwd": "/x"}) \
+        is None
+    # Explicit source="unknown" is a sentinel for "I don't know"; treat
+    # it as absent -- the caller falls through to passive parse.
+    assert caller_env.from_wire_metadata(
+        {"source": "unknown", "platform": "linux"}) is None
+    # Unknown source label: also treated as absent.
+    assert caller_env.from_wire_metadata(
+        {"source": "made_up", "platform": "linux"}) is None
+    print("  malformed/no-source metadata -> None; passive parse picks up")
+
+
+def test_from_wire_metadata_relabels_host_to_request():
+    """Round-2 should-fix: `source=host` is also plans.yaml-derived (the
+    `fallback_platform` branch of `resolve()` produces it), so a caller
+    who stamps `source=host` to bypass the precedence chain gets the
+    request tier instead -- same defensive re-labeling as `source=config`.
+    """
+    rejected = caller_env.from_wire_metadata({
+        "platform": "macos", "cwd": "/Users/x", "shell": "zsh",
+        "source": "host"})
+    assert rejected is not None
+    assert rejected.source == "request", \
+        f"metadata-stamped source=host must be re-labeled to request, " \
+        f"got {rejected.source!r}"
+    # Values still flow through (we don't drop data, we just prevent
+    # the precedence bypass).
+    assert rejected.platform == "macos"
+    assert rejected.cwd == "/Users/x"
+    assert rejected.shell == "zsh"
+    print(f"  metadata claims source=host -> re-labeled to "
+          f"{rejected.source!r}, values still flow through")
+
+
+def test_from_wire_metadata_honors_probe_source():
+    """`source=probe` is intentionally NOT re-labeled -- the only
+    legitimate minter is the sidecar's own `_consume_probe_results`,
+    which stamps source=probe on a freshly parsed env. A wire forgery
+    of probe is technically possible but not useful (the attacker
+    would have to make a real tool round-trip succeed to fake the
+    parsed env). Leave probe alone."""
+    parsed = caller_env.from_wire_metadata({
+        "platform": "linux", "cwd": "/home/u/proj", "shell": "/bin/zsh",
+        "source": "probe"})
+    assert parsed is not None
+    assert parsed.source == "probe"
+    assert parsed.platform == "linux"
+    print(f"  metadata source=probe -> honored as {parsed.source!r}")
 
 
 def test_resolve_unknown_when_nothing_yields():

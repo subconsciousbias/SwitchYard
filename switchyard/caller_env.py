@@ -135,18 +135,38 @@ def from_wire_metadata(meta: dict | None) -> CallerEnvironment | None:
     the gateway, which DID read the operator's plans.yaml -- but at this
     layer we have no way to verify the stamp was minted by the gateway
     versus by a caller that reached the sidecar directly. The safe
-    answer: NEVER honor a claimed `source=config` from the wire. The
-    ONLY path that produces `source=config` is the operator's plans.yaml
-    settings, resolved through `CallerEnvironmentSettings` -> `resolve()`.
+    answer is two-fold:
 
-    Re-labeling claim-as-config -> request is strictly defensive:
-    values still flow through, but at the request tier of the
-    precedence chain, not the config tier. A caller who stamps
-    `source=config` to try to bypass the precedence chain gets the
-    request tier instead -- the relay-env-as-caller-env bug remains
-    fixed.
+      1. NEVER honor plans.yaml-derived labels (`source=config` or
+         `source=host`) from the wire. The ONLY path that produces
+         `source=config` is the operator's plans.yaml forced values,
+         resolved through `CallerEnvironmentSettings` -> `resolve()`.
+         The ONLY path that produces `source=host` is
+         `cfg.fallback_platform` in the same resolver. Both are
+         re-labeled to `source=request` so values still flow through
+         at the request tier of the precedence chain, not at the
+         privileged plans.yaml tiers. A caller who reaches the sidecar
+         directly cannot use either label to bypass the precedence
+         chain.
+      2. Strict source-marker gate: only stamps with an explicit,
+         sensible `source` label are honored. `None`, `"unknown"`,
+         and unknown labels all return None so the caller falls back
+         to `parse_request(body)` -- matching the pre-round-1
+         behaviour. This closes a small attack-surface expansion in
+         the round-1 helper, which returned parsed for any stamp with
+         at least one field, letting values without a source marker
+         preempt passive detection.
 
-    Returns None for malformed input or when no field carries data.
+    The `source=probe` case is intentionally honored as-is: the only
+    legitimate minter is the sidecar's own `_consume_probe_results`,
+    which stamps source=probe on a freshly parsed env. A wire forgery
+    of probe is technically possible but not useful -- the attacker
+    would have to make the tool round-trip succeed to fake the parsed
+    env, which they could do anyway. Leave probe alone.
+
+    Returns None for malformed input, when no field carries data, or
+    when the source marker is absent / unknown / `unknown`. The caller
+    falls back to `parse_request(body)` in those cases.
     """
     if not isinstance(meta, dict):
         return None
@@ -156,15 +176,19 @@ def from_wire_metadata(meta: dict | None) -> CallerEnvironment | None:
     if not (cwd or platform or shell):
         return None
     raw_source = meta.get("source")
-    # `config` is NEVER honored from the wire. Anything else with a
-    # sensible label falls through to that label; unknown labels (or
-    # absent ones) become `unknown` so the renderer can decide.
-    if raw_source == "config":
+    # Strict source-marker gate. Re-label plans.yaml-derived labels to
+    # `request` (values still flow through, but at the request tier);
+    # honor `request` and `probe` as-is; everything else (None,
+    # `unknown`, unknown labels) returns None so the caller falls
+    # through to `parse_request`.
+    if raw_source == "config" or raw_source == "host":
         source = "request"       # re-labeled, never honored as-is
-    elif raw_source in ("request", "probe", "host"):
-        source = raw_source
+    elif raw_source == "request":
+        source = "request"
+    elif raw_source == "probe":
+        source = "probe"          # sidecar-minted only; leave alone
     else:
-        source = "unknown"
+        return None              # None, "unknown", unknown labels -> passive parse
     return CallerEnvironment(cwd=cwd, platform=platform, shell=shell,
                              source=source)
 

@@ -1272,21 +1272,24 @@ async def handle_fresh(body: dict, tools: list[dict],
                 # The operator set probe=required and we cannot resolve
                 # the env. Refuse the request instead of rendering
                 # "Caller platform: unknown" -- the whole point of the
-                # option is loud refusal. 503 matches the file's existing
-                # capacity / resume-gone conventions, with a Retry-After
-                # so a caller whose CLI just gained permission can retry.
+                # option is loud refusal. 400 (Bad Request), NOT 503 +
+                # Retry-After: nothing about the request, the caller,
+                # or the operator's plans.yaml can change in 5 seconds
+                # (the env will still be unresolvable on retry), so a
+                # Retry-After would actively mislead the caller. The
+                # file's 503 + Retry-After convention is reserved for
+                # transient-capacity conditions.
                 log.warning("probe=required but env unresolvable; refusing "
                             "request: %s", exc)
                 raise HTTPException(
-                    status_code=503,
+                    status_code=400,
                     detail={"error": {
                         "type": "caller_environment_required",
                         "message": (str(exc)
                             + " Configure caller_environment.platform/cwd/shell "
                               "in plans.yaml, supply a passive environment in the "
                               "request body, or set probe=auto to fall back to "
-                              "the unknown-env wording.")}},
-                    headers={"Retry-After": "5"})
+                              "the unknown-env wording.")}})
         if env is None:
             env = _caller_env.CallerEnvironment.unknown() if _caller_env else None
 
@@ -1507,19 +1510,19 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
                     if _caller_env else None
             except _caller_env.CallerEnvironmentRequired as exc:
                 # Same refusal semantics as handle_fresh: probe=required +
-                # unresolvable env = 503, not "unknown" wording.
+                # unresolvable env = 400 (Bad Request), NOT 503 +
+                # Retry-After. The failure is not transient.
                 log.warning("probe=required but env unresolvable on rebuild; "
                             "refusing request: %s", exc)
                 raise HTTPException(
-                    status_code=503,
+                    status_code=400,
                     detail={"error": {
                         "type": "caller_environment_required",
                         "message": (str(exc)
                             + " Configure caller_environment.platform/cwd/shell "
                               "in plans.yaml, supply a passive environment in the "
                               "request body, or set probe=auto to fall back to "
-                              "the unknown-env wording.")}},
-                    headers={"Retry-After": "5"})
+                              "the unknown-env wording.")}})
         if env is None:
             env = _caller_env.CallerEnvironment.unknown() if _caller_env else None
 
