@@ -59,6 +59,20 @@ _configure_logging()
 META_KEY = "switchyard"
 
 
+def _note_usage(chunk: Any, into: dict) -> None:
+    """Remember the usage block off a streamed chunk, if this one carries it.
+
+    Only one chunk in a stream has it, and it is not always the last thing
+    yielded, so the caller keeps whatever it last saw rather than reading the
+    tail.
+    """
+    usage = getattr(chunk, "usage", None)
+    if usage is None and isinstance(chunk, dict):
+        usage = chunk.get("usage")
+    if usage:
+        into["usage"] = usage
+
+
 class SwitchyardHandler(CustomLogger):
     def __init__(self) -> None:
         self.registry = models.load()
@@ -599,16 +613,23 @@ class SwitchyardHandler(CustomLogger):
         # mid-stream must not keep the seat.
         ctx = ((request_data or {}).get("metadata") or {}).get(META_KEY)
         ctx = ctx if isinstance(ctx, dict) else None
+        # A streamed reply carries its token counts on a chunk near the end --
+        # both bridges put them on the final chunk, beside finish_reason. Keep
+        # the last block seen: finishing with nothing books the whole turn as
+        # zero, so the plan the turn was spent on never moves in the ledger.
+        seen: dict = {}
         try:
             if not self.registry.settings.split_reasoning_tags:
                 async for chunk in response:
+                    _note_usage(chunk, seen)
                     yield chunk
                 return
             async for chunk in self._split_reasoning(response):
+                _note_usage(chunk, seen)
                 yield chunk
         finally:
             if ctx:
-                await self._finish_unlogged(ctx, None)
+                await self._finish_unlogged(ctx, seen or None)
 
     async def _split_reasoning(self, response: Any):
         splitter = ReasoningSplitter()
