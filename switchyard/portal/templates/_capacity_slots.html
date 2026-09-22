@@ -47,16 +47,11 @@
      labelling them "slot gone" would read as a problem the lane
      has. The cap_model_owned signal gates the loop. #}
   {% if not p.cap_model_owned|default(false) %}
-  {% for i in range(p.cap, p.cap_configured) %}
+  {% set model_top = p.model_cap if p.model_cap is not none else p.cap_configured %}
+  {% for i in range(p.cap, model_top) %}
     {% if spent %}
       <span class="slot spent"
             title="{{ p.plan }} has no {{ p.quota.window }} quota left ({{ p.quota.pct_used }}% used) — not routed to until the window resets"></span>
-    {% elif p.model_cap is not none and p.model_cap < p.cap_configured %}
-      {# The plan has more slots than this model can reach. They are
-         reachable by sibling models on the same plan, not withheld
-         from this one — a model of 1 on a plan of 2 draws one
-         bright slot for itself and one muted slot for the sibling. #}
-      <span class="slot gone" title="model limit {{ p.model_cap }} — sibling on {{ p.plan }} can use this slot"></span>
     {% else %}
       <span class="slot gone" title="withheld: {{ p.cap_reason }}"></span>
     {% endif %}

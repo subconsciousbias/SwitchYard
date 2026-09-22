@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +60,23 @@ def _off(html: str) -> bool:
 def _on(html: str) -> bool:
     return "Pacing mode on" in html and 'aria-pressed="true"' in html \
         and "Turn off" in html
+
+
+def trs_for(html):
+    # The capacity fragment emits a `<tr>` with optional inline indent
+    # style for rows inside a group, so `<tr>` alone misses them. Match
+    # the opening tag flexibly while keeping the boundary tight -- a
+    # `<tr ...>` opening followed by anything until the next `</tr>`
+    # is still one row, and the `re.DOTALL` keeps it working across
+    # the multi-line whitespace Jinja emits. Use a NON-capturing group
+    # so re.findall returns full matches (capture groups would make
+    # findall return only the captured group).
+    return re.findall(r"<tr(?: [^>]*)?>.*?</tr>", html, re.DOTALL)
+
+
+def row_with_ref(trs, plan, model):
+    ident = f">{plan}</span><span class=\"muted\">/{model}</span>"
+    return next((t for t in trs if ident in t.replace("\n", "")), None)
 
 
 def test_pacing_fragment_reflects_runtime_toggle():
@@ -247,22 +265,6 @@ def test_capacity_fragment_hides_withheld_for_model_narrowed_rows():
     squares were added for.
     """
     import asyncio
-    import re
-
-    def trs_for(html):
-        # The capacity fragment emits a `<tr>` with optional inline indent
-        # style for rows inside a group, so `<tr>` alone misses them. Match
-        # the opening tag flexibly while keeping the boundary tight -- a
-        # `<tr ...>` opening followed by anything until the next `</tr>`
-        # is still one row, and the `re.DOTALL` keeps it working across
-        # the multi-line whitespace Jinja emits. Use a NON-capturing group
-        # so re.findall returns full matches (capture groups would make
-        # findall return only the captured group).
-        return re.findall(r"<tr(?: [^>]*)?>.*?</tr>", html, re.DOTALL)
-
-    def row_with_ref(trs, plan, model):
-        ident = f">{plan}</span><span class=\"muted\">/{model}</span>"
-        return next((t for t in trs if ident in t.replace("\n", "")), None)
 
     with TestClient(portal_app.app) as client:
         # The local-box/gemma row is the canonical fixture: model cap 1 on a
@@ -325,6 +327,124 @@ def test_capacity_fragment_hides_withheld_for_model_narrowed_rows():
         finally:
             asyncio.run(portal_app.state["slots"].clear_cooldown(
                 "minimax-ultra"))
+
+
+# ============================================================================
+# Issue #81 — Workstream C (board model rows: draw withheld squares for a
+# learned cap narrower than the model's own max_parallel).
+#
+# These tests pin the render-level contract that the picker and policy
+# already agree on: when the learner has narrowed a plan's effective cap
+# below the model's own `max_parallel`, the row draws the narrower learned
+# cap as its reachable slots and paints the gap up to the model cap as
+# `slot gone` squares carrying the `learned[...]` source in the tooltip —
+# mirroring opencode-go/glm-5.3-flash on the operator config. The fixture
+# is the shipped `openrouter/mimo` row (plan max_parallel 4, model
+# max_parallel 2), which matches the issue #81 shape exactly and avoids
+# touching other workers' files.
+#
+# Learner state lives in the FakeRedis behind the app's startup event, so
+# each test seeds `sy:learn:openrouter:global` directly and clears any
+# residue at start AND in a `finally` so cross-test leakage cannot mask a
+# real regression.
+# ============================================================================
+
+
+def _seed_openrouter_learn_cap(cap):
+    """Replace any prior learner state for openrouter with a single global
+    bucket carrying `cap`. Returns the FakeRedis the test should clean up
+    in its `finally` so subsequent tests see a fresh slate."""
+    fake = portal_app.state["slots"].redis
+    for key in [k for k in list(fake.hashes)
+                if k.startswith("sy:learn:openrouter")]:
+        del fake.hashes[key]
+    fake.hashes["sy:learn:openrouter:global"] = {"cap": str(cap)}
+    return fake
+
+
+def test_capacity_row_renders_learned_cap_equal_to_model_limit():
+    """Case 1 — learner cap == model.max_parallel.
+
+    With a learned cap that exactly matches the model's own `max_parallel`
+    (2 here), the row's `cap_model_owned` flag fires and the withheld
+    branch in `_capacity_slots.html` is skipped entirely. Two free slots,
+    no gone squares, no `withheld:` tooltip, no `learned[...]` chip text
+    anywhere in the row, cap display `0/2`. The lane above (the picker)
+    sees the same number the board paints, and the operator does not
+    read the row as "2 of 4 slots gone" — which would be a regression
+    of the same shape issue #81 fixed for model-narrowed rows.
+    """
+    with TestClient(portal_app.app) as client:
+        fake = _seed_openrouter_learn_cap(2)
+        try:
+            html = client.get("/fragments/capacity").text
+        finally:
+            for key in [k for k in list(fake.hashes)
+                        if k.startswith("sy:learn:openrouter")]:
+                del fake.hashes[key]
+        trs = trs_for(html)
+        row = row_with_ref(trs, "openrouter", "mimo")
+        assert row is not None, "openrouter/mimo row missing in /fragments/capacity"
+        # Exactly 2 reachable slots, no gone squares (the learned cap ==
+        # model cap branch makes cap_model_owned True and skips the
+        # withheld loop in _capacity_slots.html).
+        assert row.count('<span class="slot"') == 2, row
+        assert 'class="slot gone"' not in row, row
+        # No tooltip text mentioning the learner reason — there's no gone
+        # square to carry one, and no chip carries the cap_reason either.
+        assert "withheld:" not in row, row
+        # The full chip ladder in _capacity_state.html: only "0/2"
+        # renders, no tag warn / tag bad / cap_reason chip.
+        assert "learned[" not in row, row
+        # Cap display: the muted cell reads `0/2`, NOT `0/4` (plan cap)
+        # and NOT `0/1` (any narrower state).
+        assert ">0/2<" in row, row
+
+
+def test_capacity_row_renders_withheld_squares_for_learned_cap_below_model():
+    """Case 2 — learner cap < model.max_parallel.
+
+    The learned cap (1 here) is narrower than the model's own
+    `max_parallel` (2). The picker sets `cap_model_owned = False`, so
+    `_capacity_slots.html` paints one reachable slot and one `slot gone`
+    square above it carrying `withheld: learned[global]` in its tooltip
+    — total 2 squares (the model cap), NOT 4 (the plan cap) and NOT 1
+    (the learned cap rendered alone). The `_capacity_state.html` chip
+    ladder does NOT render a divergence tag-warn chip on this row: the
+    `(model_cap is not none and cap < model_cap)` branch of the chip
+    condition suppresses the chip when the gap is exactly the model's
+    own narrowing surface. The board, then, reads as "1 free, 1
+    learner-withheld" rather than "1 free, 3 plan-withheld".
+    """
+    with TestClient(portal_app.app) as client:
+        fake = _seed_openrouter_learn_cap(1)
+        try:
+            html = client.get("/fragments/capacity").text
+        finally:
+            for key in [k for k in list(fake.hashes)
+                        if k.startswith("sy:learn:openrouter")]:
+                del fake.hashes[key]
+        trs = trs_for(html)
+        row = row_with_ref(trs, "openrouter", "mimo")
+        assert row is not None, "openrouter/mimo row missing in /fragments/capacity"
+        # 1 free + 1 gone = 2 total (the model cap). NOT 4 (plan cap) and
+        # NOT 1 (the row drawn without the withheld branch).
+        assert row.count('<span class="slot"') == 1, row
+        assert row.count('class="slot gone"') == 1, row
+        # The gone square carries the tooltip "withheld: learned[global]"
+        # — the learner's source string, exactly as the picker reports it.
+        assert 'title="withheld: learned[' in row, row
+        assert 'title="withheld: learned[global]"' in row, row
+        # No divergence chip: the chip condition in _capacity_state.html
+        # explicitly drops the tag when (model_cap is not none and cap <
+        # model_cap), which is exactly the case here. A regression that
+        # dropped that branch would paint `learned[global]` as a chip
+        # text on the row, which the row already carries in the tooltip —
+        # double-bad: the operator would see the same string twice in
+        # one row.
+        assert 'class="tag warn"' not in row, row
+        # Cap display: `0/1` (the learned cap, the row's effective cap).
+        assert ">0/1<" in row, row
 
 
 # ============================================================================

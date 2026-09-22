@@ -43,7 +43,7 @@
      "+ gate headroom". Learned, paced, and seed divergence reasons
      still render. The withheld-slot tooltip on the squares below the
      cap carries the full reason either way. #}
-  {% if p.cap != p.cap_configured and not p.cap_model_owned|default(false) and not p.cap_reason.startswith("configured + gate headroom") %}
+  {% if p.cap != p.cap_configured and not p.cap_model_owned|default(false) and not p.cap_reason.startswith("configured + gate headroom") and not (p.model_cap is not none and p.cap < p.model_cap) %}
     <div style="margin-bottom:3px"><span class="tag warn" title="{{ p.cap_reason }}">{{ p.cap_reason|truncate(24) }}</span></div>
   {% endif %}
   {% if p.days_left is not none and p.days_left <= 21 %}

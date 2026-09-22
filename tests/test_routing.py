@@ -4281,6 +4281,131 @@ def test_per_group_writer_recovers_raw_score_after_tier_change():
           f"-> second_grok={second_grok:.6f} (tier=0)")
 
 
+# ============================================================================
+# Issue #81 (WS-A) — learned cap on a model whose own `max_parallel` matches
+# the learned number still counts as model-owned; one below it does not.
+#
+# The row on the lane board draws its cap from the picker (`picker._cap`), so
+# once the learner has seen a connection-limit refusal, the picked-up cap is
+# the learned number rather than the plan's nominal ceiling. On a model whose
+# own `max_parallel` exactly equals that learned cap, the cap_reason must
+# stay the learner's reason ("learned[global]" in this fixture, since the
+# learner writes both the per-hour and the global buckets and the per-hour
+# bucket has not yet accumulated `min_samples`).
+#
+# Below the model cap, the same row's `cap_model_owned` flips to False
+# because `cap_model_owned` requires `model.max_parallel <= cap`. That is
+# the predicate the picker uses (picker.py:764-769) and the regression bar
+# the gated-slot tooltip is keyed to. We do NOT widen or narrow that
+# predicate; we just exercise the two shapes it produces.
+#
+# Stock fixture is enough: openrouter is `auth: api_key` (so NOT
+# is_cli_backed -> `_apply_gate_headroom` is a no-op, and the cap_reason
+# stays the bare learner string), plan max_parallel=4, model max_parallel=2,
+# concurrency learning enabled, FakeRedis. Mirrors the opencode-go/
+# glm-5.3-flash / minimax-ultra operator config at issue #81 exactly.
+# ============================================================================
+
+
+def test_a_learned_cap_at_model_limit_does_not_add_model_limit_reason():
+    """A row whose learned cap equals the model's own `max_parallel` reports
+    the learner's reason (not "model limit N"), and `cap_model_owned`
+    remains True.
+
+    Reference: issue #81 (WS-A). After one connection-limit refusal at the
+    plan's ceiling, `ConcurrencyLearner.note_rejection` halves `at=4` to
+    `new=2`, then stores `min(new=2, current=2)` for the global bucket
+    (policy.py:99-115). `effective()` reads `glob.get("cap")=2` and the
+    per-hour bucket has no samples yet, so the source is `"learned[global]"`
+    (policy.py:155-158). The picker passes that through unchanged because
+    `plan.is_cli_backed` is False for openrouter -- headroom is an
+    API-vs-CLI distinction (policy.py:411), so on this row no
+    `"+ gate headroom 1"` suffix is appended.
+
+    In the capacity row, `model.max_parallel (2) < cap (2)` is False so the
+    model-limit branch (picker.py:760-762) does NOT fire, and the row reads
+    `cap_reason="learned[global]"`. `cap_model_owned` is True because the
+    model cap IS the binding constraint (`model.max_parallel <= cap` is
+    True). The user-facing numbers per issue #81's repro must match
+    exactly:
+      cap == 2, cap_configured == 4, cap_reason == "learned[global]",
+      cap_model_owned is True, model_cap == 2.
+    """
+    async def go():
+        reg, slots, picker, _ledger = build_with_policy()
+        plan = reg.plans["openrouter"]
+        # The exact shape of a connection-limit refusal at the plan's
+        # nominal ceiling: at_concurrency=4 (openrouter's plan ceiling)
+        # halved by decrease_factor=0.5 -> new=2, floored at min_cap=1.
+        await picker.policy.learner.note_rejection(plan, at_concurrency=4)
+        cap = await picker.capacity("forge")
+        row = next(r for r in cap["plans"] if r["ref"] == "openrouter/mimo")
+        return row
+
+    row = run(go())
+    # The user's exact numbers per issue #81's repro, all on one row:
+    assert row["cap"] == 2, row
+    assert row["cap_configured"] == 4, row
+    assert row["cap_reason"] == "learned[global]", row
+    assert row["cap_model_owned"] is True, row
+    assert row["model_cap"] == 2, row
+    print(f"  openrouter/mimo learned cap == model cap (2 of 4): "
+          f"cap={row['cap']}, reason={row['cap_reason']!r}, "
+          f"cap_model_owned={row['cap_model_owned']}")
+
+
+def test_a_learned_cap_below_model_max_parallel_loses_model_owned():
+    """A row whose learned cap drops BELOW the model's own `max_parallel`
+    still keeps the learner's reason, but `cap_model_owned` flips False.
+
+    A second `note_rejection(plan, at_concurrency=2)` halves again to
+    `new=1`, and the min-merge in policy.py:109 stores `min(1, 2) = 1`
+    (policy.py:~109). The picker now reports cap=1; `model.max_parallel=2`
+    is wider than that, so `model.max_parallel <= cap` is `2 <= 1` False,
+    which is the conjunction in picker.py:768 that flips
+    `cap_model_owned` to False. The withheld-slot tooltip is keyed to
+    `cap_model_owned`; this case is the one that visibly differs from
+    the no-learner baseline (where the model cap=2 already fires the
+    "model limit 2" reason and `cap_model_owned` is True). After the
+    learner pulls down to 1, the learned reason is what the row carries,
+    and the chip that says "the row's cap is the model's own" is the
+    wrong one -- so the template-side chip (WS-B) must suppress it.
+
+    The reason string is `"learned[global]"` -- the same string the
+    withheld tooltip reads from `cap_reason`. We do not assert the
+    tooltip here; render is a sibling worker's contract.
+    """
+    async def go():
+        reg, slots, picker, _ledger = build_with_policy()
+        plan = reg.plans["openrouter"]
+        # Two consecutive refusals: at=4 -> stored cap 2; at=2 -> stored cap 1.
+        # The min-merge at policy.py:~109 is what makes the second call
+        # actually drop the stored value: new=int(2*0.5)=1, current=2,
+        # min(1, 2)=1.
+        await picker.policy.learner.note_rejection(plan, at_concurrency=4)
+        await picker.policy.learner.note_rejection(plan, at_concurrency=2)
+        cap = await picker.capacity("forge")
+        row = next(r for r in cap["plans"] if r["ref"] == "openrouter/mimo")
+        return row
+
+    row = run(go())
+    assert row["cap"] == 1, row
+    assert row["model_cap"] == 2, row
+    assert row["cap_configured"] == 4, row
+    # `learned[global]` is what the withheld tooltip reads; pinning the
+    # exact string here keeps the WS-B render contract honest.
+    assert row["cap_reason"] == "learned[global]", row
+    # The flip: with cap < model.max_parallel the model's own ceiling is
+    # NOT the binding constraint, so the predicate in picker.py:764-769
+    # reports False. The chip is template-side (WS-B suppresses it);
+    # render is covered by a sibling worker.
+    assert row["cap_model_owned"] is False, row
+    print(f"  openrouter/mimo learned cap below model cap (1 < 2): "
+          f"cap={row['cap']}, reason={row['cap_reason']!r}, "
+          f"cap_model_owned={row['cap_model_owned']} "
+          f"(template chip suppresses; render = sibling)")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):
