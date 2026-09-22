@@ -59,6 +59,56 @@ end
 return 1
 """
 
+# Atomic INCR + EXPIRE. INCR does not set a TTL on a fresh key, so the plain
+# pair left a window where a worker killed between INCR and EXPIRE would leave
+# the counter without a TTL — the next quiet gap would not drop it, so a plan
+# that was merely unlucky 90 minutes ago would still look like it had a streak
+# today. The script closes that window.
+#
+# KEYS[1] streak key (K_TFAIL)
+# ARGV[1] streak TTL (7200)
+# -> the new streak value (post-INCR)
+_BUMP_STREAK = """
+-- BUMP_STREAK
+local v = redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return v
+"""
+
+# Atomic INCR + EXPIRE + SET cooldown. The escalated cooldown ladder derives
+# from the post-INCR streak, so the cooldown written MUST be computed against
+# the same streak the caller reads back. Doing INCR and SET as two separate
+# round-trips races under concurrent TRANSIENT failures: the last SET wins
+# but it may have been computed against an earlier (smaller) streak than the
+# final INCR value, so a plan can land at streak 6 with a cooldown that
+# matches streak 5. The script keeps the streak and the cooldown in lock-step.
+#
+# KEYS[1] streak key (K_TFAIL), KEYS[2] cooldown key (K_COOL)
+# ARGV[1] streak TTL (7200), ARGV[2] base cooldown, ARGV[3] cap (max_seconds),
+# ARGV[4] reason, ARGV[5] now (epoch seconds)
+# -> the new streak value (post-INCR)
+_BUMP_AND_COOL = """
+-- BUMP_AND_COOL
+local streak = redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+local base = tonumber(ARGV[2])
+local cap = tonumber(ARGV[3])
+local cooldown = base
+if streak > 1 then
+  local doubled = base * (2 ^ (streak - 1))
+  if doubled > cap then
+    cooldown = cap
+  else
+    cooldown = doubled
+  end
+end
+local reason = ARGV[4]
+local now = tonumber(ARGV[5])
+local until_ts = now + cooldown
+redis.call('SET', KEYS[2], reason .. '|' .. until_ts, 'EX', math.max(1, math.floor(cooldown)))
+return streak
+"""
+
 
 @dataclass
 class Claim:
@@ -72,6 +122,8 @@ class SlotTable:
         self.redis = redis
         self.inflight_max_age = inflight_max_age
         self._claim = redis.register_script(_CLAIM)
+        self._bump_streak = redis.register_script(_BUMP_STREAK)
+        self._bump_and_cool = redis.register_script(_BUMP_AND_COOL)
 
     # -- capacity ----------------------------------------------------------
     async def try_claim(self, plan: str, cap: int, request_id: str,
@@ -204,14 +256,37 @@ class SlotTable:
     # that was merely quiet for two hours does not look like it has been
     # failing this whole time.
     async def note_transient_failure(self, plan: str) -> int:
-        """Increment the streak and refresh its TTL. Returns the new value."""
-        key = K_TFAIL.format(plan=plan)
-        # INCR is atomic; the trailing EXPIRE refreshes the TTL so a quiet
-        # gap of TTL seconds drops the counter entirely instead of carrying
-        # the streak forward forever.
-        value = await self.redis.incr(key)
-        await self.redis.expire(key, 7200)
-        return int(value)
+        """Increment the streak and refresh its TTL atomically.
+
+        INCR does not set a TTL on a fresh key, and INCR does not refresh the
+        TTL on an existing one — only EXPIRE does. A plain INCR + EXPIRE pair
+        left a window where a worker killed between the two calls would leave
+        the counter without a TTL, so the streak would carry forward forever
+        instead of dropping after 7200s of quiet. The Lua script closes that
+        window. Returns the new streak value.
+        """
+        return int(await self._bump_streak(
+            keys=[K_TFAIL.format(plan=plan)],
+            args=[7200],
+        ))
+
+    async def bump_and_cool(self, plan: str, base: int, cap: int,
+                            reason: str) -> int:
+        """Atomic INCR + EXPIRE + SET cooldown for the escalated ladder.
+
+        Concurrent TRANSIENT failures on the same plan used to race: the last
+        `cool_down` write wins, but it could have been computed against a
+        smaller streak than the final INCR value, leaving the picker to
+        observe a cooldown that undershoots what the streak warrants. Doing
+        INCR, the escalated-cooldown math, and the cooldown SET in a single
+        EVAL keeps the streak and the cooldown in lock-step: the cooldown
+        the picker reads is always the cooldown for the streak the caller
+        just observed. Returns the post-INCR streak value.
+        """
+        return int(await self._bump_and_cool(
+            keys=[K_TFAIL.format(plan=plan), K_COOL.format(plan=plan)],
+            args=[7200, int(base), int(cap), reason, int(time.time())],
+        ))
 
     async def transient_failure_streak(self, plan: str) -> int:
         """0 when the plan is healthy or its counter has expired."""

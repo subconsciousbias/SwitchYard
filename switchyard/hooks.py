@@ -658,18 +658,31 @@ class SwitchyardHandler(CustomLogger):
         # seat stops getting re-fed every 60s; every other outcome keeps the
         # verdict's own cooldown (a quota wall already knows how long it
         # should last).
-        if verdict.should_cool:
-            cooldown = verdict.cooldown_seconds
-            if verdict.outcome is Outcome.TRANSIENT:
-                breaker = self.registry.settings.transient_breaker
-                if breaker.enabled:
-                    streak = await self.slots.note_transient_failure(plan.key)
-                    cooldown = escalated_cooldown(
-                        cooldown, streak, cap=breaker.max_seconds)
-                    log.warning(
-                        "plan=%s transient failure streak=%d -> cooldown %ds",
-                        plan.key, streak, cooldown,
-                    )
+        did_cool_atomic = False
+        if verdict.outcome is Outcome.TRANSIENT:
+            breaker = self.registry.settings.transient_breaker
+            if breaker.enabled:
+                # Atomic: INCR + EXPIRE streak, compute cooldown from new
+                # streak, SET cooldown key. The Lua uses the same formula as
+                # `escalated_cooldown`, so the cooldown stored in Redis and
+                # the one Python computes below for the log line always
+                # agree. Returns the post-INCR streak. Concurrent TRANSIENT
+                # failures on the same plan can no longer leave the picker
+                # observing a cooldown that undershoots the final streak.
+                streak = await self.slots.bump_and_cool(
+                    plan.key,
+                    base=cooldown,
+                    cap=breaker.max_seconds,
+                    reason=verdict.outcome.value,
+                )
+                cooldown = escalated_cooldown(
+                    cooldown, streak, cap=breaker.max_seconds)
+                log.warning(
+                    "plan=%s transient failure streak=%d -> cooldown %ds",
+                    plan.key, streak, cooldown,
+                )
+                did_cool_atomic = True
+        if verdict.should_cool and not did_cool_atomic:
             await self.slots.cool_down(plan.key, cooldown, verdict.outcome.value)
         if verdict.outcome in (Outcome.QUOTA_EXHAUSTED, Outcome.PLAN_DEAD, Outcome.AUTH) and ctx.get("session"):
             # Do not strand the session on dead capacity; let it re-lease.

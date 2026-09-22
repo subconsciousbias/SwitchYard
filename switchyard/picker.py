@@ -130,11 +130,12 @@ class Picker:
         # 1. Affinity. A session that already has a provider stays on it as
         #    long as that provider is still in the lane and has a free slot.
         #    On a re-pick the held lease may be the member that just failed;
-        #    skip the pin in that case (do NOT drop_lease — a transient failure
-        #    must not strand the session on a peer) and let ordered fill land
-        #    on whoever has room. The successful re-pick's set_lease moves the
-        #    session to its new plan, and pinned semantics are otherwise
-        #    untouched.
+        #    skip the pin in that case. The elif below drops the lease so
+        #    the next, non-excluded pick doesn't try to honour a stale lease
+        #    to the broken plan — the successful re-pick's set_lease
+        #    immediately overwrites the dropped value, so the session isn't
+        #    stranded on a peer (and the held plan having left the lane is
+        #    handled the same way: drop, then let ordered fill land fresh).
         if session:
             held = await self.slots.get_lease(session)
             if held and held in by_ref and (not exclude or held not in exclude):
@@ -280,6 +281,12 @@ class Picker:
             # warning), and one row per model on the plan reads the same value
             # — the chip is intentionally duplicated rather than reconciled.
             transient_streak = await self.slots.transient_failure_streak(plan.key)
+            # The chip's alert threshold is operator-configurable, not a literal
+            # — `TransientBreaker.streak_alert` is the single source of truth,
+            # and the plans-table alert in collect_plans uses the same value.
+            # Carrying it onto each row keeps the two surfaces in lock-step
+            # when an operator raises the threshold.
+            streak_alert = self.registry.settings.transient_breaker.streak_alert
             # A model in several lanes is busy for all of them, but the traffic
             # belongs to whichever lane claimed it. Splitting the two is what
             # stops a sibling lane's work reading as this lane's consumption.
@@ -325,6 +332,7 @@ class Picker:
                 "cooldown_remaining": ttl,
                 "cooldown_reason": reason,
                 "transient_streak": transient_streak,
+                "streak_alert": streak_alert,
                 "tail": tail,
                 "days_left": plan.days_left,
                 "shares_plan_with": [m.key for m in self.registry.siblings(model)],

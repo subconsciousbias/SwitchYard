@@ -83,6 +83,11 @@ def fixture(reg):
                 "model_in_flight_direct": 0,
                 "model_cap": model.max_parallel,
                 "transient_streak": 3 if i == 0 else 0,
+                # The picker now threads `streak_alert` onto each row so the
+                # template's chip threshold is operator-configurable rather
+                # than hardcoded. Mirror it here so the preview stays aligned
+                # with the real fragment.
+                "streak_alert": reg.settings.transient_breaker.streak_alert,
                 "lanes_sharing": ["judge"] if i == 3 else [],
             })
         lanes.append({

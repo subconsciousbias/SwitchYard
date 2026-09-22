@@ -14,6 +14,7 @@ talking to one. The plans file is the tracked example.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 
@@ -183,6 +184,49 @@ def test_capacity_row_shows_failing_chip_when_streak_meets_alert():
         fake.strings[f"sy:tfail:{plan.key}"] = ("7", None)
         html = client.get("/fragments/capacity").text
         assert "failing · 7x" in html, html
+
+
+def test_capacity_row_chip_threshold_follows_streak_alert_setting():
+    """The chip threshold is operator-configurable, not a hardcoded 3.
+
+    When `TransientBreaker.streak_alert` is raised, the chip must wait the
+    full ladder — otherwise the operator-facing surface disagrees with
+    itself: a row can show a `failing · 4x` warn chip while the plans-table
+    alert (driven by the same `streak_alert` in collect_plans) waits for
+    streak 5. This test raises the threshold to 5 and asserts the chip is
+    absent at streak 3 and present at streak 5.
+    """
+    with TestClient(portal_app.app) as client:
+        registry = portal_app.state["registry"]
+        original = registry.settings
+        # Default must remain 3 — render_preview.py depends on that.
+        assert original.transient_breaker.streak_alert == 3
+
+        # Raise the threshold to 5 for the duration of this test, then
+        # restore. dataclasses.replace preserves the frozen dataclass shape
+        # without having to enumerate every field by hand.
+        registry.settings = dataclasses.replace(
+            original,
+            transient_breaker=dataclasses.replace(
+                original.transient_breaker, streak_alert=5),
+        )
+
+        try:
+            plan = registry.plans["minimax-ultra"]
+            fake = portal_app.state["slots"].redis
+
+            # Streak 3 — below the raised threshold of 5, chip absent.
+            fake.strings[f"sy:tfail:{plan.key}"] = ("3", None)
+            html = client.get("/fragments/capacity").text
+            assert "failing" not in html, html
+
+            # Streak 5 — at the raised threshold, chip present.
+            fake.strings[f"sy:tfail:{plan.key}"] = ("5", None)
+            html = client.get("/fragments/capacity").text
+            assert "failing · 5x" in html, html
+            assert 'class="tag warn"' in html, html
+        finally:
+            registry.settings = original
 
 
 if __name__ == "__main__":

@@ -142,12 +142,14 @@ def build(plans_path: str) -> dict:
             "routing_strategy": "simple-shuffle",
             "fallbacks": fallbacks,
             "context_window_fallbacks": context_fallbacks,
-            # Load-bearing with allowed_fails=1: litellm would otherwise cool
-            # the single-deployment group between attempts and the re-pick
-            # would never fire. cooldown_time:0 does NOT work — litellm's
-            # router takes the `or` default, not our zero. SwitchYard owns
-            # all real cooldowns via Redis, which is the only state that
-            # outlives this process and that the portal can see.
+            # `disable_cooldowns: True` is the only setting that keeps the
+            # router from cooling the single-deployment group between attempts
+            # (so the re-pick in async_pre_routing_hook actually fires), and
+            # SwitchYard's own cooldowns — via Redis — are the only state
+            # that outlives this process and the only state the portal can
+            # see. With this on, cooldown_time and allowed_fails do not need
+            # to be set; cooldowns live in K_COOL/{plan}, and the breaker's
+            # escalating ladder lives in K_TFAIL/{plan}.
             "disable_cooldowns": True,
             "redis_host": "os.environ/REDIS_HOST",
             "redis_port": "os.environ/REDIS_PORT",
