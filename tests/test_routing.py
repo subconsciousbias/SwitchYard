@@ -841,6 +841,139 @@ def test_spent_plan_reenters_after_window_rollover():
           f"future 100% still skips ({future_pick})")
 
 
+# ============================================================================
+# Issue #64 (WS2) — Stale-grace for cookie-expired plans
+#
+# A plan whose session cookie has expired (`sy:probe:{plan}.needs_reauth=1`)
+# has stopped polling, so its lane-order / group-order hash never gets
+# refreshed. Without grace, the hash ages past `stale_after_ms` and the
+# picker falls back to config order, even though the LAST GOOD ranking
+# is still meaningful: every window the hash was computed from is still
+# in force.
+#
+# The grace extends freshness UNTIL the window's `reset_at`, capped at
+# the window boundary. Once the window rolls over, the picker falls back
+# to config order exactly as before.
+# ============================================================================
+
+
+def test_perishable_lane_picks_up_grace_eligible_stale_ranking():
+    """A perishable lane whose ranking hash is past `stale_after_ms` but
+    whose needs_reauth plan still has a future `reset_at` keeps using the
+    last good ranking: the picker walks the higher-scored member first
+    instead of falling back to declared order.
+
+    This is the WS2 contract: a cookie-expired plan keeps real
+    staleness-marked numbers for scheduling until its window resets,
+    rather than dropping to declared-order fill. The cap is exactly the
+    window boundary, so a control case where the window has already
+    rolled over returns the picker to today's config-order behaviour.
+    """
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        # Use forge: declared body has multiple minimax plans on different
+        # subscriptions, so the picker sees two plans behind one lane.
+        # We re-target the lane to a minimal body so the test reads clearly:
+        # one ref per plan, in declared order, with a stored rank that
+        # disagrees with declared order.
+        from switchyard.models import _parse_lane_order
+        known = {m.ref for p in reg.plans.values() for m in p.models.values()}
+        parsed = _parse_lane_order(
+            "perishable-grace",
+            ["minimax-ultra/m3", "minimax-max/m3"], known)
+        lanes = dict(reg.lanes)
+        lanes["perishable-grace"] = replace(
+            reg.lanes["forge"], key="perishable-grace", order=parsed,
+            tail=[], strategy="perishable", description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        picker2 = Picker(reg2, slots, picker.policy)
+
+        reset = time.time() + 7 * 86400
+        # Healthy percentages so the picker doesn't skip either plan on
+        # quota. What the grace is being tested for is the ranking, not
+        # the spent-quota gate.
+        await ledger.note_reported_percent("minimax-ultra", 50.0, reset,
+                                           window="weekly")
+        await ledger.note_reported_percent("minimax-max", 10.0, reset,
+                                           window="weekly")
+        # Stamp needs_reauth on one plan; the grace reads its `reset_at`.
+        await picker2.policy.ledger.redis.hset(
+            "sy:probe:minimax-max", mapping={"needs_reauth": "1"})
+        # Stale lane-order hash: long ago, tiny stale_after_ms. Stored
+        # rank: max first (it has higher room). Declared order is
+        # ultra-first.
+        await ledger.set_lane_order(
+            "perishable-grace",
+            {"minimax-max/m3": {"score": 0.9, "gate5h": 0},
+             "minimax-ultra/m3": {"score": 0.5, "gate5h": 0}},
+            computed_at=time.time() - 9999,
+            stale_after_ms=1000)
+        # Grace-active pick: ranking drives -> max first.
+        picked = await picker2.pick("perishable-grace", None)
+        await picker2.release(picked.plan.key, picked.request_id, picked.ref)
+        return picked.ref
+
+    picked = run(go())
+    # Grace keeps the stored ranking alive, so the emptier plan (max)
+    # leads -- not the declared-order first member (ultra).
+    assert picked == "minimax-max/m3", picked
+    print(f"  grace: stored rank kept -> {picked} (declared order was ultra first)")
+
+
+def test_perishable_lane_drops_to_declared_order_when_grace_window_passes():
+    """Mirror of `test_perishable_lane_picks_up_grace_eligible_stale_ranking`
+    but with the needs_reauth plan's `reset_at` already in the past: the
+    grace ends at the window boundary and the picker returns to declared
+    order. This is the regression bar for "never carry a reading across a
+    window reset into the next window" -- the WS2 spec's hard cap.
+    """
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        from switchyard.models import _parse_lane_order
+        known = {m.ref for p in reg.plans.values() for m in p.models.values()}
+        parsed = _parse_lane_order(
+            "perishable-grace2",
+            ["minimax-ultra/m3", "minimax-max/m3"], known)
+        lanes = dict(reg.lanes)
+        lanes["perishable-grace2"] = replace(
+            reg.lanes["forge"], key="perishable-grace2", order=parsed,
+            tail=[], strategy="perishable", description="")
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        picker2 = Picker(reg2, slots, picker.policy)
+
+        # Both plans have a past reset_at. Stale hashes for both mean the
+        # window has rolled over; the grace must NOT save the ranking.
+        past_reset = time.time() - 86400
+        await ledger.note_reported_percent("minimax-ultra", 50.0, past_reset,
+                                           window="weekly")
+        await ledger.note_reported_percent("minimax-max", 10.0, past_reset,
+                                           window="weekly")
+        await picker2.policy.ledger.redis.hset(
+            "sy:probe:minimax-max", mapping={"needs_reauth": "1"})
+        await ledger.set_lane_order(
+            "perishable-grace2",
+            {"minimax-max/m3": {"score": 0.9, "gate5h": 0},
+             "minimax-ultra/m3": {"score": 0.5, "gate5h": 0}},
+            computed_at=time.time() - 9999,
+            stale_after_ms=1000)
+        picked = await picker2.pick("perishable-grace2", None)
+        await picker2.release(picked.plan.key, picked.request_id, picked.ref)
+        return picked.ref
+
+    picked = run(go())
+    # Past reset -> grace ends -> hash is stale -> picker falls back to
+    # declared order, which lists ultra first.
+    assert picked == "minimax-ultra/m3", picked
+    print(f"  grace ended at reset -> {picked} (declared order)")
+
+
 def test_a_mid_loop_followup_finishes_on_a_spent_plan():
     """A started tool loop completes where it started, spent or not.
 

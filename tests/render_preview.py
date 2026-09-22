@@ -173,18 +173,27 @@ def probe_fixture(reg):
     Mirrors collect_probes(): only `kind: cookie` probes appear on this panel,
     because it exists to collect a credential someone has to go and fetch. A
     preview listing every probe would not be a preview of the real page.
+
+    `last_ok_hhmm` mirrors the field collect_probes() threads onto the
+    status dict so the panel can render "last good HH:MM" on a stale row.
+    The preview matches the real shape so the template path that uses it
+    is exercised.
     """
     out = []
     cookie_plans = [p for p in reg.plans.values()
                     if p.probe and p.probe.kind == "cookie"]
     for i, plan in enumerate(cookie_plans):
         healthy = i == 0
+        last_ok = time.time() - 120 if healthy else None
+        last_ok_hhmm = (time.strftime("%H:%M", time.gmtime(last_ok))
+                        if last_ok else "—")
         out.append({
             "plan": plan,
             "status": {"has_cookie": True, "fingerprint": "412 chars, #9f2a1c3d",
                        "windows": "weekly=12% used,5h=37% used" if healthy else "",
                        "added_at": time.time() - 3600,
-                       "last_ok_at": time.time() - 120 if healthy else None,
+                       "last_ok_at": last_ok,
+                       "last_ok_hhmm": last_ok_hhmm,
                        "last_attempt_at": time.time() - 120,
                        "last_error": "" if healthy else "session rejected (401)",
                        "needs_reauth": not healthy,

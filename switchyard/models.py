@@ -80,6 +80,12 @@ class Probe:
     referer: str = ""
     user_agent: str = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+    # Opt-in sliding capture of the session cookie. When True, a verified-good
+    # probe response (2xx, no reauth marker, Set-Cookie present) overwrites the
+    # stored credential in `sy:cred:{plan}`. Default False keeps today's exact
+    # behaviour — capture only fires on plans that explicitly opt in and where
+    # the console actually rotates the cookie on each successful request.
+    capture_set_cookie: bool = False
 
 
 @dataclass(frozen=True)

@@ -476,7 +476,13 @@ class Picker:
         (lane-level `strategy: perishable` with no explicit groups) reads
         THAT key to keep a flat config bit-for-bit identical. Explicit
         perishable groups use the group-scoped key (the producer change for
-        that lives in WS2, the portal workstream)."""
+        that lives in WS2, the portal workstream).
+
+        Stale-grace: the reader passes `(plan_key, target_window_label)`
+        pairs for every member of the group, so a cookie-expired plan keeps
+        its last good ranking while its window is still in force. The cap
+        is exactly the window's `reset_at` — see
+        `Ledger._in_grace_window`."""
         if self.policy is None:
             return None
         # Implicit-perishable sugar wraps the body in a synthesised group;
@@ -487,8 +493,50 @@ class Picker:
             nodes = self.registry.lane_nodes()[lane]
             if not any(isinstance(n, Group) for n in nodes):
                 # Implicit wrap — read the legacy key.
-                return await self.policy.ledger.get_lane_order(lane)
-        return await self.policy.ledger.get_group_order(group.gid, lane)
+                return await self.policy.ledger.get_lane_order(
+                    lane, plan_windows=self._lane_plan_windows(lane))
+        return await self.policy.ledger.get_group_order(
+            group.gid, lane,
+            plan_windows=self._group_plan_windows(group))
+
+    def _group_plan_windows(
+        self, group: Group
+    ) -> list[tuple[str, str]]:
+        """(plan_key, target_window_label) pairs for every leaf ref of `group`.
+
+        Walks nested groups depth-first so the grace lookup matches the
+        refs the picker is actually about to visit. The window label is the
+        plan's primary quota (target window), the same window the perishable
+        writer scores against.
+        """
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for ref in _member_refs(group):
+            model = self.registry.model(ref)
+            if model is None:
+                continue
+            plan = self.registry.plan_of(model)
+            if plan.key in seen:
+                continue
+            seen.add(plan.key)
+            out.append((plan.key, plan.quota.label))
+        return out
+
+    def _lane_plan_windows(
+        self, lane: str
+    ) -> list[tuple[str, str]]:
+        """(plan_key, target_window_label) pairs for every member of `lane`."""
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for model in self.registry.lane_members(lane):
+            if self.registry.is_tail(lane, model.ref):
+                continue
+            plan = self.registry.plan_of(model)
+            if plan.key in seen:
+                continue
+            seen.add(plan.key)
+            out.append((plan.key, plan.quota.label))
+        return out
 
     # -- the public pick ---------------------------------------------------
     async def pick(self, lane: str, session: str | None,

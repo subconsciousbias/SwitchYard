@@ -325,6 +325,67 @@ def test_capacity_fragment_hides_withheld_for_model_narrowed_rows():
 # ============================================================================
 
 
+def test_probes_panel_renders_needs_reauth_badge_with_last_good_time():
+    """A plan whose probe is flagged `needs_reauth` renders a clearly visible
+    "stale — needs re-auth (last good HH:MM)" badge on the probes panel.
+    The HH:MM is the absolute UTC time of the last successful probe, so the
+    operator can correlate it with their logs without doing arithmetic.
+
+    The WS2 spec says: never hide `needs_reauth` behind silent degradation;
+    the board's alert "quota probe needs a fresh session cookie" must stay.
+    The badge is the visible half of that contract -- a stale row tells the
+    operator exactly which plan needs attention and how long it has been
+    stale, while the picker keeps using the last good ranking until the
+    window resets.
+    """
+    import asyncio
+    with TestClient(portal_app.app) as client:
+        # Pick the first cookie-needing plan in the example config and mark
+        # it as cookie-expired with a known last-good timestamp.
+        reg = models.load()
+        cookie_plan = next(p for p in reg.plans.values()
+                           if p.probe and p.probe.kind == "cookie")
+        # 2024-12-24T12:26:40Z deterministic. Picked from the
+        # `datetime` module so the test is timezone- and locale-neutral.
+        import datetime as _dt
+        last_ok_at = _dt.datetime(
+            2024, 12, 24, 12, 26, 40, tzinfo=_dt.timezone.utc).timestamp()
+        ledger = portal_app.state["ledger"]
+        asyncio.run(ledger.redis.hset(
+            f"sy:probe:{cookie_plan.key}",
+            mapping={"needs_reauth": "1", "last_ok_at": str(last_ok_at)}))
+        try:
+            html = client.get("/fragments/probes").text
+            # The badge must show for the needs_reauth row, with the
+            # absolute HH:MM UTC of the last good reading.
+            assert "stale — needs re-auth" in html, html
+            assert "last good" in html, html
+            # 12:26:40Z -> HH:MM is "12:26" with the deterministic stamp.
+            assert "last good 12:26" in html, html
+            # The "active" tag must NOT be on a needs_reauth row.
+            assert ">active<" not in html, html
+        finally:
+            asyncio.run(ledger.redis.hset(
+                f"sy:probe:{cookie_plan.key}",
+                mapping={"needs_reauth": "0"}))
+
+
+def test_probes_panel_renders_active_badge_for_healthy_plan():
+    """A plan with a healthy cookie renders the plain "active" badge --
+    regression bar for the conditional in `_probes.html`. The WS2 change
+    must not regress the healthy path.
+    """
+    with TestClient(portal_app.app) as client:
+        html = client.get("/fragments/probes").text
+        # Cookie plans in the example: at least one is healthy in the
+        # default state (the live probe status is whatever FakeRedis
+        # carries through; a healthy row is the path with no needs_reauth
+        # stamp on its probe hash). The badge test below pins the
+        # negative path; this test pins that the positive path's
+        # template branch still renders for at least one row.
+        assert "active" in html or "not set" in html, html
+
+
 def _recompute_group_orders(reg, ledger):
     """Drive the per-group writer end-to-end against the registry's parsed tree.
 

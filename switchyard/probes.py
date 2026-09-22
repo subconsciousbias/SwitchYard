@@ -290,6 +290,26 @@ class Prober:
         if resp.status_code >= 400:
             return await self._fail(plan, f"HTTP {resp.status_code}", False, raw=body[:1500])
 
+        # Opt-in sliding capture of the session cookie: when the probe is
+        # configured to capture Set-Cookie and we have a verified-good response
+        # (2xx, no reauth marker — those guards are already past us here — and
+        # the server returns one), overwrite the stored credential so the
+        # portal never has to ask you to paste a fresh one. A 4xx/5xx, a
+        # reauth-marked body, or a missing Set-Cookie header must NEVER
+        # overwrite a working credential — those branches all returned above
+        # or fall through this `if` without a header. `status()` only surfaces
+        # the fingerprint and added_at, never the cookie itself.
+        if probe.capture_set_cookie and probe.kind == "cookie":
+            new_cookie = resp.headers.get("set-cookie")
+            if resp.status_code < 300 and new_cookie:
+                await self.redis.hset(K_CRED.format(plan=plan.key), mapping={
+                    "cookie": new_cookie,
+                    "fingerprint": _fingerprint(new_cookie),
+                    "added_at": time.time(),
+                })
+                log.info("cookie rotated by provider (plan=%s, fingerprint=%s)",
+                         plan.key, _fingerprint(new_cookie))
+
         try:
             doc = resp.json()
         except ValueError:

@@ -675,15 +675,37 @@ async def collect_probes() -> list[dict]:
     A probe reading an API key, a CLI's own records or the OAuth proxy needs
     nothing from anyone, so listing it here is a row that can never be acted
     on — its numbers already appear in the subscription table like any other.
+
+    The `last_ok_hhmm` field is threaded into the per-plan status dict so
+    the panel can show "stale — needs re-auth (last good 14:35)" on a
+    cookie-expired row: it is the absolute HH:MM (UTC) of the last
+    successful probe, the operator's cue for how stale the row is.
     """
     reg, prober = state["registry"], state["prober"]
     out = []
     for plan in reg.plans.values():
         if plan.probe is None or plan.probe.kind != "cookie":
             continue
-        out.append({"plan": plan, "status": await prober.status(plan.key),
+        status = await prober.status(plan.key)
+        # Absolute HH:MM of the last successful probe, UTC. None when the
+        # probe has never succeeded (operator has not pasted a cookie yet).
+        last_ok_hhmm = _fmt_hhmm(status.get("last_ok_at"))
+        out.append({"plan": plan,
+                    "status": {**status, "last_ok_hhmm": last_ok_hhmm},
                     "last_test": state.get("probe_tests", {}).get(plan.key)})
     return out
+
+
+def _fmt_hhmm(ts: float | None) -> str:
+    """HH:MM UTC for a unix timestamp, or "—" when the probe never succeeded.
+
+    Absolute, not relative: the panel says "last good 14:35", not "last good
+    2h ago", so the operator can correlate the reading with a known clock
+    (their logs, the provider's UI) without doing mental arithmetic.
+    """
+    if not ts:
+        return "—"
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%H:%M")
 
 
 @app.post("/admin/probes/{plan_key}/cookie")

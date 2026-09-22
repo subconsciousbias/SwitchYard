@@ -396,6 +396,14 @@ plans:
       #      "week":{...},"month":{...}}}}
       # `used` is what it publishes, so the prober derives remaining = limit-used.
       kind: cookie
+      # Opt-in sliding capture of the session cookie. When true, a verified-good
+      # probe response (2xx, no reauth marker, Set-Cookie present) overwrites
+      # the stored credential so the portal never has to ask you to paste a
+      # fresh one. Only fire this after confirming in the browser devtools that
+      # THIS endpoint actually returns a new Set-Cookie on each successful
+      # request — a 401/reauth body with a Set-Cookie still does NOT overwrite,
+      # but a route that does not slide will just stay on its current cookie.
+      # capture_set_cookie: true
       url: https://opencode.ai/console/api/go/status
       method: GET
       window: monthly

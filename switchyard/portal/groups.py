@@ -269,15 +269,43 @@ async def _ranking_snapshots(reg: Registry, ledger: Ledger, lane_key: str) -> di
     """`{(gid, lane): [<refs in score order>]}` -- current order from Redis
     for every group that uses one. The order is the published `members`
     list (already sorted by score desc), or None when missing/stale.
+
+    Stale-grace: each group's reader is called with the per-group
+    `(plan_key, target_window_label)` pairs so a cookie-expired plan keeps
+    its last good ranking while its window is still in force -- the same
+    extension the picker reads. The cap is the window boundary; once the
+    window resets the hash falls back to None exactly as it did before.
     """
     out: dict = {}
     nodes = reg.lane_nodes().get(lane_key, [])
     for group in _walk_groups(nodes):
         if group.strategy not in ("perishable", "lowest_utilization"):
             continue
-        order = await ledger.get_group_order(group.gid, lane_key)
+        plan_windows = _group_plan_windows(reg, group)
+        order = await ledger.get_group_order(
+            group.gid, lane_key, plan_windows=plan_windows)
         if order is not None:
             out[(group.gid, lane_key)] = [m["ref"] for m in order["members"]]
+    return out
+
+
+def _group_plan_windows(reg: Registry, group: Group) -> list[tuple[str, str]]:
+    """(plan_key, target_window_label) for every leaf ref of `group`.
+
+    The portal writer uses the same shape to thread the grace window
+    into the per-group hash reader.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for ref in _group_leaf_refs(group):
+        model = reg.model(ref)
+        if model is None:
+            continue
+        plan = reg.plan_of(model)
+        if plan.key in seen:
+            continue
+        seen.add(plan.key)
+        out.append((plan.key, plan.quota.label))
     return out
 
 
