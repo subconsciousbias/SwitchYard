@@ -316,6 +316,15 @@ class Lane:
     order: list[str]                 # `plan/model` refs
     tail: list[str] = field(default_factory=list)
     description: str = ""
+    # "fill" (default) routes in config order, pure spill-and-fill. "perishable"
+    # ranks members by perishable score (headroom/hours-to-reset), gated on the
+    # 5h window's spare room, and sticks that order into a Redis hash the portal
+    # rewrites after every successful probe. Absent == "fill", and the picker
+    # never reads the lane-order key on a lane that did not opt in.
+    strategy: str = "fill"
+
+
+_VALID_STRATEGIES = ("fill", "perishable")
 
 
 @dataclass
@@ -534,12 +543,18 @@ def load(path: str | None = None) -> Registry:
 
     lanes: dict[str, Lane] = {}
     for key, body in (raw.get("lanes") or {}).items():
+        strategy = str(body.get("strategy", "fill"))
+        if strategy not in _VALID_STRATEGIES:
+            raise ValueError(
+                f"lane {key!r} strategy must be one of {_VALID_STRATEGIES}, "
+                f"got {strategy!r}")
         lanes[key] = Lane(
             key=key,
             label=body.get("label", key),
             order=list(body.get("order") or []),
             tail=list(body.get("tail") or []),
             description=body.get("description", ""),
+            strategy=strategy,
         )
 
     registry = Registry(settings=settings, plans=plans, lanes=lanes)

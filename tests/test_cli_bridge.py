@@ -56,6 +56,12 @@ def test_anthropic_cache_tokens_are_counted_in_prompt_tokens():
     to_openai boundary. The fix has to add them to prompt_tokens, otherwise
     the gateway's per-seat headroom calculation sees a cached seat as
     almost empty and leans on it harder than the plan allows.
+
+    Extended for issue #34: the same payload now also surfaces the cache
+    breakdown, so LiteLLM and Anthropic-protocol clients (Claude Code via
+    /v1/messages) can see reads under `prompt_tokens_details.cached_tokens`
+    and creations under a top-level `cache_creation_input_tokens`. Totals
+    stay exactly as before — the breakdown is additive, not a recount.
     """
     payload = {"result": "ok", "usage": {
         "input_tokens": 95,
@@ -68,6 +74,10 @@ def test_anthropic_cache_tokens_are_counted_in_prompt_tokens():
     assert u["prompt_tokens"] == expected_prompt, u
     assert u["completion_tokens"] == 200, u
     assert u["total_tokens"] == expected_prompt + 200, u
+    # Issue #25 repro pinned numerically: 95 + 63200 + 800 = 64095.
+    assert u["prompt_tokens"] == 64095, u
+    assert u["prompt_tokens_details"] == {"cached_tokens": 63200}, u
+    assert u["cache_creation_input_tokens"] == 800, u
     print(f"  anthropic cached prompt folded into total: {u}")
 
 
@@ -78,6 +88,11 @@ def test_openai_shape_cache_tokens_are_not_double_counted():
     so adding them here must be gated on the Anthropic field names —
     otherwise this branch would inflate an OpenCode-style prompt by the
     cached portion a second time.
+
+    Issue #34 keeps the gate strict: an OpenAI-shaped payload carries no
+    Anthropic cache field names, so no `prompt_tokens_details` and no
+    `cache_creation_input_tokens` are emitted — nothing for LiteLLM to
+    misattribute back to the caller's billing.
     """
     payload = {"result": "ok", "usage": {
         "input_tokens": 6194,
@@ -87,7 +102,51 @@ def test_openai_shape_cache_tokens_are_not_double_counted():
     u = server.to_openai(payload, "m")["usage"]
     assert u["prompt_tokens"] == 6194, u
     assert u["total_tokens"] == 6212, u
+    assert "prompt_tokens_details" not in u, u
+    assert "cache_creation_input_tokens" not in u, u
     print(f"  openai-shape cache stays inside input_tokens: {u}")
+
+
+def test_anthropic_cache_breakdown_emitted_even_when_creation_is_absent():
+    """An Anthropic payload may carry cache reads without a creation field
+    (a pure-read turn) or carries zero of both — issue #34 asks for a
+    stable shape so callers can rely on the keys being present, not on
+    their value being non-zero. Reads default to 0; creation defaults
+    to 0; the breakdown dict is still emitted.
+    """
+    payload = {"result": "ok", "usage": {
+        "input_tokens": 200,
+        "cache_read_input_tokens": 1500,
+        "output_tokens": 50,
+    }}
+    u = server.to_openai(payload, "claude-opus-5")["usage"]
+    assert u["prompt_tokens"] == 200 + 1500 + 0, u
+    assert u["prompt_tokens_details"] == {"cached_tokens": 1500}, u
+    assert u["cache_creation_input_tokens"] == 0, u
+    assert u["total_tokens"] == u["prompt_tokens"] + 50, u
+    print(f"  anthropic creation-absent still emits zero-valued shape: {u}")
+
+
+def test_anthropic_cache_breakdown_keys_are_exactly_what_litellm_round_trips():
+    """Lock the spelling: `prompt_tokens_details.cached_tokens` (the OpenAI
+    slot the gateway maps back to `cache_read_input_tokens` for Anthropic-
+    protocol clients) and a top-level `cache_creation_input_tokens` (the
+    verbatim Anthropic key, since no OpenAI slot exists for cache creation).
+    A different name here would break LiteLLM's translation silently.
+    """
+    payload = {"result": "ok", "usage": {
+        "input_tokens": 1,
+        "cache_read_input_tokens": 2,
+        "cache_creation_input_tokens": 3,
+        "output_tokens": 4,
+    }}
+    u = server.to_openai(payload, "m")["usage"]
+    assert set(u) >= {"prompt_tokens", "completion_tokens", "total_tokens",
+                      "prompt_tokens_details", "cache_creation_input_tokens"}, u
+    assert set(u["prompt_tokens_details"]) == {"cached_tokens"}, u["prompt_tokens_details"]
+    assert u["prompt_tokens_details"]["cached_tokens"] == 2, u
+    assert u["cache_creation_input_tokens"] == 3, u
+    print(f"  anthropic keys locked: {sorted(u)}")
 
 
 def test_reasoning_tokens_are_billed_but_not_shown():

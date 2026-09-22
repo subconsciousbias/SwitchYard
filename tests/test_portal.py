@@ -229,6 +229,78 @@ def test_capacity_row_chip_threshold_follows_streak_alert_setting():
             registry.settings = original
 
 
+def test_capacity_fragment_hides_withheld_for_model_narrowed_rows():
+    """A row whose cap is narrower than the plan's width SOLELY because of
+    its own model's `max_parallel` is the model's own row, not a slice of
+    withheld capacity.
+
+    Before this fix, every local-box/gemma-equivalent row drew a "model
+    limit N" warn tag and a grey "withheld" slot beside its single bright
+    slot — reading as broken capacity when in fact the row is exactly as
+    wide as the model can reach. The fix gates both on `cap_model_owned`:
+    the row draws its `cap` free slots and stops.
+
+    External narrowing still renders the old markers: a cooled plan paints
+    gone squares and its cooldown tag, the same way as today. That branch
+    is not gated, because it is exactly the "real trouble" the old grey
+    squares were added for.
+    """
+    import asyncio
+    import re
+
+    def trs_for(html):
+        return re.findall(r"<tr>.*?</tr>", html, re.DOTALL)
+
+    def row_with_ref(trs, plan, model):
+        ident = f">{plan}</span><span class=\"muted\">/{model}</span>"
+        return next((t for t in trs if ident in t.replace("\n", "")), None)
+
+    with TestClient(portal_app.app) as client:
+        # The local-box/gemma row is the canonical fixture: model cap 1 on a
+        # plan cap 2, with no policy narrowing it further. The view must show
+        # exactly one reachable slot, no "withheld" title, and no "model
+        # limit" warn tag — the row IS one slot, not a slice of two.
+        html = client.get("/fragments/capacity").text
+        trs = trs_for(html)
+        gemma = row_with_ref(trs, "local-box", "gemma")
+        assert gemma is not None, "local-box/gemma row missing in /fragments/capacity"
+        assert "model limit" not in gemma, gemma
+        assert "withheld:" not in gemma, gemma
+        assert gemma.count('<span class="slot"') == 1, gemma
+        # And the row is not cooled, so no "gone" squares or "bad" tag.
+        assert 'class="slot gone"' not in gemma, gemma
+        assert 'class="tag bad"' not in gemma, gemma
+
+        # An externally-narrowed row keeps ALL the old machinery. Cool
+        # minimax-ultra — the pinned example's `forge` lead row — and read
+        # the fragment again. Every slot the row would have shown is now
+        # a "gone" square, and the right-hand cell carries the cooldown
+        # tag, not a "model limit" tag.
+        asyncio.run(portal_app.state["slots"].cool_down(
+            "minimax-ultra", 900, "quota_exhausted"))
+        try:
+            html = client.get("/fragments/capacity").text
+            trs = trs_for(html)
+            ultra = row_with_ref(trs, "minimax-ultra", "m3")
+            assert ultra is not None, "minimax-ultra/m3 row missing after cooldown"
+            # The "bad" tag carries the human-readable cooldown reason; the
+            # exact text is "quota exhausted · 14m" (900s / 60 = 15, with
+            # whatever fraction has elapsed in the test).
+            assert 'class="tag bad"' in ultra, ultra
+            assert "quota exhausted" in ultra, ultra
+            # Every slot the row would have shown is "gone": the plan cap
+            # is 4, the model's cap is also 4, so four gone squares in
+            # the row's loop before the (now-skipped because cap == 0)
+            # withheld branch.
+            assert ultra.count('<span class="slot gone"></span>') == 4, ultra
+            # ... and even on a cooled plan the gating does not leak:
+            # the "model limit" string still does not appear.
+            assert "model limit" not in ultra, ultra
+        finally:
+            asyncio.run(portal_app.state["slots"].clear_cooldown(
+                "minimax-ultra"))
+
+
 if __name__ == "__main__":
     # Plain-script runner: discovers tests from globals(), like the rest of
     # tests/*.py. See CLAUDE.md — appending below this block would silently

@@ -48,6 +48,50 @@ def _why(result: int, plan_cap: int, model_cap: int | None) -> str:
     return f"plan full at {plan_cap}"
 
 
+def _perishable_visit_order(members: list, by_ref: dict,
+                             order: dict | None,
+                             skipped: list[str]) -> list:
+    """Re-rank `members` by perishable score when the writer has a fresh one.
+
+    Behaviour when `order` is None or stale is to leave `members` unchanged,
+    so the caller's flow runs in config order -- exactly what the picker does
+    for every lane without `strategy: perishable`, and bit-for-bit the same
+    shape when a probe has not yet produced a ranking.
+
+    With a fresh order the body is re-ranked: every member with a score goes
+    first in score-descending order, gate5h members are filtered out (and
+    listed in `skipped` so the capacity board can show why), and unscored
+    members are kept in their lane_members order AFTER every scored member
+    so an unknown plan never beats a known one.
+    """
+    if order is None:
+        return members
+    score_by_ref: dict[str, float] = {}
+    gate5h_refs: set[str] = set()
+    for entry in order["members"]:
+        if entry["gate5h"]:
+            gate5h_refs.add(entry["ref"])
+        else:
+            score_by_ref[entry["ref"]] = entry["score"]
+    # Position per ref in the picker's iteration order -- which is the
+    # post-`Registry.lane_members()` list (urgency-sorted body + tail), NOT
+    # the YAML `order:` list. Used to stable-sort the unscored tail so an
+    # unknown plan lands at its pre-perishable slot rather than drifting.
+    config_pos = {m.ref: i for i, m in enumerate(members)}
+    by_ref_local = {m.ref: m for m in members}
+    # Drop gate5h from the iteration list first so the existing fill loop
+    # below never reaches them; record the skip so the board says why.
+    for ref in sorted(gate5h_refs):
+        if ref in by_ref_local:
+            skipped.append(f"{ref}(gate5h)")
+    body = [m for m in members if m.ref not in gate5h_refs]
+    scored_refs = [r for r in score_by_ref if r in by_ref_local]
+    scored_refs.sort(key=lambda r: score_by_ref[r], reverse=True)
+    unscored = [m for m in body if m.ref not in scored_refs]
+    unscored.sort(key=lambda m: config_pos.get(m.ref, 1_000_000))
+    return [by_ref_local[r] for r in scored_refs if r in by_ref_local] + unscored
+
+
 class Picker:
     def __init__(self, registry: Registry, slots: SlotTable,
                  policy: CapacityPolicy | None = None):
@@ -191,6 +235,19 @@ class Picker:
             elif held:
                 await self.slots.drop_lease(session)
 
+        # 1b. Perishable strategy. The portal recomputes the lane order after
+        # every successful probe and writes it to K_LANE_ORDER; we read it once
+        # here, fall back to config order when the key is missing or stale,
+        # and otherwise re-rank the body. Skipping a gate5h member here only
+        # affects a fresh request -- the affinity branch above already
+        # returned, so re-leasing is the only way the leased plan could land
+        # back here, and that path stays unfiltered.
+        lane_cfg = self.registry.lanes.get(lane)
+        if lane_cfg is not None and lane_cfg.strategy == "perishable" \
+                and self.policy is not None:
+            order = await self.policy.ledger.get_lane_order(lane)
+            members = _perishable_visit_order(members, by_ref, order, skipped)
+
         # 2. Ordered fill. First plan with a free slot wins, which is what
         #    makes total lane capacity the sum of the live plans' caps.
         for model in members:
@@ -312,6 +369,20 @@ class Picker:
                 row_cap = model.max_parallel
                 row_cap_reason = f"model limit {model.max_parallel}"
 
+            # True exactly when the row's cap is narrower than the plan's width
+            # solely because of this model's own max_parallel — no external
+            # reason (cooldown, quota spent, pacing tail, or learner) has
+            # further narrowed it. The board uses this to draw the row as its
+            # own N slots with no grey "withheld" square and no "model limit"
+            # tag: the row IS the plan's reach for this model, not a slice of
+            # something the operator could recover.
+            cap_model_owned = (
+                not cooled
+                and cap_reason == "configured"
+                and model.max_parallel is not None
+                and model.max_parallel < cap
+            )
+
             rows.append({
                 "ref": model.ref,
                 "model": model.key,
@@ -321,6 +392,7 @@ class Picker:
                 "cap": row_cap,
                 "cap_configured": plan.max_parallel,
                 "cap_reason": row_cap_reason,
+                "cap_model_owned": cap_model_owned,
                 "in_flight": inflight,
                 "model_in_flight": model_inflight,
                 "model_in_flight_here": model_here,

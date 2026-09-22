@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +19,7 @@ os.environ["SWITCHYARD_PLANS"] = plans_path()
 from switchyard import models                      # noqa: E402
 from switchyard.picker import LaneSaturated, Picker  # noqa: F401  # noqa: E402
 from switchyard.slots import SlotTable             # noqa: E402
+from switchyard.usage import Ledger                # noqa: E402
 from tests.fake_redis import FakeRedis             # noqa: E402
 
 
@@ -26,6 +28,23 @@ def build():
     redis = FakeRedis()
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     return reg, slots, Picker(reg, slots)
+
+
+def build_with_policy():
+    """Same as build(), but with a CapacityPolicy wired up.
+
+    The perishable tests need a policy because the picker only reads the
+    lane-order key when self.policy is not None -- that is what makes the
+    default path free of Redis writes, and it is what the production code
+    does (the picker always has a policy in the gateway).
+    """
+    from switchyard.policy import CapacityPolicy
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    ledger = Ledger(redis)
+    policy = CapacityPolicy(redis, reg.settings, ledger)
+    return reg, slots, Picker(reg, slots, policy), ledger
 
 
 def run(coro):
@@ -652,6 +671,56 @@ def test_a_row_draws_its_own_model_cap_not_the_plans():
           "(1 gemma + 1 qwen = plan's 2)")
 
 
+def test_a_row_signals_when_its_narrowing_is_the_models_own():
+    """The board decides how to draw a row from one boolean: was its narrowing
+    the model's own choice, or something the operator did (cooldown, paced to
+    zero, spent)?
+
+    A row whose cap is narrower than the plan's width SOLELY because of the
+    model's own `max_parallel` gets `cap_model_owned: True`. The template
+    uses that to skip the withheld-slot loop and the "model limit N" tag, so
+    a slow model on a generous plan reads as its own N slots rather than as
+    a slice of broken capacity. A row whose model cap is unset, equal to the
+    plan, or narrowed for any external reason gets False: the existing
+    markup stays in place.
+
+    Per the pinned example fixture:
+      - local-box/gemma: model 1, plan 2 → True (narrowed by the model)
+      - glm/glm-5.3-flash: model 2, plan 2 → False (model = plan, no narrowing)
+      - minimax-ultra/m3: model None, plan 4 → False (no model cap at all)
+    """
+    async def go():
+        reg, _, picker = build()
+        local = await picker.capacity("local")
+        forge = await picker.capacity("forge")
+
+        def row(cap, ref):
+            return next(r for r in cap["plans"] if r["ref"] == ref)
+
+        gemma = row(local, "local-box/gemma")
+        glm = row(forge, "glm/glm-5.3-flash")
+        m3 = row(forge, "minimax-ultra/m3")
+
+        # The signal tracks the picker's own narrowing step, not a reroll
+        # over the plan's nominal ceiling. It is True exactly when the row's
+        # effective cap is below the plan's cap AND nothing else can claim
+        # credit — the model's own ceiling IS the reason.
+        return gemma, glm, m3
+
+    gemma, glm, m3 = run(go())
+    assert gemma["cap_model_owned"] is True, gemma
+    assert glm["cap_model_owned"] is False, glm
+    assert m3["cap_model_owned"] is False, m3
+    # And the cap_reason tells the same story from the other direction: the
+    # model-owned row carries "model limit 1", the others carry their own
+    # reasons or no reason at all.
+    assert gemma["cap_reason"] == "model limit 1", gemma
+    print(f"  local-box/gemma -> cap_model_owned={gemma['cap_model_owned']} "
+          f"(\"{gemma['cap_reason']}\"); glm/glm-5.3-flash -> "
+          f"{glm['cap_model_owned']}; minimax-ultra/m3 -> "
+          f"{m3['cap_model_owned']}")
+
+
 def test_a_spent_plan_is_skipped_unless_it_may_use_extra_quota():
     """100% of the target window means no capacity — and breaks affinity.
 
@@ -1133,6 +1202,487 @@ def test_concurrent_bump_and_cool_keep_cooldown_consistent_with_streak():
     streak, ttl = run(go())
     print(f"  5 concurrent bumps: streak={streak}, cooldown={ttl}s "
           f"(expected 960 for streak=5)")
+
+
+def test_perishable_lane_routes_higher_room_first():
+    """A perishable lane reorders the body by perishable score for new sessions.
+
+    Two members on different plans, the same reset horizon: the emptier weekly
+    allowance (90% room) ranks ahead of the half-used one (40% room), so a fresh
+    request lands on the emptier plan. The lane's CONFIG order is unchanged --
+    `lane_members()` is still the YAML order, and the picker reads its
+    perishable rank from the ledger.
+    """
+    from dataclasses import replace
+    from switchyard.policy import CapacityPolicy
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"],
+            key="perishable-test",
+            order=["claude-max/fable", "openai/sol"],
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans, lanes=lanes)
+        picker2 = Picker(reg2, slots, picker.policy)
+        reset = time.time() + 7 * 86400
+        # Plan A empty, plan B half-used, same reset. room = 100 - pct, so:
+        #   fable: 90/168 = 0.536,  sol: 40/168 = 0.238
+        await ledger.note_reported_percent("claude-max", 10.0, reset, window="weekly")
+        await ledger.note_reported_percent("openai", 60.0, reset, window="weekly")
+        await ledger.set_lane_order(
+            "perishable-test",
+            {"claude-max/fable": {"score": 0.536, "gate5h": 0},
+             "openai/sol": {"score": 0.238, "gate5h": 0}},
+            computed_at=time.time(),
+            stale_after_ms=2_000_000,
+        )
+        p1 = await picker2.pick("perishable-test", None)
+        # No release between picks: the first fable claim sits at the model's
+        # own counter (model_cap=1) so the next pick falls through to sol,
+        # exactly the spill the perishable ordering produces.
+        p2 = await picker2.pick("perishable-test", None)
+        await picker2.release(p1.plan.key, p1.request_id, p1.ref)
+        await picker2.release(p2.plan.key, p2.request_id, p2.ref)
+        config_order = [m.ref for m in reg2.lane_members("perishable-test")]
+        return p1.ref, p2.ref, config_order
+
+    p1, p2, config = run(go())
+    assert p1 == "claude-max/fable", p1
+    assert p2 == "openai/sol", p2
+    assert config == ["claude-max/fable", "openai/sol"], config
+    print(f"  perishable: room 90% ({p1}) first, room 40% ({p2}) second; "
+          f"config order unchanged")
+
+
+def test_perishable_hysteresis_swaps_at_most_one_adjacent_pair():
+    """A score below the 1.2x ratio does not swap, a large delta does exactly
+    one adjacent swap; an already-aligned order is left alone.
+
+    Hysteresis lives in the writer, so this drives `_one_adjacent_swap`
+    directly with three pre-arranged states. The 51/50 case is the noise a
+    probe picking up a fraction of a percent should not flip the lane over;
+    the 100/50 case is the real gap a 90/30 weekly split would produce.
+    """
+    from switchyard.portal.app import _one_adjacent_swap
+
+    previous = ["minimax-ultra/m3", "minimax-max/m3"]
+    desired_flipped = ["minimax-max/m3", "minimax-ultra/m3"]
+
+    # 51 vs 50: ratio 1.02, below the 1.2x threshold, no swap.
+    no_swap = _one_adjacent_swap(
+        previous, desired_flipped,
+        {"minimax-ultra/m3": (50.0, False), "minimax-max/m3": (51.0, False)})
+    assert no_swap == previous, no_swap
+
+    # 100 vs 50: ratio 2.0, well above 1.2x, one swap to align with desired.
+    one_swap = _one_adjacent_swap(
+        previous, desired_flipped,
+        {"minimax-ultra/m3": (50.0, False), "minimax-max/m3": (100.0, False)})
+    assert one_swap == desired_flipped, one_swap
+
+    # Already aligned: even with a big score gap, the writer does not invent
+    # a swap that was never needed.
+    aligned = _one_adjacent_swap(
+        desired_flipped, desired_flipped,
+        {"minimax-ultra/m3": (50.0, False), "minimax-max/m3": (100.0, False)})
+    assert aligned == desired_flipped, aligned
+
+    # Three-deep order, big score gap, still only ONE adjacent swap per poll.
+    triple_prev = ["a/m", "b/m", "c/m"]
+    triple_desired = ["c/m", "b/m", "a/m"]
+    triple = _one_adjacent_swap(
+        triple_prev, triple_desired,
+        {"a/m": (10.0, False), "b/m": (50.0, False), "c/m": (100.0, False)})
+    # b/m in front, c/m behind -- a swap of the first pair is the first
+    # change that aligns anything with `desired`. The second pair is left
+    # alone, which is the whole point: at most one swap per poll.
+    assert triple[0] == "b/m" and triple[1] == "a/m", triple
+    print("  51/50 ratio: no swap; 100/50 ratio: one swap; aligned: no swap; "
+          "three-deep: only one adjacent pair moves per poll")
+
+
+def test_perishable_lane_falls_back_to_config_order_when_stale():
+    """A ranking whose `computed_at` is older than the writer's staleness
+    bound is ignored, and the picker routes in config order.
+
+    The stale ranking says sol comes first, but if the picker honoured it the
+    pick would land on the half-used plan -- the wrong one. The staleness
+    check in `get_lane_order` returns None, so the picker falls through to
+    the existing config-order fill, which is fable first.
+    """
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"],
+            key="perishable-test",
+            order=["claude-max/fable", "openai/sol"],
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans, lanes=lanes)
+        picker2 = Picker(reg2, slots, picker.policy)
+        reset = time.time() + 7 * 86400
+        # Plans healthy so the picker does not skip them for being spent.
+        await ledger.note_reported_percent("claude-max", 10.0, reset, window="weekly")
+        await ledger.note_reported_percent("openai", 60.0, reset, window="weekly")
+        # The stored order is "sol first" (deliberately wrong per the facts),
+        # but it was written far in the past and is well past staleness.
+        await ledger.set_lane_order(
+            "perishable-test",
+            {"openai/sol": {"score": 0.5, "gate5h": 0},
+             "claude-max/fable": {"score": 0.1, "gate5h": 0}},
+            computed_at=time.time() - 9999,    # 9999s ago
+            stale_after_ms=1000,                # 1s -- this is way past
+        )
+        p1 = await picker2.pick("perishable-test", None)
+        await picker2.release(p1.plan.key, p1.request_id, p1.ref)
+        return p1.ref
+
+    p1 = run(go())
+    # Config order = [claude-max/fable, openai/sol], so fallback = fable first.
+    assert p1 == "claude-max/fable", p1
+    print(f"  stale ranking ignored, config order used -> {p1}")
+
+
+def test_perishable_5h_gate_skips_a_member_for_a_new_session():
+    """A member flagged `gate5h` is filtered out for a fresh request, listed
+    in `considered` so the board says why.
+
+    The gate is written by the portal's writer after reading each plan's 5h
+    window facts (pct_used > 90 -> gate5h=1). The picker just trusts the
+    stored flag, so this test sets the flag directly: claude-max/fable is
+    gated, the ranking lists openai/sol first, and a fresh session lands on
+    sol without ever seeing fable.
+    """
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"],
+            key="perishable-test",
+            order=["claude-max/fable", "openai/sol"],
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans, lanes=lanes)
+        picker2 = Picker(reg2, slots, picker.policy)
+        # Make plans not look "spent" -- only the gate flag matters here.
+        reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent("claude-max", 10.0, reset, window="weekly")
+        await ledger.note_reported_percent("openai", 10.0, reset, window="weekly")
+        await ledger.set_lane_order(
+            "perishable-test",
+            {"claude-max/fable": {"score": 0.0, "gate5h": 1},   # gated
+             "openai/sol": {"score": 0.5, "gate5h": 0}},
+            computed_at=time.time(),
+            stale_after_ms=2_000_000,
+        )
+        p1 = await picker2.pick("perishable-test", None)
+        return p1.ref, p1.considered
+
+    picked, considered = run(go())
+    assert picked == "openai/sol", picked
+    assert any("gate5h" in c for c in considered), considered
+    print(f"  gate5h skipped: picked {picked}, considered {considered}")
+
+
+def test_perishable_unknown_member_sorts_after_scored_ones():
+    """A member with no score slot lands after every scored member, in
+    config position. The picker reorders body members by score desc, with
+    unknown members filling in at their original config spot.
+    """
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"],
+            key="perishable-test",
+            order=["claude-max/fable", "openai/sol", "glm/glm-5.3"],
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans, lanes=lanes)
+        picker2 = Picker(reg2, slots, picker.policy)
+        reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent("claude-max", 10.0, reset, window="weekly")
+        await ledger.note_reported_percent("openai", 50.0, reset, window="weekly")
+        # glm/glm-5.3 deliberately has no entry -- it is the unknown, and
+        # must sort AFTER both scored members.
+        await ledger.set_lane_order(
+            "perishable-test",
+            {"openai/sol": {"score": 0.5, "gate5h": 0},          # 50% room
+             "claude-max/fable": {"score": 0.536, "gate5h": 0},  # 90% room
+             },
+            computed_at=time.time(),
+            stale_after_ms=2_000_000,
+        )
+        picks = []
+        # No release between picks: each model's own cap=1 forces a spill to
+        # the next member, exposing the perishable reordering directly.
+        for _ in range(3):
+            p = await picker2.pick("perishable-test", None)
+            picks.append(p.ref)
+        return picks
+
+    picks = run(go())
+    assert picks[0] == "claude-max/fable", picks  # higher score
+    assert picks[1] == "openai/sol", picks
+    assert picks[2] == "glm/glm-5.3", picks       # unknown sorts last
+    print(f"  scored first, unknown last: {' -> '.join(picks)}")
+
+
+def test_a_strategy_absent_lane_never_touches_the_lane_order_key():
+    """A lane without `strategy: perishable` is bit-for-bit unchanged: the
+    picker never reads or writes the lane-order key. Verified by asserting
+    the hash is absent from FakeRedis after exercising a fill-strategy lane.
+    """
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        redis = slots.redis
+        lanes = dict(reg.lanes)
+        lanes["fill-test"] = replace(
+            reg.lanes["apex"],
+            key="fill-test",
+            order=["claude-max/fable", "openai/sol"],
+            tail=[],
+            strategy="fill",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans, lanes=lanes)
+        picker2 = Picker(reg2, slots, picker.policy)
+        key = "sy:lane-order:fill-test"
+        before = key in redis.hashes
+        # A successful pick in config order (the lane is fill, so the YAML
+        # order wins).
+        p1 = await picker2.pick("fill-test", None)
+        # Saturate the lane to make sure even refusal paths don't write.
+        try:
+            for _ in range(20):
+                p = await picker2.pick("fill-test", None)
+                await picker2.release(p.plan.key, p.request_id, p.ref)
+        except LaneSaturated:
+            pass
+        after = key in redis.hashes
+        return before, after, p1.ref
+
+    before, after, p1 = run(go())
+    assert not before, before
+    assert not after, after
+    # The fill lane behaves exactly as it did before perishable landed:
+    # first config member wins.
+    assert p1 == "claude-max/fable", p1
+    print(f"  fill-strategy lane: no lane-order key (before={before}, "
+          f"after={after}); first pick still {p1} in config order")
+
+
+def test_perishable_writer_keeps_both_plans_after_two_polls():
+    """A perishable lane whose body mixes two plans (the common shape: every
+    shipped example lane does) survives the writer running for each plan in
+    turn. The blocker at bfa9ad3 was that `set_lane_order` is delete-then-write
+    and `_recompute_perishable_for_plan` only scored members of THIS plan, so
+    the second plan's write wiped the first plan's entries from the hash.
+
+    The fix scores every lane member in one pass: members on THIS plan use
+    fresh facts; members on OTHER plans reuse the score that was last written
+    for them (and which is at most one probe interval old, well inside the
+    staleness window the picker already tolerates). Driving the writer for
+    both plans in sequence and asserting both refs land in the stored hash
+    with non-zero scores is what catches a regression to the per-plan-only
+    behaviour.
+    """
+    from dataclasses import replace
+    from switchyard.portal.app import _recompute_perishable_for_plan
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        # apex already has one member per plan (claude-max/fable and
+        # openai/astra). Flip it to perishable with no tail, so the test is
+        # just about the body. The registry is rebuilt so the lane order
+        # takes effect; plans are unchanged.
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"],
+            key="perishable-test",
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        reset = time.time() + 7 * 86400
+        # claude-max 80% used (room 20%); openai 10% used (room 90%).
+        # openai/astra should outrank claude-max/fable on score.
+        await ledger.note_reported_percent("claude-max", 80.0, reset,
+                                           window="weekly")
+        await ledger.note_reported_percent("openai", 10.0, reset,
+                                           window="weekly")
+        # Drive the writer for claude-max first. With NO previous, only
+        # this plan's refs get a fresh score; openai/astra has no previous
+        # entry either, so it lands in `unknown` and is NOT written.
+        plan_a = reg2.plans["claude-max"]
+        await _recompute_perishable_for_plan(reg2, ledger, plan_a)
+        after_first = await ledger.get_lane_order("perishable-test")
+        # Drive the writer for openai. Now both plans have facts: openai/
+        # astra is fresh, claude-max/fable is reused from `previous`. Both
+        # refs must survive in the hash.
+        plan_b = reg2.plans["openai"]
+        await _recompute_perishable_for_plan(reg2, ledger, plan_b)
+        after_second = await ledger.get_lane_order("perishable-test")
+        return after_first, after_second
+
+    after_first, after_second = run(go())
+    refs_first = sorted(m["ref"] for m in after_first["members"])
+    refs_second = [m["ref"] for m in after_second["members"]]
+    # First poll: only the just-probed plan's ref is scored; the other
+    # plan's ref has no previous and is unknown, so it is not in the hash.
+    assert refs_first == ["claude-max/fable"], refs_first
+    # Second poll: BOTH plans' refs are scored, in score-descending order
+    # (openai/astra has higher room than claude-max/fable, so it leads).
+    assert refs_second == ["openai/astra", "claude-max/fable"], refs_second
+    # Every score is a real number, not the stale-zero fallback that a
+    # regression would produce (a ref reused from previous carries its
+    # last-written score, which is itself a fresh score from one poll ago).
+    for entry in after_second["members"]:
+        assert entry["score"] > 0, entry
+    print(f"  first poll refs={refs_first}; "
+          f"second poll refs={refs_second} (both plans present)")
+
+
+def test_perishable_writer_preserves_other_plan_score_when_re_polled():
+    """Driving the writer for plan B does not lose plan A's score. Plan A's
+    previous score is reused, so even though the writer is invoked per-plan
+    the per-lane hash stays a complete picture across the probe poll.
+
+    `set_lane_order` deletes the key first to avoid carrying over a stale
+    `score_<ref>` for a ref that left the lane -- so the test asserts that
+    the surviving score comes from THIS recompute (re-reading plan A's
+    facts through `previous`), not from a stale field left over by the
+    delete.
+    """
+    from dataclasses import replace
+    from switchyard.portal.app import _recompute_perishable_for_plan
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"],
+            key="perishable-test",
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent("claude-max", 80.0, reset,
+                                           window="weekly")
+        await ledger.note_reported_percent("openai", 10.0, reset,
+                                           window="weekly")
+        plan_a, plan_b = reg2.plans["claude-max"], reg2.plans["openai"]
+        # Poll 1: claude-max. fable scored, astra unknown (no previous).
+        await _recompute_perishable_for_plan(reg2, ledger, plan_a)
+        # Poll 2: openai. astra fresh; fable reused from previous.
+        await _recompute_perishable_for_plan(reg2, ledger, plan_b)
+        score_fable_pre = next(
+            m["score"] for m in
+            (await ledger.get_lane_order("perishable-test"))["members"]
+            if m["ref"] == "claude-max/fable")
+        # Mutate claude-max's facts OUT OF BAND and re-poll openai again.
+        # The writer must not pick up the new number for fable (it is on
+        # the other plan); fable's score in the hash must stay what it was
+        # at the previous openai poll, since we have not re-polled
+        # claude-max. If the writer were to re-read claude-max's facts on
+        # every recompute, fable's score would change here, which would be
+        # wrong -- openai's poll has no business recomputing claude-max's
+        # number.
+        await ledger.note_reported_percent("claude-max", 99.0, reset,
+                                           window="weekly")
+        await _recompute_perishable_for_plan(reg2, ledger, plan_b)
+        score_fable_post = next(
+            m["score"] for m in
+            (await ledger.get_lane_order("perishable-test"))["members"]
+            if m["ref"] == "claude-max/fable")
+        return score_fable_pre, score_fable_post
+
+    pre, post = run(go())
+    # Fable's score in the hash is unchanged across the second openai poll:
+    # the writer reused `previous` rather than re-reading claude-max's
+    # now-different facts.
+    assert abs(pre - post) < 1e-9, (pre, post)
+    print(f"  fable's score unchanged across openai's second poll "
+          f"(pre={pre:.4f}, post={post:.4f})")
+
+
+def test_perishable_one_adjacent_swap_reconciles_added_and_removed_refs():
+    """`_one_adjacent_swap` drops refs from `previous` that have left the
+    lane (a config edit, a member's plan disabled, etc.) and appends refs
+    in `desired` that are not yet in `previous` (a member whose plan just
+    probed for the first time, a new perishable lane warming up). The
+    one-swap cap still applies on top, so the result is reachable from
+    `previous` via at most one adjacent swap after reconciliation.
+
+    The should-fix at bfa9ad3 was that the implementation never moved
+    toward `desired` -- it only reordered `previous`. A newly probed ref
+    stayed absent from the hash, and a removed ref came back as a stale
+    `score: 0.0` entry.
+    """
+    from switchyard.portal.app import _one_adjacent_swap
+
+    # Drop a removed ref (config edit removed it), add a new ref (first
+    # probe of a different plan's model), with a score ratio that justifies
+    # one swap.
+    added_only = _one_adjacent_swap(
+        ["minimax-ultra/m3"],
+        ["minimax-max/m3", "minimax-ultra/m3"],
+        {"minimax-ultra/m3": (50.0, False), "minimax-max/m3": (100.0, False)},
+    )
+    # out starts as [minimax-ultra/m3]; append minimax-max/m3 (in desired
+    # order).  Loop: pair (minimax-ultra/m3, minimax-max/m3). sb/sa = 2.0
+    # >= 1.2; desired.index(minimax-max/m3) < desired.index(minimax-ultra/m3);
+    # swap. Result: [minimax-max/m3, minimax-ultra/m3].
+    assert added_only == ["minimax-max/m3", "minimax-ultra/m3"], added_only
+
+    # Removed ref is gone, surviving refs unchanged, no swap needed.
+    dropped_only = _one_adjacent_swap(
+        ["a/m", "b/m"],
+        ["b/m"],
+        {"a/m": (10.0, False), "b/m": (10.0, False)},
+    )
+    assert dropped_only == ["b/m"], dropped_only
+
+    # Drop AND add in one call: both reconcile, one swap.
+    added_and_dropped = _one_adjacent_swap(
+        ["a/m", "b/m", "c/m"],
+        ["c/m", "b/m", "d/m"],
+        {"a/m": (10.0, False), "b/m": (50.0, False),
+         "c/m": (100.0, False), "d/m": (50.0, False)},
+    )
+    # Step 1: drop a/m. out = [b/m, c/m].
+    # Step 2: append d/m. out = [b/m, c/m, d/m].
+    # Loop: pair (b/m, c/m). sb/sa = 100/50 = 2.0; desired.index(c/m) <
+    # desired.index(b/m); swap. Result: [c/m, b/m, d/m].
+    assert added_and_dropped == ["c/m", "b/m", "d/m"], added_and_dropped
+
+    print(f"  added: {added_only}; dropped: {dropped_only}; "
+          f"added+dropped: {added_and_dropped}")
 
 
 if __name__ == "__main__":

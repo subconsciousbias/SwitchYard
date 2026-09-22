@@ -69,7 +69,15 @@
             {# Slots the effective cap withholds. A spent plan's cap is 0, so
                ALL of its slots land here — they must still read as "out of
                quota" rather than as generic withheld capacity, or the red
-               outline disappears at exactly the moment it matters. #}
+               outline disappears at exactly the moment it matters.
+
+               A row whose cap is narrower than the plan's width solely
+               because of the model's own max_parallel gets no withheld
+               squares: the slots above its cap are not withheld from
+               *this* model, they belong to siblings on the same plan, and
+               labelling them "slot gone" would read as a problem the lane
+               has. The cap_model_owned signal gates the loop. #}
+            {% if not p.cap_model_owned|default(false) %}
             {% for i in range(p.cap, p.cap_configured) %}
               {% if spent %}
                 <span class="slot spent"
@@ -84,6 +92,7 @@
                 <span class="slot gone" title="withheld: {{ p.cap_reason }}"></span>
               {% endif %}
             {% endfor %}
+            {% endif %}
           </div>
         </td>
         <td class="mono nowrap" style="width:32%">
@@ -99,7 +108,7 @@
             <span class="tag warn">{{ p.cap_reason }}</span>
           {% else %}
             <span class="muted">{{ p.in_flight }}/{{ p.cap }}</span>
-            {% if p.cap != p.cap_configured %}
+            {% if p.cap != p.cap_configured and not p.cap_model_owned|default(false) %}
               <span class="tag warn" title="configured {{ p.cap_configured }}">{{ p.cap_reason }}</span>
             {% endif %}
             {% if p.days_left is not none and p.days_left <= 21 %}
