@@ -154,6 +154,17 @@ def build(plans_path: str) -> dict:
             # (hooks.py LaneSaturated), so the caller's well-behaved retry lands
             # against the fresh cooldowns the picker sees on re-entry.
             "num_retries": 0,
+            # Route Anthropic-protocol /v1/messages onto /v1/chat/completions.
+            # Without this, LiteLLM v1.101.0 translates an openai/-prefixed
+            # deployment's /v1/messages request into POST {api_base}/responses,
+            # which 404s at every sidecar — cli_bridge and mcp_bridge serve
+            # only /v1/chat/completions. (xai-token-proxy also exposes
+            # /v1/messages natively, but the flag applies uniformly and is
+            # safe there too.) This flag sends /v1/messages through LiteLLM's
+            # own Anthropic->chat-completions adapter onto the path the
+            # sidecars serve, so Claude Code reaches them without any
+            # per-bridge protocol code.
+            "use_chat_completions_url_for_anthropic_messages": True,
         },
         "router_settings": {
             "enable_pre_call_checks": True,
