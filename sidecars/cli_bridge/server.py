@@ -1197,12 +1197,30 @@ def to_openai(payload: dict, model: str) -> dict:
     # of prompt_tokens, so we only add them when the payload is clearly
     # Anthropic-shaped. Otherwise the OpenCode/Codex cache_read_tokens would
     # be double-counted into prompt_tokens.
-    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
-        prompt_tokens = (input_tokens
-                         + int(usage.get("cache_read_input_tokens", 0) or 0)
-                         + int(usage.get("cache_creation_input_tokens", 0) or 0))
+    anthropic_shape = ("cache_read_input_tokens" in usage
+                       or "cache_creation_input_tokens" in usage)
+    if anthropic_shape:
+        cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+        cache_creation = int(usage.get("cache_creation_input_tokens", 0) or 0)
+        prompt_tokens = input_tokens + cache_read + cache_creation
     else:
         prompt_tokens = input_tokens
+    out_usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": prompt_tokens + output_tokens,
+    }
+    if anthropic_shape:
+        # Expose the cache breakdown so LiteLLM and callers can see it. The
+        # OpenAI-shaped `prompt_tokens_details.cached_tokens` is what the
+        # gateway maps back to `cache_read_input_tokens` for Anthropic-protocol
+        # clients (Claude Code via /v1/messages); there is no official OpenAI
+        # slot for cache *creation*, so we carry it top-level using the
+        # verbatim Anthropic spelling — LiteLLM round-trips it if it
+        # recognises the key, and worst case drops it while totals stay
+        # correct. Both are emitted even when zero so the shape is stable.
+        out_usage["prompt_tokens_details"] = {"cached_tokens": cache_read}
+        out_usage["cache_creation_input_tokens"] = cache_creation
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
         "object": "chat.completion",
@@ -1213,11 +1231,7 @@ def to_openai(payload: dict, model: str) -> dict:
             "message": {"role": "assistant", "content": payload.get("result", "")},
             "finish_reason": "stop",
         }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": prompt_tokens + output_tokens,
-        },
+        "usage": out_usage,
     }
 
 
