@@ -8,6 +8,7 @@
 config/plans.yaml
 .env.bak
 .env.*.bak
+.env.bak-*
 __pycache__/
 *.pyc
 config/litellm.generated.yaml

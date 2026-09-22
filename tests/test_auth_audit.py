@@ -152,6 +152,29 @@ def test_container_cred_table_only_knows_cli_homes():
     print("  the static table holds CLI homes only — no per-subscription paths")
 
 
+def test_env_bak_suffix_snapshots_are_ignored():
+    # Issue #33: `.env.bak-<suffix>` is a sync-env.sh snapshot name and must
+    # be ignored alongside the other `.env`-family backup patterns.
+    # `git check-ignore -q` rejects multiple pathnames, so loop and assert
+    # each path individually — exit 0 means that path is ignored.
+    import subprocess
+    snapshot_names = [
+        ".env.bak-20260921", ".env.bak-", ".env.bak",
+        ".env.backup.1", ".env",
+    ]
+    not_ignored = []
+    for name in snapshot_names:
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", name],
+            cwd=ROOT,
+        )
+        if result.returncode != 0:
+            not_ignored.append((name, result.returncode))
+    assert not not_ignored, \
+        f"git check-ignore expected to ignore all five names, missing: {not_ignored}"
+    print("  .env.bak-<suffix> snapshots are gitignored (issue #33)")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
