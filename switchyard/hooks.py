@@ -279,6 +279,11 @@ class SwitchyardHandler(CustomLogger):
             "sticky": pick.sticky,
             "claimed_at": time.time(),
             "cap": pick.cap,
+            # Which endpoint this arrived on. The success logging event fires
+            # for chat completions and not for /v1/messages, and the slot
+            # release and the ledger write live in that event -- so the
+            # finish has to know which path it is on. See _finish_unlogged.
+            "call_type": str(call_type),
             # Carried so async_pre_routing_hook can re-pick on the same lane /
             # session with the same tool/pin rules as the first attempt — the
             # router reuses this dict across retries, and we want the re-pick
@@ -535,7 +540,43 @@ class SwitchyardHandler(CustomLogger):
                 setattr(response, "switchyard", stamp)
         except Exception:                 # never fail a served request over a label
             log.debug("could not stamp response with switchyard routing info")
+        await self._finish_unlogged(ctx, response)
         return response
+
+    # Call types whose success LOGGING event fires, so async_log_success_event
+    # already released the slot and booked the tokens. Anything else is
+    # finished by hand in the post-call hook -- measured on /v1/messages, whose
+    # logging event never fires at all.
+    _LOGGED_CALL_TYPES = frozenset({
+        "completion", "acompletion", "text_completion", "atext_completion",
+    })
+
+    async def _finish_unlogged(self, ctx: dict, response: Any) -> None:
+        """Release the slot and book the tokens for a route LiteLLM does not log.
+
+        Without this a /v1/messages request held its slot until the staleness
+        sweep and spent quota the ledger never saw: a Claude Code tool loop
+        filled a 2-slot seat and then refused its own follow-up.
+        """
+        if ctx.get("call_type") in self._LOGGED_CALL_TYPES:
+            return
+        self._stop_heartbeat(ctx["request_id"])
+        await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
+        plan = self.registry.plans.get(ctx.get("plan", ""))
+        if plan is None:
+            return
+        # Anthropic names its counters input_tokens/output_tokens; a translated
+        # reply may still carry the OpenAI pair, so read either.
+        usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+        get = ((lambda k: (usage or {}).get(k, 0)) if isinstance(usage, dict)
+               else (lambda k: getattr(usage, k, 0) or 0))
+        prompt_tokens = int(get("input_tokens") or get("prompt_tokens") or 0)
+        completion_tokens = int(get("output_tokens") or get("completion_tokens") or 0)
+        await self.ledger.record(plan, prompt_tokens=prompt_tokens,
+                                 completion_tokens=completion_tokens, cost=0.0)
+        seconds = max(0.0, time.time() - float(ctx.get("claimed_at") or time.time()))
+        units = prompt_tokens + completion_tokens
+        await self.policy.pacer.note_throughput(plan, units, seconds)
 
     async def async_post_call_streaming_iterator_hook(
         self, user_api_key_dict: UserAPIKeyAuth, response: Any, request_data: dict
@@ -551,11 +592,25 @@ class SwitchyardHandler(CustomLogger):
         Reasoning is moved, never dropped: it arrives as `reasoning_content`
         deltas, which is where the non-streamed path puts it.
         """
-        if not self.registry.settings.split_reasoning_tags:
-            async for chunk in response:
+        # A streamed reply never reaches async_post_call_success_hook, and on
+        # the Anthropic route no logging event fires either, so this is the
+        # only place left to finish a streamed request: release the slot and
+        # book the tokens. In a finally, because a client that hangs up
+        # mid-stream must not keep the seat.
+        ctx = ((request_data or {}).get("metadata") or {}).get(META_KEY)
+        ctx = ctx if isinstance(ctx, dict) else None
+        try:
+            if not self.registry.settings.split_reasoning_tags:
+                async for chunk in response:
+                    yield chunk
+                return
+            async for chunk in self._split_reasoning(response):
                 yield chunk
-            return
+        finally:
+            if ctx:
+                await self._finish_unlogged(ctx, None)
 
+    async def _split_reasoning(self, response: Any):
         splitter = ReasoningSplitter()
         async for chunk in response:
             try:
