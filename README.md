@@ -611,6 +611,15 @@ is no env-var escape hatch: this is a deliberate "fail-loud" gate, run once
 per gateway start, whose output is the audit trail in `docker logs`. The
 `selfcheck PASSED` line is what a healthy startup looks like.
 
+### `failed to count tokens. Got - 'items'` in the logs
+
+An Anthropic-format request whose tool declares an array property without an
+`items` field — `{"name": "...", "input_schema": {"type": "object", "properties": {"tags": {"type": "array"}}}}` is the legal shape, but the OpenAI tool schema requires `items`, and litellm's `_format_type` (inside `litellm/litellm_core_utils/token_counter.py`) was written against the OpenAI shape. It does a bare-subscript `props['items']` in the `type == "array"` branch, which raises `KeyError: 'items'` on first use and the wrapper logs it as `failed to count tokens. Got - 'items'`. Token-counter falls back to a default estimate, but the warning is loud in `docker logs gateway` and the failure path is repeated on every Anthropic tool call.
+
+`Dockerfile.gateway` patches the installed litellm at build time, replacing the bare-subscript with a tolerant `props.get('items') or {'type': 'string'}`, so an items-less array counts as `string[]` instead of raising. `switchyard/selfcheck.py` runs `_audit_token_counter_patch` on every gateway start and prints `ok  litellm._format_type tolerates items-less arrays; items=string still renders 'string[]'` as one of its five audit lines; a missing patch makes that line `CRITICAL` and the container restart loop surfaces it loudly.
+
+A regression after a future litellm pin bump is caught here rather than in production by the **PIN POLICY** at the top of `Dockerfile.gateway`: bumping the tag or digest means re-deriving this patch against the new upstream, and the Dockerfile's exact-occurrence assert fails the build loudly if the new litellm has drifted past the patched line. The Dockerfile header documents the contract; `tests/test_litellm_patch.py` guards it offline (no litellm import).
+
 Where a plan still cannot serve tools — because its path hasn't been fixed yet,
 or because it genuinely never will — set `supports_tools: false` on it and the
 picker keeps routing tool-using requests around it, the same as it always has.

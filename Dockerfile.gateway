@@ -41,6 +41,84 @@ if missing:
 print("switchyard: base image provides every required package")
 PY
 
+# Patch litellm.litellm_core_utils.token_counter at build time so Anthropic
+# tool schemas whose array property omits `items` do not break token counting.
+#
+# The Anthropic tool-input-schema spec does not require `items` on an array
+# property - `{"type": "array"}` is a complete schema. OpenAI's schema does
+# require it, and litellm's `_format_type` (inside token_counter.py) was
+# written against the OpenAI shape: it does a bare-subscript
+# `props['items']` in the `type == "array"` branch, which raises KeyError
+# on every legitimate Anthropic `tools=[...]` payload the gateway receives
+# and takes `token_counter` down with a stack trace on first use (issue
+# #59). Note that `_format_function_definitions`, in the same file,
+# already accepts an Anthropic-shaped schema via `input_schema` without
+# insisting on `items`, so the omission is unambiguously legal upstream.
+#
+# The fix lives in the *counting* layer only: we replace the bare-subscript
+# access with a tolerant `.get('items') or {'type': 'string'}` form, so an
+# items-less array counts as `string[]` instead of raising. Tool definitions
+# and the payloads we forward to the model are not touched.
+#
+# The exact-occurrence assert below is deliberate: this Dockerfile's PIN
+# POLICY comment insists that any change to the FROM pin re-derives this
+# patch. If a future pin bump silently drifts this line (renames the
+# function, moves the branch, inlines the call, etc.), the bare-subscript
+# comes back at request time as a KeyError - the same bug, with no commit
+# message. Fail the build loudly here so the drift gets a name instead of
+# an incident.
+RUN python3 - <<'PY'
+import os, sys
+
+import litellm
+pkg_dir = os.path.dirname(litellm.__file__)
+target = os.path.join(pkg_dir, "litellm_core_utils", "token_counter.py")
+if not os.path.isfile(target):
+    sys.exit(f"switchyard: expected litellm token_counter.py at {target}")
+
+with open(target, encoding="utf-8") as fh:
+    src = fh.read()
+
+# Vulnerable fragment: the `type == "array"` branch of `_format_type` does
+# a bare-subscript `props['items']`. We expect this exact line - 8-space
+# indent included, so the count is not artificially inflated by any
+# docstring/comment that quotes the same expression - to appear EXACTLY
+# once in the file.
+vulnerable = "        return f\"{_format_type(props['items'], indent)}[]\""
+count = src.count(vulnerable)
+if count != 1:
+    sys.exit(
+        "switchyard: token_counter.py vulnerable fragment "
+        "(props['items'] bare-subscript in _format_type) appeared "
+        f"{count} times, expected 1. The pinned litellm base image has "
+        "drifted past the patch; re-derive this patch against the new "
+        "litellm pin before rebuilding, per the PIN POLICY at the top "
+        "of Dockerfile.gateway."
+    )
+
+# Tolerant form: missing `items` (legal in the Anthropic tool spec) counts
+# as `string[]` instead of raising KeyError. The recursive call into
+# `_format_type` itself is unchanged, so the token-count shape for tools
+# that *do* carry `items` (OpenAI-shaped schemas, mixed payloads, ...) is
+# identical to the unpatched behaviour - the only thing the patch changes
+# is the missing-`items` case.
+patched = ("        return f\"{_format_type(props.get('items') or "
+           "{'type': 'string'}, indent)}[]\"")
+new_src = src.replace(vulnerable, patched, 1)
+if new_src == src:
+    sys.exit(
+        "switchyard: token_counter.py replace() returned the same source; "
+        "aborting rather than silently no-op'ing the patch."
+    )
+
+with open(target, "w", encoding="utf-8") as fh:
+    fh.write(new_src)
+print(
+    "switchyard: token_counter.py patched (tolerant items[] access; "
+    "items-less Anthropic arrays now render as 'string[]')"
+)
+PY
+
 COPY switchyard /switchyard/switchyard
 COPY docker/gateway-entrypoint.sh /switchyard/entrypoint.sh
 RUN chmod +x /switchyard/entrypoint.sh

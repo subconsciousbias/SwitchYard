@@ -1021,6 +1021,94 @@ cookie value.
 
 ---
 
+## 9. Post-deploy check: the token-counter patch
+
+This is the manual confirmation that issue #59 is fixed end to end. The
+patch is applied at build time on the litellm the gateway imports from, and
+audited on every container start. The build-time patch and the audit are
+guarded by `tests/test_litellm_patch.py` offline; the steps below prove
+they survived into the running image and that the requests they touch are
+honest, not just silent.
+
+The rebuild/redeploy happens on the **main checkout** — `scripts/apply.sh
+--build` there rebuilds the gateway image from the freshly-merged branch.
+**Never** `docker compose build` from a worktree: `docker-compose.yml` pins
+`name: switchyard`, so a worktree build rebuilds and recreates the live
+containers from branch code and mounts the worktree's `./config`, which is
+not what you want.
+
+```bash
+# from the main checkout
+scripts/apply.sh --build
+
+docker compose exec gateway python3 -m switchyard.selfcheck
+```
+
+**Expect** all five `ok` lines from the self-check, including the new one
+for the token-counter patch:
+
+```
+switchyard.selfcheck: litellm version: 1.101.0
+switchyard.selfcheck:   ok  Router.async_pre_routing_hook: no CustomLogger dispatch, internal-strategy only
+switchyard.selfcheck:   ok  Router.acompletion routes through async_function_with_fallbacks
+switchyard.selfcheck:   ok  async_function_with_retries: num_retries<=0 short-circuits before the retry loop
+switchyard.selfcheck:   ok  litellm/proxy references async_pre_call_hook (Switchyard's pre-call hook still has a dispatch site)
+switchyard.selfcheck:   ok  litellm._format_type tolerates items-less arrays; items=string still renders 'string[]'
+switchyard.selfcheck: selfcheck PASSED
+```
+
+If that last `ok` line is missing or prints `CRITICAL`, the build-time patch
+was not applied (a stale image, a partial apply, a base-image pin bump that
+didn't re-derive the patch per the **PIN POLICY** at the top of
+`Dockerfile.gateway`) and `/v1/messages` requests carrying tools will
+silently miscount tokens.
+
+Then exercise the patched path on a live request: send a `/v1/messages`
+call to any lane carrying a tool whose array parameter omits `items`, and
+confirm both that the call still works and that the warning is gone:
+
+```bash
+curl -s $GW/v1/messages \
+  -H "x-api-key: $LITELLM_MASTER_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "forge",
+    "max_tokens": 64,
+    "tools": [{
+      "name": "tag_list",
+      "description": "List of tags",
+      "input_schema": {
+        "type": "object",
+        "properties": {"tags": {"type": "array"}}
+      }
+    }],
+    "messages": [{"role": "user", "content": "hi"}]
+  }' | head -c 400
+```
+
+**Expect** a 200 with a normal completion-shaped body, AND
+`docker compose logs gateway | grep -i "failed to count tokens"` returns
+nothing for the past few minutes. Pre-patch, every such call produced a
+`failed to count tokens. Got - 'items'` line in the logs.
+
+Finally, confirm the count-tokens route that the patch made possible still
+answers:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" $GW/v1/messages/count_tokens \
+  -H "x-api-key: $LITELLM_MASTER_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"forge","messages":[{"role":"user","content":"hi"}]}'
+```
+
+**Expect** `200`. The Anthropic `count_tokens` endpoint is what the
+patched `_format_type` keeps honest, and a non-200 here means the patch
+broke something downstream of the bare-subscript it was supposed to fix.
+
+---
+
 ## A trap worth knowing: GLM's base URL
 
 Verified by direct call with a Coding Plan key:
@@ -1054,14 +1142,14 @@ Two related notes:
   business code 1113 really does arrive wrapped in an HTTP 429, which is why the
   classifier reads the body rather than trusting the status.
 
-## 8. Caller environment — issue #44 smoke tests
+## 10. Caller environment — issue #44 smoke tests
 
 These verify the per-request resolution of the caller's tool-execution
 environment (the bug where a Claude Code tab pointed at the gateway thinks
 it is on Linux in `/app/mcp_bridge`). Three live checks; the offline test
 suite covers parsers and probe-id mechanics, not the LiteLLM transport.
 
-### 8a. The metadata-transport assumption
+### 10a. The metadata-transport assumption
 
 The gateway stamps `metadata.switchyard.caller_env` on every request it
 processes. Nothing in this repo proves LiteLLM forwards that field to the
@@ -1094,7 +1182,7 @@ metadata field somewhere -- a bug, but expected behaviour given the
 known assumption. The passive path still produces a correct answer in
 that case, which is the resilience contract.
 
-### 8b. Real Claude Code tab — answer reflects the caller's OS
+### 10b. Real Claude Code tab — answer reflects the caller's OS
 
 1. Point a Claude Code tab at the gateway (`ANTHROPIC_BASE_URL=http://...
    /v1`, `ANTHROPIC_API_KEY=$LITELLM_MASTER_KEY`), open a session on
@@ -1113,14 +1201,14 @@ that case, which is the resilience contract.
    host-symlink in plan name (or the per-request resolution) is what
    distinguishes them.
 
-### 8c. What the offline suite cannot prove
+### 10c. What the offline suite cannot prove
 
 The offline test suite (`for t in tests/test_*.py`) covers the parsers,
 the probe-id round-trip and the synthetic probe response shape -- but it
 cannot prove that LiteLLM's proxy actually forwards
 `metadata.switchyard.caller_env` to the sidecar over HTTP. That transport
-is exercised only by 8a above; if you change how the gateway writes
-metadata or how the sidecar reads it, 8a is the verification step. The
+is exercised only by 10a above; if you change how the gateway writes
+metadata or how the sidecar reads it, 10a is the verification step. The
 sidecar is written so that field is optional: passive re-resolution is
 the primary source, the stamp is belt-and-braces, and the system never
 fails because the stamp is missing.
@@ -1154,3 +1242,13 @@ them first if something misbehaves:
 7. **Real token allowances.** Everything works without them, but pacing stays
    idle and headroom stays estimated until either you set them or a plan hits a
    wall once and the observed-allowance learning records it.
+8. **`CountTokens handler: 404 for /v1/responses/input_tokens` from the
+   claude-max-sidecar is EXPECTED.** LiteLLM's CountTokens handler posts there
+   to ask a vendor for an exact token figure; the bridge has no such route
+   (only `/usage`, `/health`, `/v1/models`, `/v1/chat/completions`), so the
+   call 404s. LiteLLM falls back to its local tokenizer and answers
+   `/v1/messages/count_tokens` with 200, which is what the "Post-deploy
+   check: the token-counter patch" section above verifies. The bridges
+   cannot count vendor tokens without spending a turn on it, so the local
+   fallback is the honest number rather than a wrong one; no sidecar
+   change is planned.

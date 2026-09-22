@@ -31,6 +31,15 @@ trail in `docker logs`.
 
 This file does not talk to a real provider. Loopback only, no credentials,
 no Redis, no internet.
+
+3. The token-counter at the heart of quota accounting must still tolerate
+   Anthropic tool schemas whose array property omits `items`. A regression
+   here is silent: the proxy stays up, requests still route, only the
+   tokens-attributed number goes sideways (or token_counter raises
+   KeyError on the first Anthropic tool payload, depending on the path).
+   Dockerfile.gateway patches the file at build time; this audit confirms
+   the patch is actually present on the running image and that the
+   items=string array case still renders conventionally.
 """
 from __future__ import annotations
 
@@ -305,6 +314,115 @@ def _audit_proxy_pre_call_hook_present() -> None:
     )
 
 
+def _audit_token_counter_patch() -> None:
+    """(e) litellm token_counter._format_type must tolerate items-less arrays.
+
+    The Anthropic tool spec does not require `items` on an array property:
+    `{"type": "array"}` is a complete schema, and `_format_function_
+    definitions` (in the same file) already accepts that shape via
+    `input_schema`. litellm's `_format_type` was written against the
+    OpenAI shape and does a bare-subscript `props['items']` in the
+    `type == "array"` branch, which raises KeyError on every legitimate
+    Anthropic `tools=[...]` payload and takes `token_counter` down on
+    first use. Dockerfile.gateway applies the patch at build time -
+    this audit confirms it is actually present on the running image and
+    that the items-carrying case still produces the conventional
+    'string[]' rendering. A regression here is silent from a routing
+    point of view: requests still flow, only token-attribution drifts.
+
+    We import `_format_type` directly rather than re-deriving the patch
+    against the AST: a live call is the honest test for the counting
+    layer, and it also catches an awkward in-between state where the
+    file on disk is patched but a stale package is somehow loaded.
+    """
+    try:
+        import litellm
+        from litellm.litellm_core_utils.token_counter import _format_type
+    except Exception as exc:                 # noqa: BLE001 - report with reason
+        _critical(
+            "could not import litellm.litellm_core_utils.token_counter to "
+            f"verify the build-time patch: {type(exc).__name__}: {exc}"
+        )
+        return
+
+    pkg_dir = os.path.dirname(litellm.__file__)
+    src_path = os.path.join(
+        pkg_dir, "litellm_core_utils", "token_counter.py"
+    )
+    try:
+        with open(src_path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError as exc:
+        _critical(f"could not read {src_path} for token-counter patch check: {exc}")
+        return
+
+    # Static check: the vulnerable bare-subscript must not appear in the
+    # array branch any more. We match the exact (indented) line so a
+    # docstring or comment that quotes the expression does not satisfy
+    # the count by accident. A partial build that somehow bypassed
+    # Dockerfile.gateway's RUN layer is the regression to scream about.
+    vulnerable = "        return f\"{_format_type(props['items'], indent)}[]\""
+    if vulnerable in src:
+        _critical(
+            "litellm token_counter._format_type still does "
+            "props['items'] in the array branch - the Dockerfile.gateway "
+            "build-time patch was not applied (or the litellm base-image "
+            "pin drifted past it). Rebuild the gateway image per the PIN "
+            "POLICY at the top of Dockerfile.gateway."
+        )
+        return
+
+    # Functional check 1: the items-less array must not raise, and must
+    # render as 'string[]' (the synthetic fallback shape the patch picks
+    # when `items` is absent). This is the exact shape that was
+    # previously raising KeyError; if it raises again here, the patch
+    # did not survive into the running image.
+    try:
+        got_itemsless = _format_type({"type": "array"}, 0)
+    except Exception as exc:                 # noqa: BLE001 - typed message
+        _critical(
+            "patched _format_type raised on items-less array "
+            f"{{'type': 'array'}}: {type(exc).__name__}: {exc}"
+        )
+        return
+    if got_itemsless != "string[]":
+        _critical(
+            "patched _format_type returned "
+            f"{got_itemsless!r} for an items-less array, expected "
+            "'string[]' - the build-time patch is not behaving as the "
+            "PIN POLICY derived it."
+        )
+        return
+
+    # Functional check 2: a normal items-carrying array must STILL
+    # render as 'string[]' (i.e. the patch did not silently change
+    # the well-formed path). A regression here would be very hard to
+    # spot in metrics alone - token counts shift, no exception, just
+    # quiet drift.
+    try:
+        got_with_items = _format_type(
+            {"type": "array", "items": {"type": "string"}}, 0
+        )
+    except Exception as exc:                 # noqa: BLE001 - typed message
+        _critical(
+            "patched _format_type raised on items=string array: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return
+    if got_with_items != "string[]":
+        _critical(
+            "patched _format_type returned "
+            f"{got_with_items!r} for an items=string array, expected "
+            "'string[]' - the well-formed rendering has drifted."
+        )
+        return
+
+    log.info(
+        "  ok  litellm._format_type tolerates items-less arrays; "
+        "items=string still renders 'string[]'"
+    )
+
+
 # -- dynamic probe ------------------------------------------------------------
 
 class _Stub(BaseHTTPRequestHandler):
@@ -554,7 +672,7 @@ def _litellm_version() -> str:
 
 
 def _static_audit() -> None:
-    """Run all four AST checks. Each prints its own ok/fail line."""
+    """Run all five startup checks. Each prints its own ok/fail line."""
     import litellm.router
     import litellm.proxy
     router_src = inspect.getsource(litellm.router)
@@ -562,6 +680,7 @@ def _static_audit() -> None:
     _audit_acompletion_through_fallbacks(router_src)
     _audit_num_retries_early_raise(router_src)
     _audit_proxy_pre_call_hook_present()
+    _audit_token_counter_patch()
 
 
 async def main_async() -> int:
