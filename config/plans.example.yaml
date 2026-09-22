@@ -721,6 +721,47 @@ plans:
 # has run out, so a subscription in the tail defeats the purpose — that is exactly
 # what will be exhausted at the moment the tail is needed. OpenRouter would work
 # too (it fails on money, not quota) but is deliberately not used for this.
+#
+# `strategy` controls how a lane orders its body. Default is `fill` -- the
+# config order is used as written, and the picker never reads or writes a
+# Redis key. `perishable` opts into headroom-aware ordering: the portal
+# re-ranks each member after every successful probe, and the picker reads the
+# stored rank on each request. Built for lanes that mix weekly subscriptions
+# whose budget is racing the reset -- drain the emptiest hour-per-dollar
+# first, do not waste capacity on a 90%-used plan when a 10%-used one has
+# the same reset.
+#
+# Per-member score (TARGET window only; weekly, monthly, whatever the plan's
+# target is):
+#
+#     room     = 100 - reported_pct_used            # % of the allowance left
+#     hours    = max(1.0, (reset_at - now) / 3600)  # clamp so a near-now reset
+#                                                  # doesn't blow up the ratio
+#     score    = room / hours                       # higher -> drain sooner
+#
+# A member with no usable facts (no probe yet, fresh credential, etc.) gets
+# no score and lands after every scored member, in config order. Tails never
+# score -- they stay at the end regardless.
+#
+# The 5-hour constraint window is a gate, not a rank: pct_used > 90 flips
+# `gate5h_<ref>` on, and the picker skips that member for NEW sessions --
+# affinity and a pinned follow-up stay untouched (they already returned), so
+# any session whose plan is in the middle of a burst finishes where it
+# started. Score does not incorporate the gate signal -- the gate is binary,
+# and conflating it with the rank would make a 50%-member whose 5h is at
+# 95% jump ahead of a 80%-member whose 5h is at 30% for the wrong reason.
+#
+# Hysteresis lives on the WRITER, not the rank. Each poll computes the desired
+# order as score-desc; the stored order is then allowed one adjacent swap
+# where the lower-position member beats the one ahead by ratio >= ~1.2. That
+# keeps a 51/49 flip from flipping the lane, while still draining a real 90/30
+# gap. Members with no usable facts sort last; lanes with no facts at all
+# keep their stored order (the picker will fall back to config order on
+# staleness automatically).
+#
+# Staleness bound is roughly 2x the probe interval (writer-decided). One
+# missed poll doesn't tear down a working ranking; a quiet probe pulls the
+# lane back to config order instead of serving a stale one for hours.
 # ============================================================================
 lanes:
 
@@ -730,18 +771,21 @@ lanes:
       Escalations where Opus-class judgement was not enough. Note that both
       members ride plans whose other models serve `judge`, so the connection
       limits are shared — by design.
+    # strategy: perishable
     order: [claude-max/fable, openai/astra]
     tail: [local-box/qwen]
 
   judge:
     label: "Judgement — Regular"
     description: "The normal judgement tier. Most judgement tasks land here."
+    # strategy: perishable
     order: [claude-max/opus, openai/sol, glm/glm-5.3]
     tail: [local-box/qwen]
 
   forge:
     label: "Coding Workhorse"
     description: "Getting work done. Ordered fill across every workhorse plan."
+    # strategy: perishable
     order:
       - minimax-ultra/m3
       - minimax-max/m3
