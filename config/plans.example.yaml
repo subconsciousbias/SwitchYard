@@ -736,14 +736,36 @@ plans:
 # what will be exhausted at the moment the tail is needed. OpenRouter would work
 # too (it fails on money, not quota) but is deliberately not used for this.
 #
-# `strategy` controls how a lane orders its body. Default is `fill` -- the
-# config order is used as written, and the picker never reads or writes a
-# Redis key. `perishable` opts into headroom-aware ordering: the portal
-# re-ranks each member after every successful probe, and the picker reads the
-# stored rank on each request. Built for lanes that mix weekly subscriptions
-# whose budget is racing the reset -- drain the emptiest hour-per-dollar
-# first, do not waste capacity on a 90%-used plan when a 10%-used one has
-# the same reset.
+# `strategy` controls how a lane orders its body. Five strategies are available;
+# each lane's body is a list of entries, and each entry is EITHER a bare
+# `plan/model` ref OR a single-key mapping `{strategy_name: body}`. Groups nest
+# recursively up to depth 4 -- the picker recurses through the outer strategy,
+# then the inner one, producing a single visit order per new session. Ordinary
+# spill-and-fill runs THROUGH that visit order, so gating, affinity and the
+# per-member caps keep working unchanged.
+#
+#   fill (default)        -- config order, pure spill-and-fill. The picker never
+#                             reads or writes a Redis key. Flat configs parse
+#                             bit-for-bit identically with this strategy.
+#   round_robin           -- visit the group's members in turn, one per new
+#                             session. `round_robin: [a, b]` puts a and b in
+#                             strict alternation.
+#   weighted              -- visit by `{ref: weight}` ratio. Weights are
+#                             integers; `weighted: {a: 5, b: 2}` visits a five
+#                             times for every two visits to b.
+#   lowest_utilization    -- visit the member with the lowest current load
+#                             first. Like `perishable` without the hours-to-
+#                             reset signal, so useful when probes are absent
+#                             or unreliable.
+#   perishable            -- headroom-aware ordering. The portal re-ranks each
+#                             member after every successful probe and writes
+#                             the visit order to `sy:group-order:{gid}`; the
+#                             picker reads that key on each new session. Built
+#                             for lanes that mix weekly subscriptions whose
+#                             budget is racing the reset -- drain the emptiest
+#                             hour-per-dollar first, do not waste capacity on
+#                             a 90%-used plan when a 10%-used one has the
+#                             same reset.
 #
 # Per-member score (TARGET window only; weekly, monthly, whatever the plan's
 # target is):
@@ -799,14 +821,35 @@ lanes:
   forge:
     label: "Coding Workhorse"
     description: "Getting work done. Ordered fill across every workhorse plan."
-    # strategy: perishable
+    # Demonstrates the strategy catalogue. The first three slots are groups on
+    # the twin Minimax seats -- each strategy produces a different visit order
+    # over the same two plans. The bare refs at the end need no group: one
+    # plan, one slot. The tail stays last under every strategy.
     order:
-      - minimax-ultra/m3
-      - minimax-max/m3
+      # round_robin on the twins: alternate Minimax Ultra / Minimax Max per session.
+      - round_robin: [minimax-ultra/m3, minimax-max/m3]
+      # weighted over the same twins: visit Ultra five times for every two of Max.
+      - weighted: {minimax-ultra/m3: 5, minimax-max/m3: 2}
+      # perishable over the twins: drain the emptiest hour-per-dollar twin first.
+      - perishable: [minimax-ultra/m3, minimax-max/m3]
+      # Single-plan members do not need a group; the picker visits them directly.
       - grok/grok-4.6
-      - glm/glm-5.3-flash
       - opencode-go/glm-5.3-flash
       - openrouter/mimo
+    tail: [local-box/qwen]
+
+  nest-demo:
+    label: "Strategy Nesting (demo)"
+    description: >
+      Outer `round_robin` alternates between two inner `lowest_utilization`
+      groups; each inner group picks the lighter-loaded member of its pair.
+      Groups nest recursively up to depth 4.
+    order:
+      - round_robin:
+          # Inner group A: prefer whichever Claude / OpenAI heavy model is freer.
+          - lowest_utilization: [claude-max/opus, openai/sol]
+          # Inner group B: same idea for the judgement-heavy tier.
+          - lowest_utilization: [claude-max/fable, openai/astra]
     tail: [local-box/qwen]
 
   local:

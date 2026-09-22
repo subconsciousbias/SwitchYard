@@ -742,6 +742,13 @@ to biting and need not be the target: at 12% weekly but 37% of the 5-hour burst,
 the burst is what limits you, and pacing aims at the target while never
 overshooting a constraint.
 
+- If you are exercising a lane with strategy groups (`forge`, `nest-demo`), the
+  capacity board must show the lane body as nested rows per group — round-robin,
+  weighted, perishable and lowest_utilization all render their members under the
+  group heading — and the bare `plan/model` entries as a flat row with no
+  wrapper. A group body that collapses to one row, or a bare ref that nests,
+  means WS2's board rendering did not pick up your config.
+
 ---
 
 ## 7. Point your client at it

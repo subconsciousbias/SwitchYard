@@ -90,6 +90,12 @@ def fixture(reg):
                 "streak_alert": reg.settings.transient_breaker.streak_alert,
                 "lanes_sharing": ["judge"] if i == 3 else [],
             })
+        # Walk `lane_nodes()` to build the render-ready group structure
+        # the same way the live `collect_capacity` does, so the shipped
+        # example's group-bearing lanes (`forge`, `nest-demo`) show
+        # their strategy tags / pointers / rankings in the preview.
+        rows_by_ref = {r["ref"]: r for r in rows}
+        groups = _build_preview_groups(reg, key, rows_by_ref)
         lanes.append({
             "lane": key, "label": reg.lanes[key].label,
             "slots_configured": sum(r["cap_configured"] for r in rows),
@@ -99,6 +105,7 @@ def fixture(reg):
             "slots_in_use_here": sum(r["model_in_flight_here"] for r in rows),
             "slots_in_use_elsewhere": sum(r["model_in_flight_elsewhere"] for r in rows),
             "tail_only": False, "plans": rows,
+            "groups": groups,
             "exhausted": [r["plan"] for r in rows
                           if (r["quota"]["pct_used"] or 0) >= 100 and not r["tail"]],
         })
@@ -208,6 +215,73 @@ def probe_fixture(reg):
     return out
 
 
+def _build_preview_groups(reg, lane_key, rows_by_ref):
+    """Walk the lane's parsed body into the render-ready group list.
+
+    Mirrors `build_groups` from `switchyard.portal.groups`, but uses the
+    fixture's rows_by_ref and skips the Redis lookup (no rotation pointer,
+    no ranking snapshot -- those would require a live ledger). The shape
+    matches the live template's expectations so the preview exercises the
+    same rendering code paths.
+    """
+    from switchyard.models import Group
+
+    def flatten(node, depth, out):
+        if isinstance(node, Group):
+            refs = _leaf_refs(node)
+            header = {
+                "kind": "group",
+                "strategy": node.strategy,
+                "gid": node.gid,
+                "members": refs,
+                "depth": depth,
+            }
+            if node.strategy == "round_robin":
+                # No Redis in the preview; surface the pointer at a
+                # deterministic value so the template exercises the path.
+                header["pointer"] = 0
+                header["next_index"] = 0
+            elif node.strategy == "weighted":
+                header["weights"] = dict(node.weights or {})
+            elif node.strategy in ("perishable", "lowest_utilization"):
+                # No ranking hash in the preview; show the declared order.
+                header["ranking"] = None
+            out.append(header)
+            if node.weights is None:
+                for member in node.members:
+                    flatten(member, depth + 1, out)
+            return
+        row = rows_by_ref.get(node)
+        if row is not None:
+            out.append({"kind": "ref", "row": row, "depth": depth})
+
+    out: list = []
+    for node in reg.lane_nodes().get(lane_key, []):
+        flatten(node, 0, out)
+    return out
+
+
+def _leaf_refs(group):
+    """Local copy of `Group` leaf walking -- avoids the portal.groups import
+    chain which requires a live Redis for the rotation-pointer reads."""
+    from switchyard.models import Group
+    out: list = []
+    def walk(node):
+        if isinstance(node, Group):
+            if node.weights is not None:
+                out.extend(node.weights.keys())
+                return
+            for m in node.members:
+                walk(m)
+            return
+        out.append(node)
+    if group.weights is not None:
+        return list(group.weights.keys())
+    for m in group.members:
+        walk(m)
+    return out
+
+
 def main() -> int:
     reg = models.load()
     capacity, rows = fixture(reg)
@@ -230,12 +304,121 @@ def main() -> int:
         fh.write(html)
     for name in ("_capacity.html", "_plans.html", "_probes.html"):
         env.get_template(name).render(**ctx)
+    # Also render the capacity fragment against a SYNTHETIC group-bearing
+    # lane so the preview exercises the group rendering shape (strategy tag,
+    # weights/pointer, nested indentation). The shipped example has no
+    # groups, so without this the template's group path would go untested.
+    group_html = render_group_preview(env, capacity)
+    group_out = os.path.join(tempfile.gettempdir(),
+                             "switchyard-preview-groups.html")
+    with open(group_out, "w") as fh:
+        fh.write(group_html)
     print(f"rendered index.html + fragments ({len(html)} bytes) -> {out}")
+    print(f"  flat groups preview ({len(group_html)} bytes) -> {group_out}")
     print(f"  {len(rows)} plans, {sum(len(r['models']) for r in rows)} models, "
           f"{len(capacity['lanes'])} lanes, "
           f"{sum(len(r['headroom']['windows']) for r in rows)} quota windows, "
           f"{len(ctx['probes'])} probes")
+    # A flat config renders zero group headers (regression bar); a
+    # group-bearing config must show at least one. Print the relevant
+    # excerpt so the operator can eyeball the layout without opening the
+    # generated HTML.
+    group_headers = group_html.count('class="group-head"')
+    print(f"  group-bearing preview: {group_headers} group header row(s)")
     return 0
+
+
+def render_group_preview(env, flat_capacity):
+    """Render the capacity fragment with a synthetic group-bearing lane.
+
+    The shipped example config is flat, so we build one inline: a
+    round_robin group around two existing forge members, then a nested
+    weighted group inside another lane. Indentation / strategy tag /
+    pointer / weights all show in the rendered HTML; tests assert the
+    same strings against the live fragment, and this preview lets the
+    operator eyeball the layout.
+    """
+    reg = models.load()
+    rows_by_ref = {}
+    for lane in flat_capacity["lanes"]:
+        rows_by_ref.update({r["ref"]: r for r in lane["plans"]})
+    # Pick forge members for the round_robin (always live in the example).
+    rr_members = [rows_by_ref["minimax-ultra/m3"],
+                  rows_by_ref["minimax-max/m3"]]
+    inner = {
+        "kind": "group",
+        "strategy": "lowest_utilization",
+        "gid": "g_inner_preview",
+        "members": ["claude-max/fable", "openai/astra"],
+        "depth": 1,
+        "ranking": ["claude-max/fable", "openai/astra"],
+    }
+    outer = {
+        "kind": "group",
+        "strategy": "round_robin",
+        "gid": "g_outer_preview",
+        "members": ["claude-max/fable", "openai/astra"],
+        "depth": 0,
+        "next_index": 0,
+        "pointer": 0,
+    }
+    weighted = {
+        "kind": "group",
+        "strategy": "weighted",
+        "gid": "g_weighted_preview",
+        "members": ["grok/grok-4.6", "opencode-go/glm-5.3-flash"],
+        "weights": {"grok/grok-4.6": 3, "opencode-go/glm-5.3-flash": 1},
+        "depth": 0,
+    }
+    nested_flat = [
+        {"kind": "ref", "row": rr_members[0], "depth": 0},
+        {"kind": "ref", "row": rr_members[1], "depth": 0},
+    ]
+    grouped_lane = {
+        "lane": "preview-rr",
+        "label": "Preview (round_robin)",
+        "slots_configured": 8,
+        "slots_available_now": 6,
+        "slots_in_use": 1,
+        "slots_in_use_here": 1,
+        "slots_in_use_elsewhere": 0,
+        "tail_only": False,
+        "plans": rr_members,
+        "groups": [outer, inner,
+                   {"kind": "ref", "row": rows_by_ref["claude-max/fable"],
+                    "depth": 2},
+                   {"kind": "ref", "row": rows_by_ref["openai/astra"],
+                    "depth": 2}],
+        "exhausted": [],
+    }
+    weighted_lane = {
+        "lane": "preview-w",
+        "label": "Preview (weighted)",
+        "slots_configured": 4,
+        "slots_available_now": 4,
+        "slots_in_use": 0,
+        "slots_in_use_here": 0,
+        "slots_in_use_elsewhere": 0,
+        "tail_only": False,
+        "plans": [rows_by_ref["grok/grok-4.6"],
+                  rows_by_ref["opencode-go/glm-5.3-flash"]],
+        "groups": [weighted,
+                   {"kind": "ref", "row": rows_by_ref["grok/grok-4.6"],
+                    "depth": 1},
+                   {"kind": "ref", "row": rows_by_ref["opencode-go/glm-5.3-flash"],
+                    "depth": 1}],
+        "exhausted": [],
+    }
+    preview_capacity = {
+        "lanes": [grouped_lane, weighted_lane,
+                  # A flat-config lane so the regression bar is visible too.
+                  flat_capacity["lanes"][0]],
+        "total_available": 16,
+        "total_in_use": 1,
+        "pacing": False, "pacing_configured": False, "learning": True,
+    }
+    return env.get_template("_capacity.html").render(
+        capacity=preview_capacity)
 
 
 if __name__ == "__main__":

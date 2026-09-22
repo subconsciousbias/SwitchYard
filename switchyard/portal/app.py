@@ -133,17 +133,32 @@ async def _poll_probes() -> None:
     the perishable strategy also gets a recompute: probes are the only signal
     a lane like `forge` has that plan X is at 25% and plan Y at 92%, so without
     piggybacking on the poll the rank would never move.
+
+    The per-group writer (`groups.recompute_group_orders`) runs alongside the
+    lane-level writer -- same trigger, same hysteresis, separate keys
+    (`sy:group-order:{gid}:{lane}` vs `sy:lane-order:{lane}`). Explicit
+    `perishable:` / `lowest_utilization:` groups need their own hashes, and
+    reading the same probe facts keeps the cost down.
     """
     while True:
         try:
             reg, prober, ledger = (
                 state["registry"], state["prober"], state["ledger"])
+            plan_polled = False
             for plan in reg.plans.values():
                 if not await prober.due(plan):
                     continue
                 result = await prober.run(plan)
                 if result.ok:
                     await _recompute_perishable_for_plan(reg, ledger, plan)
+                    plan_polled = True
+            # Per-group hashes are written whenever any probe fired -- the
+            # inputs may have changed even when the affected plan is not
+            # itself in this poll's set. Skipping on a quiet minute keeps
+            # the hysteresis calm (one swap per poll is the contract).
+            if plan_polled:
+                from .groups import recompute_group_orders
+                await recompute_group_orders(reg, ledger)
         except asyncio.CancelledError:
             raise
         except Exception:                      # never let the loop die
@@ -384,12 +399,20 @@ async def collect_capacity() -> dict:
         binding = hr.get("binding") or {}
         quota[plan.key] = {"pct_used": binding.get("pct_used"),
                            "window": binding.get("window")}
+    # Group structure for the capacity board: each lane gets a `groups` list
+    # that walks `Registry.lane_nodes()` so the template can render strategy
+    # tags + weights/pointer inline. Flat lanes (no Groups in the body) get
+    # an empty list and render exactly as before -- the regression bar in
+    # the test suite.
+    from .groups import build_groups
     for lane in lanes:
         for row in lane["plans"]:
             row["quota"] = quota.get(row["plan"], {})
         lane["exhausted"] = sorted({
             row["plan"] for row in lane["plans"]
             if (row["quota"].get("pct_used") or 0) >= 100 and not row["tail"]})
+        lane["groups"] = await build_groups(
+            reg, state["ledger"], lane["lane"], lane["plans"])
     return {
         "lanes": lanes,
         "total_available": sum(l["slots_available_now"] for l in lanes),

@@ -26,6 +26,9 @@ class FakePipeline:
     def zadd(self, key, mapping, xx=False, ch=False, **_):
         self.ops.append(("zadd", key, mapping, xx, ch)); return self
 
+    def incr(self, key):
+        self.ops.append(("incr", key)); return self
+
     def expire(self, key, ttl):
         return self
 
@@ -55,6 +58,9 @@ class FakePipeline:
             elif op[0] == "zadd":
                 _, key, mapping, xx, ch = op
                 results.append(await self.store.zadd(key, mapping, xx=xx, ch=ch))
+            elif op[0] == "incr":
+                _, key = op
+                results.append(await self.store.incr(key))
         self.ops.clear()
         return results
 
