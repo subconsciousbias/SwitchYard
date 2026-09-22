@@ -218,7 +218,7 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
     # false positive that quietly suppresses a plan until its next poll.
     this_plan_gate5h = gate_pct is not None and gate_pct > 90
     scoped = await ledger.window_facts(plan.key, "weekly_scoped")
-    scoped_current = reported_is_current(scoped, "week") if scoped else False
+    scoped_current = reported_is_current(scoped, "week")
     scoped_pct = (_as_float(scoped.get("reported_pct_used"))
                   if scoped_current else None)
 

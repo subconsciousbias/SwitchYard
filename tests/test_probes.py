@@ -299,17 +299,21 @@ def test_minimax_remains_percent_payload_is_read_as_percentages():
     import http.server
     import json
     import threading
+    import time
     from dataclasses import replace
     from switchyard.usage import headroom
 
+    # Self-healing offsets: baking static end_time ms here drifts into the past
+    # across runs and the gate at #45 then sends the bar back to the ledger basis.
+    now_ms = int(time.time() * 1000)
     payload = {"model_remains": [
         {"model_name": "general",
-         "start_time": 1789948800000, "end_time": 1790086380000,
+         "start_time": 1789948800000, "end_time": now_ms + 5 * 3600 * 1000,
          "current_interval_total_count": -1, "current_interval_used_count": -1,
          "current_interval_used_percent": "37.5%",
-         "weekly_start_time": 1789948800000, "weekly_end_time": 1790121600000,
+         "weekly_start_time": 1789948800000, "weekly_end_time": now_ms + 30 * 24 * 3600 * 1000,
          "current_weekly_used_count": -1, "current_weekly_used_percent": "12%"},
-        {"model_name": "video", "end_time": 1790086380000,
+        {"model_name": "video", "end_time": now_ms + 5 * 3600 * 1000,
          "current_interval_used_percent": "0%"},
     ]}
 
