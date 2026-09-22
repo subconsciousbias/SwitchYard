@@ -17,6 +17,7 @@ from plans_path import plans_path  # noqa: E402
 os.environ["SWITCHYARD_PLANS"] = plans_path()
 
 from switchyard import models                      # noqa: E402
+from switchyard.hooks import SwitchyardHandler, _tool_name  # noqa: E402
 from switchyard.picker import LaneSaturated, Picker  # noqa: F401  # noqa: E402
 from switchyard.slots import SlotTable             # noqa: E402
 from switchyard.usage import Ledger                # noqa: E402
@@ -414,6 +415,231 @@ def test_a_lane_with_one_tool_capable_member_routes_to_it():
 
     picked = run(go())
     print(f"  judge with only {picked}'s plan tool-capable routed a tool-using request there")
+
+
+def test_cli_blocklist_drops_blocked_tools_and_passes_the_rest():
+    """The per-CLI tool blocklist filters native tools out of `data["tools"]`
+    before the picker ever sees them, matching case-insensitively against
+    the configured list and against EITHER wire shape.
+
+    Three tools in: an OpenAI-shape function ("bash") that the blocklist
+    names lowercase, an Anthropic-shape flat entry ("Read") that the
+    blocklist names uppercase to prove case-insensitive matching, and an
+    MCP tool ("mcp__switchyard__bash") that nothing blocks. Exactly the
+    two named tools drop, exactly one log line names both, the MCP tool
+    survives. Wiring follows the test_verdict pattern: __new__ bypass
+    plus a fresh FakeRedis-backed registry whose cli_tool_block has the
+    uppercase "READ" entry.
+    """
+    from dataclasses import replace
+    from switchyard.policy import CapacityPolicy
+    import logging as _logging
+
+    async def go():
+        reg = models.load()
+        reg = replace(reg, settings=replace(
+            reg.settings, cli_tool_block={"opencode": ("bash", "READ")}))
+        redis = FakeRedis()
+        slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+        ledger = Ledger(redis)
+        policy = CapacityPolicy(redis, reg.settings, ledger)
+        picker = Picker(reg, slots, policy)
+
+        h = SwitchyardHandler.__new__(SwitchyardHandler)
+        h.__dict__["registry"] = reg
+        h.__dict__["_slots"] = slots
+        h.__dict__["_ledger"] = ledger
+        h.__dict__["_policy"] = policy
+        h.__dict__["_redis"] = redis
+        h.__dict__["_picker"] = picker
+        h.__dict__["_beats"] = {}
+
+        # Capture just the "switchyard" logger's records so the test is
+        # robust against any other library logging through the root.
+        captured: list[_logging.LogRecord] = []
+        handler = _logging.Handler()
+        handler.emit = captured.append
+        log = _logging.getLogger("switchyard")
+        prior_level = log.level
+        log.setLevel(_logging.INFO)
+        log.addHandler(handler)
+        try:
+            data = {
+                "model": "forge",
+                "messages": [{"role": "user", "content": "hi"}],
+                "proxy_server_request": {"headers": {
+                    "x-switchyard-session": "sess-blocklist",
+                    "x-switchyard-cli": "opencode",
+                }},
+                "tools": [
+                    {"type": "function",
+                     "function": {"name": "bash"}},           # OpenAI shape
+                    {"name": "Read"},                          # Anthropic shape
+                    {"name": "mcp__switchyard__bash"},         # MCP, untouched
+                ],
+            }
+            await h.async_pre_call_hook(None, None, data, "acompletion")
+            ctx = data["metadata"]["switchyard"]
+            await h.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
+            return data["tools"], [r.getMessage() for r in captured]
+        finally:
+            log.removeHandler(handler)
+            log.setLevel(prior_level)
+
+    tools, messages = run(go())
+    kept_names = [_tool_name(t) for t in tools]
+    # Both blocked tools gone, MCP tool untouched.
+    assert "bash" not in kept_names, kept_names
+    assert "Read" not in kept_names, kept_names
+    assert "mcp__switchyard__bash" in kept_names, kept_names
+    # Exactly one log line about the blocklist — the hook emits one
+    # `cli=... tool_block: dropped N/M (...)` record per request, listing
+    # every dropped tool inside the parens.
+    block_lines = [m for m in messages if "tool_block" in m]
+    assert len(block_lines) == 1, block_lines
+    assert "bash" in block_lines[0], block_lines
+    assert "Read" in block_lines[0], block_lines
+    print(f"  opencode blocklist dropped bash + Read, kept "
+          f"{[n for n in kept_names if n]}; one log line: "
+          f"{block_lines[0]!r}")
+
+
+def test_emptied_tools_re_derive_needs_tools_so_the_picker_does_not_misroute():
+    """When the blocklist empties the request's tool list, the hook MUST
+    re-derive needs_tools=False — otherwise the picker would still treat
+    the request as tool-bearing and 429 a lane whose every member is
+    supports_tools: false, even though there is no longer anything to
+    serve tools for.
+
+    The same lane with a genuine (unfiltered) tool list refuses — that's
+    the existing behaviour the post-filter re-derivation exists to NOT
+    BREAK. So one registration, one log shape, two assertions: with the
+    blocklist applied the pick succeeds and needs_tools=False; without it,
+    the same lane's pick raises LaneSaturated.
+    """
+    from dataclasses import replace
+    from switchyard.policy import CapacityPolicy
+
+    async def go():
+        reg = models.load()
+        # A lane whose every member's plan is `supports_tools: false`:
+        # the picker must refuse a tool-bearing request, but is happy
+        # with one that has no tools. Apex in the fixture has members,
+        # so we mutate every member's plan to disable tools.
+        lane = "apex"
+        members = reg.lane_members(lane)
+        assert members, "apex should have live members to make this meaningful"
+
+        plans = dict(reg.plans)
+        for m in members:
+            plans[m.plan_key] = replace(plans[m.plan_key], supports_tools=False)
+        reg2 = replace(reg, settings=replace(
+            reg.settings, cli_tool_block={"opencode": ("bash", "Read")}),
+                       plans=plans)
+
+        redis = FakeRedis()
+        slots = SlotTable(redis, reg2.settings.inflight_max_age_seconds)
+        ledger = Ledger(redis)
+        policy = CapacityPolicy(redis, reg2.settings, ledger)
+        picker = Picker(reg2, slots, policy)
+
+        h = SwitchyardHandler.__new__(SwitchyardHandler)
+        h.__dict__["registry"] = reg2
+        h.__dict__["_slots"] = slots
+        h.__dict__["_ledger"] = ledger
+        h.__dict__["_policy"] = policy
+        h.__dict__["_redis"] = redis
+        h.__dict__["_picker"] = picker
+        h.__dict__["_beats"] = {}
+
+        # The blocked tool names match the only tool the request carries,
+        # so the filter empties the list. Without the post-filter
+        # re-derivation, needs_tools stays True and the picker 429s.
+        blocked_data = {
+            "model": lane,
+            "messages": [{"role": "user", "content": "hi"}],
+            "proxy_server_request": {"headers": {
+                "x-switchyard-session": "sess-blocked-empty",
+                "x-switchyard-cli": "opencode",
+            }},
+            "tools": [
+                {"type": "function", "function": {"name": "bash"}},
+                {"name": "Read"},
+            ],
+        }
+        await h.async_pre_call_hook(None, None, blocked_data, "acompletion")
+        blocked_ctx = blocked_data["metadata"]["switchyard"]
+        await h.picker.release(blocked_ctx["plan"], blocked_ctx["request_id"],
+                               blocked_ctx["model"])
+
+        # Same lane with the SAME tools but NO blocklist applied — the
+        # request is genuinely tool-bearing and the lane (every plan
+        # supports_tools: false) must refuse. A separate handler is the
+        # simplest way to drive the unblocked shape without entangling
+        # the two cases.
+        reg_unblocked = replace(reg2, settings=replace(
+            reg2.settings, cli_tool_block={}))
+        redis2 = FakeRedis()
+        slots2 = SlotTable(redis2, reg_unblocked.settings.inflight_max_age_seconds)
+        policy2 = CapacityPolicy(redis2, reg_unblocked.settings,
+                                 Ledger(redis2))
+        picker_unblocked = Picker(reg_unblocked, slots2, policy2)
+        h2 = SwitchyardHandler.__new__(SwitchyardHandler)
+        h2.__dict__["registry"] = reg_unblocked
+        h2.__dict__["_slots"] = slots2
+        h2.__dict__["_ledger"] = Ledger(redis2)
+        h2.__dict__["_policy"] = policy2
+        h2.__dict__["_redis"] = redis2
+        h2.__dict__["_picker"] = picker_unblocked
+        h2.__dict__["_beats"] = {}
+
+        unblocked_data = {
+            "model": lane,
+            "messages": [{"role": "user", "content": "hi"}],
+            "proxy_server_request": {"headers": {
+                "x-switchyard-session": "sess-unblocked",
+            }},
+            "tools": [
+                {"type": "function", "function": {"name": "bash"}},
+                {"name": "Read"},
+            ],
+        }
+        refused = None
+        try:
+            await h2.async_pre_call_hook(None, None, unblocked_data, "acompletion")
+        except LaneSaturated as exc:
+            refused = str(exc)
+        except Exception as exc:
+            # The hook converts LaneSaturated into a 429 HTTPException for
+            # the caller — catch that too, since the assertion is about the
+            # refused behaviour, not the transport.
+            from fastapi import HTTPException
+            if isinstance(exc, HTTPException) and exc.status_code == 429:
+                refused = str(exc.detail)
+            else:
+                raise
+
+        return (
+            blocked_data["metadata"]["switchyard"],
+            blocked_data["tools"],
+            refused,
+        )
+
+    blocked_ctx, blocked_tools, refused = run(go())
+    # Post-filter: tools list is empty AND needs_tools is False. Without
+    # the re-derivation this assertion fails — the spec is testing the
+    # gate between blocklist and picker.
+    assert blocked_ctx["needs_tools"] is False, blocked_ctx
+    assert blocked_tools == [], (
+        f"every tool was blocked; the list must be emptied, got {blocked_tools!r}")
+    # Unblocked control: the same lane with a non-empty tool list and no
+    # blocklist refuses — proving the test setup actually reaches the
+    # refusal path when nothing rescues it.
+    assert refused is not None, (
+        "the unblocked control must hit LaneSaturated — otherwise the "
+        "blocklist test is not actually load-bearing")
+    print(f"  apex+blocklist emptied tools -> needs_tools=False, pick succeeded; "
+          f"apex unblocked refused: {refused[:60]}...")
 
 
 def test_a_pinned_followup_with_zero_wait_spills_to_a_peer():
@@ -3272,6 +3498,64 @@ def test_anthropic_messages_rides_the_chat_completions_url():
           f"{len(openai_targets)} openai/-prefixed deployments now route "
           f"/v1/messages -> /v1/chat/completions "
           f"(first: {openai_targets[0]!r})")
+
+
+def test_cli_tool_block_parses_strictly_and_normalises_keys():
+    """Two settings-parsing guards added on PR review of #63:
+
+    - A non-string inside `settings.cli_tool_block`'s inner list (e.g. `[1, 2]`
+      in YAML, which the loader happily reads as int) must raise ValueError at
+      `load()` time, NOT blow up later at the first filtered request when the
+      hook tries to `.lower()` each name. Loud-parse, matching the rest of
+      `load()`.
+    - CLI keys in the YAML mapping are normalised to `.strip().lower()` at
+      parse time. `session.identify()` lowercases the `x-switchyard-cli`
+      header before lookup, so an unnormalised key like `OpenCode:` would
+      silently never match (empty-filter / no filtering). The spec is that
+      `OpenCode`, ` opencode ` and `opencode` all collapse to the same
+      registry key.
+    """
+    import yaml as _yaml, tempfile
+
+    base_plans = {"p1": {"label": "P1",
+                          "models": {"m1": {"model": "x/m1"}}}}
+    base_lanes = {"t": {"order": ["p1/m1"]}}
+
+    # (1) non-string entry: a list of ints is what YAML hands the parser when
+    # an operator forgets the quotes on a numeric tool name. The first call
+    # site that would otherwise see this is `hooks.async_pre_call_hook`'s
+    # `{n.lower() for n in ...}` set comprehension — that's an AttributeError
+    # in production, not at config-load time. Push it left.
+    bad_int = {"settings": {"cli_tool_block": {"opencode": [1, 2]}},
+               "plans": base_plans, "lanes": base_lanes}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml",
+                                     delete=False) as f:
+        _yaml.safe_dump(bad_int, f); bad_path = f.name
+    try:
+        models.load(bad_path)
+    except ValueError as exc:
+        msg = str(exc)
+        assert "cli_tool_block['opencode']" in msg, msg
+        assert "must be tool name strings" in msg, msg
+        print(f"  non-string entry rejected at load: {msg[:80]}")
+    else:
+        raise AssertionError(
+            "non-string cli_tool_block entry must be a load-time error")
+
+    # (2) uppercase key in YAML: load succeeds and the key is normalised.
+    mixed_case = {"settings": {"cli_tool_block":
+                                 {"OpenCode": ["bash", "Edit"]}},
+                  "plans": base_plans, "lanes": base_lanes}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml",
+                                     delete=False) as f:
+        _yaml.safe_dump(mixed_case, f); mixed_path = f.name
+    reg = models.load(mixed_path)
+    keys = list(reg.settings.cli_tool_block.keys())
+    assert keys == ["opencode"], keys
+    assert reg.settings.cli_tool_block["opencode"] == ("bash", "Edit"), \
+        reg.settings.cli_tool_block
+    print(f"  'OpenCode' -> 'opencode', block intact "
+          f"({list(reg.settings.cli_tool_block['opencode'])})")
 
 
 if __name__ == "__main__":

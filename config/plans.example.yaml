@@ -62,6 +62,51 @@ settings:
   gate_headroom_slots: 1
 
   # --------------------------------------------------------------------------
+  # PER-CLI TOOL BLOCKLIST (issue #63). When the inbound request carries the
+  # `x-switchyard-cli` header naming a CLI in this mapping, the gateway
+  # filters those tool names (case-insensitive) out of the request's `tools`
+  # array before the picker runs. The harness's native file/shell tools reach
+  # the sidecar's container, not the caller's workspace, so a successful
+  # "edit" call there silently does the wrong thing — worse than failing
+  # loudly. Uncomment to override the in-code defaults below; absent, the
+  # gateway uses the values shown.
+  #
+  # The header `x-switchyard-cli` is operator-set (same governance as
+  # `x-switchyard-session`); no client sets it today, so the new behaviour
+  # is inert until opted in. Keys are matched against the lowercased header
+  # value — keep config keys lowercase.
+  #
+  # Defaults (kept in switchyard/models.py:_DEFAULT_CLI_TOOL_BLOCK):
+  #
+  #   cli_tool_block:
+  #     opencode:
+  #       - bash
+  #       - edit
+  #       - write
+  #       - read
+  #       - grep
+  #       - glob
+  #       - list
+  #       - patch
+  #       - todowrite
+  #       - todoread
+  #       - webfetch
+  #       - websearch
+  #       - task
+  #       - multiedit
+  #     claude-code:
+  #       - Bash
+  #       - Edit
+  #       - Write
+  #       - Read
+  #       - Glob
+  #       - Grep
+  #       - WebFetch
+  #       - WebSearch
+  #       - NotebookEdit
+  #     codex: []
+
+  # --------------------------------------------------------------------------
   # Learn the parallelism each plan really tolerates instead of trusting a
   # guess. Halve on a connection-limit refusal, creep back up by one when there
   # is unmet demand and no recent refusal. Bucketed by hour of day, because a

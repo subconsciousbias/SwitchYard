@@ -28,6 +28,31 @@ SEED_CAP = 2   # starting guess when a plan says `max_parallel: auto`
 # but it no longer implies anything about tool support — see Plan.can_use_tools.
 CLI_AUTH = ("cli_sidecar", "oauth_sidecar")
 
+# Default per-CLI tool blocklists. A request whose `x-switchyard-cli` header
+# names a CLI here has those tools filtered out of its `tools` array before the
+# picker ever sees the request — the harness's own file/shell tools reach the
+# sidecar's container, not the caller's workspace, and silently doing the wrong
+# thing there is worse than 400ing. The lists mirror what the sidecars already
+# disable themselves; the gateway filter exists so the picker doesn't pin a
+# mid-loop follow-up to a plan whose CLI cannot run the tools the caller's
+# tools are, then 400 mid-turn. Matches are case-insensitive against the
+# blocklist. Override per-deployment in settings.cli_tool_block.
+#
+#   opencode    — sidecars/cli_bridge/harness/opencode.json
+#   claude-code — sidecars/cli_bridge/server.py (the claude harness)
+#   codex       — no native tools to disable today
+_DEFAULT_CLI_TOOL_BLOCK: dict[str, tuple[str, ...]] = {
+    "opencode": (
+        "bash", "edit", "write", "read", "grep", "glob", "list", "patch",
+        "todowrite", "todoread", "webfetch", "websearch", "task", "multiedit",
+    ),
+    "claude-code": (
+        "Bash", "Edit", "Write", "Read", "Glob", "Grep",
+        "WebFetch", "WebSearch", "NotebookEdit",
+    ),
+    "codex": (),
+}
+
 
 @dataclass(frozen=True)
 class Quota:
@@ -222,6 +247,16 @@ class Settings:
     # sit unused. Floor at 1 in the application so a single-connection plan
     # never drops to 0.
     gate_headroom_slots: int = 1
+    # Per-CLI native-tool blocklist: a request whose `x-switchyard-cli` header
+    # names a CLI here has those tool names filtered out of its `tools` array
+    # before the picker runs, case-insensitive. The harness's own file/shell
+    # tools reach the sidecar's container rather than the caller's workspace,
+    # so a successful "edit" call there silently does the wrong thing — worse
+    # than failing loudly. Mirrors what the sidecars already disable on their
+    # side; see _DEFAULT_CLI_TOOL_BLOCK above for the source of each list.
+    cli_tool_block: dict[str, tuple[str, ...]] = field(
+        default_factory=lambda: {k: tuple(v) for k, v in _DEFAULT_CLI_TOOL_BLOCK.items()}
+    )
     concurrency_learning: ConcurrencyLearning = field(default_factory=ConcurrencyLearning)
     pacing: Pacing = field(default_factory=Pacing)
     transient_breaker: TransientBreaker = field(default_factory=TransientBreaker)
@@ -606,6 +641,47 @@ def _listify(mapping: Any) -> dict[str, list[str]]:
             for k, v in (mapping or {}).items()}
 
 
+def _parse_cli_tool_block(raw: Any) -> dict[str, tuple[str, ...]]:
+    """Coerce settings.cli_tool_block into a `cli -> tuple(tool)` mapping.
+
+    Absent key falls back to _DEFAULT_CLI_TOOL_BLOCK; an outright malformed
+    entry (non-mapping outer, non-list inner) raises — the field is operator-
+    facing and a typo that drops the default to `{}` would silently let every
+    CLI's native tools reach the wire. Loud-parse on purpose, matching the
+    rest of `load()`.
+    """
+    if raw is None:
+        return {k: tuple(v) for k, v in _DEFAULT_CLI_TOOL_BLOCK.items()}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"settings.cli_tool_block must be a mapping of cli -> tool list, "
+            f"got {type(raw).__name__}: {raw!r}")
+    out: dict[str, tuple[str, ...]] = {}
+    for cli, names in raw.items():
+        if not isinstance(cli, str):
+            raise ValueError(
+                f"settings.cli_tool_block keys must be CLI name strings, "
+                f"got {type(cli).__name__}: {cli!r}")
+        key = cli.strip().lower()
+        if not key:
+            raise ValueError(
+                f"settings.cli_tool_block keys must be non-empty CLI name "
+                f"strings, got whitespace-only: {cli!r}")
+        if not isinstance(names, list):
+            raise ValueError(
+                f"settings.cli_tool_block[{cli!r}] must be a list of tool "
+                f"name strings, got {type(names).__name__}: {names!r}")
+        parsed: list[str] = []
+        for name in names:
+            if not isinstance(name, str):
+                raise ValueError(
+                    f"settings.cli_tool_block[{cli!r}] entries must be tool "
+                    f"name strings, got {type(name).__name__}: {name!r}")
+            parsed.append(name)
+        out[key] = tuple(parsed)
+    return out
+
+
 def _parse_probe(raw: Any) -> Probe | None:
     if not raw:
         return None
@@ -759,10 +835,12 @@ def load(path: str | None = None) -> Registry:
         raw = yaml.safe_load(fh)
 
     sraw = dict(raw.get("settings") or {})
+    cli_block = _parse_cli_tool_block(sraw.pop("cli_tool_block", None))
     settings = Settings(
         **{k: v for k, v in sraw.items() if k not in (
             "concurrency_learning", "pacing", "transient_breaker",
             "caller_environment")},
+        cli_tool_block=cli_block,
         concurrency_learning=ConcurrencyLearning(**(sraw.get("concurrency_learning") or {})),
         pacing=Pacing(**(sraw.get("pacing") or {})),
         transient_breaker=TransientBreaker(**(sraw.get("transient_breaker") or {})),

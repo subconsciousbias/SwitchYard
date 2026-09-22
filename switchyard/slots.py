@@ -17,6 +17,12 @@ K_INFLIGHT = "sy:inflight:{plan}"
 K_INFLIGHT_MODEL = "sy:inflight:m:{ref}"
 K_COOL = "sy:cool:{plan}"
 K_LEASE = "sy:lease:{session}"
+# Marks a session whose first turn has had the "you are running through
+# SwitchYard, your native tools are unavailable" system note appended. Sticky
+# for the lease TTL so a resumed CLI session after a server restart still
+# reaches the model with the note in place. Dropped together with the lease so
+# a hard plan rejection (which re-leases the session) re-enables injection.
+K_INJECTED = "sy:inject:{session}"
 # request id -> the lane that claimed it. A slot's cost is real wherever it came
 # from, but a lane's board should say which of the busy slots are *its* traffic
 # and which belong to a sibling lane sharing the same model, so the two are not
@@ -247,7 +253,24 @@ class SlotTable:
         await self.redis.expire(K_LEASE.format(session=session), ttl)
 
     async def drop_lease(self, session: str) -> None:
+        # The injection marker rides on the lease: clearing it here covers the
+        # three lease-drop sites (hooks.py post-call failure, picker.py held-
+        # but-unservable, picker.py pinned-but-no-slot) so a hard plan rejection
+        # that re-leases the session re-enables injection on the next turn.
         await self.redis.delete(K_LEASE.format(session=session))
+        await self.redis.delete(K_INJECTED.format(session=session))
+
+    async def injected(self, session: str) -> bool:
+        v = await self.redis.get(K_INJECTED.format(session=session))
+        return bool(v)
+
+    async def mark_injected(self, session: str, ttl: int) -> None:
+        # Plain SET EX — never SET NX. A resumed session after a stack restart
+        # has nothing here today (Redis died with the stack); re-writing it on
+        # every first turn keeps the gate working without races. The TTL
+        # matches the lease so the two expire together. Value is opaque;
+        # `injected()` only needs to see *something*.
+        await self.redis.set(K_INJECTED.format(session=session), "1", ex=ttl)
 
     # -- transient-failure streak -----------------------------------------
     # The escalated-cooldown ladder and the board's failing chip both need to

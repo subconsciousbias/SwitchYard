@@ -39,7 +39,7 @@ from .models import Group
 from .picker import LaneSaturated, Picker
 from .policy import CapacityPolicy
 from .reasoning import ReasoningSplitter
-from .session import derive as derive_session
+from .session import derive as derive_session, identify as identify_cli
 from .slots import SlotTable
 from .usage import Ledger
 
@@ -67,6 +67,27 @@ def _configure_logging() -> None:
 _configure_logging()
 
 META_KEY = "switchyard"
+
+# CLIs whose first request gets a system message injected, telling the model
+# that its native tools are unavailable in this environment. The set is
+# permissive on purpose — adding a new CLI to the gateway without listing it
+# here would mean resumed sessions keep reasoning in their local tools and
+# fail when those calls never reach the user's workspace. `codex` is included
+# even though its native tools do not touch the filesystem today, so a future
+# CLI tool there (e.g. a `web_search` bridge) inherits the same gate.
+INJECT_CLIS = frozenset({"opencode", "claude-code", "codex", "gemini"})
+
+# Short system note appended to the first turn of a recognised CLI's session.
+# Deliberately a system message (not a user one) so it sits in front of every
+# subsequent turn and survives the bridge's leading-system-message preservation
+# in cli_bridge.fold_system / mcp_bridge.flatten_with_tool_history. ~60 tokens.
+INJECTION_NOTE = (
+    "You are running through SwitchYard, an LLM proxy. Your native tools "
+    "(file edits, shell, etc.) are stripped and unavailable in this "
+    "environment — they fail silently when called. Use the MCP tools exposed "
+    "by this session to interact with the user's workspace; native CLI "
+    "commands will not reach the user's machine."
+)
 
 # Call types that LiteLLM does NOT log via async_log_success_event /
 # async_log_failure_event (LiteLLM 1.101.0 verified mapping). For these,
@@ -269,8 +290,44 @@ class SwitchyardHandler(CustomLogger):
             key_hash = hashlib.sha256(str(token).encode()).hexdigest()[:8]
         session = derive_session(data, key_hash)
 
+        # A request whose `x-switchyard-cli` header names a known harness has
+        # its native file/shell tools filtered out before the picker runs.
+        # Those tools reach the sidecar's container rather than the caller's
+        # workspace, so a successful "edit" call there silently does the wrong
+        # thing — worse than failing loudly. The list comes from
+        # Settings.cli_tool_block (see switchyard/models.py), keyed by the
+        # lowercased header value. The filtered list is only written back when
+        # the request actually had a `tools` key AND at least one entry was
+        # dropped, so a tool-less request is not promoted into `[]` (which
+        # would still register as needing tools and the picker would 429 a
+        # lane whose every member is `supports_tools: false`).
+        cli = identify_cli(data)
+        if cli:
+            tools = data.get("tools")
+            if isinstance(tools, list) and tools:
+                blocked = {n.lower() for n in
+                           self.registry.settings.cli_tool_block.get(cli, ())}
+                if blocked:
+                    kept, dropped = [], []
+                    for tool in tools:
+                        name = _tool_name(tool)
+                        if name and name.lower() in blocked:
+                            dropped.append(name)
+                        else:
+                            kept.append(tool)
+                    if dropped:
+                        log.info(
+                            "cli=%s tool_block: dropped %d/%d (%s)",
+                            cli, len(dropped), len(tools),
+                            ",".join(sorted(set(dropped))),
+                        )
+                        data["tools"] = kept
+
         # A request carrying tool definitions cannot go to a plan marked
-        # supports_tools: false; see Plan.can_use_tools.
+        # supports_tools: false; see Plan.can_use_tools. Derived AFTER the
+        # blocklist filter above so an emptied request routes like a plain
+        # request — the picker skips supports_tools filtering on a request
+        # whose `tools` was emptied here.
         needs_tools = bool(data.get("tools"))
 
         # A request carrying tool *results* is mid-loop. While its session
@@ -358,9 +415,61 @@ class SwitchyardHandler(CustomLogger):
             " (sticky)" if pick.sticky else "",
             f" skipped={','.join(pick.considered)}" if pick.considered else "",
         )
+
+        # First-turn system injection for known CLI harnesses. The note tells
+        # the model that its native tools are stripped in this environment so
+        # the resumed session — whose earlier turns reasoned against the
+        # harness's local tool surface — stops calling tools that would never
+        # reach the user's workspace. Inserted AFTER the leading run of system
+        # messages (the while-loop below) so a caller-supplied system prompt
+        # still wins precedence: the note sits between the caller's system
+        # block and the rest of the conversation.
+        #
+        # NOT gated on `pick.sticky`. In the production incident the entire
+        # stack restarted, Redis died with it, the resumed pick is non-sticky,
+        # and a sticky gate would never fire — which is precisely the bug.
+        if cli and session and cli in INJECT_CLIS \
+                and not await self._already_injected(session):
+            messages = data.get("messages")
+            if isinstance(messages, list):
+                insert_at = 0
+                while insert_at < len(messages):
+                    msg = messages[insert_at]
+                    if isinstance(msg, dict) and msg.get("role") == "system":
+                        insert_at += 1
+                        continue
+                    break
+                messages.insert(insert_at, {"role": "system",
+                                            "content": INJECTION_NOTE})
+                log.info(
+                    "cli=%s session=%s injection: appended system note at index %d",
+                    cli, session, insert_at,
+                )
+                await self._mark_injected(session)
         return data
 
     # -- keeping a live claim alive ----------------------------------------
+    async def _already_injected(self, session: str) -> bool:
+        """Has this session already had the first-turn system note appended?
+
+        Tracked in the slot table so it survives a stack restart along with
+        the session lease: a resumed CLI session whose lease is still alive
+        must NOT be re-injected (the note is already in its message log), and
+        one whose lease expired must be (its lease renewal is what re-runs
+        the hook, and `mark_injected` writes a fresh TTL).
+        """
+        return await self.slots.injected(session)
+
+    async def _mark_injected(self, session: str) -> None:
+        """Stamp the slot table so the next turn skips re-injection.
+
+        TTL matches the lease so the two expire together; drop_lease clears
+        both keys at once, which is how a hard plan rejection re-enables
+        injection on the next pick.
+        """
+        await self.slots.mark_injected(
+            session, self.registry.settings.lease_ttl_seconds)
+
     def _start_heartbeat(self, plan_key: str, model_ref: str, request_id: str) -> None:
         interval = max(5, self.registry.settings.heartbeat_seconds)
 
@@ -1140,6 +1249,27 @@ def _carries_tool_results(messages: Any) -> bool:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     return True
     return False
+
+
+def _tool_name(tool: Any) -> str:
+    """The tool's name in EITHER wire format, or "" if neither matches.
+
+    OpenAI nests the function under a `function` key; Anthropic keeps it flat.
+    Anything else (a malformed entry, a list, a bare string) yields "" so it
+    never matches a blocklist entry — the blocklist is permissive-fail: a tool
+    we cannot name is one we do not touch.
+    """
+    if not isinstance(tool, dict):
+        return ""
+    fn = tool.get("function")
+    if isinstance(fn, dict):
+        name = fn.get("name")
+        if isinstance(name, str):
+            return name
+    name = tool.get("name")
+    if isinstance(name, str):
+        return name
+    return ""
 
 
 def _payload_of(response_obj: Any) -> Any:
