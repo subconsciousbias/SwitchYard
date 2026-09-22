@@ -304,12 +304,12 @@ def test_minimax_remains_percent_payload_is_read_as_percentages():
 
     payload = {"model_remains": [
         {"model_name": "general",
-         "start_time": 1789948800000, "end_time": 1789966800000,
+         "start_time": 1789948800000, "end_time": 1790086380000,
          "current_interval_total_count": -1, "current_interval_used_count": -1,
          "current_interval_used_percent": "37.5%",
-         "weekly_start_time": 1789948800000, "weekly_end_time": 1790553600000,
+         "weekly_start_time": 1789948800000, "weekly_end_time": 1790121600000,
          "current_weekly_used_count": -1, "current_weekly_used_percent": "12%"},
-        {"model_name": "video", "end_time": 1790035200000,
+        {"model_name": "video", "end_time": 1790086380000,
          "current_interval_used_percent": "0%"},
     ]}
 

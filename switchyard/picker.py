@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from .models import Model, Plan, Registry
 from .policy import CapacityPolicy
 from .slots import SlotTable
+from .usage import reported_is_current
 
 log = logging.getLogger("switchyard.picker")
 
@@ -129,6 +130,15 @@ class Picker:
         if plan.use_extra_quota or self.policy is None:
             return False
         facts = await self.policy.ledger.window_facts(plan.key, plan.quota.label)
+        # Stale means UNKNOWN, not spent. Without this gate, a stale `100%`
+        # from a window that has already rolled over would freeze the plan out
+        # of rotation forever: the vendor's client only writes a fresh reading
+        # when it actually serves a request, so a plan the picker refuses to
+        # touch never gets a chance to update. Re-admitting on stale lets the
+        # next attempt land, the vendor either succeed or 429, and the usual
+        # classify -> quota_exhausted path self-heal from any genuine overshoot.
+        if not reported_is_current(facts, plan.quota.period):
+            return False
         pct = facts.get("reported_pct_used")
         if isinstance(pct, float):
             return pct >= 100.0
