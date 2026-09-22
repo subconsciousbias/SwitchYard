@@ -435,6 +435,180 @@ def test_window_headroom_ignores_stale_reported_percent():
 
 
 # ---------------------------------------------------------------------------
+# Tests: stale-grace for cookie-expired plans
+# ---------------------------------------------------------------------------
+#
+# A plan whose session cookie has expired stops polling (its `due()` gate
+# is False, so the writer doesn't refresh the lane-order / group-order hash).
+# Without a grace window, the hash ages past `stale_after_ms` (~20 min, 2x
+# the probe interval) and the picker falls back to config order -- even
+# though the LAST GOOD ranking is still meaningful: every window the hash
+# was computed from is still in force.
+#
+# The grace is capped exactly at the window boundary (`reset_at`), never
+# across it. Once the window rolls over, the reader returns None and the
+# picker falls back to config order exactly as it did before this work.
+# ---------------------------------------------------------------------------
+
+
+def test_reported_reading_with_needs_reauth_stays_current_within_same_window():
+    """A `reported_*` reading on a needs_reauth plan whose window has not
+    reset is still current -- the grace window is exactly the in-force
+    window. The operator's last good reading drives the picker (and the
+    board) until the window resets, instead of dropping to ledger estimates
+    the moment the cookie dies.
+
+    This is the existing `reported_is_current` rule (a): `reset_at` is in
+    the future, so the reading is current. The test pins that
+    `needs_reauth` does NOT regress the happy path: a needs_reauth plan
+    with a future reset_at keeps its last good number.
+    """
+    now = time.time()
+    future_reset = now + 3600
+    facts = {"reset_at": future_reset, "reported_at": now - 60.0,
+             "needs_reauth": True}
+    assert reported_is_current(facts, "week", now=now) is True, facts
+
+
+def test_reported_reading_with_needs_reauth_stale_after_reset_at_passes():
+    """A needs_reauth plan whose last good reading's window has reset is
+    back to today's behaviour: NOT eligible. The grace is capped exactly
+    at the window boundary, so once `reset_at` passes the reading no
+    longer describes any in-force window and the picker / board fall back
+    to estimated numbers. This is the regression bar for the invariant
+    "never carry a reading across a window reset into the next window".
+    """
+    now = time.time()
+    past_reset = now - 3600
+    facts = {"reset_at": past_reset, "reported_at": past_reset - 60.0,
+             "needs_reauth": True}
+    assert reported_is_current(facts, "week", now=now) is False, facts
+
+
+def test_lane_order_hash_stays_fresh_under_needs_reauth_grace():
+    """A stale lane-order hash for a needs_reauth plan whose window has not
+    reset stays readable: the grace extends freshness UNTIL reset_at.
+
+    Without grace, a hash that's older than `stale_after_ms` (here, 1000ms)
+    would be dropped and `get_lane_order` would return None -- the picker
+    would fall back to config order. With grace, the same hash is returned
+    because the plan's last-good window hasn't reset yet.
+    """
+    from switchyard.usage import K_LANE_ORDER
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan()
+    plan_key = plan.key
+    window = plan.quota.label
+    # Stamp needs_reauth=1 on the probe hash; the grace looks here.
+    redis.hashes[f"sy:probe:{plan_key}"] = {"needs_reauth": "1"}
+    # Last good reading: reset_at well in the future.
+    future_reset = time.time() + 86400
+    redis.hashes[K_WINDOW.format(plan=plan_key, window=window)] = {
+        "reset_at": str(future_reset),
+        "reported_at": str(time.time() - 600),
+    }
+    # Write the lane-order hash long ago (past stale_after_ms).
+    redis.hashes[K_LANE_ORDER.format(lane="forge")] = {
+        "computed_at": str(time.time() - 9999),
+        "stale_after_ms": "1000",
+        "score_claude-max/fable": "0.9",
+        "gate5h_claude-max/fable": "0",
+    }
+    # Without plan_windows -> still stale (no grace info to consult).
+    stale = run(ledger.get_lane_order("forge"))
+    assert stale is None, "without grace info, stale hash is None"
+    # With plan_windows and a future reset_at -> fresh under grace.
+    fresh = run(ledger.get_lane_order(
+        "forge", plan_windows=[(plan_key, window)]))
+    assert fresh is not None, "grace should keep the hash readable"
+    assert fresh["members"][0]["ref"] == "claude-max/fable"
+    assert fresh["members"][0]["score"] == 0.9
+
+
+def test_lane_order_hash_grace_ends_when_reset_at_passes():
+    """A stale lane-order hash whose only grace-eligible plan has a reset_at
+    already in the past returns None -- the grace is capped at the window
+    boundary. This is the same shape as the existing
+    `test_reported_reading_expires_when_reset_passes` regression bar: the
+    picker MUST drop to config order once the window rolls over.
+    """
+    from switchyard.usage import K_LANE_ORDER
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan()
+    plan_key = plan.key
+    window = plan.quota.label
+    redis.hashes[f"sy:probe:{plan_key}"] = {"needs_reauth": "1"}
+    # Reset_at already passed -> window has rolled over.
+    past_reset = time.time() - 3600
+    redis.hashes[K_WINDOW.format(plan=plan_key, window=window)] = {
+        "reset_at": str(past_reset),
+        "reported_at": str(past_reset - 600),
+    }
+    redis.hashes[K_LANE_ORDER.format(lane="forge")] = {
+        "computed_at": str(time.time() - 9999),
+        "stale_after_ms": "1000",
+        "score_claude-max/fable": "0.9",
+    }
+    out = run(ledger.get_lane_order(
+        "forge", plan_windows=[(plan_key, window)]))
+    assert out is None, "grace must end at the window boundary"
+
+
+def test_lane_order_hash_grace_only_for_needs_reauth_plan():
+    """A stale lane-order hash for a healthy plan is treated as stale even
+    when `reset_at` is in the future: the grace is a needs_reauth-only
+    extension, not a general freshness boost. Without this guard, a hash
+    past its `stale_after_ms` would silently outlive its bound on every
+    plan, and the perishable order would drift off real numbers rather
+    than admit it is unknown.
+    """
+    from switchyard.usage import K_LANE_ORDER
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan()
+    plan_key = plan.key
+    window = plan.quota.label
+    # Healthy: no needs_reauth.
+    redis.hashes[f"sy:probe:{plan_key}"] = {"needs_reauth": "0"}
+    future_reset = time.time() + 86400
+    redis.hashes[K_WINDOW.format(plan=plan_key, window=window)] = {
+        "reset_at": str(future_reset),
+        "reported_at": str(time.time() - 600),
+    }
+    redis.hashes[K_LANE_ORDER.format(lane="forge")] = {
+        "computed_at": str(time.time() - 9999),
+        "stale_after_ms": "1000",
+        "score_claude-max/fable": "0.9",
+    }
+    out = run(ledger.get_lane_order(
+        "forge", plan_windows=[(plan_key, window)]))
+    assert out is None, "grace must not apply to non-needs_reauth plans"
+
+
+def test_lane_order_hash_still_stale_when_no_plan_in_grace():
+    """When the listed plans are all healthy and have no grace-eligible
+    member, the hash is stale exactly as before -- the grace is purely
+    opt-in via `plan_windows`. This pins that an empty / omitted plan
+    list behaves bit-for-bit as the previous (no-grace) reader did.
+    """
+    from switchyard.usage import K_LANE_ORDER
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    redis.hashes[K_LANE_ORDER.format(lane="forge")] = {
+        "computed_at": str(time.time() - 9999),
+        "stale_after_ms": "1000",
+        "score_claude-max/fable": "0.9",
+    }
+    # Empty plan list -> no grace -> stale.
+    assert run(ledger.get_lane_order(
+        "forge", plan_windows=[])) is None
+    # No plan_windows arg at all -> stale (back-compat).
+    assert run(ledger.get_lane_order("forge")) is None
+
+
+# ---------------------------------------------------------------------------
 # Main runner
 # ---------------------------------------------------------------------------
 

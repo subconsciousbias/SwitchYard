@@ -363,15 +363,23 @@ class Ledger:
         await self.redis.delete(key)
         await self.redis.hset(key, mapping=mapping)
 
-    async def get_lane_order(self, lane: str) -> dict | None:
+    async def get_lane_order(self, lane: str,
+                            plan_windows: list[tuple[str, str]] | None = None
+                            ) -> dict | None:
         """The stored per-lane order, or None if the lane never produced one.
 
         Picker-facing shape: members is a list of refs in the order the writer
         ranked them, each entry carries `score` and `gate5h`. The freshness
         fields are read and checked here so the picker does one hash read and
         falls back to config order on a missing/stale key without further work.
+
+        `plan_windows` is the stale-grace opt-in: when the hash would otherwise
+        be stale, the reader extends freshness if any of the listed plans is
+        in `needs_reauth` AND its window's `reset_at` is still in the future.
+        See `_read_order` and `_in_grace_window` for the rationale.
         """
-        return await self._read_order(K_LANE_ORDER.format(lane=lane))
+        return await self._read_order(
+            K_LANE_ORDER.format(lane=lane), plan_windows=plan_windows)
 
     async def set_group_order(self, gid: str, lane: str,
                               entries: dict[str, float | str], *,
@@ -384,9 +392,18 @@ class Ledger:
         await self.redis.delete(key)
         await self.redis.hset(key, mapping=mapping)
 
-    async def get_group_order(self, gid: str, lane: str) -> dict | None:
-        """Per-group rank read. Same return shape as `get_lane_order`."""
-        return await self._read_order(K_GROUP_ORDER.format(gid=gid, lane=lane))
+    async def get_group_order(self, gid: str, lane: str,
+                              plan_windows: list[tuple[str, str]] | None = None
+                              ) -> dict | None:
+        """Per-group rank read. Same return shape as `get_lane_order`.
+
+        Same stale-grace opt-in as `get_lane_order`: `plan_windows` lets the
+        reader keep the hash fresh while a cookie-expired plan's window is
+        in force, so the picker reads the last good ranking instead of
+        dropping to config order.
+        """
+        return await self._read_order(
+            K_GROUP_ORDER.format(gid=gid, lane=lane), plan_windows=plan_windows)
 
     async def bump_group_rot(self, gid: str, lane: str) -> int:
         """Increment and return the group's rotation pointer.
@@ -415,7 +432,66 @@ class Ledger:
         except (TypeError, ValueError):
             return 0
 
-    async def _read_order(self, key: str) -> dict | None:
+    # -- stale-grace for cookie-expired plans ------------------------------
+    # A plan with `sy:probe:{plan}.needs_reauth=1` has stopped polling
+    # (its cookie is dead and the portal is asking the operator to paste
+    # a fresh one). Its lane-order / group-order hash is therefore never
+    # refreshed: the writer runs only on a successful probe. Without a
+    # grace window, the hash ages past `stale_after_ms` (~20 min, 2x the
+    # probe interval) and the picker falls back to config order, even
+    # though the LAST GOOD ranking is still meaningful: every window the
+    # hash was computed from is still in force.
+    #
+    # The grace is capped at the window boundary. The reader checks each
+    # needs_reauth plan in the lane: if its window's `reset_at` is still
+    # in the future, the previously stored ranking stays current for
+    # scheduling. Once `reset_at` passes the window has rolled over and
+    # the reading no longer describes any in-force window, so the hash
+    # is treated as stale exactly as it was before this work -- the
+    # fallback to config order returns. The grace cannot carry a reading
+    # across a window reset into the next window; the test at
+    # `test_reported_reading_expires_when_reset_passes` is the existing
+    # regression bar for that invariant.
+    K_PROBE = "sy:probe:{plan}"
+
+    async def _plan_needs_reauth(self, plan_key: str) -> bool:
+        """Whether the probe hash for `plan_key` carries needs_reauth=1.
+
+        Mirrors `Prober.status`'s decode: the field is stored as a string
+        "1" / "1.0" / "True" (Redis hash values are bytes-or-strings).
+        """
+        raw = await self.redis.hget(self.K_PROBE.format(plan=plan_key),
+                                    "needs_reauth")
+        if raw is None:
+            return False
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        return raw in ("1", "1.0", "True")
+
+    async def _in_grace_window(
+        self, plan_windows: list[tuple[str, str]]
+    ) -> bool:
+        """True iff at least one (plan, window) in the list is a needs_reauth
+        plan whose window's `reset_at` is still in the future.
+
+        Used by `_read_order` to extend freshness for the lane-order and
+        group-order hashes while a cookie-expired plan's window is in
+        force. Capped at the window boundary: once `reset_at` passes the
+        grace ends, exactly as `reported_is_current`'s rule (a) does for
+        per-window facts.
+        """
+        now = time.time()
+        for plan_key, window_label in plan_windows:
+            if not await self._plan_needs_reauth(plan_key):
+                continue
+            facts = await self.window_facts(plan_key, window_label)
+            reset_at = facts.get("reset_at")
+            if isinstance(reset_at, (int, float)) and float(reset_at) > now:
+                return True
+        return False
+
+    async def _read_order(self, key: str,
+                         plan_windows: list[tuple[str, str]] | None = None) -> dict | None:
         raw = await self.redis.hgetall(key)
         if not raw:
             return None
@@ -430,7 +506,19 @@ class Ledger:
             return None
         age_ms = (time.time() - computed_at) * 1000.0
         if age_ms >= stale_after_ms:
-            return None
+            # Stale-grace: a plan whose session cookie has expired
+            # (`sy:probe:{plan}.needs_reauth=1`) stops polling, so its
+            # ranking hash never gets refreshed. While the window the
+            # last good reading describes is still in force, treat the
+            # hash as current -- capping exactly at the window boundary
+            # (`reset_at`), never across it. The picker keeps using the
+            # last good ranking instead of falling back to config order,
+            # which is the difference between scheduling on the plan's
+            # real numbers and on declared order with a dead cookie.
+            if plan_windows and await self._in_grace_window(plan_windows):
+                pass
+            else:
+                return None
         members: list[dict] = []
         for key_name, value in decoded.items():
             if not key_name.startswith("score_"):

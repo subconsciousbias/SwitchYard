@@ -25,7 +25,12 @@
         </td>
         <td class="nowrap">
           {% if st.needs_reauth %}
-            <span class="tag bad">needs re-auth</span>
+            {# Stale-grace: when the cookie has expired, the probe is no
+               longer running, but the LAST GOOD reading stays in force
+               for scheduling until its window resets. The board must say
+               so plainly -- this is the operator's cue to paste a fresh
+               cookie. last_ok_hhmm is pre-formatted in collect_probes(). #}
+            <span class="tag bad">stale — needs re-auth (last good {{ st.last_ok_hhmm }})</span>
           {% elif st.has_cookie %}
             <span class="tag ok">active</span>
           {% else %}

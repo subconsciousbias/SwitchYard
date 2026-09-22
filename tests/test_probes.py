@@ -464,6 +464,200 @@ def test_polling_runs_for_a_kind_none_plan_without_a_cookie():
           f"sees the plan as spent")
 
 
+def test_set_cookie_is_not_captured_without_a_response_header():
+    """When the server does not return a Set-Cookie header, the stored
+    credential is left untouched. A capture path that invented a value from
+    nothing would silently overwrite a working cookie with an empty one."""
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+
+    payload = {"data": {"remains": 7000, "total": 10000}}
+    windows = {"weekly": {"remaining": ["data.remains"], "total": ["data.total"]}}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/no-cookie"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        # Opt-in capture, but the server never sets a cookie. Custom windows
+        # so the probe actually parses this stub payload as a valid reading —
+        # otherwise the failure-path returns first and we'd never reach the
+        # capture check.
+        probe = replace(plan.probe, url=url, capture_set_cookie=True,
+                        windows=windows, fields={})
+        plan = replace(plan, probe=probe)
+
+        original = "session=original-cookie-value-1234567890"
+        await prober.set_cookie(plan.key, original)
+        before = dict(redis.hashes["sy:cred:minimax-ultra"])
+        result = await prober.run(plan)
+        return result, redis.hashes["sy:cred:minimax-ultra"], before
+
+    result, cred, before = run(go())
+    srv.shutdown()
+
+    assert result.ok, result
+    # Cookie, fingerprint and added_at all carry through unchanged.
+    assert cred.get("cookie") == "session=original-cookie-value-1234567890", cred
+    assert cred.get("fingerprint") == before.get("fingerprint"), (
+        cred.get("fingerprint"), before.get("fingerprint"))
+    assert cred.get("added_at") == before.get("added_at"), (
+        cred.get("added_at"), before.get("added_at"))
+    print("  no Set-Cookie -> credential untouched")
+
+
+def test_set_cookie_is_not_captured_on_a_reauth_response():
+    """A 401 or a reauth-marked body must NEVER overwrite a stored cookie, even
+    if the server still returns a Set-Cookie alongside the rejection. The
+    whole point of capture is to refresh a working session; writing on top of
+    a known-bad session would mask the reauth signal and keep polling a dead
+    plan. needs_reauth semantics stay exactly as today."""
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+
+    # MiniMax's exact reauth shape so REAUTH_MARKERS hits and the existing
+    # 401 path fires. The server hands back a fresh-looking Set-Cookie anyway,
+    # which is the trap the test is built around.
+    reauth_body = ('{"base_resp":{"status_code":1004,'
+                   '"status_msg":"cookie is missing, log in again"}}')
+    new_cookie = "session=brand-new-cookie-from-the-server"
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = reauth_body.encode()
+            self.send_response(401)
+            self.send_header("content-type", "application/json")
+            self.send_header("set-cookie", new_cookie)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/reauth"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        probe = replace(plan.probe, url=url, capture_set_cookie=True)
+        plan = replace(plan, probe=probe)
+
+        original = "session=original-cookie-value-1234567890"
+        await prober.set_cookie(plan.key, original)
+        before = dict(redis.hashes["sy:cred:minimax-ultra"])
+        result = await prober.run(plan)
+        return (result, redis.hashes["sy:cred:minimax-ultra"],
+                redis.hashes["sy:probe:minimax-ultra"], before)
+
+    result, cred, probe_state, before = run(go())
+    srv.shutdown()
+
+    assert not result.ok and result.needs_reauth, result
+    # Credential untouched despite the Set-Cookie header on the response.
+    assert cred.get("cookie") == "session=original-cookie-value-1234567890", cred
+    assert cred.get("fingerprint") == before.get("fingerprint"), (
+        cred.get("fingerprint"), before.get("fingerprint"))
+    # needs_reauth is set exactly as today — capture cannot rescue a dead
+    # session.
+    assert probe_state.get("needs_reauth") == "1", probe_state
+    print("  401 + reauth body with Set-Cookie -> credential NOT overwritten")
+
+
+def test_set_cookie_is_captured_on_a_verified_good_response():
+    """A 2xx response with no reauth marker and a Set-Cookie header updates
+    the stored credential: new cookie value, new added_at, new fingerprint.
+    `status()` surfaces the new fingerprint but never the cookie value
+    itself — the same non-leak guarantee the secret-stays-in-the-hash test
+    pins for the manual paste path."""
+    import http.server
+    import json
+    import threading
+    import time
+    from dataclasses import replace
+
+    payload = {"data": {"remains": 7000, "total": 10000}}
+    windows = {"weekly": {"remaining": ["data.remains"], "total": ["data.total"]}}
+    new_cookie = "session=brand-new-cookie-from-the-server-session=abcdef1234567890"
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("set-cookie", new_cookie)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/fresh"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        # Custom windows so the probe parses this stub as a successful reading.
+        probe = replace(plan.probe, url=url, capture_set_cookie=True,
+                        windows=windows, fields={})
+        plan = replace(plan, probe=probe)
+
+        original = "session=original-cookie-value-1234567890"
+        await prober.set_cookie(plan.key, original)
+        before = dict(redis.hashes["sy:cred:minimax-ultra"])
+        # Lower bound on the new added_at: anything at-or-after this counts as
+        # a fresh stamp, which is what "updated" means here.
+        before_run = time.time()
+        result = await prober.run(plan)
+        status = await prober.status(plan.key)
+        return result, redis.hashes["sy:cred:minimax-ultra"], before, before_run, status
+
+    result, cred, before, before_run, status = run(go())
+    srv.shutdown()
+
+    assert result.ok, result
+    assert cred.get("cookie") == new_cookie, cred
+    # New fingerprint is distinct from the old one, even though both come from
+    # the same _fingerprint function — two different cookies must read as two.
+    assert cred.get("fingerprint") != before.get("fingerprint"), (
+        cred.get("fingerprint"), before.get("fingerprint"))
+    assert float(cred.get("added_at")) >= before_run, (
+        cred.get("added_at"), before_run)
+    # status() exposes the new fingerprint but never the cookie value.
+    assert status["fingerprint"] == cred.get("fingerprint"), (
+        status["fingerprint"], cred.get("fingerprint"))
+    blob = repr(status)
+    assert new_cookie not in blob, blob
+    assert "abcdef1234567890" not in blob, blob
+    print(f"  captured -> fingerprint {status['fingerprint']!r}, value never surfaced")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

@@ -781,6 +781,246 @@ Then move `judge`, then the rest.
 
 ---
 
+## 8. Cookie auto-renewal recon (one-time)
+
+Two of the probe-backed plans — **minimax-ultra** / **minimax-max** and
+**opencode-go** — authenticate with a session cookie you paste once. The
+cookie expires, the probe flips to `needs re-auth`, and you have to paste
+another. Whether that ever stops happening is the question this section is
+designed to settle, once, by hand.
+
+The recon has three steps. **8a** is the only one that changes SwitchYard's
+behaviour — it tells you whether to set `capture_set_cookie: true` under the
+plan's `probe:` block in `config/plans.yaml`. **8b** and **8c** are leads for
+a future where the probe can be kept alive without you: a refresh route the
+console itself calls on page load, or an auth-exchange endpoint the OpenCode
+CLI exposes. None of the steps reach a provider from this worktree — they are
+all a browser, a clipboard, and a local file.
+
+A working recon record is one row per provider per step. Empty cells mean
+"not investigated"; they are not the same as "no" — the operator who skips
+a step is the operator who has to come back. **Never paste a cookie value,
+refresh token, or `auth.json` content into the recon or anywhere else.**
+Fingerprints (`284 chars, #a1b2c3d4`) and filenames are enough.
+
+### 8a. Set-Cookie sliding check (the key evidence)
+
+The probe's `capture_set_cookie` flag (off by default — see
+`config/plans.example.yaml` under `opencode-go.probe`) only does anything
+useful if the probed endpoint actually returns a fresh `Set-Cookie` on
+every successful request. When it does, the probe writes that header into
+Redis, the **Real usage** panel on the portal shows the new fingerprint, and
+you never have to paste another cookie. When it does not, the flag is a
+silent no-op: a stored cookie never gets overwritten and the probe keeps
+working until the original cookie's real expiry, at which point it stops
+exactly as it does today. So enabling it on a non-sliding endpoint costs
+nothing — but it also does nothing, and the answer to "can the cookie
+auto-renew" stays "no".
+
+Reproduce the probe's own request, then read what comes back.
+
+**MiniMax** (`platform.minimax.io`):
+
+1. Log in normally in a browser. Devtools open, **Network** tab, "Preserve
+   log" on.
+2. In the devtools console, run the same call the probe makes:
+
+   ```js
+   await fetch("/backend/account/token_plan/remains_percent",
+               {credentials: "include"})
+     .then(r => ({status: r.status, setCookie: r.headers.get("set-cookie")}))
+   ```
+
+3. Click the row for that request in the Network tab. Record three things:
+   - **Response status**: expect `200`. A `401` here means the cookie is
+     already dead — paste a fresh one (per the README's "Real numbers from a
+     browser session") and retry.
+   - **Response Headers → `set-cookie`**: is the row present?
+     - **Empty / missing** — the endpoint does **not** slide. Record "no
+       Set-Cookie" under MiniMax in the table below.
+     - **Present, with the same cookie name and a future `Expires` /
+       `Max-Age`** — it slides. Record the new `Expires` / `Max-Age` value;
+       the probe will keep that rolling window.
+     - **Present, with `Expires` in the past or `Max-Age=0`** — that is a
+       logout, not a slide. Record "expires in past" and treat it as no
+       slide.
+4. Application tab → Cookies → `https://platform.minimax.io`. Pick the
+   session cookie (the one named in the request's `Cookie:` header — usually
+   `session`, `token`, or `acw_tc`). Record its `Expires` / `Max-Age`
+   attribute. A cookie with no expiry attribute is a **session cookie**: it
+   lives until the browser closes. If step 3 issued a `Set-Cookie`, the
+   attribute on the **stored** cookie should reflect the response's
+   `Expires` / `Max-Age`; if the two disagree, the server is sliding — note
+   both values.
+
+**OpenCode console** (`opencode.ai/console`):
+
+1. Log in normally. Devtools open.
+2. The probe sends a header this fetch won't, so add it:
+
+   ```js
+   await fetch("/console/api/go/status",
+               {credentials: "include",
+                headers: {"x-org-id": "wrk_..."}})
+     .then(r => ({status: r.status, setCookie: r.headers.get("set-cookie")}))
+   ```
+
+   The `wrk_...` value is the workspace id from the README's setup step 1 —
+   the route answers `{"code":"org_required"}` without it, which would look
+   like a successful response that happened not to slide.
+3. Record the same three things: response status, presence of `Set-Cookie`,
+   and its `Expires` / `Max-Age`. Same three outcomes as MiniMax.
+
+Outcomes, recorded once per provider:
+
+| Provider | Endpoint | `Set-Cookie` on 2xx? | Expiry shape | Slide? |
+|---|---|---|---|---|
+| MiniMax | `/backend/account/token_plan/remains_percent` | yes / no | future / past / none | yes / no |
+| OpenCode console | `/console/api/go/status` | yes / no | future / past / none | yes / no |
+
+A **yes** in the last column is the only condition under which step 8d
+turns the flag on. The fingerprint visible on the portal's **Real usage**
+panel (e.g. `284 chars, #a1b2c3d4`) is what tells you the flag is working:
+hit **test now** twice in a row on that plan and the fingerprint should
+change on the second hit — the probe logged
+`cookie rotated by provider (plan=…, fingerprint=…)` on the first and the
+second sees a new value.
+
+### 8b. Refresh/token route search
+
+A sliding cookie is the easiest way to keep the probe alive, but not the
+only one. Some consoles extend the session out of band — a separate
+`/auth/refresh` or `/session/extend` call fired by the page itself on load
+— which the probe could in principle fire once before its real call.
+Recording whether such a route exists does not change behaviour today; it
+is a lead for a future probe that calls it pre-flight.
+
+Per provider, in the same logged-in browser session as 8a:
+
+1. Network tab, filter **Fetch/XHR** (or **All** if you want to see beacons
+   too).
+2. Hard-reload the console page (`Cmd-Shift-R` / `Ctrl-Shift-R`). Capture
+   every request on first paint.
+3. Skim the request paths. Candidates worth a closer look, with the shape
+   the probe could call:
+   - `…/auth/refresh`, `…/token/refresh`, `…/session/extend`,
+     `…/token/rotate`, `…/api/v1/auth/…`
+   - any request whose response carries a `Set-Cookie` even though it is
+     not itself the probe route
+4. Record presence / absence per provider:
+
+| Provider | Refresh route present? | Path (if any) | Fires on page load? |
+|---|---|---|---|
+| MiniMax | yes / no | | yes / no |
+| OpenCode console | yes / no | | yes / no |
+
+"yes" on both columns is the pre-flight shape: the probe could call it once
+before the real probe request and inherit any new `Set-Cookie`. "yes on
+first, no on second" means the route exists but only in response to user
+action (e.g. a click), which is not useful for a poller. "no" closes the
+lead.
+
+### 8c. OpenCode CLI-token lead
+
+The OpenCode CLI is what the sidecar shells out to (`opencode run --model
+…`), and its own OAuth login is what it uses to authenticate — stored
+under `./secrets/opencode/data/auth.json` (and the same for `opencode2`),
+per `secrets/README.md`. If that CLI exposes an auth-exchange route that
+mints or mirrors a console session, the probe could use it instead of a
+pasted cookie. Check by inspection, never by running the binary against a
+live account from this worktree.
+
+```bash
+# Find the binary the sidecar actually runs (read-only, against the live stack):
+docker compose exec -T opencode-go-sidecar which opencode
+
+# Copy it out into a scratch dir on the host (NOT the live stack's config):
+mkdir -p /tmp/opencode-recon && cd /tmp/opencode-recon
+docker compose cp opencode-go-sidecar:$(docker compose exec -T \
+  opencode-go-sidecar which opencode) ./opencode
+
+# Inspect without executing. None of these print credential values — they
+# look at the binary's own string table for hints about auth endpoints.
+go version -m ./opencode 2>/dev/null | head -5     # build info, if a Go binary
+strings ./opencode | grep -E "opencode\.ai|/auth/|/token/|/session/" \
+  | sort -u | head -40
+# Fallback if strings(1) is not installed:
+grep -aoE "(/[a-z]+/)?(auth|token|session|refresh)[a-z/_-]{0,40}" \
+  ./opencode | sort -u | head -40
+```
+
+What you are looking for in the output is any path that looks like a
+console auth endpoint — `/api/auth/...`, `/api/v1/auth/...`,
+`/backend/account/...`, anything with `session`, `refresh`, `token` in it,
+especially if it appears next to a host string (`opencode.ai`,
+`api.opencode.ai`). A Go module path that mentions the same host is weaker
+evidence but still worth recording. Many of the matches will be unrelated
+library strings — triage by what appears *next to* a literal host string,
+which is much harder to fake by accident.
+
+Outcomes, recorded once:
+
+| What was found | Path / host / module | Plausibility |
+|---|---|---|
+| Auth path in `strings` | | high / medium / low |
+| Host literal in `strings` | | high / medium / low |
+| Build module path mentions console | | high / medium / low |
+
+**A high-plausibility find is the only thing that would justify adding a
+second credential flow to the probe.** Even then, it is a feature, not a
+bug-fix: the cookie path is already verified end to end, and the right
+next move is a separate dispatch for an OAuth-via-CLI prober — not a
+config edit to `plans.yaml`.
+
+What you also record but never paste into the recon:
+
+- `ls secrets/opencode/data/auth.json secrets/opencode2/data/auth.json` —
+  the files exist or they do not (mode `0600`, gitignored). Their CONTENTS
+  are a refresh-token chain and must never be echoed. If a file is missing,
+  `scripts/auth_audit.py` will tell you which sidecar has no login.
+
+### 8d. Decision guide: enabling `capture_set_cookie`
+
+| 8a result | 8b / 8c result | Action |
+|---|---|---|
+| Slide = yes | either or both leads noted | Set `capture_set_cookie: true` under that plan's `probe:` block in `config/plans.yaml` |
+| Slide = yes | both empty | Same as row 1 — but record in the recon that the operator did not look for refresh / CLI-token leads, so a future operator knows to revisit |
+| Slide = no | either or both leads noted | Do **not** enable. The flag is a silent no-op on a non-sliding endpoint, and leaving it commented out keeps the intent visible |
+| Slide = no | both empty | Do not enable. Record the negative slide result so the next operator does not redo 8a |
+
+**Mechanics of turning it on:**
+
+The flag lives on the probe plan you already configured, in your own
+`config/plans.yaml` (gitignored — your live config). Uncomment the
+`capture_set_cookie: true` line under the plan's `probe:` block — the
+example is in `config/plans.example.yaml` under `opencode-go`. Then
+rebuild from the main checkout, **not** this worktree:
+
+```bash
+# From the main checkout, NOT this worktree:
+scripts/apply.sh --build
+```
+
+`apply.sh` restarts the gateway and sidecars, which re-reads
+`plans.yaml` and picks up the new flag. The fingerprint on the portal's
+**Real usage** panel is the proof: hit **test now** twice on that plan
+and the second reading's fingerprint differs from the first. If it does
+not, the endpoint does not actually slide and the flag should come back
+off.
+
+A flag that fires correctly is also the right time to subscribe to the
+gateway log line:
+
+```bash
+docker compose logs -f gateway | grep 'cookie rotated'
+```
+
+A successful probe run with `capture_set_cookie: true` will print one
+line per rotation, with `plan=…` and `fingerprint=…` only — never the
+cookie value.
+
+---
+
 ## A trap worth knowing: GLM's base URL
 
 Verified by direct call with a Coding Plan key:
