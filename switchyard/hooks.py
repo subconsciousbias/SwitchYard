@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import sys
@@ -66,6 +67,24 @@ def _configure_logging() -> None:
 _configure_logging()
 
 META_KEY = "switchyard"
+
+# Call types that LiteLLM does NOT log via async_log_success_event /
+# async_log_failure_event (LiteLLM 1.101.0 verified mapping). For these,
+# slot release + usage accounting runs from async_post_call_success_hook
+# (buffered) or async_post_call_streaming_iterator_hook (streamed). Buffered
+# and streamed variants both belong on the post-call side; the success path's
+# exactly-once marker covers the rare case where both happen to fire.
+#
+# Everything else stays owned by normal success logging -- the four classic
+# chat/text call types (completion, acompletion, text_completion,
+# atext_completion) keep firing async_log_success_event on success and
+# async_log_failure_event on failure, and we MUST NOT do the work twice.
+UNLOGGED_CALL_TYPES = frozenset({"anthropic_messages", "aanthropic_messages"})
+
+# Per-call ctx marker. The first path to finish sets the marker; whichever
+# finishes second is a no-op. The value is "success" or "failure" so a future
+# log can show which side ran (mostly for debugging a double-fire surprise).
+_TERMINATED = "_terminated"
 
 
 class SwitchyardHandler(CustomLogger):
@@ -304,6 +323,15 @@ class SwitchyardHandler(CustomLogger):
                                  if pick.picked_group is not None else ""),
             "picked_group_strategy": (pick.picked_group.strategy
                                       if pick.picked_group is not None else ""),
+            # LiteLLM's call_type ("acompletion", "anthropic_messages", ...).
+            # Stamped here so every downstream hook sees the same value and can
+            # decide which side of LiteLLM's split logging path owns the slot
+            # release. Buffered /v1/messages (anthropic_messages) reaches
+            # async_post_call_success_hook only, streamed /v1/messages reaches
+            # async_post_call_streaming_iterator_hook only -- the normal
+            # async_log_success_event does NOT fire for either (LiteLLM 1.101.0
+            # verified mapping).
+            "call_type": call_type,
         }
         log.info(
             "lane=%s -> %s [%s]%s%s%s",
@@ -377,15 +405,81 @@ class SwitchyardHandler(CustomLogger):
         return actual, served.ref
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        """Buffered /v1/chat/completions, /v1/completions and friends finish here.
+
+        LiteLLM 1.101.0 keeps the normal success logging on
+        ``completion / acompletion / text_completion / atext_completion`` -- this
+        is the only hook that fires for them. Buffered ``/v1/messages`` does
+        NOT reach here (verified), and is owned by async_post_call_success_hook
+        instead, gated on call_type. Either way the exactly-once marker inside
+        ``_finish_success`` keeps both paths from running the work twice on the
+        rare LiteLLM build where both happen to fire.
+        """
         ctx = self._ctx(kwargs)
         if not ctx:
             return
+        # Defensive gate. The unlogged call types do not normally reach this
+        # hook, but if a future LiteLLM version starts firing it for them,
+        # the post-call side still owns the slot -- we must not release twice.
+        if ctx.get("call_type") in UNLOGGED_CALL_TYPES:
+            return
+        await self._finish_success(
+            ctx, response_obj=response_obj,
+            start_time=start_time, end_time=end_time,
+            kwargs=kwargs,
+        )
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        """Same ownership story as ``async_log_success_event``, for the failure side.
+
+        Failure accounting for ``/v1/messages`` is owned by
+        ``async_post_call_failure_hook``; this hook stays out of the way for
+        those call types and runs ``_finish_failure`` for everything else.
+        """
+        ctx = self._ctx(kwargs)
+        if not ctx:
+            return
+        if ctx.get("call_type") in UNLOGGED_CALL_TYPES:
+            return
+        await self._finish_failure(
+            ctx, kwargs.get("exception") or kwargs.get("original_exception"),
+        )
+
+    async def _finish_success(
+        self, ctx: dict, *,
+        response_obj: Any = None,
+        start_time: Any = None,
+        end_time: Any = None,
+        kwargs: dict | None = None,
+        usage: dict | None = None,
+    ) -> bool:
+        """Common success accounting. Idempotent via the ctx marker.
+
+        Exactly-once guarantee: the first call sets ``ctx[_TERMINATED]``; any
+        later call (success or failure path, post-call or normal) is a no-op.
+        Without this guard, LiteLLM builds that fire both
+        ``async_post_call_success_hook`` and ``async_log_success_event`` for
+        buffered OpenAI routes would book the same slot release twice and the
+        ledger would double-count.
+
+        Returns True when this call did the work, False when it short-circuited.
+
+        ``usage`` is an explicit override for streamed responses where the
+        caller has already extracted usage out of the SSE chunks; absent, the
+        method pulls it off ``response_obj.usage`` in either OpenAI shape
+        (``prompt_tokens`` / ``completion_tokens``) or Anthropic shape
+        (``input_tokens`` / ``output_tokens``).
+        """
+        if ctx.get(_TERMINATED):
+            return False
+        ctx[_TERMINATED] = "success"
+        kwargs = kwargs or {}
         self._stop_heartbeat(ctx["request_id"])
         # Always release what we claimed, whoever ended up serving it.
         await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
         plan, served_ref = self._check_served_deployment(ctx, kwargs)
         if not plan:
-            return
+            return True
 
         # A 200 is not proof of success. MiniMax can return HTTP 200 with the
         # real failure in base_resp.status_code; recording that as a success
@@ -399,12 +493,9 @@ class SwitchyardHandler(CustomLogger):
             )
             await self.ledger.record(plan, failed=True, model=served_ref)
             await self._apply_verdict(plan, verdict, ctx)
-            return
+            return True
 
-        usage = getattr(response_obj, "usage", None) or {}
-        get = (lambda k: usage.get(k, 0)) if isinstance(usage, dict) else (lambda k: getattr(usage, k, 0) or 0)
-        prompt_tokens = int(get("prompt_tokens") or 0)
-        completion_tokens = int(get("completion_tokens") or 0)
+        prompt_tokens, completion_tokens = _prompt_completion_tokens(response_obj, usage)
         # Only metered providers have a per-request cost. On a subscription the
         # fee is fixed and the marginal cost of a request is zero; recording
         # LiteLLM's notional price would inflate month_cost and corrupt the
@@ -434,11 +525,19 @@ class SwitchyardHandler(CustomLogger):
         await self.policy.pacer.note_throughput(plan, units, seconds)
 
         await self._absorb_limit_headers(plan.key, kwargs)
+        return True
 
-    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        ctx = self._ctx(kwargs)
-        if not ctx:
-            return
+    async def _finish_failure(self, ctx: dict, exception: Exception | None) -> bool:
+        """Common failure accounting. Idempotent via the ctx marker.
+
+        Same marker as ``_finish_success``: whichever path runs first wins, so
+        a slot cannot be released twice when both ``async_log_failure_event``
+        and ``async_post_call_failure_hook`` fire for the same request (which
+        LiteLLM does for the buffered OpenAI routes on a router-level retry).
+        """
+        if ctx.get(_TERMINATED):
+            return False
+        ctx[_TERMINATED] = "failure"
         self._stop_heartbeat(ctx["request_id"])
         await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
         plan = self.registry.plans.get(ctx["plan"])
@@ -448,19 +547,28 @@ class SwitchyardHandler(CustomLogger):
         # its own fresh pick against the cooldowns this failure just set.
         if plan:
             await self.ledger.record(plan, failed=True, model=ctx["model"])
-        await self._handle_failure(ctx, kwargs.get("exception") or kwargs.get("original_exception"))
+        await self._handle_failure(ctx, exception)
+        return True
 
     async def async_post_call_success_hook(
         self, data: dict, user_api_key_dict: UserAPIKeyAuth, response, **_: Any
     ):
-        """Tell the caller which plan actually served it.
+        """Tell the caller which plan served it AND finish ``/v1/messages`` accounting.
 
-        The body's `model` echoes what was asked for — usually a lane name like
-        `judge` — so a caller doing its own token or cost accounting cannot see
-        which subscription the tokens came out of. LiteLLM puts the answer in
-        response *headers* (x-litellm-model-group and friends), which is easy to
-        miss and lost by any client that only keeps the JSON. So it goes in the
-        body too, under one namespaced key that a strict client will ignore.
+        The body's ``model`` echoes what was asked for -- usually a lane name
+        like ``judge`` -- so a caller doing its own token or cost accounting
+        cannot see which subscription the tokens came out of. LiteLLM puts the
+        answer in response *headers* (x-litellm-model-group and friends), which
+        is easy to miss and lost by any client that only keeps the JSON. So it
+        goes in the body too, under one namespaced key that a strict client
+        will ignore.
+
+        For call types LiteLLM does NOT route through ``async_log_success_event``
+        (``anthropic_messages`` / ``aanthropic_messages``, per the 1.101.0
+        mapping) this hook also runs ``_finish_success`` -- the slot release,
+        ledger booking, transient-failure reset, throughput note and limit
+        headers. For OpenAI-shaped buffered routes that call BOTH hooks the
+        exactly-once marker keeps the work from running twice.
         """
         ctx = (((data or {}).get("metadata") or {}).get(META_KEY))
         if not isinstance(ctx, dict):
@@ -474,29 +582,46 @@ class SwitchyardHandler(CustomLogger):
                 setattr(response, "switchyard", stamp)
         except Exception:                 # never fail a served request over a label
             log.debug("could not stamp response with switchyard routing info")
+
+        if ctx.get("call_type") in UNLOGGED_CALL_TYPES:
+            kwargs = (data or {}).get("litellm_params") or {}
+            await self._finish_success(ctx, response_obj=response, kwargs=kwargs)
         return response
 
     async def async_post_call_streaming_iterator_hook(
         self, user_api_key_dict: UserAPIKeyAuth, response: Any, request_data: dict
     ):
-        """Lift inline `<think>` reasoning out of a STREAMED response.
+        """Lift inline ``<think>`` reasoning and finish streamed ``/v1/messages`` accounting.
 
-        LiteLLM already does this for a buffered response, so the same model
-        answers cleanly when buffered and leaks raw tags when streamed. A client
-        that renders content verbatim then shows the model thinking out loud.
-        Normalising it here means one behaviour whatever the provider and
-        whatever the transport.
+        Two responsibilities, kept in one hook because LiteLLM only gives us
+        one place in the streamed path:
 
-        Reasoning is moved, never dropped: it arrives as `reasoning_content`
-        deltas, which is where the non-streamed path puts it.
+        1. **Reasoning split**: a streamed chunk that arrives with inline
+           ``<think>...</think>`` tags is rewritten so the reasoning moves
+           into ``reasoning_content`` (matching the buffered path). Reasoning
+           is moved, never dropped.
+        2. **Finish streamed ``/v1/messages``**: LiteLLM does NOT fire
+           ``async_log_success_event`` for streamed ``/v1/messages``, so the
+           slot release + ledger booking + transient-failure reset + throughput
+           note + limit headers have to happen here. ``_stream_chunks`` wraps
+           the upstream iterator with usage parsing and a detached finalize
+           task, so client cancellation cannot leave the slot claimed. OpenAI
+           streamed routes are still owned by ``async_log_success_event``; the
+           call_type gate below keeps us out of their way.
+
+        Cancellation safety: the finalize is a detached asyncio task scheduled
+        from the iterator's `try/except/else` arms, so the iterator itself
+        never `await`s after the last `yield` -- the FastAPI/Starlette
+        streaming response does not stall waiting for Redis writes, and a
+        client disconnect mid-stream still produces a slot release.
         """
         if not self.registry.settings.split_reasoning_tags:
-            async for chunk in response:
+            async for chunk in self._stream_chunks(response, request_data):
                 yield chunk
             return
 
         splitter = ReasoningSplitter()
-        async for chunk in response:
+        async for chunk in self._stream_chunks(response, request_data):
             try:
                 choices = getattr(chunk, "choices", None) or []
                 delta = getattr(choices[0], "delta", None) if choices else None
@@ -518,15 +643,179 @@ class SwitchyardHandler(CustomLogger):
             log.debug("stream ended mid-tag; flushed %d content, %d reasoning chars",
                       len(trailing_content), len(trailing_reasoning))
 
+    async def _stream_chunks(self, response: Any, request_data: dict):
+        """Yield every byte/chunk from `response` and finish streamed accounting.
+
+        The hook is a `yield`-per-chunk iterator, so the FastAPI/Starlette
+        streaming response stays unblocked. We:
+
+        * Parse every chunk for Anthropic SSE usage (``message_start`` carries
+          the input-token total; successive ``message_delta`` frames carry
+          the running output/cache totals). Tolerate chunks shaped as bytes,
+          str, dict or pydantic objects; a malformed chunk is logged and
+          skipped -- never propagated to the client.
+        * Schedule a detached task from the success, exception and cancel
+          arms so the slot is released whether the stream completes cleanly,
+          errors out, or has its consumer disconnect mid-iteration.
+        """
+        ctx = ((request_data or {}).get("metadata") or {}).get(META_KEY)
+        if not isinstance(ctx, dict):
+            # Not one of ours -- /v1/chat/completions streamed, etc. Pass the
+            # iterator through unchanged; ``async_log_success_event`` owns the
+            # finish. The reasoning split above still runs (a no-op for chunks
+            # that lack a ``.choices`` attribute).
+            async for chunk in response:
+                yield chunk
+            return
+
+        # Only this call type needs streamed finish. OpenAI-shaped routes
+        # still own their success logging through async_log_success_event, so
+        # we yield through and let the hook above do the reasoning split.
+        if ctx.get("call_type") not in UNLOGGED_CALL_TYPES:
+            async for chunk in response:
+                yield chunk
+            return
+
+        collected: dict[str, int] = {}
+        try:
+            async for chunk in response:
+                try:
+                    self._absorb_chunk_usage(chunk, collected)
+                except Exception:
+                    log.debug("stream usage parse skipped for one chunk",
+                              exc_info=True)
+                yield chunk
+        except BaseException:
+            self._schedule_stream_finalize(ctx, collected, request_data)
+            raise
+        else:
+            self._schedule_stream_finalize(ctx, collected, request_data)
+
+    def _schedule_stream_finalize(
+        self, ctx: dict, collected: dict, request_data: dict,
+    ) -> None:
+        """Detached finish task so iterator cleanup is never blocked on Redis.
+
+        Awaiting the finish inside the streaming hook would delay the final
+        yield to the client (FastAPI's StreamingResponse holds the generator
+        open until it returns) and risk GeneratorExit swallowing the release.
+        A detached task runs even if the hook's generator is GC'd -- the slot
+        is released whether the stream completed, errored, or had the client
+        hang up.
+
+        The task wrapper swallows every exception: a finalize-time error
+        (``Redis is down``, the registry has been hot-swapped, the model
+        request id no longer exists) is logged at exception level rather than
+        left as an unobserved task exception that would surface as
+        ``Task exception was never retrieved``.
+        """
+        async def _run() -> None:
+            try:
+                kwargs = ((request_data or {}).get("litellm_params") or {})
+                await self._finish_success(
+                    ctx, kwargs=kwargs,
+                    usage=collected or None,
+                )
+            except Exception:
+                log.exception(
+                    "stream finalize failed for request_id=%s",
+                    ctx.get("request_id"),
+                )
+        try:
+            asyncio.create_task(_run())
+        except RuntimeError:
+            # No running loop (synchronous caller, e.g. a test). Run inline.
+            try:
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(_run())
+                finally:
+                    loop.close()
+            except Exception:
+                log.exception(
+                    "stream inline finalize failed for request_id=%s",
+                    ctx.get("request_id"),
+                )
+
+    @staticmethod
+    def _absorb_chunk_usage(chunk: Any, collected: dict) -> None:
+        """Extract Anthropic usage from one streamed chunk. Never raises.
+
+        Tolerated shapes:
+
+        * ``bytes`` / ``bytearray``: raw SSE frame(s), as the provider
+          passthrough emits for ``/v1/messages``. Frames are ``\n\n``
+          terminated; each ``data:`` line carries a JSON event.
+        * ``str``: same content, decoded.
+        * ``dict``: a pre-parsed event (``message_start`` etc.). ``response.usage``
+          is checked on the dict directly so a synthetic-stream or
+          agentic-loop chunk is also covered.
+        * Pydantic model with ``model_dump``: same as dict.
+
+        Other shapes are skipped. Anything that throws while parsing is
+        swallowed at the caller (`_stream_chunks`) so a malformed chunk
+        cannot break the client stream.
+        """
+        if chunk is None:
+            return
+        if isinstance(chunk, dict):
+            _collect_anthropic_event_usage(chunk, collected)
+            return
+        if isinstance(chunk, (bytes, bytearray)):
+            try:
+                text = bytes(chunk).decode("utf-8", errors="ignore")
+            except Exception:
+                return
+        elif isinstance(chunk, str):
+            text = chunk
+        else:
+            fn = getattr(chunk, "model_dump", None)
+            if callable(fn):
+                try:
+                    dumped = fn()
+                    if isinstance(dumped, dict):
+                        _collect_anthropic_event_usage(dumped, collected)
+                except Exception:
+                    return
+            return
+        if not text:
+            return
+        # A single chunk can carry one or more `\n\n`-terminated frames. Walk
+        # each, find the `data:` line, parse the JSON event.
+        for frame in text.split("\n\n"):
+            if not frame.strip():
+                continue
+            payload: str | None = None
+            for line in frame.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("data:"):
+                    candidate = stripped[len("data:"):].strip()
+                    if candidate and candidate != "[DONE]":
+                        payload = candidate
+                    break
+            if payload is None:
+                continue
+            try:
+                event = json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(event, dict):
+                _collect_anthropic_event_usage(event, collected)
+
     async def async_post_call_failure_hook(
         self, request_data: dict, original_exception: Exception, user_api_key_dict: UserAPIKeyAuth, **_: Any
     ) -> None:
+        """Failure-side counterpart of ``async_post_call_success_hook``.
+
+        ``/v1/messages`` failures reach here (LiteLLM does NOT fire
+        ``async_log_failure_event`` for them, verified 1.101.0); OpenAI-shaped
+        routes can call BOTH hooks, in which case ``_finish_failure`` short-
+        circuits on the second arrival.
+        """
         meta = (request_data or {}).get("metadata") or {}
         ctx = meta.get(META_KEY)
         if isinstance(ctx, dict):
-            self._stop_heartbeat(ctx["request_id"])
-            await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
-            await self._handle_failure(ctx, original_exception)
+            await self._finish_failure(ctx, original_exception)
 
     async def _handle_failure(self, ctx: dict, exc: Exception | None) -> None:
         plan = self.registry.plans.get(ctx.get("plan", ""))
@@ -757,6 +1046,107 @@ def _as_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _prompt_completion_tokens(
+    response_obj: Any, usage_override: dict | None,
+) -> tuple[int, int]:
+    """Pull prompt/completion token counts out of whatever shape arrived.
+
+    Anthropic uses ``input_tokens`` / ``output_tokens`` on the ``usage`` block
+    of a buffered /v1/messages response (and the same keys appear inside
+    message_start/message_delta SSE frames). OpenAI uses
+    ``prompt_tokens`` / ``completion_tokens``. LiteLLM's chat-completion path
+    exposes both OpenAI keys. The buffered Anthropic response does not.
+
+    The streamed path passes its collected usage dict explicitly, so it does
+    not have to look up attributes on a finished object. The buffered path
+    reads ``response_obj.usage`` -- which LiteLLM serves as a dict or a pydantic
+    Usage object depending on the provider -- and tries both key names per
+    field. Cache tokens (``cache_creation_input_tokens``,
+    ``cache_read_input_tokens``) are folded into ``prompt_tokens`` here so the
+    ledger, which only knows the OpenAI shape, sees the full input cost; the
+    gateway CLI bridge and bridge wrappers already do the same conversion
+    when folding to OpenAI shape, and double-counting a cache read as a fresh
+    input is the original Anthropic-flavoured bug this preserves.
+    """
+    src: Any = usage_override
+    if src is None and response_obj is not None:
+        if isinstance(response_obj, dict):
+            src = response_obj.get("usage") or {}
+        else:
+            src = getattr(response_obj, "usage", None) or {}
+    if isinstance(src, dict):
+        prompt = int(src.get("prompt_tokens") or src.get("input_tokens") or 0)
+        completion = int(src.get("completion_tokens") or src.get("output_tokens") or 0)
+        cache_read = int(src.get("cache_read_input_tokens") or 0)
+        cache_creation = int(src.get("cache_creation_input_tokens") or 0)
+    else:
+        prompt = int(
+            getattr(src, "prompt_tokens", None)
+            or getattr(src, "input_tokens", None)
+            or 0
+        )
+        completion = int(
+            getattr(src, "completion_tokens", None)
+            or getattr(src, "output_tokens", None)
+            or 0
+        )
+        cache_read = int(getattr(src, "cache_read_input_tokens", None) or 0)
+        cache_creation = int(getattr(src, "cache_creation_input_tokens", None) or 0)
+    return prompt + cache_read + cache_creation, completion
+
+
+def _collect_anthropic_event_usage(event: dict, collected: dict) -> None:
+    """Take the totals from a single Anthropic SSE event.
+
+    ``message_start`` carries the initial input-token count on ``message.usage``;
+    a subsequent ``message_delta`` carries the running output and cache totals
+    directly on the top-level ``usage``. Both are *totals*, not deltas -- a
+    later ``message_delta`` is the latest authoritative reading, not an
+    addition. We overwrite the running figure so a fragmented stream (or a
+    provider that emits a ``message_delta`` before any tokens are counted)
+    cannot inflate the total.
+
+    The function is intentionally narrow: ``message_start`` only writes the
+    input/cache fields it actually carries, ``message_delta`` only the output/
+    cache fields it carries, and any other event type is ignored. Other call
+    shapes (text completions, embeddings, etc.) reach a different hook path.
+    """
+    typ = event.get("type")
+    if typ == "message_start":
+        msg = event.get("message") or {}
+        usage = msg.get("usage") if isinstance(msg, dict) else None
+        if isinstance(usage, dict):
+            for key in ("input_tokens", "cache_creation_input_tokens",
+                        "cache_read_input_tokens"):
+                value = usage.get(key)
+                if value is not None:
+                    try:
+                        collected[key] = int(value)
+                    except (TypeError, ValueError):
+                        pass
+            # Some providers emit output_tokens in message_start (often the
+            # ``1`` placeholder Anthropic writes for "at least one"). Preserve
+            # it; later message_delta frames overwrite with the real count.
+            value = usage.get("output_tokens")
+            if value is not None:
+                try:
+                    collected["output_tokens"] = int(value)
+                except (TypeError, ValueError):
+                    pass
+        return
+    if typ == "message_delta":
+        usage = event.get("usage")
+        if isinstance(usage, dict):
+            for key in ("output_tokens", "cache_creation_input_tokens",
+                        "cache_read_input_tokens"):
+                value = usage.get(key)
+                if value is not None:
+                    try:
+                        collected[key] = int(value)
+                    except (TypeError, ValueError):
+                        pass
 
 
 switchyard_handler = SwitchyardHandler()
