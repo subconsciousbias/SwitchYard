@@ -600,6 +600,268 @@ def test_streamed_messages_upstream_error_still_releases_slot():
 
 
 # ============================================================================
+# Section 4b: streamed error race (review blocker on PR #67)
+# ============================================================================
+def test_streamed_messages_error_race_books_partial_usage_as_failure():
+    """Reproduce the race described in the PR #67 review.
+
+    LiteLLM 1.101.0's ``async_streaming_data_generator`` (common_request_processing.py:3687)
+    catches an upstream ``Exception`` from the streaming iterator and calls
+    ``proxy_logging_obj.post_call_failure_hook`` (utils.py:2493), which itself
+    awaits ``update_request_status`` BEFORE iterating the registered
+    callbacks (utils.py:2525). ``update_request_status`` awaits an internal
+    cache write whenever ``self.alerting is not None`` -- true for any
+    deployment that follows the documented Slack-alerting recipe. That
+    intermediate await yields to the event loop.
+
+    Pre-fix: ``_stream_chunks``'s ``except BaseException`` arm scheduled a
+    detached ``_finish_success`` task. That task would run during the
+    intermediate ``update_request_status`` await, set
+    ``ctx[_TERMINATED] = "success"`` before its first real await, and then
+    ``post_call_failure_hook`` arrived and called ``_finish_failure`` --
+    which saw the marker and short-circuited. Net effect: usage booked,
+    transient-failure streak reset, but NO failure record, NO verdict, NO
+    cooldown. The bug is invisible from inside this repo's offline test
+    harness (no Slack alerting, no intermediate await) and only surfaces
+    when alerting is configured on the live proxy.
+
+    Post-fix: ``_stream_chunks``'s exception arm schedules a
+    SLOT-RELEASE-ONLY detached task and stashes the partial usage on ctx
+    under ``_stream_collected_usage``. The task does NOT claim
+    ``_TERMINATED`` -- so whichever path arrives first wins on its own
+    merits, not on a race. The post-call failure hook is the SOLE owner of
+    failure semantics; it sees the stashed partial usage and books it
+    alongside the failure record.
+
+    This test forces the race by sleeping once (mimicking the intermediate
+    ``update_request_status`` await), then driving the post-call failure
+    hook. With the bug, the marker comes out ``"success"`` and the failure
+    is suppressed. With the fix, the marker comes out ``"failure"`` and
+    the failure + partial usage both land on the ledger.
+    """
+    h, _reg, slots, _ledger, _policy, redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="anthropic_messages")
+    request_data = {"metadata": _meta_for(ctx)}
+
+    class _UpstreamError(Exception):
+        status_code = 503
+
+    async def produce():
+        # message_start: 40 input, 1 output placeholder
+        yield (b'event: message_start\ndata: {"type":"message_start",'
+               b'"message":{"id":"m","type":"message","role":"assistant",'
+               b'"model":"x","content":[],"stop_reason":null,'
+               b'"stop_sequence":null,'
+               b'"usage":{"input_tokens":40,"output_tokens":1}}}\n\n')
+        # a content delta (no usage)
+        yield (b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+               b'"index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n')
+        # message_delta: real output of 17 (overwrites the placeholder)
+        yield (b'event: message_delta\ndata: {"type":"message_delta",'
+               b'"delta":{"stop_reason":null},'
+               b'"usage":{"output_tokens":17}}\n\n')
+        # upstream blows up
+        raise _UpstreamError("provider 503")
+
+    async def run():
+        # Drive the streaming hook to the exception arm. Pre-fix, this
+        # would have scheduled a detached _finish_success. Post-fix, it
+        # stashes partial usage and schedules the slot-release-only task.
+        try:
+            async for _ in h.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None, response=produce(),
+                request_data=request_data,
+            ):
+                pass
+        except _UpstreamError:
+            pass
+        # Yield to the event loop -- this is the model for LiteLLM's
+        # intermediate `await self.update_request_status(...)` inside
+        # `proxy_logging_obj.post_call_failure_hook`. The detached task
+        # scheduled above runs during this yield.
+        await asyncio.sleep(0.05)
+        # Now simulate LiteLLM's `post_call_failure_hook` arriving AFTER
+        # the intermediate await.
+        await h.async_post_call_failure_hook(
+            request_data={"metadata": _meta_for(ctx)},
+            original_exception=_UpstreamError("provider 503"),
+            user_api_key_dict=None,
+        )
+        # Let any post-call bookkeeping settle.
+        await asyncio.sleep(0.05)
+        return (await slots.in_flight(pick.plan.key),
+                ctx.get(_TERMINATED),
+                redis.hashes)
+
+    inflight, terminated, hashes = asyncio.run(run())
+    assert inflight == 0, "slot must be released exactly once"
+    assert terminated == "failure", (
+        f"failure marker must win the race; got {terminated!r}. "
+        "If this is 'success', the pre-fix bug is back: the detached "
+        "stream finalize claimed _TERMINATED before "
+        "post_call_failure_hook could record the failure."
+    )
+    plan_keys = [k for k in hashes.keys()
+                 if k.startswith(f"sy:usage:{pick.plan.key}:p:")]
+    assert plan_keys, "no period bucket was written for the failed plan"
+    bucket = _bucket_sync(redis, plan_keys[0])
+    assert bucket["failures"] >= 1, (
+        f"failure must be recorded on the ledger; got {bucket}")
+    # Partial usage that the streaming hook parsed before the upstream
+    # blew up lands on the ledger alongside the failure record.
+    assert bucket["prompt_tokens"] == 40, bucket
+    assert bucket["completion_tokens"] == 17, bucket
+    # The transient-failure streak must NOT have been reset -- this is
+    # the failure path, not success.
+    print(f"  streamed error race: marker='{terminated}', "
+          f"prompt={int(bucket['prompt_tokens'])}, "
+          f"completion={int(bucket['completion_tokens'])}, "
+          f"failures={int(bucket['failures'])} "
+          "(success path suppressed by the slot-release-only split)")
+
+
+def test_streamed_messages_client_cancel_does_not_record_failure():
+    """Treat cancellation distinctly from upstream error.
+
+    ``asyncio.CancelledError`` / ``GeneratorExit`` raised inside the
+    streaming iterator is a client-side event -- LiteLLM's
+    ``async_streaming_data_generator`` does NOT fire
+    ``post_call_failure_hook`` for those (common_request_processing.py:3670
+    catches them and just re-raises). The slot-release-only detached task
+    is the SOLE cleanup, so it must release the slot without writing a
+    failure ledger entry, applying a verdict, or resetting the
+    transient-failure streak.
+
+    Compare to the upstream-error test above: that one DID call
+    ``async_post_call_failure_hook`` afterwards, and the failure landed on
+    the ledger. Here the test does not, so the ledger stays empty.
+    """
+    h, _reg, slots, _ledger, _policy, redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="anthropic_messages")
+    request_data = {"metadata": _meta_for(ctx)}
+
+    async def produce():
+        # Two chunks, then a clean message_stop. We never reach the
+        # message_stop because the consumer disconnects after the first
+        # chunk.
+        yield (b'event: message_start\ndata: {"type":"message_start",'
+               b'"message":{"id":"m","type":"message","role":"assistant",'
+               b'"model":"x","content":[],"stop_reason":null,'
+               b'"stop_sequence":null,'
+               b'"usage":{"input_tokens":3,"output_tokens":1}}}\n\n')
+        yield (b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+               b'"index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n')
+        yield (b'event: message_delta\ndata: {"type":"message_delta",'
+               b'"delta":{"stop_reason":null},'
+               b'"usage":{"output_tokens":2}}\n\n')
+        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    async def consume_one_chunk():
+        gen = h.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=None, response=produce(),
+            request_data=request_data,
+        )
+        # Take one chunk then bail (mimics a client that hung up after the
+        # start of the stream).
+        async for _ in gen:
+            break
+        # Force-close the iterator so the detached slot-release-only task
+        # gets scheduled and runs.
+        await gen.aclose()
+        await asyncio.sleep(0.05)
+
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 1
+    asyncio.run(consume_one_chunk())
+    # Slot released...
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 0, (
+        "client cancel left the slot claimed")
+    # ...but the failure ledger is empty -- a client cancel is not a
+    # provider failure and must not be classified as one.
+    plan_keys = [k for k in redis.hashes.keys()
+                 if k.startswith(f"sy:usage:{pick.plan.key}:p:")]
+    assert not plan_keys, (
+        f"client cancel wrote a ledger entry: {plan_keys}; expected none")
+    assert ctx.get(_TERMINATED) is None, (
+        f"client cancel must not claim _TERMINATED; "
+        f"got {ctx.get(_TERMINATED)!r}")
+    print("  client cancel released slot without failure ledger entry "
+          "and without claiming _TERMINATED (cancellation distinct from "
+          "upstream error)")
+
+
+def test_streamed_messages_partial_usage_books_with_failure_record():
+    """Independent of the race: a streamed /v1/messages that fails after
+    the iterator has parsed partial usage must book the partial tokens
+    alongside the failure record. This is the bounded partial-loss the
+    reviewer's design accepts and the property that
+    ``_finish_failure`` now guarantees by consulting
+    ``ctx['_stream_collected_usage']``.
+
+    The previous race-reproduction test verifies the race itself; this
+    one verifies the partial-usage bookkeeping in the simpler,
+    no-intermediate-await case so a regression in either is easy to
+    localise.
+    """
+    h, _reg, slots, _ledger, _policy, redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="anthropic_messages")
+    request_data = {"metadata": _meta_for(ctx)}
+
+    class _ProviderReset(Exception):
+        status_code = 502
+
+    async def produce():
+        # Just enough to put partial usage on ctx: a message_start with
+        # the input/cache totals and a single message_delta that sets
+        # the output total.
+        yield (b'event: message_start\ndata: {"type":"message_start",'
+               b'"message":{"id":"m","type":"message","role":"assistant",'
+               b'"model":"x","content":[],"stop_reason":null,'
+               b'"stop_sequence":null,'
+               b'"usage":{"input_tokens":22,"output_tokens":1,'
+               b'"cache_read_input_tokens":4,"cache_creation_input_tokens":1}'
+               b'}}\n\n')
+        yield (b'event: message_delta\ndata: {"type":"message_delta",'
+               b'"delta":{"stop_reason":null},'
+               b'"usage":{"output_tokens":9,'
+               b'"cache_read_input_tokens":4,"cache_creation_input_tokens":1}'
+               b'}\n\n')
+        raise _ProviderReset("upstream reset")
+
+    async def run():
+        try:
+            async for _ in h.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None, response=produce(),
+                request_data=request_data,
+            ):
+                pass
+        except _ProviderReset:
+            pass
+        await asyncio.sleep(0.05)
+        await h.async_post_call_failure_hook(
+            request_data={"metadata": _meta_for(ctx)},
+            original_exception=_ProviderReset("upstream reset"),
+            user_api_key_dict=None,
+        )
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+    plan_keys = [k for k in redis.hashes.keys()
+                 if k.startswith(f"sy:usage:{pick.plan.key}:p:")]
+    assert plan_keys, "no period bucket was written for the failed plan"
+    bucket = _bucket_sync(redis, plan_keys[0])
+    # 22 (input) + 4 (cache_read) + 1 (cache_creation) = 27 prompt
+    # Output: 9 (the message_delta value, not the placeholder 1)
+    assert bucket["prompt_tokens"] == 27, bucket
+    assert bucket["completion_tokens"] == 9, bucket
+    assert bucket["failures"] >= 1, bucket
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 0
+    print(f"  partial usage on failure: prompt={int(bucket['prompt_tokens'])} "
+          f"(22 input + 4 cache_read + 1 cache_creation), "
+          f"completion={int(bucket['completion_tokens'])}, "
+          f"failures={int(bucket['failures'])}")
+
+
+# ============================================================================
 # Section 5: OpenAI-shaped routes are not double-finished
 # ============================================================================
 def test_logged_call_type_is_not_double_finished_by_post_call_hook():

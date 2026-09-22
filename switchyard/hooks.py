@@ -534,6 +534,14 @@ class SwitchyardHandler(CustomLogger):
         a slot cannot be released twice when both ``async_log_failure_event``
         and ``async_post_call_failure_hook`` fire for the same request (which
         LiteLLM does for the buffered OpenAI routes on a router-level retry).
+
+        For a streamed ``/v1/messages`` that errored mid-stream, the iterator
+        stashes any partial usage it managed to parse on ctx under
+        ``_stream_collected_usage``. We book those tokens as part of the
+        failure record so a partial stream is not silently dropped on the
+        ledger -- the bounded loss the reviewer's design accepts -- and we
+        do NOT reset the transient-failure streak (this is the failure path,
+        not success). The verdict and cooldown ladder still run as usual.
         """
         if ctx.get(_TERMINATED):
             return False
@@ -546,7 +554,27 @@ class SwitchyardHandler(CustomLogger):
         # the caller's retry re-enters through async_pre_call_hook which gets
         # its own fresh pick against the cooldowns this failure just set.
         if plan:
-            await self.ledger.record(plan, failed=True, model=ctx["model"])
+            partial = ctx.get("_stream_collected_usage")
+            if isinstance(partial, dict) and partial:
+                # Partial usage means the streaming hook got at least one
+                # message_start or message_delta out before the upstream
+                # failed. Booking those tokens alongside the failure counter
+                # is the bounded partial-loss the design accepts; not
+                # resetting transient_failures is the whole point of moving
+                # the success finalize out of the iterator's exception arm.
+                prompt_tokens, completion_tokens = _prompt_completion_tokens(
+                    None, partial,
+                )
+                await self.ledger.record(
+                    plan,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cost=0.0,
+                    failed=True,
+                    model=ctx["model"],
+                )
+            else:
+                await self.ledger.record(plan, failed=True, model=ctx["model"])
         await self._handle_failure(ctx, exception)
         return True
 
@@ -654,9 +682,38 @@ class SwitchyardHandler(CustomLogger):
           the running output/cache totals). Tolerate chunks shaped as bytes,
           str, dict or pydantic objects; a malformed chunk is logged and
           skipped -- never propagated to the client.
-        * Schedule a detached task from the success, exception and cancel
-          arms so the slot is released whether the stream completes cleanly,
-          errors out, or has its consumer disconnect mid-iteration.
+        * Schedule cleanup tasks on a deterministic split:
+          - **Clean completion (else arm):** the existing
+            ``_schedule_stream_finalize`` task runs ``_finish_success``, which
+            claims the ``_TERMINATED`` marker before its first await and does
+            the slot release / ledger book / transient-failure reset /
+            throughput note / limit-header capture.
+          - **Mid-stream interruption (except BaseException arm):** a
+            slot-RELEASE-ONLY detached task frees the slot; the partial
+            usage parsed so far is stashed on ctx under
+            ``_stream_collected_usage`` so the post-call failure hook can
+            book it as part of the failure record. The iterator does NOT
+            claim ``_TERMINATED`` here, so the failure path is the sole
+            owner of failure semantics -- LiteLLM's
+            ``post_call_failure_hook`` runs ``_finish_failure`` and the
+            transient-failure streak is not reset.
+
+          The split closes the reviewer's race: with Slack alerting
+          configured, ``proxy_logging_obj.post_call_failure_hook``
+          (utils.py:2525) awaits ``update_request_status`` before iterating
+          callbacks. That intermediate await would have let the pre-fix
+          detached ``_finish_success`` claim ``_TERMINATED`` first, which
+          suppressed the failure record. The post-fix design makes the
+          failure path deterministic regardless of which event-loop turn
+          runs first.
+
+          For pure client cancellation (``asyncio.CancelledError`` /
+          ``GeneratorExit``), LiteLLM's ``async_streaming_data_generator``
+          does NOT fire ``post_call_failure_hook``
+          (common_request_processing.py:3670-3686 just re-raises); the
+          slot-release-only task is the sole cleanup, which is what we want
+          for a non-provider exit (no usage, no failure ledger entry, no
+          verdict / cooldown).
         """
         ctx = ((request_data or {}).get("metadata") or {}).get(META_KEY)
         if not isinstance(ctx, dict):
@@ -686,9 +743,21 @@ class SwitchyardHandler(CustomLogger):
                               exc_info=True)
                 yield chunk
         except BaseException:
-            self._schedule_stream_finalize(ctx, collected, request_data)
+            # Stash the partial usage for the post-call failure hook to
+            # consult. ``dict(collected)`` snapshots so a later mutation of
+            # the local cannot surprise the failure record.
+            ctx["_stream_collected_usage"] = dict(collected)
+            # Slot-release-only cleanup. Idempotent with picker.release and
+            # _stop_heartbeat so it is race-safe with whichever side of
+            # LiteLLM's proxy eventually drives the bookkeeping.
+            self._schedule_stream_slot_release(ctx, request_data)
             raise
         else:
+            # Clean completion. The success finalize claims the marker in
+            # its first synchronous step before any await, so a stray
+            # post-call failure hook (if any) sees ``_TERMINATED == "success"``
+            # and short-circuits -- preserving exactly-once across the rare
+            # double-fire case the design calls out.
             self._schedule_stream_finalize(ctx, collected, request_data)
 
     def _schedule_stream_finalize(
@@ -734,6 +803,70 @@ class SwitchyardHandler(CustomLogger):
             except Exception:
                 log.exception(
                     "stream inline finalize failed for request_id=%s",
+                    ctx.get("request_id"),
+                )
+
+    def _schedule_stream_slot_release(
+        self, ctx: dict, request_data: dict,
+    ) -> None:
+        """Detached slot-release cleanup so the iterator never strands the seat.
+
+        Scheduled from ``_stream_chunks``'s ``except BaseException`` arm,
+        which means any of: client ``CancelledError`` / ``GeneratorExit``
+        mid-iteration, an upstream ``Exception`` raised by the provider
+        iterator, or a non-Exception ``BaseException`` (rare; SystemExit).
+        The task does ONLY the slot release + heartbeat stop -- no ledger
+        record, no verdict, no usage booking, no ``_TERMINATED`` claim -- so:
+
+        * LiteLLM's ``post_call_failure_hook`` (which fires for ``Exception``
+          subclasses in ``async_streaming_data_generator``'s
+          ``except Exception`` arm) still gets to run ``_finish_failure``
+          unblocked, claim the marker, and write the failure ledger entry
+          + verdict. Without this split, the pre-fix race let the detached
+          ``_finish_success`` claim ``_TERMINATED`` during the intermediate
+          ``update_request_status`` await inside
+          ``proxy_logging.post_call_failure_hook``, suppressing the failure
+          record.
+        * ``_stop_heartbeat`` and ``picker.release`` are both idempotent
+          (zrem/hdel no-op on a missing key; ``_beats.pop`` no-op on an
+          already-cancelled task), so the task is race-safe with whichever
+          side of LiteLLM's proxy eventually drives the bookkeeping.
+        * For a client cancel where LiteLLM does NOT fire
+          ``post_call_failure_hook`` (the CancelledError / GeneratorExit
+          ``async_streaming_data_generator`` path just re-raises), the task
+          is the sole cleanup -- which is what we want: a non-provider exit
+          records neither a usage nor a failure.
+
+        The task wrapper swallows every exception: a finalize-time error
+        (``Redis is down``, the registry has been hot-swapped, the model
+        request id no longer exists) is logged at exception level rather
+        than left as an unobserved task exception that would surface as
+        ``Task exception was never retrieved``.
+        """
+        async def _run() -> None:
+            try:
+                self._stop_heartbeat(ctx["request_id"])
+                await self.picker.release(
+                    ctx["plan"], ctx["request_id"], ctx["model"],
+                )
+            except Exception:
+                log.exception(
+                    "stream slot release failed for request_id=%s",
+                    ctx.get("request_id"),
+                )
+        try:
+            asyncio.create_task(_run())
+        except RuntimeError:
+            # No running loop (synchronous caller, e.g. a test). Run inline.
+            try:
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(_run())
+                finally:
+                    loop.close()
+            except Exception:
+                log.exception(
+                    "stream inline slot release failed for request_id=%s",
                     ctx.get("request_id"),
                 )
 
