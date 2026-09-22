@@ -1384,19 +1384,40 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
 
     SESSIONS[session_id] = session
     session.new_turn()
-    asyncio.create_task(run_session(session, argv, stdin_data))
-    result = await await_turn(session, request)
-    response = render_turn(session, result, body.get("model"))
-    # Cache the rendered response so a duplicate follow-up can be answered
-    # with the same tool_calls response instead of being misread as a lost
-    # session (issue #13, defect 1). For a brand-new session, no follow-up
-    # has been minted yet so this is defensive -- _continue_followup also
-    # caches, and supersedes on rebuild.
-    session.last_response = response
-    if result["type"] != "tool_calls":
-        await end_session(session)
-    else:
-        await park_session(session)
+    try:
+        asyncio.create_task(run_session(session, argv, stdin_data))
+        result = await await_turn(session, request)
+        response = render_turn(session, result, body.get("model"))
+        # Cache the rendered response so a duplicate follow-up can be answered
+        # with the same tool_calls response instead of being misread as a lost
+        # session (issue #13, defect 1). For a brand-new session, no follow-up
+        # has been minted yet so this is defensive -- _continue_followup also
+        # caches, and supersedes on rebuild.
+        session.last_response = response
+        if result["type"] != "tool_calls":
+            await end_session(session)
+        else:
+            await park_session(session)
+    except BaseException:
+        # render_turn raises HTTPException on every CLI failure path (502,
+        # TEXT_LOST, 413, 429, ...), and a cancelled handler is also possible.
+        # Both must tear the session down: otherwise the session stays in
+        # SESSIONS holding its gate slot until the 1800 s idle reaper comes
+        # round, and four such leaks physically fill the sidecar gate (issue
+        # #80). BaseException (not Exception) catches the cancel too;
+        # end_session's `if session.dead: return` makes the call idempotent
+        # against the 499-already-reaped path that await_turn can raise when
+        # the caller has hung up. NOT a bare `finally: end_session` -- parked
+        # sessions hold no slot by design and must survive the tool_calls
+        # success path. The cleanup itself awaits cli_bridge._gate.release(),
+        # which can be interrupted by a *second* CancelledError (server-shutdown
+        # re-cancel, FastAPI lifespan teardown, ...) -- swallow anything the
+        # cleanup raises so the ORIGINAL exception still propagates and the
+        # 1800 s reaper stays the last-resort backstop if even that didn't run
+        # to completion. (PR #82 review round 1.)
+        with contextlib.suppress(BaseException):
+            await end_session(session)
+        raise
     if img_dir is not None:
         # Clean up the staging dir we own. end_session above already cleaned
         # the session workdir, which is a separate tree.
@@ -1550,6 +1571,8 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
                 headers={"Retry-After": "30"})
         log.info("resuming %s session %s after waiting %.1fs for a slot",
                  why, session_id, time.time() - waited)
+        # Slot ownership passes to start_session here; it owns the teardown
+        # contract (issue #80) on this rebuild path too.
         return await start_session(body, mcp_tools, prompt, system, model, request,
                                     image_paths, img_dir, env=env, first_turn=True)
     except Exception:
@@ -1708,19 +1731,39 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
             why="no parked call matched delivered ids")
 
     # The results are in; the model is about to run again, so take a slot back.
+    # unpark_session is deliberately OUTSIDE the try below: its 503-on-saturated-
+    # gate failure intentionally leaves the session in place for the gateway to
+    # retry (issue #13, follow-up path must queue rather than fail fast).
     await unpark_session(session)
-    session.touch()
-    await session.new_turn()
-    result = await await_turn(session, request)
-    response = render_turn(session, result, body.get("model"))
-    # Cache the rendered response so a later duplicate delivery of THIS
-    # batch's tool_call_ids can be answered with the same tool_calls response
-    # -- without this, every retry looks like a lost session and rebuilds.
-    session.last_response = response
-    if result["type"] != "tool_calls":
-        await end_session(session)
-    else:
-        await park_session(session)
+    try:
+        session.touch()
+        await session.new_turn()
+        result = await await_turn(session, request)
+        response = render_turn(session, result, body.get("model"))
+        # Cache the rendered response so a later duplicate delivery of THIS
+        # batch's tool_call_ids can be answered with the same tool_calls response
+        # -- without this, every retry looks like a lost session and rebuilds.
+        session.last_response = response
+        if result["type"] != "tool_calls":
+            await end_session(session)
+        else:
+            await park_session(session)
+    except BaseException:
+        # Same teardown contract as start_session: every CLI failure mode
+        # makes render_turn raise HTTPException, which used to escape here
+        # without running end_session -- the session stayed in SESSIONS
+        # holding its gate slot until the 1800 s idle reaper came round, and
+        # four such leaks physically filled the sidecar gate (issue #80).
+        # end_session's dead-guard makes the call idempotent against the
+        # 499-already-reaped path await_turn can raise when the caller
+        # disconnects mid-turn. NOT a bare `finally: end_session` -- parked
+        # sessions must survive the tool_calls success path. Same second-
+        # cancel hardening as start_session: swallow anything the cleanup
+        # raises so the ORIGINAL exception still propagates and the 1800 s
+        # reaper stays the last-resort backstop. (PR #82 review round 1.)
+        with contextlib.suppress(BaseException):
+            await end_session(session)
+        raise
     return response
 
 

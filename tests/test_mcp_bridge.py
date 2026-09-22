@@ -1502,6 +1502,351 @@ def test_resume_gone_returns_503_quickly_when_gate_is_full():
     print(f"  resume_gone_session bounded to RESUME_WAIT (~{SHORT}s) instead of 300s")
 
 
+# ------------------------------------------ issue #80: gate-slot leak on error ---
+def test_error_result_releases_gate_slot_and_removes_session():
+    """A CLI failure on a fresh turn must tear the session down, not leak a slot.
+
+    Before issue #80, every CLI subprocess failure path resolved the turn
+    future with `{"type": "error", ...}` and `render_turn` then raised
+    HTTPException. That exception escaped `start_session` *without* running
+    `end_session`, so the Session stayed in `SESSIONS` holding its gate slot
+    until the 1800 s idle reaper came round. Four such leaks physically
+    filled the sidecar gate, every request 429'd `sidecar at capacity`, and
+    the gateway's `ConcurrencyLearner` ratcheted the learned cap to 1.
+
+    Drives `handle_fresh` (the new-session path) end-to-end: get_weather is
+    not command-shaped so the env probe does not fire (`find_command_tool`
+    returns None and `_maybe_probe` falls through under `probe: auto`), the
+    gate has free capacity, and the stubbed `run_session` resolves the turn
+    future with a 502 error dict. The contract: HTTPException 502 propagates,
+    `gate.in_flight == 0`, `server.SESSIONS == {}`, and the captured session
+    is `dead` and `not holds_slot`.
+    """
+    ERROR = {"type": "error", "status": 502,
+             "detail": f"{server.PROVIDER} cli failed (1): boom"}
+    captured_session: dict = {}
+
+    async def scenario():
+        # Same fresh-gate reason as the 503 tests above: bind the lock/
+        # condition to this scenario's event loop, not one an earlier test
+        # used.
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+        real_run = server.run_session
+
+        async def fake_run(session, argv, stdin_data=None):
+            captured_session["session"] = session
+            session.resolve_final(ERROR)
+
+        server.run_session = fake_run
+        try:
+            body = {"model": "m",
+                    "tools": [{"type": "function", "function": {
+                        "name": "get_weather", "description": "",
+                        "parameters": {"type": "object",
+                                       "properties": {"city": {"type": "string"}},
+                                       "required": ["city"]}}}],
+                    "messages": [{"role": "user", "content": "weather in Oslo?"}]}
+            try:
+                await server.handle_fresh(body, body["tools"], None)
+            except server.HTTPException as exc:
+                assert exc.status_code == 502, exc.status_code
+                assert exc.detail == ERROR["detail"], exc.detail
+            else:
+                raise AssertionError("handle_fresh must 502 when the CLI errors")
+            return captured_session.get("session")
+        finally:
+            server.run_session = real_run
+            server.SESSIONS.clear()
+            server.SESSIONS.update(saved_sessions)
+            server.cli_bridge._gate = saved_gate
+
+    session = asyncio.run(scenario())
+    # The gate slot is back: the leak that physically filled the sidecar gate
+    # under the bug is gone.
+    assert server.cli_bridge._gate.in_flight == 0, \
+        server.cli_bridge._gate.in_flight
+    # The captured session was removed from SESSIONS, not just marked dead --
+    # the leak that filled the sidecar gate under the bug. (Earlier tests in
+    # this file leave their own parked sessions behind, so the dict is not
+    # necessarily empty as a whole; the assertion is on THIS session.)
+    assert session is not None
+    assert session.id not in server.SESSIONS, \
+        {sid: (s.dead, s.holds_slot)
+         for sid, s in server.SESSIONS.items()}
+    # end_session flipped the dead/holds_slot flags exactly as it does for the
+    # happy-path final-answer case.
+    assert session.dead, session
+    assert not session.holds_slot, session
+    print(f"  fresh turn -> 502 error; gate slot released "
+          f"(in_flight={server.cli_bridge._gate.in_flight}); session dead and gone")
+
+
+def test_text_lost_does_not_leak_a_slot():
+    """The TEXT_LOST / WS1 contract path must tear the session down too.
+
+    The gateway's `_NO_TEXT` regex classifies the 502 error detail that
+    cli_bridge / mcp_bridge emit when the CLI printed tokens but no answer.
+    Both sidecars use the same `format_no_text_detail` helper so the
+    classifier cannot drift between them (issue #64). This test pins the
+    exact byte-for-byte detail and asserts the no-leak invariants.
+
+    Same harness as the regression above; the only difference is the
+    detail string -- shaped exactly the way cli_bridge / mcp_bridge / the
+    gateway's classifier all expect.
+    """
+    detail = server.cli_bridge.format_no_text_detail(
+        server.PROVIDER, {"input_tokens": 239, "output_tokens": 22})
+    ERROR = {"type": "error", "status": 502, "detail": detail}
+    captured_session: dict = {}
+
+    async def scenario():
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+        real_run = server.run_session
+
+        async def fake_run(session, argv, stdin_data=None):
+            captured_session["session"] = session
+            session.resolve_final(ERROR)
+
+        server.run_session = fake_run
+        try:
+            body = {"model": "m",
+                    "tools": [{"type": "function", "function": {
+                        "name": "get_weather", "description": "",
+                        "parameters": {"type": "object",
+                                       "properties": {"city": {"type": "string"}},
+                                       "required": ["city"]}}}],
+                    "messages": [{"role": "user", "content": "weather in Oslo?"}]}
+            try:
+                await server.handle_fresh(body, body["tools"], None)
+            except server.HTTPException as exc:
+                # Byte-for-byte equality guards the gateway's _NO_TEXT
+                # regex classification: a single drift here would re-break
+                # the WS1 contract downstream.
+                assert exc.detail == detail, (exc.detail, detail)
+            else:
+                raise AssertionError("handle_fresh must 502 on the TEXT_LOST path")
+            return captured_session.get("session")
+        finally:
+            server.run_session = real_run
+            server.SESSIONS.clear()
+            server.SESSIONS.update(saved_sessions)
+            server.cli_bridge._gate = saved_gate
+
+    session = asyncio.run(scenario())
+    assert server.cli_bridge._gate.in_flight == 0, \
+        server.cli_bridge._gate.in_flight
+    assert session is not None
+    assert session.id not in server.SESSIONS, \
+        {sid: (s.dead, s.holds_slot)
+         for sid, s in server.SESSIONS.items()}
+    assert session.dead, session
+    assert not session.holds_slot, session
+    print(f"  TEXT_LOST detail preserved byte-for-byte ({detail!r}); "
+          f"gate slot released; session dead and gone")
+
+
+def test_followup_error_result_does_not_leak():
+    """A CLI failure mid-tool-loop must tear the parked-session->continue
+    path down, on the same contract as the fresh-turn path.
+
+    Hand-builds a parked session (`_new_session()`, park a call via
+    `register_tool_call`, consume the tool_calls turn, mark the session
+    awaiting_followup, holds_slot=False -- the parked state from
+    `test_a_parked_session_holds_no_concurrency_slot`). Then deliver a
+    real tool result for the parked call (so `_continue_followup` takes
+    the resolve path, not the rebuild path), and stub `await_turn` to
+    return a 502 error dict. The contract: HTTPException 502 propagates,
+    `gate.in_flight == 0`, the session is gone from SESSIONS, dead,
+    and `not holds_slot`.
+
+    `unpark_session` is exercised against a fresh gate with free
+    capacity, so the failure mode being tested is purely the awaited
+    turn returning an error -- not a saturated gate (the 503 path is
+    covered by `test_unpark_returns_503_quickly_when_gate_is_full`).
+    """
+    ERROR = {"type": "error", "status": 502,
+             "detail": f"{server.PROVIDER} cli failed (1): boom"}
+    captured_session: dict = {}
+
+    async def scenario():
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+
+        # Hand-build a parked session, identical pattern to
+        # test_duplicate_delivery_returns_cached_response_... /
+        # test_rebuild_supersedes_the_old_session_...
+        session = _new_session()
+        session.new_turn()
+        parked = asyncio.create_task(
+            server.register_tool_call(session.id, "get_weather",
+                                      {"city": "Oslo"}))
+        await asyncio.sleep(0)
+        turn = await session.turn_future
+        assert turn["type"] == "tool_calls", turn
+        call = turn["calls"][0]
+
+        # Park state, exactly as the happy path leaves it. Crucially, do
+        # NOT pre-resolve the parked future -- _continue_followup needs to
+        # consume it (via `call.future.set_result(...)` in the resolve
+        # branch) so the resolve loop increments and we take the
+        # unpark/new_turn/error path, not the rebuild path on a
+        # zero-resolved branch.
+        session.awaiting_followup = True
+        session.holds_slot = False
+        captured_session["session"] = session
+
+        # _continue_followup awaits `session.new_turn()` to install a new
+        # turn_future. In production the existing run_session task resolves
+        # that future when the CLI emits its next answer; here we stub
+        # await_turn to return the error dict directly, but the await on
+        # new_turn itself still has to be unblocked or the test hangs.
+        # Override new_turn on this session only so it returns an
+        # already-resolved future -- otherwise `await session.new_turn()`
+        # would hang (run_session is never started in this scenario).
+        real_new_turn = type(session).new_turn
+
+        def resolved_new_turn(self):
+            f = asyncio.get_event_loop().create_future()
+            f.set_result(ERROR)
+            self.turn_future = f
+            return f
+        type(session).new_turn = resolved_new_turn
+
+        # Stub await_turn to return an error dict directly. The handler does
+        # the unpark/new_turn dance first, so this stub short-circuits only
+        # the model-turn step -- exactly the failure mode the issue describes.
+        real_await_turn = server.await_turn
+
+        async def error_turn(sess, request):
+            return ERROR
+        server.await_turn = error_turn
+
+        try:
+            body = {"model": "m",
+                    "messages": [
+                        {"role": "tool", "tool_call_id": call.id,
+                         "content": '{"temp_c":-3}'},
+                    ]}
+            try:
+                await server._continue_followup(body, session.id,
+                                                body["messages"], None)
+            except server.HTTPException as exc:
+                assert exc.status_code == 502, exc.status_code
+                assert exc.detail == ERROR["detail"], exc.detail
+            else:
+                raise AssertionError("_continue_followup must 502 when "
+                                     "the awaited turn returns an error")
+            return session
+        finally:
+            server.await_turn = real_await_turn
+            type(session).new_turn = real_new_turn
+            server.SESSIONS.clear()
+            server.SESSIONS.update(saved_sessions)
+            server.cli_bridge._gate = saved_gate
+
+    session = asyncio.run(scenario())
+    assert server.cli_bridge._gate.in_flight == 0, \
+        server.cli_bridge._gate.in_flight
+    assert session.id not in server.SESSIONS, \
+        {sid: (s.dead, s.holds_slot)
+         for sid, s in server.SESSIONS.items()}
+    assert session.dead, session
+    assert not session.holds_slot, session
+    print(f"  follow-up turn -> 502 error; gate slot released "
+          f"(in_flight={server.cli_bridge._gate.in_flight}); session dead and gone")
+
+
+def test_rebuild_error_does_not_leak():
+    """`resume_gone_session` must tear the rebuilt session down on error too.
+
+    The rebuild path inherits the slot (acquired by `acquire_resume_slot`)
+    and hands it to `start_session`, which now owns the teardown contract
+    on the rebuild path as well. A 502 from the rebuilt CLI must release
+    the slot and remove the rebuilt session -- otherwise a stuck sidecar
+    whose CLI fails on every rebuild accumulates one slot per attempt until
+    the gate is full (issue #80 symptom, rebuild variant).
+
+    Real `resume_gone_session` with a fresh gate that has free capacity (so
+    `acquire_resume_slot` returns True and we exercise the error path,
+    not the 503 path covered by `test_resume_gone_returns_503_quickly_...`).
+    The stubbed `run_session` resolves with a 502 error dict; the rebuild
+    in `start_session` raises HTTPException(502) out of `render_turn`,
+    which the new try/except in `start_session` catches and tears down.
+    """
+    ERROR = {"type": "error", "status": 502,
+             "detail": f"{server.PROVIDER} cli failed (1): boom"}
+    captured_session: dict = {}
+
+    async def scenario():
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+        real_run = server.run_session
+
+        async def fake_run(session, argv, stdin_data=None):
+            captured_session["session"] = session
+            session.resolve_final(ERROR)
+
+        server.run_session = fake_run
+        try:
+            # Mirrors the body shape used by test_resume_gone_returns_503_...
+            # above, with a tool that does NOT fire the env probe.
+            body = {
+                "model": "m",
+                "tools": [{"type": "function", "function": {
+                    "name": "get_weather", "description": "",
+                    "parameters": {"type": "object",
+                                   "properties": {"city": {"type": "string"}},
+                                   "required": ["city"]}}}],
+                "messages": [
+                    {"role": "user", "content": "weather in Oslo?"},
+                    {"role": "tool", "tool_call_id": "call_x",
+                     "content": '{"temp_c":-3}'},
+                ],
+            }
+            try:
+                await server.resume_gone_session(
+                    body, body["tools"], "nonexistent-session-id", None,
+                    why="lost")
+            except server.HTTPException as exc:
+                assert exc.status_code == 502, exc.status_code
+                assert exc.detail == ERROR["detail"], exc.detail
+            else:
+                raise AssertionError("resume_gone_session must 502 when the "
+                                     "rebuilt CLI errors")
+            return captured_session.get("session")
+        finally:
+            server.run_session = real_run
+            server.SESSIONS.clear()
+            server.SESSIONS.update(saved_sessions)
+            server.cli_bridge._gate = saved_gate
+
+    session = asyncio.run(scenario())
+    assert server.cli_bridge._gate.in_flight == 0, \
+        server.cli_bridge._gate.in_flight
+    assert session is not None
+    assert session.id not in server.SESSIONS, \
+        {sid: (s.dead, s.holds_slot)
+         for sid, s in server.SESSIONS.items()}
+    assert session.dead, session
+    assert not session.holds_slot, session
+    print(f"  rebuild -> 502 error; gate slot released "
+          f"(in_flight={server.cli_bridge._gate.in_flight}); rebuilt session dead and gone")
+
+
 # ------------------------------------------ issue #29: argv E2BIG regression ---
 def test_an_oversized_system_prompt_goes_to_a_file_not_argv():
     """Claude's --system-prompt flag is one argv element, and MAX_ARG_STRLEN
