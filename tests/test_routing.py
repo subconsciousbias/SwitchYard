@@ -1741,6 +1741,56 @@ def test_perishable_one_adjacent_swap_reconciles_added_and_removed_refs():
           f"added+dropped: {added_and_dropped}")
 
 
+def test_every_coollable_verdict_writes_a_cooldown_key():
+    """After a verdict that should cool, sy:cool:<plan> exists. Every class.
+
+    Stated as the invariant rather than as one case on purpose: the bug it
+    guards (issue #48) was a `cooldown` that no branch ever assigned, so
+    _apply_verdict raised UnboundLocalError before reaching the write and NO
+    outcome class had ever cooled a plan. A test pinned to one outcome would
+    have looked like a single gap instead of the whole floor being missing.
+    """
+    from switchyard.classify import Outcome, Verdict
+    from switchyard.hooks import SwitchyardHandler
+
+    async def go():
+        handler = SwitchyardHandler()
+        plan = next(p for p in handler.registry.plans.values() if not p.metered)
+        cooled = {}
+        for outcome in (Outcome.TRANSIENT, Outcome.RATE_LIMITED,
+                        Outcome.QUOTA_EXHAUSTED, Outcome.CONCURRENCY,
+                        Outcome.PLAN_DEAD):
+            # A fresh Redis per class, so one class's key cannot stand in for
+            # another's and the streak ladder starts from the same place.
+            handler._redis = FakeRedis()
+            handler._slots = handler._picker = None
+            handler._ledger = handler._policy = None
+            verdict = Verdict(outcome=outcome, cooldown_seconds=120,
+                              detail=f"synthetic {outcome.value}")
+            await handler._apply_verdict(
+                plan, verdict,
+                {"request_id": f"req-{outcome.value}", "plan": plan.key,
+                 "model": plan.key + "/m", "cap": plan.max_parallel})
+            raw = await handler.redis.get(f"sy:cool:{plan.key}")
+            assert raw is not None, f"{outcome.value} left the plan uncooled"
+            cooled[outcome.value] = raw.decode() if isinstance(raw, bytes) else raw
+
+        # Our own bad request is the one thing that must NOT cool a plan.
+        handler._redis = FakeRedis()
+        handler._slots = handler._picker = None
+        handler._ledger = handler._policy = None
+        await handler._apply_verdict(
+            plan, Verdict(outcome=Outcome.BAD_REQUEST, cooldown_seconds=120),
+            {"request_id": "req-bad", "plan": plan.key, "model": plan.key + "/m"})
+        assert await handler.redis.get(f"sy:cool:{plan.key}") is None, \
+            "a bad prompt is ours, not the plan's"
+        return cooled
+
+    cooled = asyncio.run(go())
+    for outcome, value in sorted(cooled.items()):
+        print(f"  {outcome:18s} -> {value}")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_") and callable(fn):
