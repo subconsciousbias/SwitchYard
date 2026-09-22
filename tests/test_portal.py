@@ -764,10 +764,16 @@ def test_per_group_writer_writes_group_order_hash():
     the same hysteresis contract the lane-level writer has.
 
     The test seeds probe facts (pct_used + reset) on three plans and asserts
-    the stored hash carries scored refs in score-desc order. Members whose
-    plan has no probe facts are dropped from `entries` -- the writer does
-    not invent a zero score for them, matching the lane-level writer's
+    the stored hash carries scored refs in family-partition order. Members
+    whose plan has no probe facts are dropped from `entries` -- the writer
+    does not invent a zero score for them, matching the lane-level writer's
     "unknown sorts last" contract.
+
+    Family partition (issue #53): the body declares
+    `[minimax-ultra, minimax-max, grok]`. minimax appears first, so its
+    bucket leads and grok's xai bucket sorts after, regardless of raw
+    score. The within-bucket score order still puts max (more room) ahead
+    of ultra (less room) inside the minimax bucket.
     """
     import asyncio
     import time
@@ -807,8 +813,28 @@ def test_per_group_writer_writes_group_order_hash():
         order = asyncio.run(ledger.get_group_order(gid, "per-writer"))
         assert order is not None, order
         refs = [m["ref"] for m in order["members"]]
-        # max scores highest (most room), grok next, ultra last.
-        assert refs == ["minimax-max/m3", "grok/grok-4.6", "minimax-ultra/m3"], refs
+        # Family partition: minimax bucket leads (declared first in the
+        # body), xai bucket trails. Within the minimax bucket, max (more
+        # room) outranks ultra (less room) by score. Grok lands after both
+        # minimax refs even though grok's raw room beats ultra's.
+        assert refs == ["minimax-max/m3", "minimax-ultra/m3",
+                        "grok/grok-4.6"], refs
+        # Tier offset must be baked into the stored scores so the board
+        # (which reads `get_group_order` without re-partitioning) sorts
+        # the partition order verbatim. The minimax bucket leads (tier=1
+        # of 2), so both minimax refs sit above 1e9; the xai bucket
+        # trails (tier=0 of 2), so grok sits below 1e9. The picker
+        # re-partitions anyway, so a missing tier would not break the
+        # picker tests -- this assertion is the only thing that pins
+        # the offset for the board view.
+        scores = {m["ref"]: m["score"] for m in order["members"]}
+        assert scores["minimax-max/m3"] >= 1e9, scores
+        assert scores["minimax-ultra/m3"] >= 1e9, scores
+        assert scores["grok/grok-4.6"] < 1e9, scores
+        # Within the minimax bucket, raw score-desc: max (room 90) outranks
+        # ultra (room 10). Subtract the 1e9 tier to recover the raw score.
+        assert (scores["minimax-max/m3"] - 1e9) > (
+            scores["minimax-ultra/m3"] - 1e9), scores
         # Every entry carries a real score, not the default-zero fallback.
         for entry in order["members"]:
             assert entry["score"] > 0, entry

@@ -653,6 +653,63 @@ def utilization_score(room_pct: float | None, reset_at: float | None = None,
     return float(room_pct) / hours
 
 
+def family_partitioned_order(refs: list[str],
+                             config_order: list[str],
+                             family_of) -> list[str]:
+    """Reorder a score-ranked list so the score never competes across families.
+
+    The input is what the writer / picker would have produced today: scored
+    members first in score-descending order, then unscored/unknown members
+    in declared (config) order. Within a single provider family that order
+    is already what the operator wants, so the helper leaves it alone. The
+    problem only appears when a lane mixes providers from different
+    families: a high-room openai/astra with score 90 and a half-used
+    claude-max/fable with score 30 used to interleave by raw score, and an
+    openai plan briefly ahead of every claude plan in a `forge`-shaped
+    lane. That re-rank is what was costing us a quiet avalanche into a
+    foreign plan every time the perishable writer fired -- the figure at
+    issue #53.
+
+    The partition puts every ref behind a leading-family bucket whose
+    member order is the input order verbatim; the leading family is the
+    first family to appear in `config_order` (the lane body, or the
+    group's leaf refs in declaration order). Each subsequent family
+    becomes its own bucket in the same first-appearance order. The output
+    concatenates the buckets back-to-back. A single-family input returns
+    an order identical to the input -- the regression bar.
+
+    `family_of` is a `str | None` callable; a None family joins ONE shared
+    "unspecified" bucket keyed (for bucket ordering) as the empty string.
+    A non-empty string family uses the string as its bucket key directly.
+    Note: this helper does NOT validate `family_of`'s return value -- if
+    a caller returns the empty string `""` for a real family, that family
+    silently joins the unspecified bucket. The shipped Plan schema does
+    not currently enforce a non-empty family, so callers should treat
+    `None` as "unspecified" and any string (including `""`) as "this
+    family" accordingly.
+    """
+    if not refs:
+        return refs
+    refs_set = set(refs)
+    bucket_order: list[str] = []
+    for ref in config_order:
+        if ref not in refs_set:
+            continue
+        family = family_of(ref)
+        key = family if family is not None else ""
+        if key not in bucket_order:
+            bucket_order.append(key)
+    bucket_of: dict[str, list[str]] = {key: [] for key in bucket_order}
+    for ref in refs:
+        family = family_of(ref)
+        key = family if family is not None else ""
+        bucket_of.setdefault(key, []).append(ref)
+    out: list[str] = []
+    for key in bucket_order:
+        out.extend(bucket_of.get(key, []))
+    return out
+
+
 async def headroom(ledger: Ledger, plan: Plan) -> dict:
     """Headroom for every quota window, plus which one is closest to biting.
 

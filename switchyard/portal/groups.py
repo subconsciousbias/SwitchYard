@@ -5,9 +5,10 @@ flat `strategy: perishable` sugar. Explicit groups that need a score hash --
 `perishable:` and `lowest_utilization:` -- get their own writer, keyed by
 `sy:group-order:{gid}:{lane}` so the picker can read them independently for
 each group occurrence. The hysteresis / 5h gate / unscored-last semantics are
-shared: this file leans on the same `_one_adjacent_swap`, the same
-`perishable_score` and `utilization_score` plumbing, the same `stale_after_ms`
-writer. Only the key shape and the score function differ.
+shared: this file leans on the same `_one_adjacent_swap_partitioned` (and
+the underlying `_one_adjacent_swap` it calls per family bucket), the same
+`perishable_score` and `utilization_score` plumbing, the same
+`stale_after_ms` writer. Only the key shape and the score function differ.
 
 Why a separate file:
     * the picker reads `sy:group-order:{gid}:{lane}` for an explicit group,
@@ -23,7 +24,7 @@ import time
 from typing import Any
 
 from ..models import Group, Plan, Registry
-from ..usage import Ledger, perishable_score, utilization_score
+from ..usage import Ledger, family_partitioned_order, perishable_score, utilization_score
 
 
 # Maps a group strategy to the score function that ranks its members. New
@@ -121,6 +122,37 @@ def _stale_after_ms(plan: Plan | None) -> int:
     return max(60_000, int(interval) * 2000)
 
 
+# Per-family tier offset the writer adds to each `score_<ref>`. The reader
+# sorts by score desc, so a per-family tier above the actual score range
+# preserves the family partition when the picker / board reads the hash
+# back. Same constant lives in app.py for the lane-level writer; mirrored
+# here so the two writers stay in lock-step without a circular import.
+_TIER_OFFSET = 1_000_000_000.0
+
+
+def _partition_with_tier(refs: list[str], config_order: list[str],
+                         family_of) -> tuple[list[str], dict[str, int]]:
+    """Partition `refs` by family and return the partitioned list plus a
+    `{ref: tier}` mapping for the writer to encode the partition into the
+    stored score. See app.py's `_partition_with_tier` for the full rationale.
+    """
+    partitioned = family_partitioned_order(refs, config_order, family_of)
+    ref_tier: dict[str, int] = {}
+    bucket_order: list[str] = []
+    for ref in partitioned:
+        family = family_of(ref)
+        key = family if family is not None else ""
+        if key not in bucket_order:
+            bucket_order.append(key)
+    n_buckets = len(bucket_order)
+    for ref in partitioned:
+        family = family_of(ref)
+        key = family if family is not None else ""
+        bucket_idx = bucket_order.index(key)
+        ref_tier[ref] = n_buckets - 1 - bucket_idx
+    return partitioned, ref_tier
+
+
 async def recompute_group_orders(reg: Registry, ledger: Ledger) -> int:
     """Recompute `sy:group-order:{gid}:{lane}` for every explicit
     `perishable:` and `lowest_utilization:` group in the parsed tree.
@@ -135,7 +167,7 @@ async def recompute_group_orders(reg: Registry, ledger: Ledger) -> int:
     score lookup reads the same facts the lane writer already pulled, so
     the cost is one extra hash read per affected group per poll.
     """
-    from .app import _one_adjacent_swap  # local import: keeps the module standalone
+    from .app import _one_adjacent_swap_partitioned  # local import: keeps the module standalone
 
     written = 0
     for lane_key, nodes in reg.lane_nodes().items():
@@ -145,7 +177,7 @@ async def recompute_group_orders(reg: Registry, ledger: Ledger) -> int:
         for group in groups:
             await _write_group_order(
                 reg, ledger, lane_key, group, _stale_after_ms(None),
-                _one_adjacent_swap)
+                _one_adjacent_swap_partitioned)
             written += 1
     return written
 
@@ -174,6 +206,21 @@ async def _write_group_order(
     previous = await ledger.get_group_order(group.gid, lane_key)
     previous_by_ref = ({m["ref"]: m for m in previous["members"]}
                        if previous else {})
+    # Strip the previous poll's tier offset before reusing so the new
+    # tier can be added without compounding across polls. Same rationale
+    # as the lane-level writer's previous-poll step in app.py: detect
+    # the OLD tier from the stored magnitude (round(stored /
+    # _TIER_OFFSET)), not the NEW tier, so a config edit that shifts a
+    # ref between leading and trailing family does not leave the stale
+    # inflated score in the hash. The new tier is added below in
+    # `entries[...]`.
+    family_of = (lambda ref: (
+        reg.plan_of(reg.model(ref)).provider_family
+        if reg.model(ref) is not None else None))
+    if previous:
+        for prev in previous_by_ref.values():
+            stored = float(prev["score"])
+            prev["score"] = stored - round(stored / _TIER_OFFSET) * _TIER_OFFSET
 
     scored: list[tuple[str, float, bool]] = []
     unknown: list[str] = []
@@ -215,18 +262,28 @@ async def _write_group_order(
     config_position = {r: i for i, r in enumerate(leaf_refs)}
     unknown_sorted = sorted(unknown, key=lambda r: config_position.get(r, 1e9))
     desired = [r[0] for r in scored] + unknown_sorted
+    # Family partition: same rule as the lane-level writer. A score never
+    # competes across families, so a high-scoring other-family member cannot
+    # rank ahead of every leading-family member in the published hash.
+    # Bucket order = first appearance in the group's declared leaf refs.
+    # The tier offset encodes the partition into `score_<ref>` so the
+    # reader's sort-by-score-desc returns the partition order -- without
+    # it, the board (which reads via `get_group_order` without re-partition)
+    # would still see raw score-desc, not the family partition.
+    desired, ref_tier = _partition_with_tier(desired, leaf_refs, family_of)
 
     if previous is None:
         next_order = desired
     else:
         previous_refs = [m["ref"] for m in previous["members"]]
-        next_order = swap_fn(previous_refs, desired, scored_map)
+        next_order = swap_fn(previous_refs, desired, scored_map, family_of)
 
     entries: dict[str, dict] = {}
     for ref in next_order:
         if ref in scored_map:
             s, g = scored_map[ref]
-            entries[ref] = {"score": s, "gate5h": 1 if g else 0}
+            entries[ref] = {"score": ref_tier[ref] * _TIER_OFFSET + s,
+                            "gate5h": 1 if g else 0}
     await ledger.set_group_order(
         group.gid, lane_key, entries,
         computed_at=time.time(), stale_after_ms=stale_after_ms)

@@ -26,6 +26,7 @@ from ..periods import windows_remaining
 from ..usage import (
     Ledger,
     effective_cost_per_mtok,
+    family_partitioned_order,
     headroom,
     model_effective_cost_per_mtok,
     perishable_score,
@@ -244,6 +245,28 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
         previous = await ledger.get_lane_order(lane.key)
         previous_by_ref = ({m["ref"]: m for m in previous["members"]}
                            if previous else {})
+        # The previous stored scores already carry the per-family tier
+        # offset. Strip it before reusing so the current poll can add the
+        # fresh tier without compounding the offset across polls. The
+        # tier we strip is the one that WROTE the previous hash, NOT the
+        # tier this poll is about to write -- the previous bucket order
+        # may differ from the current one if a config edit has moved a
+        # ref's family between leading and trailing position, so the new
+        # tier is not the right thing to subtract. The raw score is
+        # bounded (perishable_score and utilization_score both return
+        # room_pct / hours with hours >= 1 and room_pct in [0, 100], so
+        # raw <= 100; well below the tier offset), so round(stored /
+        # _TIER_OFFSET) recovers the integer tier written by the previous
+        # poll. The new tier is added below in `entries[...]`.
+        config_refs = [m.ref for m in reg.lane_members(lane.key)
+                       if not reg.is_tail(lane.key, m.ref)]
+        family_of = (lambda ref: (
+            reg.plan_of(reg.model(ref)).provider_family
+            if reg.model(ref) is not None else None))
+        if previous:
+            for prev in previous_by_ref.values():
+                stored = float(prev["score"])
+                prev["score"] = stored - round(stored / _TIER_OFFSET) * _TIER_OFFSET
 
         scored: list[tuple[str, float, bool]] = []
         unknown: list[str] = []
@@ -291,16 +314,32 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
         unknown_sorted = sorted(unknown,
                                 key=lambda r: config_position.get(r, 1e9))
         desired = [r[0] for r in scored] + unknown_sorted
+        # Family partition: a cross-family score interleaving lets a member of
+        # any family rank ahead of every member of the leading family on a raw
+        # score basis. Issue #53's example had an openai ref briefly outrank
+        # every claude-max ref in a perishable lane -- the leading family's
+        # own ordering is what the operator configured, so the score must not
+        # cross family boundaries. Bucket order is the first appearance of each
+        # family in the lane body; within a bucket, the input order is kept.
+        # The partitioned order also drives the tier offset the writer
+        # stores into `score_<ref>`. The reader sorts by score desc, so a
+        # per-family tier above the actual score range preserves the
+        # partition when the picker / board reads the hash back.
+        desired, ref_tier = _partition_with_tier(
+            desired, config_refs, family_of)
 
         # First poll after config has no `previous`, so write the full
         # desired order. After that, reconcile toward desired with at most
         # one adjacent swap per poll so the rank drifts rather than swings.
+        # The swap now runs PER family bucket: a ref may not move across a
+        # family boundary in either direction. A single-family set produces
+        # one bucket, so its behaviour is byte-identical to today.
         if previous is None:
             next_order = desired
         else:
             previous_refs = [m["ref"] for m in previous["members"]]
-            next_order = _one_adjacent_swap(
-                previous_refs, desired, scored_map)
+            next_order = _one_adjacent_swap_partitioned(
+                previous_refs, desired, scored_map, family_of)
 
         # Tail refs always live at the end; move them there in case they
         # appear in `previous_refs` from an older writer. Tail refs are
@@ -316,7 +355,8 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
         for ref in next_order:
             if ref in scored_map:
                 s, g = scored_map[ref]
-                entries[ref] = {"score": s, "gate5h": 1 if g else 0}
+                entries[ref] = {"score": ref_tier[ref] * _TIER_OFFSET + s,
+                                "gate5h": 1 if g else 0}
             # Tail and unknown refs are intentionally NOT in `entries`:
             # the picker puts refs absent from score_by_ref in the
             # unscored bucket, which sorts after every scored member.
@@ -325,11 +365,99 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
             stale_after_ms=_stale_after_ms(plan))
 
 
+def _one_adjacent_swap_partitioned(previous: list[str], desired: list[str],
+                                   scores: dict[str, tuple[float, bool]],
+                                   family_of) -> list[str]:
+    """Reconcile `previous` toward `desired`, applying at most one adjacent
+    swap per family bucket -- never across a bucket boundary.
+
+    Bucket order is determined by first-appearance of each family in
+    `desired` (which already reflects the partition order applied
+    upstream); the swap runs against the surviving slice of `previous`
+    that falls inside each bucket and the matching slice of `desired`,
+    then concatenates the per-bucket results in bucket order. A
+    single-family input produces one bucket, so its result matches
+    `_one_adjacent_swap` exactly.
+    """
+    bucket_order: list[str] = []
+    bucket_of: dict[str, list[str]] = {}
+    for ref in desired:
+        family = family_of(ref)
+        key = family if family is not None else ""
+        if key not in bucket_of:
+            bucket_order.append(key)
+            bucket_of[key] = []
+        bucket_of[key].append(ref)
+    out: list[str] = []
+    for key in bucket_order:
+        bucket_desired = bucket_of[key]
+        bucket_desired_set = set(bucket_desired)
+        bucket_previous = [r for r in previous if r in bucket_desired_set]
+        out.extend(_one_adjacent_swap(bucket_previous, bucket_desired, scores))
+    return out
+
+
 def _as_float(v) -> float | None:
     try:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# Per-family tier offset the writer adds to each `score_<ref>`. The reader
+# sorts by score desc, so a per-family tier above the actual score range
+# preserves the family partition when the picker / board reads the hash
+# back. 1e9 is orders of magnitude larger than the perishable score (room_pct
+# is bounded by 100, hours clamped at >=1), so no within-bucket score can
+# cross into the next tier. The picker re-partitions explicitly anyway, so
+# this is also defence-in-depth rather than the only partition mechanism.
+_TIER_OFFSET = 1_000_000_000.0
+
+
+def _partition_with_tier(refs: list[str], config_order: list[str],
+                         family_of) -> tuple[list[str], dict[str, int]]:
+    """Partition `refs` by family and return the partitioned list plus a
+    `{ref: tier}` mapping for the writer to encode the partition into the
+    stored score.
+
+    Bucket order is determined by first-appearance of each family in
+    `config_order` (the same rule `family_partitioned_order` follows). The
+    leading bucket gets the HIGHEST tier so its score range sits above
+    every trailing bucket's when the reader sorts desc; trailing buckets
+    get progressively lower tiers, so within a bucket the actual score
+    range is well below the next-bucket floor and the sort returns the
+    partition order verbatim.
+    """
+    partitioned, ref_tier = _build_ref_tier(refs, config_order, family_of)
+    return partitioned, ref_tier
+
+
+def _build_ref_tier(refs: list[str], config_order: list[str],
+                    family_of) -> tuple[list[str], dict[str, int]]:
+    """Partition by family and return `(partitioned_refs, ref_tier)`.
+
+    Used by both `_partition_with_tier` (writer's new write) and the
+    previous-poll tier-strip step (writer's reuse from previous): in both
+    cases the inputs are refs and the output is the same shape, so a single
+    helper serves both. The leading bucket (first family in config order)
+    gets the highest tier so its score range sits above every trailing
+    bucket's when the reader sorts desc.
+    """
+    partitioned = family_partitioned_order(refs, config_order, family_of)
+    ref_tier: dict[str, int] = {}
+    bucket_order: list[str] = []
+    for ref in partitioned:
+        family = family_of(ref)
+        key = family if family is not None else ""
+        if key not in bucket_order:
+            bucket_order.append(key)
+    n_buckets = len(bucket_order)
+    for ref in partitioned:
+        family = family_of(ref)
+        key = family if family is not None else ""
+        bucket_idx = bucket_order.index(key)
+        ref_tier[ref] = n_buckets - 1 - bucket_idx
+    return partitioned, ref_tier
 
 
 def _stale_after_ms(plan) -> int:

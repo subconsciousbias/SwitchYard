@@ -172,12 +172,21 @@ Five strategies are available (see [issue #43](https://github.com/Fledgewing/Swi
 - **`lowest_utilization`** — visit the member with the lowest current load
   first. `lowest_utilization` is `perishable` without the hours-to-reset
   signal, so it is the right choice when probes are absent or unreliable
-  (e.g. plans whose provider does not publish quota headroom).
+  (e.g. plans whose provider does not publish quota headroom). Like
+  `perishable`, the re-rank is **per provider family**: the score never
+  competes across families, so the leading family (first appearance in
+  the lane body) ranks among itself first and other families sort behind
+  among only themselves.
 - **`perishable`** — headroom-aware ordering. The portal re-ranks each member
   after every successful probe and writes the visit order to
   `sy:group-order:{gid}`; the picker reads that key on each new session.
   Built for lanes that mix weekly subscriptions whose budget is racing the
-  reset.
+  reset. The re-rank is **per provider family**: the score never competes
+  across families. A high-room member from another provider cannot rank
+  ahead of every member of the leading family; other families keep their
+  spill role behind the leading family and rank among only themselves.
+  Bucket order follows the first appearance of each family in the lane
+  body, so the operator's declared order determines which family leads.
 
 Groups nest recursively up to depth 4, so an outer strategy can dispatch to
 inner strategies:

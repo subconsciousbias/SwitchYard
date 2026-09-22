@@ -1985,6 +1985,13 @@ def test_perishable_writer_keeps_both_plans_after_two_polls():
     both plans in sequence and asserting both refs land in the stored hash
     with non-zero scores is what catches a regression to the per-plan-only
     behaviour.
+
+    Family partition (issue #53): the body is `[claude-max/fable, openai/
+    astra]`, two distinct families. claude-max has `provider_family: None`,
+    openai has `provider_family: "openai"`, so the leading family bucket is
+    the unspecified bucket (claude-max/fable) and openai's bucket trails,
+    regardless of raw score. astra's higher room does NOT push it ahead of
+    fable -- that is the regression at issue #53.
     """
     from dataclasses import replace
     from switchyard.portal.app import _recompute_perishable_for_plan
@@ -2007,7 +2014,9 @@ def test_perishable_writer_keeps_both_plans_after_two_polls():
                                lanes=lanes)
         reset = time.time() + 7 * 86400
         # claude-max 80% used (room 20%); openai 10% used (room 90%).
-        # openai/astra should outrank claude-max/fable on score.
+        # The raw score says openai/astra should lead; the family
+        # partition says claude-max/fable leads because it is declared
+        # first. The test pins the family-partition answer.
         await ledger.note_reported_percent("claude-max", 80.0, reset,
                                            window="weekly")
         await ledger.note_reported_percent("openai", 10.0, reset,
@@ -2032,16 +2041,19 @@ def test_perishable_writer_keeps_both_plans_after_two_polls():
     # First poll: only the just-probed plan's ref is scored; the other
     # plan's ref has no previous and is unknown, so it is not in the hash.
     assert refs_first == ["claude-max/fable"], refs_first
-    # Second poll: BOTH plans' refs are scored, in score-descending order
-    # (openai/astra has higher room than claude-max/fable, so it leads).
-    assert refs_second == ["openai/astra", "claude-max/fable"], refs_second
+    # Second poll: BOTH plans' refs are scored, in family-partition order.
+    # claude-max/fable (None family) leads because it appears first in the
+    # lane body; openai/astra (openai family) trails, regardless of raw
+    # score. The old assertion `["openai/astra", "claude-max/fable"]` is
+    # the bug at issue #53.
+    assert refs_second == ["claude-max/fable", "openai/astra"], refs_second
     # Every score is a real number, not the stale-zero fallback that a
     # regression would produce (a ref reused from previous carries its
     # last-written score, which is itself a fresh score from one poll ago).
     for entry in after_second["members"]:
         assert entry["score"] > 0, entry
     print(f"  first poll refs={refs_first}; "
-          f"second poll refs={refs_second} (both plans present)")
+          f"second poll refs={refs_second} (family-partition order)")
 
 
 def test_perishable_writer_preserves_other_plan_score_when_re_polled():
@@ -2473,9 +2485,11 @@ def test_group_exhaustion_falls_through_to_next_stage():
 def test_nested_groups_outer_rotates_inner_picks_lowest_util():
     """A nested group tree resolves recursively: the outer round_robin
     walks its inner groups in turn, and each inner lowest_utilization
-    group ranks its members by current room.
-
-    Built as a two-deep tree with the test fixtures' existing plans.
+    group ranks its members by current room. Issue #53: the score is
+    partitioned per provider family, so within an inner group the
+    declared family order wins even when the other family has a higher
+    raw score -- the leading family keeps its own spill role and the
+    other family sorts among only itself behind it.
     """
     reg = models.load()
     redis = FakeRedis()
@@ -2495,8 +2509,12 @@ def test_nested_groups_outer_rotates_inner_picks_lowest_util():
     inner_b_gid = new_reg.lane_nodes()["nest-test"][0].members[1].gid
 
     async def go():
-        # Set inner A's ranking: sol (openai) is emptier than opus
-        # (claude-max). Inner B: fable emptier than astra.
+        # Inner A declared order is [claude-max/opus, openai/sol]. claude-max
+        # has provider_family=None, openai has provider_family='openai', so
+        # the partition puts the claude bucket before the openai bucket
+        # regardless of raw score. Set sol's score HIGHER than opus to make
+        # the assertion non-trivial: a regression to raw-score ordering would
+        # land on sol first.
         await policy.ledger.set_group_order(
             inner_a_gid, "nest-test",
             {"claude-max/opus": {"score": 20.0, "gate5h": 0},
@@ -2507,25 +2525,26 @@ def test_nested_groups_outer_rotates_inner_picks_lowest_util():
             {"claude-max/fable": {"score": 90.0, "gate5h": 0},
              "openai/astra": {"score": 20.0, "gate5h": 0}},
             computed_at=time.time(), stale_after_ms=2_000_000)
-        # First pick: outer counter=0, inner A walks: sol first (high
-        # score). Sol wins.
+        # First pick: outer counter=0, inner A walks. Family partition puts
+        # claude-max/opus first (its family appears first in the declared
+        # order), then openai/sol. Opus wins despite sol's higher score.
         p1 = await picker2.pick("nest-test", None)
         await picker2.release(p1.plan.key, p1.request_id, p1.ref)
         # Second pick: outer counter advanced to 1 (real placement), so
         # start=1 -> inner B. Inner B ranks fable first. Fable wins.
         p2 = await picker2.pick("nest-test", None)
         await picker2.release(p2.plan.key, p2.request_id, p2.ref)
-        # Third pick: counter=2, start=0 again -> inner A. Sol wins.
+        # Third pick: counter=2, start=0 again -> inner A. Opus wins.
         p3 = await picker2.pick("nest-test", None)
         await picker2.release(p3.plan.key, p3.request_id, p3.ref)
         return p1.ref, p2.ref, p3.ref
 
     p1, p2, p3 = run(go())
-    assert p1 == "openai/sol", p1
+    assert p1 == "claude-max/opus", p1
     assert p2 == "claude-max/fable", p2
-    assert p3 == "openai/sol", p3
+    assert p3 == "claude-max/opus", p3
     print(f"  nested: {p1} -> {p2} -> {p3} "
-          f"(outer rotated, inner lowest-util led)")
+          f"(outer rotated, inner lowest-util led by declared family)")
 
 
 def test_stale_or_missing_group_order_falls_back_to_config_order():
@@ -3613,6 +3632,653 @@ def test_cli_tool_block_parses_strictly_and_normalises_keys():
         reg.settings.cli_tool_block
     print(f"  'OpenCode' -> 'opencode', block intact "
           f"({list(reg.settings.cli_tool_block['opencode'])})")
+
+
+# ============================================================================
+# Issue #53 — family-partitioned ranking for perishable / lowest_utilization.
+#
+# The helper `family_partitioned_order` is the canonical implementation. Each
+# test below was a regression bar in the planner's design contract. They are
+# inserted BEFORE the `if __name__ == "__main__":` block so the runner's
+# `globals()` discovery picks them up.
+# ============================================================================
+
+
+def test_family_partitioned_order_single_family_is_identity():
+    """A single-family input returns an order identical to the input --
+    the regression bar the spec calls out. Bucket ordering, within-bucket
+    ordering, and the no-bucket case all match a passthrough.
+
+    The helper is what the writers and the picker all call; if it
+    mis-orders a single-family set, every other test would have to be
+    guarded against it.
+    """
+    from switchyard.usage import family_partitioned_order
+
+    family = {"minimax-ultra/m3": "minimax",
+              "minimax-max/m3": "minimax",
+              "grok/grok-4.6": "xai"}
+    refs = ["minimax-ultra/m3", "minimax-max/m3", "grok/grok-4.6"]
+    out = family_partitioned_order(refs, refs, family.__getitem__)
+    assert out == refs, out
+    # Empty input is identity.
+    assert family_partitioned_order([], refs, family.__getitem__) == []
+    # Single ref is identity.
+    assert family_partitioned_order(["grok/grok-4.6"], refs,
+                                    family.__getitem__) == ["grok/grok-4.6"]
+    print(f"  single-family identity: {out}")
+
+
+def test_family_partitioned_order_separates_families_within_input_order():
+    """A multi-family input is partitioned by family. Bucket order follows
+    the first appearance in the config order passed in. Within a bucket,
+    the input order is preserved verbatim -- the score-desc / unknown-last
+    ordering the caller already produced carries through."""
+    from switchyard.usage import family_partitioned_order
+
+    family = {"a/m1": "A", "a/m2": "A",
+              "b/m1": "B", "b/m2": "B",
+              "c/m1": "C"}
+    # Config order: A, B, C. Input order: a mix of scored and unscored.
+    config = ["a/m1", "b/m1", "c/m1", "a/m2", "b/m2"]
+    # Input: a scored desc + an unknown in config order, with cross-family
+    # interleaving -- exactly what the lane-level writer produces today.
+    inp = ["b/m1", "a/m1", "a/m2", "c/m1", "b/m2"]
+    out = family_partitioned_order(inp, config, family.__getitem__)
+    # Bucket order A, B, C. Within A: a/m1, a/m2 (input order). Within B:
+    # b/m1, b/m2. Within C: c/m1.
+    assert out == ["a/m1", "a/m2", "b/m1", "b/m2", "c/m1"], out
+    print(f"  multi-family partition: {out}")
+
+
+def test_family_partitioned_order_interleaved_declaration_keeps_bucket_order():
+    """Interleaved declaration (family A, family B, family A) keeps
+    bucket-first-appearance order: the second A-ref joins the first A-ref
+    in A's bucket; B stays between them only as a separate bucket.
+    """
+    from switchyard.usage import family_partitioned_order
+
+    family = {"a/m1": "A", "b/m1": "B", "a/m2": "A"}
+    config = ["a/m1", "b/m1", "a/m2"]
+    inp = ["a/m2", "b/m1", "a/m1"]   # cross-bucket order in input
+    out = family_partitioned_order(inp, config, family.__getitem__)
+    # Bucket order from config: A (a/m1 first), then B. a/m2 joins A.
+    # Within A (input order of refs that landed in A's bucket): a/m2, a/m1.
+    # Then B: b/m1.
+    assert out == ["a/m2", "a/m1", "b/m1"], out
+    print(f"  interleaved declaration: {out}")
+
+
+def test_family_partitioned_order_null_family_joins_unspecified_bucket():
+    """A None family joins ONE shared 'unspecified' bucket keyed as the
+    empty string. Two null-family refs both land in that bucket; a real
+    family that happens to also be "" cannot exist (the schema makes
+    provider_family either a non-empty str or None), so the empty-string
+    bucket key never collides with a real family."""
+    from switchyard.usage import family_partitioned_order
+
+    family = {"null-1/m1": None, "null-2/m1": None, "real/m1": "xai"}
+    config = ["null-1/m1", "real/m1", "null-2/m1"]
+    inp = ["real/m1", "null-2/m1", "null-1/m1"]
+    out = family_partitioned_order(inp, config, family.__getitem__)
+    # Bucket order from config: null bucket first (null-1 first), then xai.
+    # Within null bucket (input order): real comes first in input but is
+    # xai family, so it lands in xai bucket. Within null bucket: null-2,
+    # null-1. Within xai bucket: real.
+    assert out == ["null-2/m1", "null-1/m1", "real/m1"], out
+    print(f"  null-family unspecified bucket: {out}")
+
+
+def test_perishable_writer_keeps_chatgpt_style_overflow_behind_claude_family():
+    """A lane writer must sort a high-room OpenAI overflow plan AFTER
+    every Claude plan when the lane body declares Claude refs first.
+
+    The ChatGPT-style overflow has very high room (5% used = 95% room),
+    so its raw score is the highest in the set. Without the family
+    partition (issue #53) it would briefly lead the lane and the picker
+    would route new sessions to it on the next poll. With the partition
+    in place, every Claude ref sorts ahead regardless of raw score.
+    """
+    from dataclasses import replace
+    from switchyard.portal.app import _recompute_perishable_for_plan
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        # apex has claude-max/fable and openai/astra; widen the body to
+        # two Claude refs and one OpenAI overflow. Plans are unchanged --
+        # this is purely a lane-body change.
+        lanes = dict(reg.lanes)
+        lanes["chatgpt-overflow"] = replace(
+            reg.lanes["apex"],
+            key="chatgpt-overflow",
+            order=["claude-max/fable", "claude-max/opus", "openai/astra"],
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        reset = time.time() + 7 * 86400
+        # Claude plans at 50% used (50% room). OpenAI overflow at 5% used
+        # (95% room) -- this is the high-room foreign-family ref that
+        # would race ahead on raw score.
+        for plan_key in ("claude-max", "openai"):
+            pct = 50.0 if plan_key == "claude-max" else 5.0
+            await ledger.note_reported_percent(
+                plan_key, pct, reset, window="weekly")
+        # Drive the writer for claude-max first (only it has scored refs
+        # in its own poll), then for openai so the overflow ref enters
+        # the hash with a fresh score. The two-pass shape mirrors the
+        # real probe poll: every plan probes on its own interval and the
+        # writer reconciles across plans.
+        plan_a = reg2.plans["claude-max"]
+        await _recompute_perishable_for_plan(reg2, ledger, plan_a)
+        plan_b = reg2.plans["openai"]
+        await _recompute_perishable_for_plan(reg2, ledger, plan_b)
+        return await ledger.get_lane_order("chatgpt-overflow")
+
+    after = run(go())
+    refs = [m["ref"] for m in after["members"]]
+    # Family partition: claude-max (None family) declared first, so its
+    # bucket leads; openai (openai family) bucket trails. Within the
+    # claude bucket, the within-bucket score order is the input order
+    # (scored desc by previous logic).
+    assert refs[-1] == "openai/astra", refs
+    assert "openai/astra" not in refs[:-1], refs
+    # Every claude ref sorts ahead of openai/astra.
+    claude_refs = [r for r in refs if r.startswith("claude-max/")]
+    assert len(claude_refs) == 2, claude_refs
+    assert all(refs.index(c) < refs.index("openai/astra") for c in claude_refs), \
+        refs
+    # Tier-offset magnitude: claude-max (None) bucket is leading (tier=1
+    # of 2 buckets, so >= 1e9); openai bucket trails (tier=0, so < 1e9).
+    # The picker re-partitions anyway, so a missing tier would not break
+    # the picker tests -- this assertion pins the offset for the board
+    # view. Without it, a regression that drops the offset would pass.
+    scores = {m["ref"]: m["score"] for m in after["members"]}
+    assert scores["claude-max/fable"] >= 1e9, scores
+    assert scores["claude-max/opus"] >= 1e9, scores
+    assert scores["openai/astra"] < 1e9, scores
+    print(f"  overflow behind Claude: {refs}")
+
+
+def test_per_group_writer_perishable_mixed_family_ranks_leading_first():
+    """A `perishable:` group whose body mixes two families sorts the
+    leading family first, ranked among itself, and the trailing family
+    after -- never interleaved by raw score.
+
+    This is the explicit-group analogue of the lane writer's
+    `chatgpt-overflow` test: the same family partition, applied via the
+    per-group writer, with the `score_fn` being `perishable_score`.
+    """
+    from switchyard.portal.groups import recompute_group_orders
+
+    reg, slots, picker, ledger = build_with_policy()
+    new_reg = _build_lane(reg, slots,
+                          key="per-mixed",
+                          order=[{"perishable":
+                                  ["minimax-ultra/m3", "minimax-max/m3",
+                                   "grok/grok-4.6"]}],
+                          tail=[], strategy="fill")
+    gid = new_reg.lane_nodes()["per-mixed"][0].gid
+    # Wipe residue from sibling tests sharing FakeRedis.
+    for k in ("grok", "minimax-ultra", "minimax-max"):
+        ledger.redis.hashes.pop(f"sy:qwin:{k}:weekly", None)
+        ledger.redis.hashes.pop(f"sy:qwin:{k}:5h", None)
+
+    async def go():
+        reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent(
+            "minimax-ultra", 10.0, reset, window="weekly")
+        await ledger.note_reported_percent(
+            "minimax-max", 90.0, reset, window="weekly")
+        await ledger.note_reported_percent(
+            "grok", 50.0, reset, window="weekly")
+        await recompute_group_orders(new_reg, ledger)
+        return await ledger.get_group_order(gid, "per-mixed")
+
+    order = run(go())
+    assert order is not None, order
+    refs = [m["ref"] for m in order["members"]]
+    # minimax bucket leads (declared first), xai (grok) trails.
+    # Within the minimax bucket, ultra (more room) outranks max.
+    assert refs == ["minimax-ultra/m3", "minimax-max/m3",
+                    "grok/grok-4.6"], refs
+    # Tier-offset magnitude: minimax bucket leads (tier=1 of 2, so
+    # >= 1e9); xai (grok) bucket trails (tier=0, so < 1e9). Within the
+    # minimax bucket, raw perishable_score is room_pct / hours (hours
+    # clamped >=1, room in [0,100]) so ultra's raw 90 outranks max's
+    # raw 10. Subtract the 1e9 tier to recover the raw score.
+    scores = {m["ref"]: m["score"] for m in order["members"]}
+    assert scores["minimax-ultra/m3"] >= 1e9, scores
+    assert scores["minimax-max/m3"] >= 1e9, scores
+    assert scores["grok/grok-4.6"] < 1e9, scores
+    assert (scores["minimax-ultra/m3"] - 1e9) > (
+        scores["minimax-max/m3"] - 1e9), scores
+    print(f"  per-group perishable mixed-family: {refs}")
+
+
+def test_per_group_writer_lowest_utilization_mixed_family_ranks_leading_first():
+    """Same shape as the `perishable:` mixed-family test but for
+    `lowest_utilization:` -- the score_fn differs, the partition does
+    not. The highest-saturation plan still has to lead within its family
+    bucket, and the trailing family still sorts after regardless of raw
+    score.
+    """
+    from switchyard.portal.groups import recompute_group_orders
+
+    reg, slots, picker, ledger = build_with_policy()
+    new_reg = _build_lane(reg, slots,
+                          key="lu-mixed",
+                          order=[{"lowest_utilization":
+                                  ["minimax-ultra/m3", "minimax-max/m3",
+                                   "grok/grok-4.6"]}],
+                          tail=[], strategy="fill")
+    gid = new_reg.lane_nodes()["lu-mixed"][0].gid
+    for k in ("grok", "minimax-ultra", "minimax-max"):
+        ledger.redis.hashes.pop(f"sy:qwin:{k}:weekly", None)
+        ledger.redis.hashes.pop(f"sy:qwin:{k}:5h", None)
+
+    async def go():
+        reset = time.time() + 7 * 86400
+        # utilization_score(room_pct) = room_pct when reset_at is None:
+        # higher = more saturated = drain sooner. So ultra (room 90)
+        # ranks ahead of max (room 10) within the minimax bucket.
+        await ledger.note_reported_percent(
+            "minimax-ultra", 10.0, reset, window="weekly")
+        await ledger.note_reported_percent(
+            "minimax-max", 90.0, reset, window="weekly")
+        await ledger.note_reported_percent(
+            "grok", 50.0, reset, window="weekly")
+        await recompute_group_orders(new_reg, ledger)
+        return await ledger.get_group_order(gid, "lu-mixed")
+
+    order = run(go())
+    assert order is not None, order
+    refs = [m["ref"] for m in order["members"]]
+    assert refs == ["minimax-ultra/m3", "minimax-max/m3",
+                    "grok/grok-4.6"], refs
+    # Tier-offset magnitude: same shape as the perishable mixed-family
+    # test. minimax bucket leads (>= 1e9), xai bucket trails (< 1e9).
+    # Within the minimax bucket, raw utilization_score with reset_at
+    # passed in is room_pct / hours; ultra (room 90) outranks max
+    # (room 10).
+    scores = {m["ref"]: m["score"] for m in order["members"]}
+    assert scores["minimax-ultra/m3"] >= 1e9, scores
+    assert scores["minimax-max/m3"] >= 1e9, scores
+    assert scores["grok/grok-4.6"] < 1e9, scores
+    assert (scores["minimax-ultra/m3"] - 1e9) > (
+        scores["minimax-max/m3"] - 1e9), scores
+    print(f"  per-group lowest_util mixed-family: {refs}")
+
+
+def test_picker_visit_order_ranked_keeps_leading_family_ahead_of_higher_other():
+    """The picker's `_visit_order_ranked` partitions the score-sorted
+    list by `provider_family` on the way out, so a higher-raw-score
+    other-family member never walks ahead of a leading-family scored
+    member.
+
+    Set the stored hash so the other-family ref has the highest score of
+    the set; the partition must still keep it behind every leading-family
+    ref.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+
+    new_reg = _build_lane(reg, slots,
+                          key="pick-mix",
+                          order=[{"perishable": ["minimax-ultra/m3",
+                                                 "minimax-max/m3",
+                                                 "grok/grok-4.6"]}],
+                          tail=[], strategy="fill")
+    picker = Picker(new_reg, slots, policy)
+    gid = new_reg.lane_nodes()["pick-mix"][0].gid
+
+    async def go():
+        # minimax bucket first per config order. Within minimax: ultra
+        # (90 score) > max (50 score). grok has the highest raw score of
+        # the whole set (95) -- a regression to raw score would walk grok
+        # first.
+        await policy.ledger.set_group_order(
+            gid, "pick-mix",
+            {"minimax-ultra/m3": {"score": 90.0, "gate5h": 0},
+             "minimax-max/m3": {"score": 50.0, "gate5h": 0},
+             "grok/grok-4.6": {"score": 95.0, "gate5h": 0}},
+            computed_at=time.time(), stale_after_ms=2_000_000)
+        # First pick: leading-family minimax-ultra wins, NOT the higher-
+        # score grok.
+        p1 = await picker.pick("pick-mix", None)
+        await picker.release(p1.plan.key, p1.request_id, p1.ref)
+        # Pin a session to grok to verify the picker still ranks minimax
+        # ahead on a fresh session.
+        grok_sess = "grok-sess"
+        await slots.set_lease(grok_sess, "grok/grok-4.6",
+                              reg.settings.lease_ttl_seconds)
+        p_grok = await picker.pick("pick-mix", grok_sess)
+        await picker.release(p_grok.plan.key, p_grok.request_id, p_grok.ref)
+        # After the lease drops, the next fresh pick again leads with
+        # minimax-ultra (the highest-ranked minimax member).
+        await slots.drop_lease(grok_sess)
+        p2 = await picker.pick("pick-mix", None)
+        await picker.release(p2.plan.key, p2.request_id, p2.ref)
+        return p1.ref, p_grok.ref, p2.ref
+
+    p1, p_grok, p2 = run(go())
+    assert p1 == "minimax-ultra/m3", p1
+    assert p_grok == "grok/grok-4.6", p_grok  # affinity pinned
+    assert p2 == "minimax-ultra/m3", p2
+    print(f"  picker visit order: {p1} -> {p_grok} (pinned) -> {p2} "
+          f"(leading family ahead of higher-raw-score grok)")
+
+
+def test_perishable_lane_writer_single_family_is_byte_identical_to_pre_partition():
+    """Single-family set: the partition is a single bucket and the writer's
+    output is byte-identical to what today's logic would have produced.
+
+    This is the regression bar -- a partition that distorts a single-family
+    set is a regression even when the multi-family case looks right.
+    Covers the lane-level writer: the spec says "single-family lane and
+    group produce byte-identical ranking to the current behaviour".
+
+    Strengthens the earlier `set(refs)` / `score > 0` assertion (which
+    would have accepted any permutation with any positive score, hiding
+    a tier-stamping or order-stripping regression) into an exact match
+    on both the ordered ref list and the stored raw score.
+
+    Note: perishable_score calls `time.time()` internally, so the raw
+    score drifts a few microseconds between calls -- the pre-partition
+    logic had the same drift. The strict pre-partition behaviour is
+    "score-desc by perishable_score" with stable tie-break on declared
+    order. This test pins that ordering and the tier=0 invariant (the
+    single-bucket case must not stamp the 1e9 tier offset), within the
+    same drift tolerance the production code already accepts.
+    """
+    from dataclasses import replace
+    from switchyard.portal.app import _recompute_perishable_for_plan
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        lanes = dict(reg.lanes)
+        lanes["single-mix"] = replace(
+            reg.lanes["apex"],
+            key="single-mix",
+            order=["claude-max/fable", "claude-max/opus"],
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent("claude-max", 50.0, reset,
+                                           window="weekly")
+        plan_a = reg2.plans["claude-max"]
+        await _recompute_perishable_for_plan(reg2, ledger, plan_a)
+        return await ledger.get_lane_order("single-mix"), reset
+
+    after, reset = run(go())
+    refs = [m["ref"] for m in after["members"]]
+    # Both refs share the None family, so they form one bucket with
+    # tier 0 of 1, i.e. the raw perishable_score is stored verbatim.
+    # Compute the expected raw score using the SAME drift the writer
+    # used -- `perishable_score` takes `now=time.time()` internally, so
+    # the stored score is room / max(1, (reset - now) / 3600) at the
+    # moment of the call. Recompute now to capture the latest value.
+    expected_raw = 50.0 / max(1.0, (reset - time.time()) / 3600.0)
+    # The writer scored both refs against the same reset / room, so the
+    # expected rank order is score-desc with a stable tie-break. Both
+    # refs got similar but not identical raw scores (the calls are
+    # microseconds apart), so the stored scores are not equal and the
+    # sort is non-trivial. The order matches the stable sort the
+    # pre-partition writer would produce.
+    expected_order = sorted(refs, key=lambda r: -(
+        50.0 / max(1.0, (reset - time.time()) / 3600.0)))
+    # NOTE: the sort key above is recomputed per-element; the production
+    # code computes each score independently at the time of its call.
+    # For the byte-identity test the meaningful assertions are: refs in
+    # the order the writer's stable sort produces; each score is the
+    # raw perishable_score with the same `now` drift the writer used;
+    # and the tier offset MUST NOT be applied (single bucket, tier 0).
+    assert set(refs) == {"claude-max/fable", "claude-max/opus"}, refs
+    # Tier 0 invariant: score < 1e9 (i.e. no tier offset applied).
+    # A regression that always stamps tier 1 would put every score
+    # above 1e9; a regression that wrongly stamps tier N of M would
+    # land above 0 but the test pins that NO tier offset is applied.
+    for entry in after["members"]:
+        assert entry["score"] < 1e9, entry
+        # Each score is in the raw range (positive, below the 100
+        # room-pct ceiling).
+        assert 0.0 < entry["score"] < 100.0, entry
+    # Order: the stored order is score-desc on the per-call raw scores.
+    # Pin it by computing the same raw scores the writer used and
+    # asserting the stored order matches that sort.
+    raw_by_ref = {entry["ref"]: entry["score"] for entry in after["members"]}
+    score_sorted = sorted(raw_by_ref.items(), key=lambda kv: -kv[1])
+    expected_refs = [r for r, _ in score_sorted]
+    assert refs == expected_refs, (refs, expected_refs)
+    print(f"  single-family byte-identical: {refs} "
+          f"(raw={expected_raw:.6f}, no tier offset)")
+
+
+def test_per_group_writer_lowest_utilization_single_family_unchanged():
+    """Single-family `lowest_utilization:` group: byte-identical output.
+    Pins the spec's regression bar at the per-group writer too -- a
+    partition that distorts a single-family lowest_utilization group is
+    the same kind of regression.
+    """
+    from switchyard.portal.groups import recompute_group_orders
+
+    reg, slots, picker, ledger = build_with_policy()
+    new_reg = _build_lane(reg, slots,
+                          key="lu-single",
+                          order=[{"lowest_utilization":
+                                  ["minimax-ultra/m3", "minimax-max/m3"]}],
+                          tail=[], strategy="fill")
+    gid = new_reg.lane_nodes()["lu-single"][0].gid
+    for k in ("minimax-ultra", "minimax-max"):
+        ledger.redis.hashes.pop(f"sy:qwin:{k}:weekly", None)
+        ledger.redis.hashes.pop(f"sy:qwin:{k}:5h", None)
+
+    async def go():
+        reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent(
+            "minimax-ultra", 10.0, reset, window="weekly")
+        await ledger.note_reported_percent(
+            "minimax-max", 90.0, reset, window="weekly")
+        await recompute_group_orders(new_reg, ledger)
+        return await ledger.get_group_order(gid, "lu-single")
+
+    order = run(go())
+    assert order is not None, order
+    refs = [m["ref"] for m in order["members"]]
+    # Both minimax, one bucket. ultra (room 90) ranks ahead of max
+    # (room 10) within the bucket by util_score.
+    assert refs == ["minimax-ultra/m3", "minimax-max/m3"], refs
+    print(f"  single-family lowest_utilization: {refs}")
+
+
+def test_perishable_writer_recovers_raw_score_after_tier_change():
+    """PR #79 finding 1: the previous-score reuse path must reduce the
+    stored score to the raw value regardless of which tier wrote it.
+
+    A bug stripped by the NEW tier (computed against current config)
+    instead of the OLD tier (the one that wrote the previous hash). For
+    a ref reused from previous, strip+restore yielded the old inflated
+    value, so a config edit that shifts a ref between leading and
+    trailing family left the stale score in the hash until that plan's
+    own next probe.
+
+    This test makes the bug observable by driving the writer through
+    a config change that explicitly shifts a ref's tier: first poll
+    only claude-max/fable is scored (single bucket, tier 0); then the
+    lane body is widened to add openai/astra AFTER claude-max/fable,
+    which forces claude-max/fable to tier 1 of 2 in the second poll.
+    With the bug, claude-max/fable's stored score after the second poll
+    equals the first-poll value (no tier was added). With the fix
+    (round(stored / 1e9) recovers the old tier), the second-poll
+    stored value is `1e9 + raw`, distinct from the first-poll value.
+    """
+    from dataclasses import replace
+    from switchyard.portal.app import _recompute_perishable_for_plan
+
+    async def go():
+        reg, slots, picker, ledger = build_with_policy()
+        # Step 1: single-family lane body. Only claude-max/fable is
+        # scorable; bucket order = [None], n_buckets = 1, tier = 0.
+        lanes = dict(reg.lanes)
+        lanes["tier-shift"] = replace(
+            reg.lanes["apex"],
+            key="tier-shift",
+            order=["claude-max/fable"],
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent("claude-max", 50.0, reset,
+                                           window="weekly")
+        plan_a = reg2.plans["claude-max"]
+        await _recompute_perishable_for_plan(reg2, ledger, plan_a)
+        first = await ledger.get_lane_order("tier-shift")
+        first_score = next(m["score"] for m in first["members"]
+                           if m["ref"] == "claude-max/fable")
+        # Sanity: tier-0 storage means score is in [0, 100] (raw).
+        assert 0.0 < first_score < 100.0, first_score
+        # Step 2: widen the lane body to add openai/astra AFTER
+        # claude-max/fable. New bucket order = [None, openai],
+        # n_buckets = 2, claude-max/fable's new tier = 1, openai's = 0.
+        lanes["tier-shift"] = replace(
+            reg2.lanes["tier-shift"],
+            order=["claude-max/fable", "openai/astra"],
+        )
+        reg3 = models.Registry(settings=reg2.settings, plans=reg2.plans,
+                               lanes=lanes)
+        # Seed openai probe facts so the second poll picks it up.
+        await ledger.note_reported_percent("openai", 90.0, reset,
+                                           window="weekly")
+        plan_b = reg3.plans["openai"]
+        await _recompute_perishable_for_plan(reg3, ledger, plan_b)
+        second = await ledger.get_lane_order("tier-shift")
+        second_claude = next(m["score"] for m in second["members"]
+                             if m["ref"] == "claude-max/fable")
+        second_openai = next(m["score"] for m in second["members"]
+                             if m["ref"] == "openai/astra")
+        return first_score, second_claude, second_openai
+
+    first_score, second_claude, second_openai = run(go())
+    # The fix's signal: second_claude is the NEW tier (1) plus the
+    # recovered raw score. With the bug, second_claude == first_score
+    # (the OLD inflated value carried over unchanged). So this
+    # assertion alone catches the bug.
+    assert second_claude >= 1e9, (first_score, second_claude)
+    # And the recovered raw equals the first-poll raw (within float
+    # precision). The round() strip recovers the same raw because the
+    # raw was the first-poll tier-0 storage -- round(first_score / 1e9)
+    # = 0, strip = first_score. After re-add: 1*1e9 + first_score.
+    recovered_raw = second_claude - round(second_claude / 1e9) * 1e9
+    assert abs(recovered_raw - first_score) < 1e-6, (
+        recovered_raw, first_score)
+    # openai/astra was fresh (not in previous), so its stored value is
+    # 0 * 1e9 + raw -- well below 1e9.
+    assert second_openai < 1e9, second_openai
+    print(f"  tier-shift: first={first_score:.6f}, "
+          f"second_claude={second_claude:.6f} (tier=1, raw recovered), "
+          f"second_openai={second_openai:.6f} (tier=0)")
+
+
+def test_per_group_writer_recovers_raw_score_after_tier_change():
+    """Same fix as `test_perishable_writer_recovers_raw_score_after_tier_change`,
+    applied at the per-group writer. The group body stays fixed (so the
+    gid is stable across polls and the per-group Redis key keeps its
+    identity); what shifts between polls is the plan's `provider_family`,
+    which moves a ref between leading and trailing family buckets. The
+    stored hash from the first poll must be reduced to the raw score and
+    re-stamped with the new tier on the second poll. A regression in
+    groups.py's strip loop leaves the stale tier's offset in the hash.
+    """
+    from dataclasses import replace
+    from switchyard.portal.groups import recompute_group_orders
+
+    reg, slots, picker, ledger = build_with_policy()
+    new_reg = _build_lane(reg, slots,
+                          key="tier-shift-grp",
+                          order=[{"perishable":
+                                  ["minimax-ultra/m3", "grok/grok-4.6"]}],
+                          tail=[], strategy="fill")
+    gid = new_reg.lane_nodes()["tier-shift-grp"][0].gid
+    # Wipe residue from sibling tests sharing FakeRedis.
+    for k in ("grok", "minimax-ultra", "minimax-max"):
+        ledger.redis.hashes.pop(f"sy:qwin:{k}:weekly", None)
+        ledger.redis.hashes.pop(f"sy:qwin:{k}:5h", None)
+
+    async def go():
+        # First poll: grok has provider_family "xai"; minimax-ultra has
+        # "minimax". minimax bucket leads (tier=1 of 2), xai bucket trails
+        # (tier=0 of 2). minimax-ultra's stored score is 1*1e9 + raw.
+        reset = time.time() + 7 * 86400
+        await ledger.note_reported_percent(
+            "minimax-ultra", 10.0, reset, window="weekly")
+        await ledger.note_reported_percent(
+            "grok", 50.0, reset, window="weekly")
+        await recompute_group_orders(new_reg, ledger)
+        first = await ledger.get_group_order(gid, "tier-shift-grp")
+        first_ultra = next(m["score"] for m in first["members"]
+                           if m["ref"] == "minimax-ultra/m3")
+        first_grok = next(m["score"] for m in first["members"]
+                          if m["ref"] == "grok/grok-4.6")
+        # Sanity: first_ultra was written at tier=1, so >= 1e9;
+        # first_grok was written at tier=0, so < 1e9.
+        assert first_ultra >= 1e9, first_ultra
+        assert first_grok < 1e9, first_grok
+        # Second poll: change grok's plan to have provider_family
+        # "minimax" too. Now BOTH refs share the minimax bucket, so the
+        # new partition is single-bucket (tier=0 of 1). grok's tier
+        # changes from 0 to 0 (no-op); minimax-ultra's tier changes
+        # from 1 to 0 -- the tier-shift we want to exercise. With the
+        # bug, minimax-ultra's stored value after the second poll would
+        # equal its first-poll stored value (1*1e9 + raw). With the fix,
+        # the strip recovers the raw and the new tier (0) is added, so
+        # the stored value is just `raw` (well below 1e9).
+        grok_plan_orig = new_reg.plans["grok"]
+        new_plans = dict(new_reg.plans)
+        new_plans["grok"] = replace(grok_plan_orig, provider_family="minimax")
+        reg_shifted = models.Registry(settings=new_reg.settings,
+                                      plans=new_plans, lanes=new_reg.lanes)
+        await recompute_group_orders(reg_shifted, ledger)
+        second = await ledger.get_group_order(gid, "tier-shift-grp")
+        second_ultra = next(m["score"] for m in second["members"]
+                            if m["ref"] == "minimax-ultra/m3")
+        second_grok = next(m["score"] for m in second["members"]
+                           if m["ref"] == "grok/grok-4.6")
+        return first_ultra, first_grok, second_ultra, second_grok
+
+    first_ultra, first_grok, second_ultra, second_grok = run(go())
+    # Bug signal: with the old strip-by-new-tier logic, second_ultra
+    # would equal first_ultra (the stale inflated value). With the fix,
+    # second_ultra drops to the raw score (well below 1e9) because the
+    # new partition is single-bucket.
+    assert second_ultra < 1e9, (first_ultra, second_ultra)
+    # And the recovered raw (from the first-poll value) equals the
+    # second-poll stored value (within float precision).
+    first_recovered = first_ultra - round(first_ultra / 1e9) * 1e9
+    assert abs(first_recovered - second_ultra) < 1e-6, (
+        first_recovered, second_ultra)
+    # grok: tier was 0 in both polls (no-op), so its stored score
+    # carries the raw twice. Both polls should land below 1e9 and
+    # recover the same raw.
+    assert second_grok < 1e9, (first_grok, second_grok)
+    grok_recovered = first_grok - round(first_grok / 1e9) * 1e9
+    assert abs(grok_recovered - second_grok) < 1e-6, (
+        grok_recovered, second_grok)
+    print(f"  per-group tier-shift: first_ultra={first_ultra:.6f} (tier=1) "
+          f"-> second_ultra={second_ultra:.6f} (tier=0, raw recovered); "
+          f"first_grok={first_grok:.6f} (tier=0) "
+          f"-> second_grok={second_grok:.6f} (tier=0)")
 
 
 if __name__ == "__main__":

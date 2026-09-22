@@ -12,6 +12,7 @@ from .models import Group, Model, Plan, Registry
 from .policy import CapacityPolicy
 from .slots import SlotTable
 from .usage import (
+    family_partitioned_order,
     perishable_score,
     reported_is_current,
     utilization_score,
@@ -417,6 +418,14 @@ class Picker:
         recursion carries the same scoring contract into the inner group.
         The hash key for the score lookup is the FIRST leaf ref reachable
         from each member (refs sit at the leaves in the shipped example).
+
+        Family partition: when the hash is present, the score-sorted list is
+        re-ordered so the score never competes across `provider_family`
+        boundaries. Without this, a fresh-pinned other-family member with a
+        higher raw score would walk ahead of every leading-family member
+        (issue #53). Bucket order is first-appearance of each family in the
+        group's declared member order. A stale/missing hash skips the
+        partition and walks the declared order unchanged.
         """
         order = await self._read_group_order(group, ctx.lane)
         members = list(group.members)
@@ -451,7 +460,31 @@ class Picker:
             # actually owned) is the smallest fix that honours the contract
             # the eager `gate5h` recording below already promises the board:
             # a gated ref never lands on the wire, regardless of nesting.
-            ranked = [n for n, (_s, gated) in scored if not gated] + unscored
+            ranked_nodes = (
+                [n for n, (_s, gated) in scored if not gated] + unscored)
+            # Re-order by family so the score never crosses family boundaries.
+            # `node_key` resolves a member node to a single ref-key (the same
+            # first-leaf the score lookup uses); the family is then read off
+            # that ref's plan. A node with no first leaf (empty group) is
+            # passed through the partition via an empty-string key, which
+            # the helper joins with the unspecified-bucket family rather
+            # than crashing on a None model lookup.
+            def _node_key(node):
+                leaf = _first_leaf(node)
+                return leaf if leaf is not None else ""
+            def _family_for_key(key):
+                if not key:
+                    return None
+                model = self.registry.model(key)
+                if model is None:
+                    return None
+                return self.registry.plan_of(model).provider_family
+            config_refs = [_node_key(m) for m in members]
+            ranked_keys = [_node_key(n) for n in ranked_nodes]
+            partitioned_keys = family_partitioned_order(
+                ranked_keys, config_refs, _family_for_key)
+            key_to_node = {_node_key(n): n for n in ranked_nodes}
+            ranked = [key_to_node[k] for k in partitioned_keys]
             # Eagerly record gated refs before the walk so a higher-ranked
             # peer's success does not hide the gate on the board. The walk
             # itself now skips them (see the filter above), so this is purely
