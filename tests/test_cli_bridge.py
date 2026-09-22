@@ -542,6 +542,64 @@ def test_e2big_from_the_spawn_is_413_and_other_spawn_errors_are_502():
     print(f"  E2BIG -> 413, other spawn OSError -> 502 (no 500 leak)")
 
 
+def test_the_claude_file_flags_carry_an_oversized_system_prompt():
+    """The context manager's claude paths, which the opencode default never reaches.
+
+    tests here run PROVIDER=opencode, whose profile has no file-args keys, so
+    every other test exercises at most the no-op yield. Reload with
+    PROVIDER=claude -- the same env-swap pattern _read_for uses -- to drive
+    the real profile through all three branches: append-form file flag,
+    replace-form file flag with --exclude-dynamic-system-prompt-sections,
+    and the strict no-fallback when replace mode has no replace-form key
+    (an override must never quietly become a stack-up; issue #29 review).
+    """
+    import _modules
+    from pathlib import Path
+
+    old = dict(os.environ)
+    os.environ.update({"PROVIDER": "claude"})
+    os.environ.pop("SYSTEM_MODE", None)
+    os.environ.pop("SWITCHYARD_PLAN", None)
+    try:
+        mod = _modules.reload(server)
+        huge = "s" * (mod.STDIN_PROMPT_LIMIT + 10)
+
+        # Append mode: --append-system-prompt-file, temp file unlinked after.
+        with mod.system_prompt_file(huge) as (args, system):
+            assert system is None, "the file path must consume the system text"
+            assert args[0] == "--append-system-prompt-file", args
+            path = Path(args[1])
+            assert path.read_text() == huge + "\n", "file must carry the caller's text"
+        assert not path.exists(), "temp file must be unlinked when the with block exits"
+
+        # Replace mode: --system-prompt-file plus --exclude-dynamic-system-
+        # prompt-sections -- the load-bearing detail: replace_extra_args must
+        # ride the file path too, or replace mode would stop stripping the
+        # CLI's injected sections.
+        os.environ["SYSTEM_MODE"] = "replace"
+        mod = _modules.reload(server)
+        with mod.system_prompt_file(huge) as (args, system):
+            assert system is None
+            assert args[0] == "--system-prompt-file", args
+            assert args[2] == "--exclude-dynamic-system-prompt-sections", args
+            assert Path(args[1]).read_text() == huge + "\n"
+
+        # Replace mode with no replace-form key: unchanged yield, never the
+        # append form.
+        saved = mod.PROFILE.pop("system_file_args_replace")
+        try:
+            with mod.system_prompt_file(huge) as (args, system):
+                assert args == [] and system == huge, (args, system[:40])
+        finally:
+            mod.PROFILE["system_file_args_replace"] = saved
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+        _modules.reload(server)
+    print("  claude file flags: append + replace(+extras) covered; "
+          "replace without the key stays no-op; temp files cleaned up")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

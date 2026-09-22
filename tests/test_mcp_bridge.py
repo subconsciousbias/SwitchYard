@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import http.server
 import json
 import os
@@ -1413,6 +1414,11 @@ def test_an_oversized_system_prompt_goes_to_a_file_not_argv():
     assert "--system-prompt" in argv2, argv2
     assert "be terse" in argv2, argv2
     assert "--system-prompt-file" not in argv2, argv2
+
+    # The claimed lifecycle, closed: the workdir (and the file in it) must
+    # actually be reclaimed, not merely created.
+    server.cleanup_workdir(workdir)
+    assert not spath.exists(), "cleanup_workdir must reclaim system-prompt.md with the workdir"
     print(f"  {len(huge)}-char system prompt -> {spath.name}; small system prompt still inline")
 
 
@@ -1425,8 +1431,6 @@ def test_e2big_from_the_spawn_is_413():
     would tell the router this is a transient blip and burn retries on a
     request that will never fit.
     """
-    import errno
-
     async def scenario():
         session = _new_session()
         session.new_turn()
