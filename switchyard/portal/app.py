@@ -29,6 +29,7 @@ from ..usage import (
     family_partitioned_order,
     headroom,
     model_effective_cost_per_mtok,
+    model_effective_cost_per_session,
     perishable_score,
     reported_is_current,
 )
@@ -601,6 +602,19 @@ async def collect_plans() -> list[dict]:
         model_overview = await ledger.model_overview(
             plan.key, model_refs, month
         ) if model_refs else {}
+        # Distinct sessions this month for the plan as a whole (the UNION of
+        # per-model HLLs, not the sum). The subscription rate
+        # `monthly_cost / plan_sessions` is sensitive to this denominator --
+        # summing per-model cardinalities would double-count any session
+        # that touched multiple models of one plan (e.g. mid-loop spillover
+        # between two configured models) and understate the published
+        # $/session for every model of a subscription plan. model_overview
+        # surfaces the same value on every row's `plan_n_sessions`, so we
+        # read it once from the first ref; an empty plan has no models to
+        # ask, defaulting to 0.
+        plan_sessions = (
+            model_overview[model_refs[0]]["plan_n_sessions"]
+            if model_refs else 0)
         model_rows = []
         for m in plan.models.values():
             overview = model_overview.get(m.ref, {})
@@ -625,11 +639,21 @@ async def collect_plans() -> list[dict]:
                                                  "tokens_per_hour": 0.0},
                 "month_tokens": overview.get("month_tokens", 0.0),
                 "month_cost": overview.get("month_cost", 0.0),
+                "n_sessions": overview.get("n_sessions", 0),
                 "eff_cost": model_effective_cost_per_mtok(
                     plan,
                     overview.get("month_tokens", 0.0),
                     overview.get("month_cost", 0.0),
                     month_tokens,
+                ),
+                "eff_cost_session": (
+                    model_effective_cost_per_session(
+                        plan,
+                        overview.get("n_sessions", 0),
+                        overview.get("month_cost", 0.0),
+                        plan_sessions,
+                    )
+                    if reg.settings.show_cost_per_session else None
                 ),
             })
         pace = await policy.pace_state(plan) if await policy.plan_is_paced(plan) else None

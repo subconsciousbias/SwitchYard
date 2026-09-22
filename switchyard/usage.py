@@ -47,6 +47,11 @@ K_DAY = "sy:usage:{plan}:d:{day}"
 # be queried without touching the plan-level burn rate, pacing or headroom.
 K_M_HOUR = "sy:usage:{plan}:m:{model}:h:{hour}"
 K_M_DAY = "sy:usage:{plan}:m:{model}:d:{day}"
+# Per-model sessions-this-month: an HLL keyed by model ref so PFCOUNT returns
+# the number of distinct sessions that model served this month. One session
+# counted once regardless of how many requests it made -- a re-leased model
+# on the same session is a free PFADD, the HLL stays at the same cardinality.
+K_M_SMONTH = "sy:usage:{plan}:m:{model}:sp:{period}"
 K_QUOTA = "sy:quota:{plan}"                 # plan-level facts
 K_WINDOW = "sy:qwin:{plan}:{window}"        # per-window facts (observed allowance)
 # Per-lane ordering written by the portal's probe poller and read on the pick
@@ -85,6 +90,7 @@ class Ledger:
         cost: float = 0.0,
         failed: bool = False,
         model: str | None = None,
+        session: str | None = None,
     ) -> None:
         now = _now()
         # One bucket per quota window: a plan with a 5-hour *and* a weekly
@@ -115,6 +121,15 @@ class Ledger:
             if failed:
                 pipe.hincrbyfloat(key, "failures", 1)
             pipe.expire(key, ttl)
+        # Sessions-this-month HLL: counted on success only (failure paths pass
+        # no session), one PFADD per session -- the HLL dedupes naturally, so
+        # a session that re-leases the same model across many requests still
+        # shows up as exactly one session in the month's PFCOUNT.
+        if model and session and not failed:
+            s_month = K_M_SMONTH.format(plan=plan.key, model=model,
+                                        period=now.strftime("%Y-%m"))
+            pipe.pfadd(s_month, session)
+            pipe.expire(s_month, 400 * 86400)
         await pipe.execute()
 
     @staticmethod
@@ -186,10 +201,31 @@ class Ledger:
         pipe = self.redis.pipeline()
         for _, _, key in reads:
             pipe.hgetall(key)
+        # Trailing HLL reads: the per-model PFCOUNTs and one plan-level
+        # union PFCOUNT. The queue order is captured in `trailing` so
+        # decoding is a single zip against the slice of results after the
+        # hash reads -- never an arithmetic offset that a future op
+        # appended after these would silently mis-attribute.
+        trailing: list[tuple[str, str | None]] = []
+        for ref in model_refs:
+            trailing.append(("model", ref))
+            pipe.pfcount(K_M_SMONTH.format(
+                plan=plan_key, model=ref, period=month))
+        # Plan-level PFCOUNT: the union of every per-model HLL, returned by
+        # Redis as a single integer. Sums of per-model cardinalities would
+        # double-count any session that touched more than one model of this
+        # plan (e.g. mid-loop spillover between two configured models), and
+        # the subscription rate `monthly_cost / plan_sessions` is sensitive to
+        # that denominator -- an over-counted plan_sessions understates the
+        # board's $/session for every model of a subscription plan.
+        trailing.append(("plan", None))
+        pipe.pfcount(*[K_M_SMONTH.format(
+            plan=plan_key, model=ref, period=month) for ref in model_refs])
         raw = await pipe.execute()
 
         out = {ref: {"burn": {"cost_per_hour": 0.0, "tokens_per_hour": 0.0},
-                     "month_tokens": 0.0, "month_cost": 0.0}
+                     "month_tokens": 0.0, "month_cost": 0.0,
+                     "n_sessions": 0, "plan_n_sessions": 0}
                for ref in model_refs}
         for (ref, kind, _), r in zip(reads, raw):
             b = self._decode_bucket(r)
@@ -200,7 +236,18 @@ class Ledger:
             else:
                 row["month_cost"] += b["cost"]
                 row["month_tokens"] += b["prompt_tokens"] + b["completion_tokens"]
+        plan_n_sessions = 0
+        for (kind, ref_or_none), count in zip(trailing, raw[len(reads):]):
+            count = int(count or 0)
+            if kind == "model":
+                out[ref_or_none]["n_sessions"] = count
+            else:  # "plan"
+                plan_n_sessions = count
+        # Surface plan_n_sessions on every row -- same value everywhere, but
+        # keeps the per-model dict self-contained so callers don't need a
+        # special-case lookup path.
         for row in out.values():
+            row["plan_n_sessions"] = plan_n_sessions
             row["burn"]["cost_per_hour"] /= hours
             row["burn"]["tokens_per_hour"] /= hours
         return out
@@ -848,3 +895,51 @@ def model_effective_cost_per_mtok(
     if spend <= 0:
         return 0.0
     return round(spend / (model_tokens / 1_000_000), 4)
+
+
+# Thresholds for `model_effective_cost_per_session`. Hardcoded for the same
+# reason `model_effective_cost_per_mtok` is: the numbers are operator-facing
+# board values, not knobs, and a missing-threshold path that returns a wrong
+# rate is worse than admitting the answer is unknown.
+SESSION_MIN_SUBSCRIPTION = 50
+SESSION_MIN_METERED = 100
+
+
+def model_effective_cost_per_session(
+    plan: Plan, n_sessions: float, model_cost: float, plan_sessions: float,
+) -> float | None:
+    """Per-model effective $/session.
+
+    A session here is the unit of work SwitchYard actually meters on the
+    board: one CLI / API caller carrying a stable lease. A subscription
+    charges one fee for the month and serves N sessions; the fee allocated
+    to a model is fee * model_sessions / plan_sessions, and the share cancels
+    in the per-session division -- rate = plan.monthly_cost / plan_sessions,
+    the plan's own rate, shown to every model once the PLAN clears the
+    subscription threshold. A metered plan charges the model's own spend
+    divided by its own session count.
+
+    Gating, in order: no sessions -> None (no work to price); subscription
+    under its threshold -> None (the plan's own rate would divide by too
+    few sessions to mean anything); metered under its threshold -> None;
+    spend <= 0 -> 0.0; else rounded to 4 decimals.
+    """
+    if n_sessions <= 0:
+        return None
+    if plan.metered:
+        if n_sessions < SESSION_MIN_METERED:
+            return None
+        if model_cost <= 0:
+            return 0.0
+        return round(model_cost / n_sessions, 4)
+    # Subscription: rate is plan-level (the per-model share cancels), so
+    # model_cost is unused -- fee / plan_sessions directly. The original
+    # round-trip cancel (fee * n / plan_sessions, then /n) produced the
+    # same number with one multiply and one divide that a reader has to
+    # verify; the form here is the one the docstring already states.
+    if plan_sessions < SESSION_MIN_SUBSCRIPTION:
+        return None
+    fee = plan.monthly_cost or 0.0
+    if fee <= 0:
+        return 0.0
+    return round(fee / plan_sessions, 4)

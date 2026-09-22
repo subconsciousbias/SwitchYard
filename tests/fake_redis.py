@@ -29,6 +29,16 @@ class FakePipeline:
     def incr(self, key):
         self.ops.append(("incr", key)); return self
 
+    def pfadd(self, key, *members):
+        self.ops.append(("pfadd", key, members)); return self
+
+    def pfcount(self, *keys):
+        # Real PFCOUNT accepts multiple keys and returns the union cardinality
+        # in a single call; the pipeline mirrors that so model_overview can
+        # queue one multi-key PFCOUNT for the plan-level n_sessions without
+        # branching the API.
+        self.ops.append(("pfcount", keys)); return self
+
     def expire(self, key, ttl):
         return self
 
@@ -61,6 +71,12 @@ class FakePipeline:
             elif op[0] == "incr":
                 _, key = op
                 results.append(await self.store.incr(key))
+            elif op[0] == "pfadd":
+                _, key, members = op
+                results.append(await self.store.pfadd(key, *members))
+            elif op[0] == "pfcount":
+                _, keys = op
+                results.append(await self.store.pfcount(*keys))
         self.ops.clear()
         return results
 
@@ -70,6 +86,11 @@ class FakeRedis:
         self.strings: dict[str, tuple[str, float | None]] = {}
         self.zsets: dict[str, dict[str, float]] = {}
         self.hashes: dict[str, dict[str, str]] = {}
+        # HLL fake: each key is a set of distinct members added via pfadd.
+        # Real Redis HLLs are approximate (~1% error) and shaped differently;
+        # the test surface only cares about "how many distinct sessions this
+        # model saw this month" so an exact set is the right semantics to fake.
+        self.hlls: dict[str, set[str]] = {}
 
     # -- strings -----------------------------------------------------------
     async def set(self, key, value, ex=None):
@@ -156,6 +177,36 @@ class FakeRedis:
         h = self.hashes.setdefault(key, {})
         h[field] = str(float(h.get(field, 0)) + float(amount))
         return float(h[field])
+
+    # -- hyperloglog (fake) ------------------------------------------------
+    # Set-membership semantics: PFADD adds each member to the set, no-op if
+    # already present; PFCOUNT returns len(set). Real HLLs use register arrays
+    # and have bounded error; tests asserting "this many distinct sessions"
+    # want exact answers.
+    async def pfadd(self, key, *members):
+        # Real PFADD returns 1 if at least one new member was added, 0
+        # otherwise (independent of how many were passed). The fake had been
+        # returning the count of newly-added members, which is *different*
+        # semantics: a caller branching on `await pipe.pfadd(...) == 1` for
+        # the canonical "did I add something" check would silently read a
+        # count > 1 and behave wrong. Align here while only one PFADD caller
+        # exists and the only test surface that cares is the cardinalities.
+        s = self.hlls.setdefault(key, set())
+        added = 0
+        for m in members:
+            if m not in s:
+                s.add(m)
+                added += 1
+        return 1 if added else 0
+
+    async def pfcount(self, *keys):
+        # Real PFCOUNT accepts multiple keys and returns the cardinality of
+        # the union of the HLLs in a single call. The fake is exact, so the
+        # union is set.union over the underlying sets (with absent keys
+        # treated as empty sets, same as single-key behaviour).
+        if len(keys) == 1:
+            return len(self.hlls.get(keys[0], set()))
+        return len(set().union(*(self.hlls.get(k, set()) for k in keys)))
 
     def pipeline(self):
         return FakePipeline(self)

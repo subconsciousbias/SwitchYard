@@ -154,7 +154,14 @@ def fixture(reg):
                          "tokens_per_hour": 5e5 if m.enabled else 0.0},
                 "month_tokens": 1.23e7 if m.enabled else 0.0,
                 "month_cost": 8.10 if m.enabled else 0.0,
+                "n_sessions": 150 if m.enabled else 0,
                 "eff_cost": 0.66 if m.enabled and plan.monthly_cost else None,
+                # Mirror the live shape: $/session populated on enabled rows,
+                # None where the threshold or fee would gate it. The preview
+                # template uses m.get('eff_cost_session') so an absent key also
+                # renders cleanly.
+                "eff_cost_session": 0.73 if m.enabled and plan.monthly_cost
+                                    else None,
             } for m in plan.models.values()],
             "cli_backed": plan.is_cli_backed,
             "probe": None,

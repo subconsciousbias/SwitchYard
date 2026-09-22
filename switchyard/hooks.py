@@ -632,7 +632,7 @@ class SwitchyardHandler(CustomLogger):
         await self.ledger.record(
             plan, prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens, cost=cost,
-            model=served_ref,
+            model=served_ref, session=ctx.get("session"),
         )
 
         # A genuine 200 against this plan resets its transient-failure

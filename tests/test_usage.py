@@ -15,11 +15,13 @@ from switchyard.models import Plan, Quota
 from switchyard.usage import (
     Ledger,
     model_effective_cost_per_mtok,
+    model_effective_cost_per_session,
     effective_cost_per_mtok,
     reported_is_current,
     window_headroom,
     K_M_HOUR,
     K_M_DAY,
+    K_M_SMONTH,
     K_HOUR,
     K_DAY,
     K_WINDOW,
@@ -606,6 +608,183 @@ def test_lane_order_hash_still_stale_when_no_plan_in_grace():
         "forge", plan_windows=[])) is None
     # No plan_windows arg at all -> stale (back-compat).
     assert run(ledger.get_lane_order("forge")) is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: model_effective_cost_per_session (issue #76)
+# ---------------------------------------------------------------------------
+
+def test_model_eff_cost_session_metered():
+    """Metered plan: rate = model_cost / n_sessions; gate at 100 sessions.
+
+    A metered provider charges actual spend, so the per-session rate is the
+    model's own spend divided by how many distinct sessions it served.
+    Under 100 sessions the number is too noisy to read.
+    """
+    plan = fake_plan(monthly_cost=0.0, metered=True)
+    # 200 sessions at $0.10 model spend = $0.0005/session
+    result = model_effective_cost_per_session(plan, 200, 0.10, 200)
+    assert result == round(0.10 / 200, 4)
+
+
+def test_model_eff_cost_session_subscription():
+    """Subscription plan: rate = plan.monthly_cost / plan_sessions.
+
+    The fee allocated by session share is fee * m / p, so per-session the
+    share cancels -- every model that saw traffic shows the plan's own
+    rate once the PLAN clears 50 sessions. $132 across 550 plan sessions
+    is $0.24/session, regardless of how the 550 split across models.
+    """
+    plan = fake_plan(monthly_cost=132.0, metered=False)
+    # 200 of 550 plan sessions, model_cost is irrelevant for a subscription
+    result = model_effective_cost_per_session(plan, 200, 0.0, 550)
+    assert result == round(132.0 / 550, 4)
+
+
+def test_model_eff_cost_session_subscription_small_slice():
+    """A small slice of a used subscription shows the plan rate, not a
+    divided-up rate.
+
+    Mirror of `test_model_eff_cost_subscription_small_slice`: the share
+    cancels in the per-session division too, so the number is the plan's
+    own $/session once the PLAN clears 50 sessions, not gated on the
+    model's own session count beyond the >0 check.
+    """
+    plan = fake_plan(monthly_cost=10.0, metered=False)
+    # Model saw 22 sessions of the plan's 250; rate = $10 / 250.
+    result = model_effective_cost_per_session(plan, 22, 0.0, 250)
+    assert result == round(10.0 / 250, 4)
+
+
+def test_model_eff_cost_session_under_thresholds():
+    """Both plan kinds gate on a minimum session count.
+
+    The subscription gate is on the PLAN's session count (50) because the
+    rate is plan-level; gating on the model's own count would silently
+    hide the plan rate from a small slice that is being used. The metered
+    gate is on the model's own sessions (100) because the rate is the
+    model's own spend.
+    """
+    plan = fake_plan(monthly_cost=132.0, metered=False)
+    # Subscription with plan_sessions=49 -> below the threshold -> None,
+    # regardless of model session count.
+    assert model_effective_cost_per_session(plan, 200, 0.0, 49) is None
+
+    metered = fake_plan(monthly_cost=0.0, metered=True)
+    # Metered with n_sessions=99 -> below the model's threshold -> None,
+    # even though the PLAN's count (plan_sessions) is fine.
+    assert model_effective_cost_per_session(metered, 99, 0.10, 500) is None
+
+
+def test_model_eff_cost_session_cold_and_zero_spend():
+    """No traffic at all -> None (both kinds); zero spend -> 0.0.
+
+    n_sessions=0 means no work to price, on either plan kind -- the same
+    way model_tokens<=0 short-circuits the per-Mtok helper. A subscription
+    whose monthly_cost is 0 has zero spend regardless of sessions: 0.0,
+    not None (the plan still ran, it just cost nothing).
+    """
+    plan = fake_plan(monthly_cost=132.0, metered=False)
+    assert model_effective_cost_per_session(plan, 0, 0.0, 200) is None
+
+    metered = fake_plan(monthly_cost=0.0, metered=True)
+    assert model_effective_cost_per_session(metered, 0, 0.10, 200) is None
+
+    # Subscription with monthly_cost=0 and live sessions -> 0.0, not None.
+    free = fake_plan(monthly_cost=0.0, metered=False)
+    assert model_effective_cost_per_session(free, 200, 0.0, 200) == 0.0
+
+
+def test_model_overview_counts_unique_sessions():
+    """PFADD is idempotent per session; PFCOUNT reports the cardinality.
+
+    Recording the SAME session id several times for model m1 (one session
+    making many requests / re-leasing the model) keeps n_sessions at 1;
+    a session-free record for m2 leaves it at 0. The /session cell on the
+    board is the number of distinct CLI / API callers the model served,
+    not the number of requests.
+    """
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan(metered=True)
+
+    with _patch_now(datetime(2025, 9, 21, 14, 0, 0, tzinfo=timezone.utc)):
+
+        async def record_sessions():
+            # Same session id recorded 5 times -> PFCOUNT = 1.
+            for _ in range(5):
+                await ledger.record(plan, prompt_tokens=100, cost=0.01,
+                                    model="m1", session="session-A")
+            # m2 sees traffic but no session at all -- a session='' record
+            # would skip the PFADD (exercising the "no session, no count"
+            # path), but a missing session arg exercises the same branch.
+            await ledger.record(plan, prompt_tokens=100, cost=0.01, model="m2")
+
+        run(record_sessions())
+
+        # Spot-check the HLL key exists for m1, not for m2.
+        assert K_M_SMONTH.format(
+            plan="test-plan", model="m1", period="2025-09") in redis.hlls
+        assert K_M_SMONTH.format(
+            plan="test-plan", model="m2", period="2025-09") not in redis.hlls
+
+        result = run(ledger.model_overview("test-plan", ["m1", "m2"], "2025-09"))
+    assert result["m1"]["n_sessions"] == 1, result["m1"]
+    assert result["m2"]["n_sessions"] == 0, result["m2"]
+
+
+def test_record_failed_event_does_not_pfadd():
+    """failed=True + session=... must NOT PFADD -- the success-only invariant.
+
+    `record()` gates the HLL on `not failed`: a session that landed on a
+    model but errored every request would otherwise pollute the rate
+    denominator. Call sites today also pass no session on failure, so this
+    is doubly-protected, but the helper's clause is the last line of defence
+    and worth pinning: a refactor that lifts the gate (e.g. to "PFADD even
+    on failure so failures show up too") would silently change what the
+    board's $/session means.
+    """
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan(metered=True)
+
+    with _patch_now(datetime(2025, 9, 21, 14, 0, 0, tzinfo=timezone.utc)):
+        # failed=True with both model and session set -- the exact branch
+        # the gate protects.
+        run(ledger.record(plan, failed=True, model="m3", session="session-A"))
+
+    assert K_M_SMONTH.format(
+        plan="test-plan", model="m3", period="2025-09") not in redis.hlls
+
+
+def test_model_overview_plan_n_sessions_is_union_not_sum():
+    """plan_n_sessions = |union of per-model HLLs|, not the sum.
+
+    One session hitting two models of one plan must NOT double-count:
+    union cardinality is 1 even though per-model cardinalities both read 1.
+    The original implementation summed per-model counts, which over-counted
+    and understated the subscription rate -- the round-2 fix is the
+    multi-key PFCOUNT here, so the union semantics are the invariant.
+    """
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan(metered=True)
+    with _patch_now(datetime(2025, 9, 21, 14, 0, 0, tzinfo=timezone.utc)):
+        async def record():
+            await ledger.record(plan, model="m1", session="shared",
+                                prompt_tokens=100, cost=0.01)
+            await ledger.record(plan, model="m2", session="shared",
+                                prompt_tokens=100, cost=0.01)
+            await ledger.record(plan, model="m2", session="unique-m2",
+                                prompt_tokens=100, cost=0.01)
+        run(record())
+        result = run(ledger.model_overview("test-plan", ["m1", "m2"], "2025-09"))
+    # Per-model: m1 saw 1 distinct, m2 saw 2 distinct.
+    assert result["m1"]["n_sessions"] == 1
+    assert result["m2"]["n_sessions"] == 2
+    # Plan-level union: the shared session counted once, plus the unique one = 2.
+    assert result["m1"]["plan_n_sessions"] == 2
+    assert result["m2"]["plan_n_sessions"] == 2
 
 
 # ---------------------------------------------------------------------------

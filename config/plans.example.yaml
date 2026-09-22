@@ -38,6 +38,10 @@ settings:
   # streamed content — LiteLLM lifts it into reasoning_content only for a
   # buffered reply. Set false to pass the tags through untouched.
   split_reasoning_tags: true
+  # Per-model $/session column on the board (issue #76). Gates the cell
+  # only — the underlying HLL is always written. Set false to hide the
+  # column from the plans table.
+  show_cost_per_session: true
   # A slot whose heartbeat has stopped for this long is assumed dead and pruned.
   # Slots are heartbeaten while their request is alive, so this can be short
   # without cutting off legitimately long calls — an OpenCode request runs for

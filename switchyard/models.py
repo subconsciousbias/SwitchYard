@@ -233,6 +233,10 @@ class Settings:
     # Move inline <think>...</think> out of streamed content and into
     # reasoning_content, the way a buffered response already does.
     split_reasoning_tags: bool = True
+    # Show the per-model $/session cell on the board (issue #76). Gates
+    # rendering only -- the underlying HLL is always written so the number
+    # is available the moment this is re-enabled.
+    show_cost_per_session: bool = True
     inflight_max_age_seconds: int = 120
     heartbeat_seconds: int = 30
     default_cooldown_seconds: int = 900
