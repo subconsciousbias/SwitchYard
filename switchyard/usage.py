@@ -49,6 +49,11 @@ K_M_HOUR = "sy:usage:{plan}:m:{model}:h:{hour}"
 K_M_DAY = "sy:usage:{plan}:m:{model}:d:{day}"
 K_QUOTA = "sy:quota:{plan}"                 # plan-level facts
 K_WINDOW = "sy:qwin:{plan}:{window}"        # per-window facts (observed allowance)
+# Per-lane ordering written by the portal's probe poller and read on the pick
+# path. Only present for a lane whose `strategy: perishable` produced at least
+# one ranked member in its last poll; absent everywhere else, so a default lane
+# is bit-for-bit unchanged.
+K_LANE_ORDER = "sy:lane-order:{lane}"
 
 FIELDS = ("requests", "prompt_tokens", "completion_tokens", "cost", "failures")
 
@@ -320,6 +325,104 @@ class Ledger:
             except (TypeError, ValueError):
                 out[k] = v
         return out
+
+    # -- perishable ordering -----------------------------------------------
+    async def set_lane_order(self, lane: str, entries: dict[str, float | str],
+                             *, computed_at: float, stale_after_ms: int) -> None:
+        """Write the per-lane perishable ordering the picker reads.
+
+        `entries` is the *output* of the writer: each ref's score and gate flag
+        plus whatever bookkeeping fields the writer chose to add. The picker
+        only reads `score_<ref>`, `gate5h_<ref>`, `computed_at`, and
+        `stale_after_ms`, so anything else is documentation for the board /
+        debugging. Stale entries (older than `stale_after_ms`) are dropped on
+        write, not just on read, so the picker can fall back to config order
+        with one hash read instead of having to also timestamp-check the call.
+
+        Not pipelined: the writer runs once per probe interval per affected
+        lane (a handful of keys per minute at most), and a delete-then-write
+        pair is what guarantees we never carry over an old `score_<ref>` for
+        a ref that left the lane.
+        """
+        key = K_LANE_ORDER.format(lane=lane)
+        mapping: dict[str, str] = {"computed_at": str(computed_at),
+                                   "stale_after_ms": str(stale_after_ms)}
+        for ref, fields in entries.items():
+            for k, v in fields.items():
+                mapping[f"{k}_{ref}"] = str(v)
+        await self.redis.delete(key)
+        await self.redis.hset(key, mapping=mapping)
+
+    async def get_lane_order(self, lane: str) -> dict | None:
+        """The stored per-lane order, or None if the lane never produced one.
+
+        Picker-facing shape: members is a list of refs in the order the writer
+        ranked them, each entry carries `score` and `gate5h`. The freshness
+        fields are read and checked here so the picker does one hash read and
+        falls back to config order on a missing/stale key without further work.
+        """
+        raw = await self.redis.hgetall(K_LANE_ORDER.format(lane=lane))
+        if not raw:
+            return None
+        decoded: dict[str, str] = {}
+        for k, v in raw.items():
+            decoded[k.decode() if isinstance(k, bytes) else k] = (
+                v.decode() if isinstance(v, bytes) else v)
+        try:
+            computed_at = float(decoded["computed_at"])
+            stale_after_ms = int(float(decoded["stale_after_ms"]))
+        except (KeyError, ValueError, TypeError):
+            return None
+        age_ms = (time.time() - computed_at) * 1000.0
+        if age_ms >= stale_after_ms:
+            return None
+        # Group fields per ref: score_<ref>, gate5h_<ref>.
+        members: list[dict] = []
+        seen: set[str] = set()
+        for key, value in decoded.items():
+            if not key.startswith("score_"):
+                continue
+            ref = key[len("score_"):]
+            seen.add(ref)
+            try:
+                score = float(value)
+            except (TypeError, ValueError):
+                score = 0.0
+            gate_raw = decoded.get(f"gate5h_{ref}", "0")
+            try:
+                gate = int(float(gate_raw)) == 1
+            except (TypeError, ValueError):
+                gate = False
+            members.append({"ref": ref, "score": score, "gate5h": gate})
+        if not members:
+            return None
+        members.sort(key=lambda m: m["score"], reverse=True)
+        return {"members": members, "computed_at": computed_at,
+                "stale_after_ms": stale_after_ms}
+
+
+def perishable_score(room_pct: float | None, reset_at: float | None,
+                     now: float | None = None) -> float | None:
+    """Perishable score: how much room each hour of remaining window buys us.
+
+    Higher = drain it faster. The choice (room% / hours_remaining) is the burn
+    rate that uses the rest of the window most aggressively without overshooting
+    the reset: a plan with 80% room and a reset in 4h scores 80/4 = 20, while a
+    plan with 20% room and the same reset scores 20/4 = 5. With hours clamped
+    to a minimum of 1 to avoid divide-by-near-zero on a window that has just
+    rolled over (where reset_at is essentially "now"), the absolute number
+    loses meaning -- it is only used for relative ordering.
+
+    Returns None when either fact is missing rather than guessing, so a member
+    with no facts is silently left to fall through the picker's "unknown sorts
+    last" rule instead of getting an arbitrary rank.
+    """
+    if room_pct is None or reset_at is None:
+        return None
+    if now is None:
+        now = time.time()
+    hours = max(1.0, (float(reset_at) - float(now)) / 3600.0)
+    return float(room_pct) / hours
 
 
 async def headroom(ledger: Ledger, plan: Plan) -> dict:
