@@ -1214,12 +1214,19 @@ def _prompt_completion_tokens(
     not have to look up attributes on a finished object. The buffered path
     reads ``response_obj.usage`` -- which LiteLLM serves as a dict or a pydantic
     Usage object depending on the provider -- and tries both key names per
-    field. Cache tokens (``cache_creation_input_tokens``,
-    ``cache_read_input_tokens``) are folded into ``prompt_tokens`` here so the
-    ledger, which only knows the OpenAI shape, sees the full input cost; the
-    gateway CLI bridge and bridge wrappers already do the same conversion
-    when folding to OpenAI shape, and double-counting a cache read as a fresh
-    input is the original Anthropic-flavoured bug this preserves.
+    field.
+
+    Cache tokens (``cache_creation_input_tokens``,
+    ``cache_read_input_tokens``) are folded into the prompt figure ONLY when
+    the prompt figure came from the Anthropic-side ``input_tokens`` key.
+    When ``prompt_tokens`` is present (truthy), it is already whole -- the
+    gateway CLI bridge folds ``input_tokens`` + cache_read + cache_creation
+    into ``prompt_tokens`` before re-exposing the cache counts at the top
+    level (``sidecars/cli_bridge/server.py::to_openai``); adding them again
+    here would double-count. Same shape detection applies to attribute-shaped
+    (pydantic) usage objects. Cache reads stay at full weight -- the ledger
+    schema does not differentiate cached from fresh input, and the planner
+    weighed the alternatives and kept this raw-count fold.
     """
     src: Any = usage_override
     if src is None and response_obj is not None:
@@ -1228,23 +1235,29 @@ def _prompt_completion_tokens(
         else:
             src = getattr(response_obj, "usage", None) or {}
     if isinstance(src, dict):
-        prompt = int(src.get("prompt_tokens") or src.get("input_tokens") or 0)
+        if src.get("prompt_tokens"):
+            prompt = int(src.get("prompt_tokens") or 0)
+            cache_read = 0
+            cache_creation = 0
+        else:
+            prompt = int(src.get("input_tokens") or 0)
+            cache_read = int(src.get("cache_read_input_tokens") or 0)
+            cache_creation = int(src.get("cache_creation_input_tokens") or 0)
         completion = int(src.get("completion_tokens") or src.get("output_tokens") or 0)
-        cache_read = int(src.get("cache_read_input_tokens") or 0)
-        cache_creation = int(src.get("cache_creation_input_tokens") or 0)
     else:
-        prompt = int(
-            getattr(src, "prompt_tokens", None)
-            or getattr(src, "input_tokens", None)
-            or 0
-        )
+        if getattr(src, "prompt_tokens", None):
+            prompt = int(getattr(src, "prompt_tokens", None) or 0)
+            cache_read = 0
+            cache_creation = 0
+        else:
+            prompt = int(getattr(src, "input_tokens", None) or 0)
+            cache_read = int(getattr(src, "cache_read_input_tokens", None) or 0)
+            cache_creation = int(getattr(src, "cache_creation_input_tokens", None) or 0)
         completion = int(
             getattr(src, "completion_tokens", None)
             or getattr(src, "output_tokens", None)
             or 0
         )
-        cache_read = int(getattr(src, "cache_read_input_tokens", None) or 0)
-        cache_creation = int(getattr(src, "cache_creation_input_tokens", None) or 0)
     return prompt + cache_read + cache_creation, completion
 
 

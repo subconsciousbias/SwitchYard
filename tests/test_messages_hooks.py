@@ -328,6 +328,80 @@ def test_buffered_messages_folds_cache_tokens_into_prompt_tokens():
           f"50 cache_creation = {int(bucket['prompt_tokens'])} prompt tokens")
 
 
+def test_buffered_messages_issue58_payload_folds_cache_into_prompt_tokens():
+    """Regression pin for the #58 booking hole: an Anthropic-shaped usage
+    block where input_tokens is tiny (6) but cache_read_input_tokens
+    (41,302) and cache_creation_input_tokens (6,932) carry almost all of
+    the prompt cost must book as 48,240 prompt tokens, not 6. Without the
+    cache fold the pacer thinks it has near-infinite headroom and a
+    cache-heavy plan burns the budget in one burst.
+    """
+    h, _reg, _slots, _ledger, _policy, redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="anthropic_messages")
+    request_data = {
+        "metadata": _meta_for(ctx),
+        "litellm_params": {"metadata": _meta_for(ctx)},
+    }
+    response = _anthropic_response(pick, usage={
+        "input_tokens": 6,
+        "cache_creation_input_tokens": 6932,
+        "cache_read_input_tokens": 41302,
+        "output_tokens": 201,
+    })
+
+    async def go():
+        await h.async_post_call_success_hook(
+            data=request_data, user_api_key_dict=None, response=response,
+        )
+        plan_keys = [k for k in redis.hashes.keys()
+                     if k.startswith(f"sy:usage:{pick.plan.key}:p:")]
+        return _bucket_sync(redis, plan_keys[0])
+
+    bucket = asyncio.run(go())
+    # 6 (input) + 6932 (cache_creation) + 41302 (cache_read) = 48240
+    assert bucket["prompt_tokens"] == 48240, bucket
+    assert bucket["completion_tokens"] == 201, bucket
+    print(f"  #58 Anthropic payload booked: {int(bucket['prompt_tokens'])} "
+          f"prompt / {int(bucket['completion_tokens'])} completion "
+          f"(6 + 6932 + 41302)")
+
+
+def test_buffered_messages_does_not_double_count_cache_when_prompt_tokens_present():
+    """No-double-count regression: when the OpenAI-shaped ``prompt_tokens``
+    is present (already folded: e.g. the gateway CLI bridge's ``to_openai``
+    output) the cache counters must NOT be added again. The buggy
+    unconditional fold would produce 96474 (= 48240 + 41302 + 6932) instead
+    of 48240 -- which silently doubles every cache-heavy plan's burn rate.
+    """
+    h, _reg, _slots, _ledger, _policy, redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="anthropic_messages")
+    request_data = {
+        "metadata": _meta_for(ctx),
+        "litellm_params": {"metadata": _meta_for(ctx)},
+    }
+    response = _anthropic_response(pick, usage={
+        "prompt_tokens": 48240,
+        "completion_tokens": 201,
+        "cache_read_input_tokens": 41302,
+        "cache_creation_input_tokens": 6932,
+    })
+
+    async def go():
+        await h.async_post_call_success_hook(
+            data=request_data, user_api_key_dict=None, response=response,
+        )
+        plan_keys = [k for k in redis.hashes.keys()
+                     if k.startswith(f"sy:usage:{pick.plan.key}:p:")]
+        return _bucket_sync(redis, plan_keys[0])
+
+    bucket = asyncio.run(go())
+    assert bucket["prompt_tokens"] == 48240, bucket
+    assert bucket["completion_tokens"] == 201, bucket
+    print(f"  OpenAI-shaped prompt_tokens honoured verbatim "
+          f"(no cache double-count): {int(bucket['prompt_tokens'])} prompt "
+          f"/ {int(bucket['completion_tokens'])} completion")
+
+
 def test_buffered_messages_uses_response_cost_when_metered():
     """``response_cost`` from the litellm_params must land in the ledger when
     the plan is metered. On a subscription the marginal cost is zero and
