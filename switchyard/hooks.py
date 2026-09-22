@@ -1386,6 +1386,15 @@ def _prompt_completion_tokens(
             src = response_obj.get("usage") or {}
         else:
             src = getattr(response_obj, "usage", None) or {}
+    # The mcp_bridge reports the conversation's size in the usage block and
+    # what the whole inner CLI run actually spent beside it. Book the spend.
+    billed_prompt = (src.get("switchyard_billed_prompt_tokens") if isinstance(src, dict)
+                     else getattr(src, "switchyard_billed_prompt_tokens", None))
+    if billed_prompt is not None:
+        billed_completion = (src.get("switchyard_billed_completion_tokens")
+                             if isinstance(src, dict)
+                             else getattr(src, "switchyard_billed_completion_tokens", None))
+        return int(billed_prompt or 0), int(billed_completion or 0)
     if isinstance(src, dict):
         if src.get("prompt_tokens"):
             prompt = int(src.get("prompt_tokens") or 0)

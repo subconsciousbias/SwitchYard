@@ -53,6 +53,7 @@ import contextlib
 import errno
 import importlib.util
 import json
+import re
 import logging
 import os
 import shutil
@@ -1263,6 +1264,59 @@ async def internal_tools_call(request: Request):
                                      payload.get("arguments") or {})
 
 
+
+# ---------------------------------------------------------------------------
+# What the caller should be told about context size.
+#
+# One mcp_bridge session is ONE inner CLI run that spans every tool round of
+# the caller's turn, so the CLI's final `usage` is the SUM of all its model
+# calls: twenty tool rounds over a 100k context come back as ~2M input tokens.
+# Claude Code reads a reply's usage as "how full is my context" and
+# auto-compacts once that passes the window, so every tool-using answer was
+# compacting the caller's session for nothing (measured: 9.9M reported on a
+# ~170k conversation). The size of the conversation is the LAST call's usage,
+# which the CLI writes to its own transcript; the sum is still what the plan
+# spent, so it rides along as switchyard_billed_* for the gateway ledger.
+# ---------------------------------------------------------------------------
+_USAGE_KEYS = ("input_tokens", "cache_read_input_tokens",
+               "cache_creation_input_tokens", "output_tokens")
+
+
+def last_call_usage(session: "Session") -> dict | None:
+    """Usage of the inner CLI's most recent model call, or None if unknown."""
+    if PROVIDER != "claude":
+        return None
+    folder = cli_bridge.CLAUDE_PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", str(session.workdir))
+    try:
+        files = sorted(folder.glob("*.jsonl"), key=lambda f: f.stat().st_mtime)
+        if not files:
+            return None
+        lines = files[-1].read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if '"assistant"' not in line or '"usage"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        usage = (entry.get("message") or {}).get("usage") if entry.get("type") == "assistant" else None
+        if isinstance(usage, dict):
+            return {k: int(usage.get(k) or 0) for k in _USAGE_KEYS}
+    return None
+
+
+def _with_context_usage(response: dict, session: "Session", billed: dict) -> dict:
+    """Report the last call's size to the caller; carry the spend for the ledger."""
+    last = last_call_usage(session)
+    if last is not None:
+        response["usage"] = cli_bridge.to_openai({"usage": last}, "")["usage"]
+    response["usage"]["switchyard_billed_prompt_tokens"] = int(billed.get("prompt_tokens") or 0)
+    response["usage"]["switchyard_billed_completion_tokens"] = int(billed.get("completion_tokens") or 0)
+    return response
+
+
 # ---------------------------------------------------------------------------
 # The public OpenAI-compatible surface.
 # ---------------------------------------------------------------------------
@@ -1272,16 +1326,18 @@ def render_turn(session: Session, result: dict, requested_model: str | None) -> 
             {"id": c.id, "type": "function",
              "function": {"name": c.name, "arguments": json.dumps(c.arguments)}}
             for c in result["calls"]]}
-        return {
+        response = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}", "object": "chat.completion",
             "created": int(time.time()), "model": requested_model or session.model,
             "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
-            # Token accounting for the CLI-backed path is already approximate
-            # (see cli_bridge); mid-loop it is not available at all.
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
+        # Mid-loop nothing is billed yet: the whole run is booked once, on the
+        # final turn. The context size is known, though, and the caller wants it.
+        return _with_context_usage(response, session, {})
     if result["type"] == "final":
-        return cli_bridge.to_openai(result["payload"], requested_model or session.model)
+        response = cli_bridge.to_openai(result["payload"], requested_model or session.model)
+        return _with_context_usage(response, session, dict(response["usage"]))
     if result["type"] == "error":
         raise HTTPException(status_code=result["status"], detail=result["detail"],
                              headers=result.get("headers"))
