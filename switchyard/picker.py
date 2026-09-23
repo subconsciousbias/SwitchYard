@@ -245,6 +245,14 @@ class Picker:
         if cooled:
             ctx.skipped.append(f"{ref}(cooled: {reason})")
             return None
+        # Drain gate: a plan with the drain flag set refuses to be picked.
+        # The picker is safe regardless of apply.sh's order of operations;
+        # the affinity path has its own is_draining check (see _affinity),
+        # and this body-walk gate catches every NEW request so falling
+        # through to the sibling is the only path a drained ref can take.
+        if await self.slots.is_draining(plan.key):
+            ctx.skipped.append(f"{ref}(draining)")
+            return None
         # 5h gate: a perishable or lowest_utilization group may have gated this
         # ref on the 5h constraint window. The flag is read from the SAME hash
         # the ranking lives in, so a missing/stale hash means "no gate", which
@@ -276,7 +284,8 @@ class Picker:
             return None
         if ctx.session:
             await self.slots.set_lease(
-                ctx.session, model.ref, self.registry.settings.lease_ttl_seconds)
+                ctx.session, model.ref,
+                self.registry.settings.lease_ttl_seconds, plan.key)
         return Pick(ctx.lane, model, plan, ctx.rid, ctx.session, False,
                     list(ctx.skipped), cap, cap_reason, picked_group)
 
@@ -649,6 +658,25 @@ class Picker:
         if held in ctx.exclude:
             await self.slots.drop_lease(ctx.session)
             return None
+        # Drain gate: refuse to honour a lease on any plan that is currently
+        # draining, regardless of apply.sh's order of operations. apply.sh
+        # sets `sy:drain:{plan}` BEFORE it runs `python -m switchyard.drain`,
+        # so the migrator walks `sessions_on_plan(plan)` while the flag is on;
+        # `picker.pick(lane, session, exclude=drained_refs)` reaches this
+        # path with the held lease still on the drained plan, drops it via
+        # the `held in ctx.exclude` branch above, and re-leases onto a
+        # sibling. The defensive check here covers the opposite direction:
+        # a fresh request (no exclude set) arriving for a session whose
+        # lease is still on a drained plan — which happens between the
+        # flag flip and the migrate's SREM finishing — must NOT honour
+        # that lease either. Drop it; the body walk below lands on a sibling.
+        held_model = self.registry.model(held)
+        if held_model is not None:
+            held_plan = self.registry.plan_of(held_model)
+            if await self.slots.is_draining(held_plan.key):
+                await self.slots.drop_lease(ctx.session)
+                ctx.skipped.append(f"{held}(draining)")
+                return None
         reachable = set(self.registry.routing_order(ctx.lane))
         reachable.update(self.registry.lanes[ctx.lane].tail)
         if held not in reachable:

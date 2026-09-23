@@ -91,6 +91,11 @@ class FakeRedis:
         # the test surface only cares about "how many distinct sessions this
         # model saw this month" so an exact set is the right semantics to fake.
         self.hlls: dict[str, set[str]] = {}
+        # Sets: exact membership (real Redis SETs use a hash table internally;
+        # the test surface only needs set semantics, not encoding). Backs the
+        # drain flow's reverse lease index (sy:lease_plan:{plan}) and any other
+        # SMEMBERS-shaped surface that lands in tests.
+        self.sets: dict[str, set[str]] = {}
 
     # -- strings -----------------------------------------------------------
     async def set(self, key, value, ex=None):
@@ -208,6 +213,39 @@ class FakeRedis:
             return len(self.hlls.get(keys[0], set()))
         return len(set().union(*(self.hlls.get(k, set()) for k in keys)))
 
+    # -- sets --------------------------------------------------------------
+    async def sadd(self, key, *members):
+        # Real SADD returns the number of members that were ADDED (i.e. were
+        # not already present). Members that were already members do not
+        # count. The drain flow's reverse lease index ignores the return
+        # value, but keep the count right so anything branching on it later
+        # (e.g. "did this session make it into the index") reads honestly.
+        s = self.sets.setdefault(key, set())
+        added = 0
+        for m in members:
+            if m not in s:
+                s.add(m)
+                added += 1
+        return added
+
+    async def srem(self, key, *members):
+        s = self.sets.get(key, set())
+        removed = 0
+        for m in members:
+            if m in s:
+                s.discard(m)
+                removed += 1
+        return removed
+
+    async def smembers(self, key):
+        return list(self.sets.get(key, set()))
+
+    async def scard(self, key):
+        return len(self.sets.get(key, set()))
+
+    async def sismember(self, key, member):
+        return 1 if member in self.sets.get(key, set()) else 0
+
     def pipeline(self):
         return FakePipeline(self)
 
@@ -217,10 +255,9 @@ class FakeRedis:
     # -- the claim script --------------------------------------------------
     def register_script(self, src):
         # Dispatch on the Lua source so the fake can shadow both the original
-        # claim script and the two added in slots.py (atomic INCR+EXPIRE, and
-        # the atomic INCR+EXPIRE+SET-cooldown pair that backs the escalating
-        # ladder). Real Redis compiles each script once; the fake has to
-        # match by hand.
+        # claim script, the two transient-failure scripts added in slots.py,
+        # and the two lease scripts added for the drain flow. Real Redis
+        # compiles each script once; the fake has to match by hand.
         if "BUMP_AND_COOL" in src:
             async def bump_and_cool(keys, args):
                 streak_key, cool_key = keys
@@ -245,6 +282,59 @@ class FakeRedis:
                 await self.expire(streak_key, int(args[0]))
                 return v
             return bump_streak
+        if "TOUCH_LEASE" in src:
+            async def touch_lease(keys, args):
+                # Mirror the Lua: GET lease, return 0 if absent (and skip
+                # the SET TTL refresh, the exact contract a "lease was just
+                # dropped under us" caller wants); otherwise EXPIRE both
+                # the lease and the per-plan SET.
+                lease_key = keys[0]
+                ttl = int(args[0])
+                v = await self.get(lease_key)
+                if v is None:
+                    return 0
+                await self.expire(lease_key, ttl)
+                # The SET is just a Python set in this fake; the real Redis
+                # SET TTL is what the Lua EXPIRE on `sy:lease_plan:{plan}`
+                # would touch. Nothing for the fake to do here.
+                return 1
+            return touch_lease
+        if "DROP_LEASE" in src:
+            async def drop_lease(keys, args):
+                # Mirror the Lua: GET lease (to learn the plan), then
+                # DEL lease + DEL injection marker + SREM from the SET.
+                lease_key, inject_key = keys
+                session = args[0]
+                v = await self.get(lease_key)
+                await self.delete(lease_key)
+                await self.delete(inject_key)
+                if v is not None:
+                    plan_key = v.split("/", 1)[0]
+                    await self.srem(f"sy:lease_plan:{plan_key}", session)
+                return 1
+            return drop_lease
+        if "SET_LEASE" in src:
+            async def set_lease(keys, args):
+                # Mirror the Lua: SADD to the SET, SET the lease with EX,
+                # EXPIRE the SET. The fake's `expire` only updates string
+                # keys today — same pre-existing gap the TOUCH_LEASE shadow
+                # already calls out. Adding SET-key TTL tracking would let
+                # a future test simulate a partial-failure mid-script; for
+                # now the fake faithfully reproduces the *bug* shape (the
+                # membership lands but the SET TTL is a no-op in the fake),
+                # so any test that wants the "atomicity holds across
+                # failures" property needs to assert the script's behaviour
+                # in real Redis. The test we add here pins the membership
+                # contract only.
+                lease_key, set_key = keys
+                session, ref, ttl = args
+                added = await self.sadd(set_key, session)
+                await self.set(lease_key, ref, ex=int(ttl))
+                # SET EXPIRE — see comment above; the fake's expire is
+                # string-only and silently does nothing for SET keys today.
+                # The contract under test is the membership, not the TTL.
+                return added
+            return set_lease
 
         async def claim(keys, args):
             inflight_key, cool_key, model_key, lane_key = keys
