@@ -727,6 +727,47 @@ def _parse_probe(raw: Any) -> Probe | None:
     return Probe(fields=fields, windows=windows, **body)
 
 
+def _parse_model_max_parallel(plan_key: str, model_key: str, raw: Any) -> int | None:
+    """Coerce and validate a model's `max_parallel`.
+
+    Reject `0` and negative values rather than silently dropping them to
+    None: a model that wants no cap on its plan is spelled `enabled: false`,
+    not `max_parallel: 0` — the truthiness check the loader used to apply
+    turned `0` into `None`, which let a plan keep its full configured cap
+    while the operator expected the model to be throttled to zero.
+    Non-int strings fail loudly with the offending model named, matching
+    `_parse_cli_tool_block`'s convention. Floats are rejected outright
+    rather than silently truncated by `int()`: a YAML `3.0` would land as
+    `3` and `3.5` also as `3` with no warning, hiding a typo until the
+    learned cap diverged from the configured one.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        # `bool` is a subclass of `int`, but "True" / "False" are not caps.
+        raise ValueError(
+            f"model {plan_key}/{model_key} max_parallel must be an integer "
+            f">= 1, got {type(raw).__name__}: {raw!r}")
+    if isinstance(raw, float):
+        # `int()` silently truncates 3.0 -> 3 and -0.5 -> 0; the latter
+        # then raises the misleading "got 0" below. Force a loud failure
+        # so the operator sees the value they actually typed.
+        raise ValueError(
+            f"model {plan_key}/{model_key} max_parallel must be an integer "
+            f">= 1, got {type(raw).__name__}: {raw!r}")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"model {plan_key}/{model_key} max_parallel must be an integer "
+            f">= 1, got {type(raw).__name__}: {raw!r}") from None
+    if n < 1:
+        raise ValueError(
+            f"model {plan_key}/{model_key} max_parallel must be an integer "
+            f">= 1, got {n} (to disable a model, set enabled: false)")
+    return n
+
+
 def _parse_models(plan_key: str, raw: Any) -> dict[str, Model]:
     if not raw:
         raise ValueError(f"plan {plan_key!r} declares no models")
@@ -746,7 +787,8 @@ def _parse_models(plan_key: str, raw: Any) -> dict[str, Model]:
             model=body["model"],
             label=body.get("label", ""),
             enabled=bool(body.get("enabled", True)),
-            max_parallel=(int(body["max_parallel"]) if body.get("max_parallel") else None),
+            max_parallel=_parse_model_max_parallel(
+                plan_key, key, body.get("max_parallel")),
             context_window=(int(body["context_window"]) if body.get("context_window") else None),
             supports_images=supports_images,
         )
@@ -911,6 +953,102 @@ def _parse_lane_order(lane_key: str, raw: list, known: set[str],
     return parsed
 
 
+def _parse_plan_max_parallel(plan_key: str, raw: Any) -> int | None:
+    """Coerce and validate a plan's `max_parallel`.
+
+    The plan's cap is either the literal string `auto` (case-insensitive),
+    which becomes the learner-managed `None` once stored on the dataclass,
+    or an integer >= 1. Anything else -- a non-int string, a negative
+    integer, or zero -- is a load-time error: a negative cap would crash
+    `asyncio.Semaphore(-N)`, zero would silently strand the plan forever,
+    and "auto with a typo" (`"Auto"` works, `"auto-pilot"` does not) is the
+    kind of thing a quiet truthiness parse used to swallow. The plan key
+    is named in the message so an operator reading the failure knows
+    exactly which plan to fix. Floats are rejected outright rather than
+    silently truncated by `int()`: a YAML `3.0` would land as `3` and
+    `3.5` also as `3`, hiding a typo until the next restart hit
+    `asyncio.Semaphore(3)` instead of the cap the operator typed.
+    """
+    if isinstance(raw, bool):
+        raise ValueError(
+            f"plan {plan_key!r} max_parallel must be 'auto' or an integer "
+            f">= 1, got {type(raw).__name__}: {raw!r}")
+    if isinstance(raw, str):
+        if raw.strip().lower() == "auto":
+            return None
+        raise ValueError(
+            f"plan {plan_key!r} max_parallel must be 'auto' or an integer "
+            f">= 1, got string: {raw!r}")
+    if isinstance(raw, float):
+        # `int()` silently truncates 3.0 -> 3 and -0.5 -> 0; the latter
+        # then raises the misleading "got 0" below. Force a loud failure
+        # so the operator sees the value they actually typed.
+        raise ValueError(
+            f"plan {plan_key!r} max_parallel must be 'auto' or an integer "
+            f">= 1, got {type(raw).__name__}: {raw!r}")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"plan {plan_key!r} max_parallel must be 'auto' or an integer "
+            f">= 1, got {type(raw).__name__}: {raw!r}") from None
+    if n < 1:
+        raise ValueError(
+            f"plan {plan_key!r} max_parallel must be 'auto' or an integer "
+            f">= 1, got {n} (to disable a plan, set enabled: false)")
+    return n
+
+
+def _parse_plan_max_parallel_ceiling(
+        plan_key: str, raw: Any, configured_parallel: int | None) -> int | None:
+    """Coerce and validate a plan's `max_parallel_ceiling`.
+
+    The ceiling caps the learner -- a `max_parallel: auto` plan can probe
+    upward up to this number. It must be an integer >= 1 when set, and
+    when the plan also has a concrete `max_parallel` (i.e. not `auto`),
+    the ceiling must be at least that number: a ceiling below the
+    configured cap is a contradiction the learner cannot satisfy.
+
+    None (the field omitted) is allowed and means "no ceiling". The
+    truthiness check the loader used to apply -- `int(body[k]) if
+    body.get(k) else None` -- silently dropped `0` to None and so could
+    never catch a typo. Using `is not None` keeps the off-by-one between
+    `0` and "unset" visible at load time. Floats are rejected outright
+    rather than silently truncated by `int()`: a YAML `3.0` would land as
+    `3` and `3.5` also as `3`, hiding a typo until the learned cap
+    diverged from the configured one (or `asyncio.Semaphore(3)` opened
+    fewer slots than the operator typed).
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise ValueError(
+            f"plan {plan_key!r} max_parallel_ceiling must be an integer "
+            f">= 1, got {type(raw).__name__}: {raw!r}")
+    if isinstance(raw, float):
+        # `int()` silently truncates 3.0 -> 3 and -0.5 -> 0; the latter
+        # then raises the misleading "got 0" below. Force a loud failure
+        # so the operator sees the value they actually typed.
+        raise ValueError(
+            f"plan {plan_key!r} max_parallel_ceiling must be an integer "
+            f">= 1, got {type(raw).__name__}: {raw!r}")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"plan {plan_key!r} max_parallel_ceiling must be an integer "
+            f">= 1, got {type(raw).__name__}: {raw!r}") from None
+    if n < 1:
+        raise ValueError(
+            f"plan {plan_key!r} max_parallel_ceiling must be an integer "
+            f">= 1, got {n}")
+    if configured_parallel is not None and n < configured_parallel:
+        raise ValueError(
+            f"plan {plan_key!r} max_parallel_ceiling must be >= "
+            f"max_parallel ({configured_parallel}), got {n}")
+    return n
+
+
 def load(path: str | None = None) -> Registry:
     with open(path or CONFIG_PATH) as fh:
         raw = yaml.safe_load(fh)
@@ -935,8 +1073,10 @@ def load(path: str | None = None) -> Registry:
         quotas = _parse_quotas(body)
         probe = _parse_probe(body.pop("probe", None))
         models = _parse_models(key, body.pop("models", None))
-        raw_parallel = body.get("max_parallel", 1)
-        auto = str(raw_parallel).lower() == "auto"
+        configured_parallel = _parse_plan_max_parallel(
+            key, body.get("max_parallel", 1))
+        max_parallel_ceiling = _parse_plan_max_parallel_ceiling(
+            key, body.get("max_parallel_ceiling"), configured_parallel)
         plans[key] = Plan(
             key=key,
             label=body.get("label", key),
@@ -949,9 +1089,8 @@ def load(path: str | None = None) -> Registry:
             expires=_parse_date(body.get("expires")),
             api_base=body.get("api_base"),
             api_key=body.get("api_key"),
-            configured_parallel=None if auto else int(raw_parallel),
-            max_parallel_ceiling=(int(body["max_parallel_ceiling"])
-                                  if body.get("max_parallel_ceiling") else None),
+            configured_parallel=configured_parallel,
+            max_parallel_ceiling=max_parallel_ceiling,
             pacing=body.get("pacing"),
             learning=body.get("learning"),
             use_extra_quota=bool(body.get("use_extra_quota", False)),
