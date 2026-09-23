@@ -18,8 +18,8 @@ from `.opencode/opencode.json`. The rules they enforce:
   by the top-of-file `exit 2` checks in `scripts/apply.sh` and
   `scripts/reload.sh`, by the `name: ${SWITCHYARD_PROJECT:?…}` fail-closed
   substitution in `docker-compose.yml`, and by `.claude/hooks/guard.sh`
-  blocking `git merge`, `docker compose build`, `docker compose up`,
-  `docker login`, and `docker logout` from inside a worktree.
+  blocking `docker compose build`, `docker compose up`, `docker login`,
+  and `docker logout` from inside a worktree.
 
 - **Don't touch credential stores.** Never `docker login`/`docker logout`,
   never write to the keychain, never delete a stored token. Diagnose

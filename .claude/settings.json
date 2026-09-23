@@ -11,7 +11,6 @@
       "Bash(docker compose up *)",
       "Bash(docker login *)",
       "Bash(docker logout *)",
-      "Bash(git merge *)",
       "Bash(security add-*)",
       "Bash(security delete-*)"
     ]

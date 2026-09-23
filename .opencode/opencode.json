@@ -22,8 +22,6 @@
       "*docker login": "deny",
       "*docker logout *": "deny",
       "*docker logout": "deny",
-      "*git merge *": "deny",
-      "*git merge": "deny",
       "*security add-*": "deny",
       "*security delete-*": "deny"
     }

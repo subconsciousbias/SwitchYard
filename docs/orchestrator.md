@@ -127,11 +127,13 @@ apply to every worker, every time:
    containers from branch code and mounts the worktree's `./config`
    into them. This is not an isolated copy of the stack — it is the
    live stack wearing worktree clothes.
-2. **Never merge the worktree branch into `main` from a worktree.**
-   The main checkout owns that handoff. Running `git merge` from a
-   worktree drags the worktree's branch into the main checkout's
-   working tree, which then has to be rebuilt anyway. Just commit;
-   let the merge happen at the main checkout (or via the PR).
+2. **The branch→`main` handoff lands at the main checkout or via a
+   PR.** Merging `origin/<base>` into the feature branch (the
+   conflict-fix flow) is a local op and runs inside the worktree —
+   that is fine. What stays out of the worktree is merging the feature
+   branch INTO `main`: the main checkout owns that handoff, so commit
+   on the worktree branch and let the merge happen at the main
+   checkout (or via the PR).
 3. **Never write to `.env`** and never touch credential stores
    (keychain, `docker login`/`logout`, OAuth tokens). `.env` holds
    real API keys; add new keys to `.env.example` only and run

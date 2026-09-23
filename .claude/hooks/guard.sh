@@ -36,19 +36,17 @@ SECURITY_PATTERN='security (add|delete)-'
 
 # Worktree-only refuses — fine in the main checkout, refused from a worktree.
 # docker-compose.yml pins ${SWITCHYARD_PROJECT}, so every worktree addresses
-# the same compose project; building / up / login / logout / merging here
-# would touch the live stack from branch code.
+# the same compose project; building / up / login / logout here would touch
+# the live stack from branch code.
 #
 # Anchored with ERE so we don't false-positive on `docker compose buildx`
 # (matches `docker compose build` as a substring), `docker compose upgrade`
-# (matches `docker compose up`), etc. `git merge` has no trailing-space
-# requirement on purpose — `git merge<EOF>` is also caught (review NIT).
+# (matches `docker compose up`), etc.
 #
 # Associative array so the operator-facing error prints the human-readable
 # label (`docker compose build`) and not the regex literal
 # (`(^|[[:space:]])docker[[:space:]]+compose[[:space:]]+build([[:space:]]|$)`).
 declare -A WORKTREE_ONLY=(
-  [git merge]='(^|[[:space:]])git[[:space:]]+merge([[:space:]]|$)'
   [docker login]='(^|[[:space:]])docker[[:space:]]+login([[:space:]]|$)'
   [docker logout]='(^|[[:space:]])docker[[:space:]]+logout([[:space:]]|$)'
   [docker compose build]='(^|[[:space:]])docker[[:space:]]+compose[[:space:]]+build([[:space:]]|$)'

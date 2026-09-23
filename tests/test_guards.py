@@ -17,8 +17,11 @@ These tests assert the offline pieces in plain text form:
       `.env` writes and keychain commands, and lets benign reads / commands
       through, when fed crafted stdin JSON. Includes the review-found gaps
       (rm/dd/install/rsync writes, .env.example/.env.backup.* false
-      positives, `test.env` false positives) and the worktree-only anchors
-      (buildx/buildkit/upgrade/upload must NOT trip the worktree guard).
+      positives, `test.env` false positives), the worktree-only anchors
+      (buildx/buildkit/upgrade/upload must NOT trip the worktree guard),
+      and the issue's acceptance test that `git merge` (with or without
+      args) is allowed from a worktree cwd while docker compose build / up
+      / login / logout still exit 2.
   (c) compose fail-closed — `docker-compose.yml` declares its project name
       with the `${SWITCHYARD_PROJECT:?…}` required-substitution form so a
       worktree (no `.env`) fails at parse time, and `.env.example` carries
@@ -294,18 +297,32 @@ def test_worktree_only_anchors_subcommand_boundary():
     print(f"  worktree guard allows {len(allow_cmds)} anchored subcommand shapes")
 
 
-def test_worktree_only_catches_git_merge_no_args():
-    """NIT 3: `git merge` with no trailing arguments is also denied from a
-    worktree. The default needle had a trailing space, which dropped this
-    case; the regex now catches it.
+def test_worktree_only_allows_git_merge_and_still_denies_docker_stop_list():
+    """Issue acceptance test: `git merge` (bare, `--ff-only`, and `--no-ff`
+    forms) must be ALLOWED from a worktree cwd, while the docker / login /
+    logout stop list still fires. This guards the rule change that drops
+    `git merge` from `WORKTREE_ONLY` — merging origin/<base> into the
+    feature branch is a local op and the conflict-fix flow depends on it
+    running inside the worktree.
     """
     for cmd in ["git merge", "git merge main --ff-only", "git merge --no-ff"]:
         res = _feed_guard(cmd)
+        assert res.returncode == 0, \
+            f"worktree guard must ALLOW {cmd!r} (issue: git merge is no " \
+            f"longer worktree-only), got rc={res.returncode}; " \
+            f"stderr={res.stderr!r}"
+    for cmd in [
+        "docker compose build web",
+        "docker compose up -d",
+        "docker login",
+        "docker logout",
+    ]:
+        res = _feed_guard(cmd)
         assert res.returncode == 2, \
-            f"worktree guard should deny {cmd!r}, got rc={res.returncode}; " \
+            f"worktree guard must still deny {cmd!r}, got rc={res.returncode}; " \
             f"stderr={res.stderr!r}"
         assert "refusing" in res.stderr.lower(), res.stderr
-    print("  worktree guard denies git merge (with and without args)")
+    print("  worktree guard allows git merge (with and without args) while still denying docker stop list")
 
 
 def test_worktree_only_short_circuits_on_main_checkout():
@@ -330,7 +347,6 @@ def test_worktree_only_short_circuits_on_main_checkout():
         for cmd in [
             "docker compose build web",
             "docker compose up -d",
-            "git merge main",
         ]:
             res = _feed_guard(cmd, cwd=standalone)
             assert res.returncode == 0, (
@@ -556,7 +572,6 @@ def test_claude_settings_json_has_deny_rules():
         "Bash(docker compose up *)",
         "Bash(docker login *)",
         "Bash(docker logout *)",
-        "Bash(git merge *)",
         "Bash(security add-*)",
         "Bash(security delete-*)",
     ]
@@ -620,13 +635,11 @@ def test_opencode_json_mirrors_deny_intent():
         "*docker compose up *",
         "*docker login *",
         "*docker logout *",
-        "*git merge *",
         # no-trailing-space — matches the bare no-args form too
         "*docker compose build",
         "*docker compose up",
         "*docker login",
         "*docker logout",
-        "*git merge",
         # security subcommands — already prefix-anchored on `add-`/`delete-`
         "*security add-*",
         "*security delete-*",
@@ -637,7 +650,7 @@ def test_opencode_json_mirrors_deny_intent():
     # The substring-glob form (`*docker compose build*` without the
     # trailing space) MUST be gone — it would false-positive on buildx.
     for bad in ("*docker compose build*", "*docker compose up*",
-                "*docker login*", "*docker logout*", "*git merge*"):
+                "*docker login*", "*docker logout*"):
         if bad in bash_rules:
             raise AssertionError(
                 f"permission.bash must not use the substring-glob form "
@@ -738,13 +751,18 @@ def test_opencode_wildcard_no_false_positives_on_buildx_buildkit():
         "docker compose upgrade postgres",
         "docker compose upload nginx",
         # Adjacent commands that ARE real docker compose invocations but
-        # don't match the build / up / login / logout / merge stop list.
-        # These would each be a regression trip wire if someone widens
-        # the rules too far:
+        # don't match the build / up / login / logout stop list. These
+        # would each be a regression trip wire if someone widens the
+        # rules too far:
         "docker compose ps",
         "docker compose logs web",
         "docker compose down",
         "docker compose config",
+        # Issue: `git merge` is no longer a stop-list command — it must
+        # fall through to the broad `*` allow rule, both bare and with
+        # args (the conflict-fix flow runs inside the worktree).
+        "git merge",
+        "git merge main --ff-only",
     ]
     for cmd in allow_cmds:
         action = _oc_evaluate(rules, cmd)
@@ -762,8 +780,6 @@ def test_opencode_wildcard_no_false_positives_on_buildx_buildkit():
         "docker login",
         "docker login foo",
         "docker logout",
-        "git merge",
-        "git merge main --ff-only",
         "security add-generic-password -a me -s test -w foo",
         "security delete-keychain",
     ]

@@ -68,11 +68,13 @@ Two things must not happen on a worktree:
      was nearly done once from the issue-11 worktree and aborted by the
      user.
 
-  2. **Never merge the worktree branch into main here.** The main checkout
-     owns that handoff — running `git merge` from a worktree drags the
-     worktree's branch into the main checkout's working tree, which then has
-     to be rebuilt anyway. Just commit; let the merge happen at the main
-     checkout (or via a PR).
+  2. **The branch→main handoff lands at the main checkout or via a PR.**
+     Merging `origin/<base>` into the feature branch (the conflict-fix
+     flow) is a local op and runs inside the worktree — that is fine.
+     What stays out of the worktree is merging the feature branch INTO
+     `main`: the main checkout owns that handoff, so commit on the
+     worktree branch and let the merge happen at the main checkout (or
+     via a PR).
 
 `scripts/apply.sh` and `scripts/reload.sh` refuse to run from a worktree at
 the top of the script (exit 2, before any Docker call), and
