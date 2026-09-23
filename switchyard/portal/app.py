@@ -276,8 +276,12 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
             ref = member.ref
             if member.plan_key == plan.key:
                 # This plan just probed: use fresh facts.
-                member_pct = (scoped_pct if scoped_pct is not None
-                              else target_pct)
+                # `weekly_scoped` is one model's share of the week and
+                # can read far lower than the window that actually stops
+                # the seat (#209). Never let it overstate room: rank on
+                # whichever known reading is tighter.
+                known = [p for p in (target_pct, scoped_pct) if p is not None]
+                member_pct = max(known) if known else None
                 member_room = (None if member_pct is None
                                else max(0.0, 100.0 - member_pct))
                 score = perishable_score(member_room, target_reset)

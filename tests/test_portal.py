@@ -1069,6 +1069,57 @@ def test_perishable_writer_treats_stale_target_and_gate_as_unknown():
           "picker falls back to config order")
 
 
+def test_perishable_scoped_window_never_overstates_room():
+    """#209: a current `weekly_scoped` reading used to REPLACE the target
+    window in the perishable rank. The example config's probe payload
+    (`weekly` 98% used, `weekly_scoped` 12%) then scored the seat as if 88%
+    of its week were left while it sat 2% from the wall. The ranker now
+    uses the tighter of the two known readings.
+    """
+    import asyncio
+    import time as _time
+    from dataclasses import replace
+    from switchyard import models
+    from switchyard.policy import CapacityPolicy
+    from switchyard.usage import Ledger, perishable_score
+    from switchyard.portal.app import _recompute_perishable_for_plan
+
+    reset = _time.time() + 48 * 3600
+
+    async def go():
+        reg = models.load()
+        redis = FakeRedis()
+        ledger = Ledger(redis)
+        CapacityPolicy(redis, reg.settings, ledger)
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"], key="perishable-test", tail=[],
+            strategy="perishable", description="")
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        plan = reg2.plans["claude-max"]
+        await ledger.note_reported_percent("claude-max", 98.0, reset,
+                                           window="weekly")
+        await ledger.note_reported_percent("claude-max", 12.0, reset,
+                                           window="weekly_scoped")
+        await _recompute_perishable_for_plan(reg2, ledger, plan)
+        return await ledger.get_lane_order("perishable-test")
+
+    stored = asyncio.run(go())
+    assert stored is not None, "expected a written lane order"
+    claude = [m for m in stored["members"] if m["ref"].startswith("claude-max/")]
+    assert claude, stored
+    # Strip the per-family tier offset the writer adds, as the writer does.
+    from switchyard.portal.app import _TIER_OFFSET
+    raw = float(claude[0]["score"])
+    raw -= round(raw / _TIER_OFFSET) * _TIER_OFFSET
+    tight = perishable_score(2.0, reset)
+    loose = perishable_score(88.0, reset)
+    assert abs(raw - tight) < abs(raw - loose), (raw, tight, loose)
+    assert raw < tight * 1.5, (raw, tight)
+    print(f"  weekly 98% + scoped 12%: ranked on 2% room ({raw:.3f}), not 88%")
+
+
 if __name__ == "__main__":
     # Plain-script runner: discovers tests from globals(), like the rest of
     # tests/*.py. See CLAUDE.md — appending below this block would silently
