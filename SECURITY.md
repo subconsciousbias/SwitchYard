@@ -24,10 +24,20 @@ not.
   keys set up. Everything behind it — every plan, every credential path — is
   one boundary. Do not publish the port to a network whose users you do not
   trust.
+- **The gateway and the portal bind to `127.0.0.1` by default.** A bare
+  `"${GATEWAY_PORT:-4000}:4000"` in `docker-compose.yml` would bind `0.0.0.0`,
+  exposing the master-key-protected gateway and the unauthenticated portal to
+  every host on the network the moment an operator runs `docker compose up
+  -d` on a LAN, VPS or café Wi-Fi (issue #118). The fix: every published
+  port now reads `"${BIND_ADDR:-127.0.0.1}:${PORT}:PORT"`, so a fresh clone
+  comes up loopback-only. Set `BIND_ADDR=0.0.0.0` in `.env` to expose on
+  purpose; the default is the safe one.
 - **The portal (`:4001`) has no authentication at all.** It shows your quota
   headroom, monthly costs and plan inventory, and it can store a vendor
-  session cookie pasted into it. On a shared network, bind it to loopback
-  (`127.0.0.1:4001:4001` in `docker-compose.yml`) or firewall it.
+  session cookie pasted into it. The loopback default above already
+  mitigates this on a single-host setup; on a shared or multi-host network,
+  firewall `:4001` separately or set `BIND_ADDR` only for the hosts you
+  control.
 - **The sidecars and the token proxy publish no host ports.** They are
   reachable only on the compose network. A neighbouring host cannot get at
   them; a compromised container on that network is a different story.

@@ -11,6 +11,10 @@ python3 -m switchyard.gen_litellm "$PLANS" /tmp/litellm.generated.yaml
 # that silently mis-routes. The check prints its result on every start, so
 # `docker logs` is the audit trail. A CRITICAL exit here is the container's
 # way of saying "stop restarting me, the proxy would lie about every request".
-echo "switchyard: running litellm self-check"
+# The selfcheck also audits the secrets on which the proxy depends (master
+# key length / default placeholder, Postgres password), so a CRITICAL line is
+# equally likely to mean "LITELLM_MASTER_KEY is the published default" as
+# "the litellm AST drifted".
+echo "switchyard: running litellm self-check (env secrets, litellm AST, loopback probe)"
 python3 -m switchyard.selfcheck
 exec litellm --config /tmp/litellm.generated.yaml --port 4000 --num_workers "${GATEWAY_WORKERS:-2}"

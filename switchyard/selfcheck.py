@@ -68,6 +68,99 @@ def _critical(msg: str) -> None:
     raise _CheckFailed(1)
 
 
+def _audit_secrets() -> None:
+    """(0) Refuse to start on a default/weak master key; warn on a default
+    Postgres password.
+
+    A gateway that boots with `LITELLM_MASTER_KEY=sk-switchyard-change-me` is
+    indistinguishable from one that boots with no master key at all: the
+    placeholder is published in the repo, so anyone who has read the README
+    can mint a valid bearer against the running container. The same applies,
+    less dramatically, to `POSTGRES_PASSWORD=change-me` (the default in
+    .env.example): the database accepts connections from anyone who knows the
+    published string. Both of these are fail-loud defaults on purpose, and
+    the startup gate is the right place to catch them.
+
+    Why this runs first, ahead of the litellm AST audits: every check below
+    either pulls litellm from disk or talks to the loopback stub; a missing
+    master key is a smaller, cheaper-to-detect condition, and catching it
+    before the litellm imports avoids a noise line in `docker logs` ("selfcheck
+    FAILED: litellm not importable" after the real "LITELLM_MASTER_KEY is
+    unset" message) when the actual operator problem is "I never ran
+    scripts/sync-env.sh".
+
+    Pure env function: no network, no litellm import. The rest of this
+    module follows the lazy-import pattern so a missing litellm is a CRITICAL
+    with the real reason; this function is the same shape (only `os.environ`
+    access, no I/O) so tests can call it without a litellm install.
+    """
+    master_key = os.environ.get("LITELLM_MASTER_KEY", "").strip()
+    if not master_key:
+        _critical(
+            "LITELLM_MASTER_KEY is unset or empty. The gateway refuses to "
+            "start with no master key - tools would authenticate as "
+            "'anyone'. Generate one with `bash scripts/sync-env.sh` (it "
+            "appends a random sk- key when creating a fresh .env), or set "
+            "LITELLM_MASTER_KEY in .env."
+        )
+        return
+    if "change-me" in master_key:
+        _critical(
+            "LITELLM_MASTER_KEY still contains the placeholder 'change-me' "
+            f"(got {master_key!r}). The default key is published in the "
+            "repo and authenticates anyone who has read the README to the "
+            "gateway. Generate a real key with `bash scripts/sync-env.sh` "
+            "and put the result in LITELLM_MASTER_KEY in .env."
+        )
+        return
+    if len(master_key) < 32:
+        _critical(
+            f"LITELLM_MASTER_KEY is shorter than 32 characters "
+            f"(got {len(master_key)}: {master_key!r}). A short master key "
+            "brute-forces in seconds. Generate one with "
+            "`bash scripts/sync-env.sh` (it appends a random sk- key when "
+            "creating a fresh .env)."
+        )
+        return
+    log.info(
+        "  ok  LITELLM_MASTER_KEY: present, no default placeholder, "
+        f"length {len(master_key)}"
+    )
+
+    # POSTGRES_PASSWORD is a loud warning, not a CRITICAL: the rest of the
+    # stack can still come up against a default-password database (the
+    # Compose file fail-closes on `POSTGRES_PASSWORD:?missing`, so 'unset'
+    # here means the env was supplied but empty). An operator who explicitly
+    # accepts the default password for a local-only Postgres still gets a
+    # clean startup; an operator who copied .env.example to .env gets a line
+    # they cannot miss in `docker logs`.
+    postgres_password = os.environ.get("POSTGRES_PASSWORD", "").strip()
+    if not postgres_password:
+        log.warning(
+            "WARNING: POSTGRES_PASSWORD is unset or empty. The database "
+            "falls back to its published default (or fails closed). Set "
+            "POSTGRES_PASSWORD in .env, or run `bash scripts/sync-env.sh` "
+            "to seed one."
+        )
+    elif "change-me" in postgres_password:
+        log.warning(
+            "WARNING: POSTGRES_PASSWORD still contains the placeholder "
+            f"'change-me' (got {postgres_password!r}). The default is "
+            "published in the repo; anyone reaching the Postgres port gets "
+            "in. Replace it with a random value in .env."
+        )
+    elif postgres_password == "litellm":
+        log.warning(
+            "WARNING: POSTGRES_PASSWORD is the literal 'litellm' (the "
+            "LiteLLM-image default). Replace it with a random value in .env."
+        )
+    else:
+        log.info(
+            "  ok  POSTGRES_PASSWORD: not the default placeholder "
+            f"(length {len(postgres_password)})"
+        )
+
+
 def _audit_router_pre_routing_hook(router_src: str) -> None:
     """(a) Router.async_pre_routing_hook must NOT iterate callback registries.
 
@@ -697,6 +790,7 @@ async def main_async() -> int:
     for noisy in ("LiteLLM", "LiteLLM Router", "litellm", "litellm.litellm_core_utils.litellm_logging"):
         logging.getLogger(noisy).setLevel(logging.WARNING + 1)
     log.info("litellm version: %s", _litellm_version())
+    _audit_secrets()
     _static_audit()
     await _dynamic_probe()
     log.info("selfcheck PASSED")

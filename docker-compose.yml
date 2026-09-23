@@ -47,7 +47,13 @@ services:
     <<: *common
     environment:
       POSTGRES_USER: litellm
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-litellm}
+      # Fail-closed on unset: the previous `${POSTGRES_PASSWORD:-litellm}` let
+      # the database boot with the LiteLLM-image default password, which is
+      # published on Docker Hub and lets anyone reach the DB on the network.
+      # The main checkout's .env always sets this (scripts/sync-env.sh appends
+      # it), so the only operators who hit `:?missing` are the ones who
+      # genuinely forgot to run sync-env.sh — and they need to know.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing - run scripts/sync-env.sh and set a value}
       POSTGRES_DB: litellm
     volumes: [pg-data:/var/lib/postgresql/data]
     healthcheck:
@@ -59,7 +65,15 @@ services:
   gateway:
     build: {context: ., dockerfile: Dockerfile.gateway}
     <<: *common
-    ports: ["${GATEWAY_PORT:-4000}:4000"]
+    # Loopback by default: the gateway speaks OpenAI/Anthropic over plain HTTP,
+    # and `LITELLM_MASTER_KEY` is the only authentication. A bare
+    # `"${GATEWAY_PORT:-4000}:4000"` would bind 0.0.0.0 and expose the master
+    # key to every host on the network — that's the failure mode issue #118
+    # documents. Set `BIND_ADDR=0.0.0.0` to expose intentionally; the loopback
+    # default is what keeps a fresh `docker compose up -d` from being
+    # reachable from the LAN/VPS/café Wi-Fi. See SECURITY.md's "trust
+    # boundary" section.
+    ports: ["${BIND_ADDR:-127.0.0.1}:${GATEWAY_PORT:-4000}:4000"]
     volumes:
       # /switchyard, not /app: /app is LiteLLM's own application directory.
       - ./config:/switchyard/config:ro
@@ -68,7 +82,7 @@ services:
       SWITCHYARD_REDIS_URL: redis://redis:6379/1
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:-litellm}@postgres:5432/litellm
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:?missing - run scripts/sync-env.sh and set a value}@postgres:5432/litellm
       LOCAL_API_BASE: ${LOCAL_API_BASE:-http://host.docker.internal:11434/v1}
       LOCAL_API_KEY: ${LOCAL_API_KEY:-}
       GATEWAY_WORKERS: ${GATEWAY_WORKERS:-2}
@@ -97,7 +111,10 @@ services:
   portal:
     build: {context: ., dockerfile: Dockerfile.portal}
     <<: *common
-    ports: ["${PORTAL_PORT:-4001}:4001"]
+    # Same loopback-by-default rationale as the gateway above. The portal has
+    # no authentication at all — anyone reaching :4001 can read your quota
+    # headroom and monthly spend. Override BIND_ADDR in .env to expose.
+    ports: ["${BIND_ADDR:-127.0.0.1}:${PORTAL_PORT:-4001}:4001"]
     volumes:
       - ./config:/app/config:ro
     environment:

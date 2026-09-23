@@ -21,7 +21,52 @@ fi
 
 if [ ! -f "$target" ]; then
   cp "$example" "$target"
-  echo "created $target from $example — fill in the blanks"
+  # Issue #118: the published `LITELLM_MASTER_KEY=sk-switchyard-change-me` is
+  # a CRITICAL at startup, and the gateway's selfcheck refuses to boot on it.
+  # Generate a random key and rewrite ONLY this one line in the freshly
+  # created file. The rewrite is structural — it happens after cp, before any
+  # operator edit, and only on a fresh create — so it cannot overwrite an
+  # existing value: by definition no .env existed before this branch ran.
+  generated_key=""
+  if command -v openssl >/dev/null 2>&1; then
+    generated_key="sk-$(openssl rand -hex 24)"
+  elif command -v python3 >/dev/null 2>&1; then
+    # POSIX fallback if openssl is missing (alpine without it, minimal
+    # images, etc). python3 is in the gateway image but this script runs on
+    # the operator's host, so prefer a host-side generator when available.
+    # The `command -v` gate keeps a missing-python3 from turning this into
+    # the literal string "sk-" (the prefix outside the subshell, with the
+    # subshell swallowing its own non-zero exit via `2>/dev/null`); without
+    # the gate we would write `LITELLM_MASTER_KEY=sk-` to .env, exit 0, and
+    # hand the operator a credential that the gateway's selfcheck will
+    # refuse on the next start anyway.
+    generated_key="sk-$(python3 -c 'import secrets;print(secrets.token_hex(24))' 2>/dev/null)"
+  fi
+  if [ -n "$generated_key" ]; then
+    # Rewrite ONLY the LITELLM_MASTER_KEY line in the freshly copied file.
+    # We use a tempfile + mv rather than `sed -i` because BSD sed (macOS)
+    # and GNU sed (Linux) take different arguments for in-place editing, and
+    # portability matters more than a single fork here. The mv is atomic on
+    # the same filesystem, so a partial write cannot leave an envfile with
+    # an empty master-key slot.
+    tmp_env="${target}.tmp.$$"
+    sed "s|^LITELLM_MASTER_KEY=.*$|LITELLM_MASTER_KEY=${generated_key}|" \
+      "$target" > "$tmp_env"
+    mv "$tmp_env" "$target"
+    echo "created $target from $example with a random LITELLM_MASTER_KEY — fill in the other blanks"
+  else
+    # No generator available: refuse to leave the published placeholder in
+    # place, because the next `docker compose up -d` will refuse to start.
+    # Better to error loudly here than to silently hand the operator a .env
+    # they will copy back to source control wondering why nothing works.
+    echo "ERROR: created $target but could not generate a random LITELLM_MASTER_KEY" >&2
+    echo "       (no openssl or python3 on PATH)." >&2
+    echo "       Edit $target and replace LITELLM_MASTER_KEY=sk-switchyard-change-me" >&2
+    echo "       with a random sk- key of at least 32 characters before running" >&2
+    echo "       docker compose up -d, or install openssl and re-run" >&2
+    echo "       scripts/sync-env.sh." >&2
+    exit 1
+  fi
   exit 0
 fi
 

@@ -17,7 +17,7 @@ provider below is optional, including the paid ones.
 ## Quickstart
 
 ```bash
-scripts/sync-env.sh      # creates .env and config/plans.yaml from the examples
+scripts/sync-env.sh      # creates .env (with a random LITELLM_MASTER_KEY) and config/plans.yaml from the examples
 $EDITOR .env             # keys for the plans you actually have
 $EDITOR config/plans.yaml   # your plans, their limits, and the lane order
 docker compose up -d
@@ -31,7 +31,18 @@ seven providers, which you should cut down to the ones you have.
 
 Use `sync-env.sh` rather than `cp .env.example .env`: on an existing checkout
 that copy overwrites real credentials, which is the mistake the script exists
-to prevent.
+to prevent. On a fresh clone `sync-env.sh` also rewrites the copied
+`LITELLM_MASTER_KEY=` line with a random `sk-…` key — without that rewrite
+the gateway's startup self-check refuses to boot with the published
+`sk-switchyard-change-me` placeholder, and `POSTGRES_PASSWORD` keeps its
+default.
+
+The gateway (`:4000`) and the portal (`:4001`) bind to **127.0.0.1 by
+default**. The gateway authenticates with a single bearer over plain HTTP,
+and the portal has no authentication at all, so binding 0.0.0.0 would
+expose both to every host on the network. If you want to reach them from
+another host on purpose, set `BIND_ADDR=0.0.0.0` in `.env`. See
+SECURITY.md for the trust-boundary reasoning.
 
 Then point anything at `http://<host>:4000` with `LITELLM_MASTER_KEY` as the key:
 
