@@ -8,11 +8,15 @@ never reads or writes a real credential store.
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
+import shutil
+import stat
 import sys
 import tempfile
 import time
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -220,6 +224,143 @@ def test_status_has_one_shape_whether_or_not_a_grant_exists():
     for shape in (missing, present):
         assert "access_token" not in str(shape), "status must never carry a token"
     print(f"  identical keys either way: {sorted(missing)}")
+
+
+def test_default_store_moves_existing_grant_into_xai_subdir():
+    """Issue #117 migration: a pre-existing secrets/oauth.json must end up at
+    secrets/xai/oauth.json on first import, with the grant preserved and the
+    file mode restored to 0600."""
+    root = tempfile.mkdtemp(prefix="oauth_mig_")
+    try:
+        os.makedirs(os.path.join(root, "secrets"))
+        old_path = os.path.join(root, "secrets", "oauth.json")
+        payload = {"xai": {"access_token": "tok-old", "refresh_token": "r-old",
+                           "expires_at": time.time() + 3600, "scope": "api"}}
+        with open(old_path, "w") as fh:
+            json.dump(payload, fh)
+        os.chmod(old_path, 0o644)  # anything not 0600 — proves the migration re-chmods
+
+        new_path = oauth._default_store(root=root)
+
+        assert new_path == os.path.join(root, "secrets", "xai", "oauth.json"), new_path
+        assert os.path.exists(new_path), f"migration did not create {new_path}"
+        assert not os.path.exists(old_path), f"migration did not remove {old_path}"
+        with open(new_path) as fh:
+            assert json.load(fh) == payload, "grant bytes were not preserved"
+        assert stat.S_IMODE(os.stat(new_path).st_mode) == 0o600, \
+            f"mode is {oct(stat.S_IMODE(os.stat(new_path).st_mode))}, expected 0o600"
+        print("  secrets/oauth.json -> secrets/xai/oauth.json, mode 0600, payload preserved")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_default_store_does_not_overwrite_existing_new_path():
+    """Issue #117 cycle-3 guard: if both secrets/oauth.json and
+    secrets/xai/oauth.json exist (partial migration, manual cp while
+    debugging), _default_store() must leave the new file untouched. The new
+    one is the valid grant; overwriting it with the (older, possibly stale)
+    old one would silently revoke a working session."""
+    root = tempfile.mkdtemp(prefix="oauth_both_")
+    try:
+        os.makedirs(os.path.join(root, "secrets", "xai"))
+        old_path = os.path.join(root, "secrets", "oauth.json")
+        new_path = os.path.join(root, "secrets", "xai", "oauth.json")
+        new_payload = {"xai": {"access_token": "tok-NEW", "refresh_token": "r-new",
+                               "expires_at": time.time() + 7200, "scope": "api"}}
+        old_payload = {"xai": {"access_token": "tok-OLD", "refresh_token": "r-old",
+                               "expires_at": time.time() - 60, "scope": "api"}}
+        with open(new_path, "w") as fh:
+            json.dump(new_payload, fh)
+        with open(old_path, "w") as fh:
+            json.dump(old_payload, fh)
+
+        result = oauth._default_store(root=root)
+
+        assert result == new_path
+        # The new path must be byte-for-byte the new payload, not the old one.
+        with open(new_path) as fh:
+            assert json.load(fh) == new_payload, \
+                "secrets/xai/oauth.json was overwritten by the older old payload"
+        # The old path is also still there — we did not touch it.
+        with open(old_path) as fh:
+            assert json.load(fh) == old_payload, \
+                "secrets/oauth.json was unexpectedly modified"
+        print("  both files present -> new path preserved, old path preserved, no overwrite")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_default_store_swallows_filenotfound_from_a_raced_replace():
+    """Issue #117 cycle-2 race-loser path: two importers both pass
+    `os.path.exists(old_path) and not os.path.exists(new_path)` and the
+    winner renames the source before the loser reaches `os.replace`. The
+    loser's call must not propagate the FileNotFoundError out of
+    _default_store — otherwise module import crashes and every downstream
+    reader of oauth.STORE hits NameError.
+
+    Driving the race window with unittest.mock is the only way to exercise
+    this code path deterministically in a single-process test: we patch
+    `os.path.exists` to claim the source is still there (so the gate
+    passes) and patch `os.replace` to raise the exact exception a real race
+    would produce. Without this, the second call's `os.path.exists(old_path)`
+    would return False and the entire try/except would be skipped — the
+    FileNotFoundError handler would never run."""
+    root = tempfile.mkdtemp(prefix="oauth_race_")
+    try:
+        os.makedirs(os.path.join(root, "secrets"))
+        new_path_expected = os.path.join(root, "secrets", "xai", "oauth.json")
+
+        # Capture the real os.path.exists before patching, otherwise the
+        # patched function would call itself recursively.
+        real_exists = oauth.os.path.exists
+
+        def fake_exists(p):
+            # The migration gate checks old_path and new_path; the source is
+            # still "there" at check time, the destination is not — exactly
+            # the window where two concurrent callers both enter the if.
+            if p.endswith(os.path.join("secrets", "oauth.json")):
+                return True
+            if p.endswith(os.path.join("secrets", "xai", "oauth.json")):
+                return False
+            # os.path.isdir for /app/secrets and os.makedirs(exist_ok=True)
+            # use the real filesystem; fall through to the real exists.
+            return real_exists(p)
+
+        def race_replace(src, dst):
+            # Simulate the winner having already moved the source out from
+            # under us between the exists() check and the rename.
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), src)
+
+        with mock.patch.object(oauth.os.path, "exists", side_effect=fake_exists), \
+             mock.patch.object(oauth.os, "replace", side_effect=race_replace):
+            new_path = oauth._default_store(root=root)
+
+        assert new_path == new_path_expected, new_path
+        # The function did not crash, and it returned the path the caller
+        # asked it to default to.
+        print("  FileNotFoundError on os.replace -> swallowed, new path returned")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_default_store_with_no_old_grant_still_returns_the_new_path():
+    """Fresh installs have no secrets/oauth.json to migrate. _default_store()
+    must still return the new path and create secrets/xai/ lazily when needed
+    (the container side mounts that exact directory)."""
+    root = tempfile.mkdtemp(prefix="oauth_fresh_")
+    try:
+        # No secrets/ at all — a clean checkout.
+        new_path = oauth._default_store(root=root)
+        assert new_path == os.path.join(root, "secrets", "xai", "oauth.json"), new_path
+        assert not os.path.exists(new_path), "must not create the file on a read-only check"
+        # A subsequent save (which is what _save() does on first login) finds
+        # the directory is created on demand.
+        oauth.STORE = new_path
+        oauth._save({"xai": {"access_token": "tok", "refresh_token": "r"}})
+        assert os.path.exists(new_path)
+        print("  fresh checkout -> new path returned, secrets/xai/ created lazily on save")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_concurrent_access_token_calls_do_not_deadlock():

@@ -302,10 +302,11 @@ docker compose exec -T xai-token-proxy python3 -c \
 ```
 
 **Expect** `authorised: true`, `ok: true`, `has_refresh: true`, and
-`upstream_base: https://api.x.ai/v1`. The tokens land in `./secrets/oauth.json`
-(mode 0600, gitignored), which the container mounts at `/app/secrets` — so the
-host CLI and the proxy share one grant and one refresh. `ok: false` with
-`authorised: false` is the normal state before the login, not a crash.
+`upstream_base: https://api.x.ai/v1`. The tokens land in
+`./secrets/xai/oauth.json` (mode 0600, gitignored), which the container mounts
+at `/app/secrets` — so the host CLI and the proxy share one grant and one
+refresh. `ok: false` with `authorised: false` is the normal state before the
+login, not a crash.
 
 **Expect** each to report its subscription, the concurrency it read from
 `plans.yaml`, and the model aliases it will accept, e.g.:

@@ -72,7 +72,10 @@ The token-proxy image is smaller still:
 
   - `SWITCHYARD_PROVIDER` — `xai` or `openai`, one process per provider.
   - `SWITCHYARD_AUTH_STORE=/app/secrets/oauth.json` — read-write mount of
-    `./secrets`, so the proxy can refresh the access token in place.
+    `./secrets/xai`, so the proxy can refresh the access token in place. The
+    mount is scoped to just this provider's grant directory; the other
+    `./secrets/<provider>` stores (claude, codex, opencode, ...) are not
+    reachable from this container.
 
 ## The bridge-siblings rule
 

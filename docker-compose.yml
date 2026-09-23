@@ -210,9 +210,11 @@ services:
     volumes:
       - ./config:/app/config:ro
       # Read-write: the proxy refreshes the access token and writes it back, so
-      # the host CLI and every container share one current grant. Nothing else
-      # in ./secrets is readable from here.
-      - ./secrets:/app/secrets
+      # the host CLI and the container share one current grant. The mount is
+      # scoped to ./secrets/xai, not the whole ./secrets tree — the Claude,
+      # Codex and OpenCode credential stores (mounted separately on their own
+      # sidecars above) are NOT visible here.
+      - ./secrets/xai:/app/secrets
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:8090/health')\""]
       interval: 30s

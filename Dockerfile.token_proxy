@@ -17,8 +17,10 @@ COPY sidecars/token_proxy/server.py /app/token_proxy/server.py
 COPY switchyard/oauth.py /app/switchyard/oauth.py
 COPY switchyard/__init__.py /app/switchyard/__init__.py
 
-# /app/secrets is the mount for ./secrets, which holds oauth.json. It is the
-# same file the host's `python3 -m switchyard.oauth login` writes.
+# /app/secrets is the mount for ./secrets/xai, which holds oauth.json. It is
+# the same file the host's `python3 -m switchyard.oauth login` writes. The
+# mount is scoped to this directory on purpose: the other ./secrets/<provider>
+# stores (claude, codex, opencode, ...) are unrelated to this container.
 ENV SWITCHYARD_PROVIDER=xai \
     SWITCHYARD_AUTH_STORE=/app/secrets/oauth.json \
     SWITCHYARD_PLANS=/app/config/plans.yaml \

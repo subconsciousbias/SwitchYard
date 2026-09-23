@@ -9,8 +9,12 @@ docker compose exec codex-sidecar        codex login --device-auth
 docker compose exec opencode-go-sidecar  opencode auth login --provider opencode-go
 docker compose exec opencode-go2-sidecar opencode auth login --provider opencode-go
 python3 -m switchyard.oauth login xai    # SuperGrok: SwitchYard's own grant,
-                                         # stored as secrets/oauth.json — no CLI
+                                         # stored as secrets/xai/oauth.json — no CLI
 ```
+
+The xai-token-proxy container only sees `secrets/xai/` — its compose mount
+is scoped to that subdirectory, so it can read and refresh its own grant
+without ever being able to reach the Claude / Codex / OpenCode stores above.
 
 `scripts/auth_audit.py` audits all of the above (and whatever sidecars
 docker-compose.yml grows), and apply.sh runs the missing logins for you.

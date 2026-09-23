@@ -40,23 +40,56 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-def _default_store() -> str:
+def _default_store(root: str | None = None) -> str:
     """Where the token store lives, host or container.
 
-    The containers mount the repo's ./secrets at /app/secrets, so both sides
-    read the same file — but only the container has /app. Defaulting to the
-    container path meant `login` run from the shell (which is the only way to
-    run it: the grant needs a human at a browser) completed the grant and then
-    lost the tokens to a read-only /app.
+    The container mounts ./secrets/xai at /app/secrets, so both sides read the
+    same file — but only the container has /app. Defaulting to the container
+    path meant `login` run from the shell (which is the only way to run it:
+    the grant needs a human at a browser) completed the grant and then lost
+    the tokens to a read-only /app.
+
+    On the host, the grant lives under secrets/xai/ rather than secrets/
+    directly so the xai-token-proxy container can mount just its own grant
+    directory (./secrets/xai) instead of the whole ./secrets tree. A
+    one-time migration moves an existing secrets/oauth.json into secrets/xai/.
+
+    `root` exists so the host-side migration path can be exercised in tests
+    against a temp directory without monkeypatching `__file__`. It is
+    internal: callers outside this module should use the module-level STORE.
     """
     override = os.environ.get("SWITCHYARD_AUTH_STORE")
     if override:
         return override
     if os.path.isdir("/app/secrets"):
         return "/app/secrets/oauth.json"
-    # The repo checkout: this file is <root>/switchyard/oauth.py.
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(root, "secrets", "oauth.json")
+    if root is None:
+        # The repo checkout: this file is <root>/switchyard/oauth.py.
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    new_path = os.path.join(root, "secrets", "xai", "oauth.json")
+    old_path = os.path.join(root, "secrets", "oauth.json")
+    # One-time migration: an existing install has its grant at the old path.
+    # Move it to the new path so the container's mount of ./secrets/xai sees
+    # the same file the host CLI is writing. The `not os.path.exists(new_path)`
+    # guard is critical: if both files exist (partial migration, manual cp
+    # while debugging), the new one is the valid grant and must NOT be
+    # overwritten with the (older, possibly stale) contents of the old one.
+    # The TOCTOU race-loser path is handled by the inner except: when two
+    # importers both pass the existence check and the winner renames the
+    # source, the loser's os.replace raises FileNotFoundError and is
+    # swallowed. Any other OSError (read-only filesystem, chmod denied) is
+    # also swallowed so an import never crashes the host CLI for a migration
+    # that has already happened.
+    if os.path.exists(old_path) and not os.path.exists(new_path):
+        try:
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            os.replace(old_path, new_path)
+            os.chmod(new_path, 0o600)
+        except (FileNotFoundError, NotADirectoryError):
+            pass  # raced: another importer moved it first
+        except OSError:
+            pass
+    return new_path
 
 
 STORE = _default_store()
