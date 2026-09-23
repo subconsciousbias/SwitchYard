@@ -46,11 +46,21 @@ def test_first_matching_candidate_wins():
     print("  candidate lists resolve in order, strings parse, booleans ignored")
 
 
-def test_expired_cookie_is_detected_from_minimax_1004():
+def test_minimax_reauth_body_contains_prose_marker():
+    # After #164, "1004" is no longer a prose marker (a real 200 reading can
+    # carry it inside an unrelated field), and the 1004 reauth is detected
+    # structurally out of base_resp.status_code instead. What this test
+    # actually asserts is that the surviving prose markers
+    # ("cookie is missing", "log in again") still match MiniMax's reauth
+    # body verbatim — and that "1004" really is gone from REAUTH_MARKERS so
+    # a successful reading that happens to contain "11004" can't trip it.
     body = ('{"base_resp":{"status_code":1004,'
             '"status_msg":"cookie is missing, log in again"}}').lower()
+    assert "cookie is missing" in body
     assert any(m in body for m in REAUTH_MARKERS)
-    print("  MiniMax 1004 'cookie is missing' reads as needs-reauth, not a generic failure")
+    assert "1004" not in REAUTH_MARKERS
+    print("  MiniMax reauth body matches a surviving prose marker; "
+          "'1004' is no longer a marker of its own")
 
 
 def test_cookie_is_never_readable_through_status():
@@ -655,6 +665,167 @@ def test_set_cookie_is_captured_on_a_verified_good_response():
     assert new_cookie not in blob, blob
     assert "abcdef1234567890" not in blob, blob
     print(f"  captured -> fingerprint {status['fingerprint']!r}, value never surfaced")
+
+
+def test_minimax_200_body_with_unauthorized_count_is_not_a_reauth():
+    """The repro that started this: MiniMax's real 200 response carries an
+    `unauthorized_count: 0` field. The substring "unauthorized" used to fire
+    the prose-marker scan on any successful payload, mark the plan as
+    needs_reauth, and stop polling — even when the response was a perfectly
+    good 200 with real numbers inside it.
+
+    The fix is that the prose scan only runs when the body is *not* valid
+    JSON: a body that parses cleanly is treated as data, and any
+    reauth-classified status (MiniMax's 1004) is read structurally out of
+    `base_resp.status_code` instead. This test serves the exact issue payload
+    (a 200 with `unauthorized_count: 0` next to a `model_remains` entry that
+    holds real percentages) and asserts the probe parses it, not kills it.
+    """
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+
+    payload = {
+        "base_resp": {"status_code": 0, "status_msg": "success"},
+        "model_remains": [{
+            "model_name": "general",
+            "current_interval_usage_count": 11004,
+            "current_interval_used_percent": "37.5%",
+            "current_weekly_used_percent": "12%",
+        }],
+        "unauthorized_count": 0,
+    }
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/backend/account/token_plan/remains_percent"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        plan = replace(plan, probe=replace(plan.probe, url=url))
+        await prober.set_cookie(plan.key, "session=x")
+        return await prober.run(plan)
+
+    result = asyncio.run(go())
+    srv.shutdown()
+
+    assert result.ok, result
+    assert not result.needs_reauth, ("the substring 'unauthorized' in "
+                                     "unauthorized_count flagged a 200 as reauth")
+    assert result.windows, result
+    got = {w.window: w for w in result.windows}
+    assert got["weekly"].used_percent == 12.0, got["weekly"]
+    assert got["5h"].used_percent == 37.5, got["5h"]
+    print("  200 with unauthorized_count -> parsed as a real reading, not reauth")
+
+
+def test_minimax_1004_in_200_body_triggers_reauth_via_base_resp():
+    """MiniMax's structured 1004 reauth used to need a 401 to be caught, but
+    the provider has been seen answering 200 with a `base_resp.status_code`
+    of 1004. The bare substring `"1004"` is no longer in REAUTH_MARKERS (a
+    legitimate response could contain it), so this must come from the
+    structured `base_resp` check that runs before the prose scan and works
+    on any HTTP status."""
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+
+    body = json.dumps({"base_resp": {"status_code": 1004,
+                                      "status_msg": "cookie is missing, log in again"}})
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            data = body.encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/backend/account/token_plan/remains"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        plan = replace(plan, probe=replace(plan.probe, url=url))
+        await prober.set_cookie(plan.key, "session=x")
+        return await prober.run(plan)
+
+    result = asyncio.run(go())
+    srv.shutdown()
+
+    assert not result.ok, result
+    assert result.needs_reauth, ("a 200 with base_resp.status_code=1004 must "
+                                 "still flag the plan as needs_reauth")
+    assert "1004" not in REAUTH_MARKERS, ("the bare '1004' marker would flag "
+                                          "any response containing that digit")
+    print("  200 with base_resp.status_code=1004 -> needs_reauth, no bare '1004' marker")
+
+
+def test_non_json_body_with_unauthorized_still_triggers_reauth():
+    """A non-JSON 200 with 'unauthorized' in the prose still goes through the
+    prose scan — only valid-JSON bodies are exempted, because only a valid
+    body could have been the structured 1004 path's target. This is the
+    third leg of the contract: 401/403 always reauth, valid-JSON 2xx only
+    reauth when `base_resp.status_code` says so, and prose-marker reauth is
+    reserved for the case where we genuinely have no structured data."""
+    import http.server
+    import threading
+    from dataclasses import replace
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            data = b"401 Unauthorized: please authenticate"
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/backend/account/token_plan/remains"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        plan = replace(plan, probe=replace(plan.probe, url=url))
+        await prober.set_cookie(plan.key, "session=x")
+        return await prober.run(plan)
+
+    result = asyncio.run(go())
+    srv.shutdown()
+
+    assert result.needs_reauth, ("non-JSON body containing 'unauthorized' must "
+                                 "still flag as reauth when JSON parsing failed")
+    assert not result.ok, result
+    print("  non-JSON 200 'unauthorized' -> needs_reauth via prose path")
 
 
 if __name__ == "__main__":

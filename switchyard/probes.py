@@ -38,8 +38,11 @@ K_CRED = "sy:cred:{plan}"
 K_PROBE = "sy:probe:{plan}"
 
 # The tell that a session cookie has expired rather than something else failing.
+# The MiniMax 1004 code is detected structurally below once the body has parsed
+# as JSON, so it does not belong here: a bare "1004" string in an otherwise
+# successful response would otherwise flag a perfectly good cookie as dead.
 REAUTH_MARKERS = ("cookie is missing", "log in again", "not logged in",
-                  "unauthorized", "1004")
+                  "unauthorized")
 
 
 @dataclass
@@ -283,10 +286,49 @@ class Prober:
             return await self._fail(plan, f"request failed: {exc}", False)
 
         body = resp.text or ""
+
+        # Parse the body before the rejection check so we can detect MiniMax's
+        # structured reauth signal (`base_resp.status_code == 1004`) on any
+        # status code, not just 401/403 — the response can be HTTP 200 with a
+        # 1004 payload, and previously that slipped past the prose scan and
+        # got parsed as a real reading.
+        try:
+            doc = resp.json()
+            doc_valid = True
+        except ValueError:
+            doc = None
+            doc_valid = False
+
+        # MiniMax wraps its reauth code in base_resp. A bare "1004" string in
+        # an unrelated field (or a substring of "unauthorized_count") would
+        # otherwise trip a generic prose scan, so we only match the structured
+        # shape here, and only on its own merits.
+        if isinstance(doc, dict):
+            base_resp = doc.get("base_resp")
+            if isinstance(base_resp, dict):
+                br_code = base_resp.get("status_code")
+                if br_code == 1004 or br_code == "1004":
+                    # Name both signals so the board can't read a 200 OK as a
+                    # session rejection — `last_error` is printed verbatim on
+                    # `_probes.html:60` and "session rejected (200)" reads as
+                    # a contradiction to the operator.
+                    return await self._fail(
+                        plan,
+                        f"session rejected (base_resp {br_code}, HTTP {resp.status_code})",
+                        True, raw=body[:1500])
+
         lowered = body.lower()
-        if resp.status_code in (401, 403) or any(m in lowered for m in REAUTH_MARKERS):
-            return await self._fail(plan, f"session rejected ({resp.status_code})", True,
-                                    raw=body[:1500])
+        if resp.status_code in (401, 403) or (
+                not doc_valid and any(m in lowered for m in REAUTH_MARKERS)):
+            # 401/403 is unambiguous on its own: the server said the session is
+            # dead. The prose-on-non-JSON leg can fire on a 200 body (e.g.
+            # "401 Unauthorized: please authenticate" served with HTTP 200),
+            # so name the prose match explicitly when the HTTP status itself
+            # didn't reject us.
+            detail = (f"session rejected (HTTP {resp.status_code})"
+                      if resp.status_code in (401, 403)
+                      else f"session rejected (HTTP {resp.status_code}, prose match)")
+            return await self._fail(plan, detail, True, raw=body[:1500])
         if resp.status_code >= 400:
             return await self._fail(plan, f"HTTP {resp.status_code}", False, raw=body[:1500])
 
@@ -310,9 +352,7 @@ class Prober:
                 log.info("cookie rotated by provider (plan=%s, fingerprint=%s)",
                          plan.key, _fingerprint(new_cookie))
 
-        try:
-            doc = resp.json()
-        except ValueError:
+        if not doc_valid:
             return await self._fail(plan, "response was not JSON", False, raw=body[:1500])
 
         target = probe.window or plan.quota.label
