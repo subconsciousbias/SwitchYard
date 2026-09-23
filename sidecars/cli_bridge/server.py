@@ -404,6 +404,21 @@ PROFILES: dict[str, dict] = {
         "args": os.environ.get(
             "OPENCODE_ARGS",
             "run --model {model} --format json --agent switchyard {prompt}").split(),
+        # Issue #121: OpenCode uses yargs (verified on 1.18.31), and yargs
+        # parses any argv element starting with '-' as a flag. A caller
+        # prompt (or system block folded onto it) like "--agent=build" would
+        # silently override the `--agent switchyard` the bridge pinned,
+        # replacing the no-tools harness with one that has every tool --
+        # and the difference is invisible from the answer, because the
+        # override happens at flag parse, not at the model layer.
+        #
+        # The fix is a `--` sentinel spliced in by build_argv immediately
+        # before the prompt element; yargs treats `--` as "stop parsing
+        # flags", so the element that follows is a positional no matter what
+        # it starts with. The sentinel lives in the profile (not in the
+        # args template) so OPENCODE_ARGS env overrides keep working --
+        # overrides only need to carry the {prompt} slot, not the terminator.
+        "prompt_terminator": "--",
         # No system-prompt FLAG at all, verified by testing: --prompt, --system
         # and --system-prompt each exit 1 as unknown options.
         #
@@ -817,7 +832,30 @@ def build_argv(prompt: str, system: str | None,
         elif use_stdin and PROVIDER == "codex":
             argv.append("-")
         elif not use_stdin:
-            argv.append(prompt)
+            # Issue #121: a prompt element that starts with "-" can be parsed
+            # as a CLI flag by yargs (OpenCode) or clap (Codex), or sit in the
+            # value slot of an option (claude's `-p "{prompt}"`) and still be
+            # misinterpreted by tools that lookahead past option boundaries.
+            # Two profiles, two strategies, applied only on the argv path:
+            #   * opencode carries a profile-level "prompt_terminator" ("--");
+            #     spliced in immediately before the prompt so yargs sees the
+            #     element that follows as a positional.
+            #   * claude and codex have no sentinel option (the prompt slot is
+            #     an option value or a positional whose arg shape we do not
+            #     own); for them, prefix the prompt with a fixed non-dash line
+            #     when it starts with "-", so the element can never look like
+            #     a flag.
+            # On the stdin path neither fix is needed: the prompt rides the
+            # pipe, not argv, and the flag-vs-positional question never
+            # comes up.
+            terminator = PROFILE.get("prompt_terminator")
+            if terminator:
+                argv.append(terminator)
+                argv.append(prompt)
+            elif prompt.startswith("-"):
+                argv.append(f"Message:\n{prompt}")
+            else:
+                argv.append(prompt)
 
     key = ("system_args_replace" if SYSTEM_MODE == "replace"
            and PROFILE.get("system_args_replace") else "system_args")

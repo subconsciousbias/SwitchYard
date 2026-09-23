@@ -230,6 +230,16 @@ MCP_PROFILES: dict[str, dict] = {
         "cli": os.environ.get("OPENCODE_CLI", "opencode"),
         "argv": ["run", "--model", "{model}", "--format", "json",
                  "--dir", "{workdir}", "--agent", "switchyard", "{prompt}"],
+        # Issue #121: opencode's argv parser greedily consumes a `-FLAG`
+        # prompt as an option. build_argv reads this key and inserts the
+        # sentinel on the argv path immediately before the prompt element,
+        # so the next element is unambiguously a positional. Skipped on
+        # the stdin path -- there the prompt is fed via stdin (or, for
+        # codex, the `"-"` placeholder already in argv), and there is no
+        # argv element to be parsed as a flag. Adding `"--"` directly to
+        # the argv template is not enough: build_argv substitutes `{prompt}`
+        # outside `fill()`, and only this codepath runs the insertion.
+        "prompt_terminator": "--",
         # OpenCode's tool ids are <server>_<tool>; see write_opencode_dir.
         "tool_qualifier": lambda name: f"switchyard_{name}",
         "parser": "events_json",
@@ -876,13 +886,27 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
     # the template and claude/opencode drop the element entirely.
     use_stdin = over_argv_limit(effective_prompt)
     argv = [PROFILE["cli"]]
+    terminator = PROFILE.get("prompt_terminator")
     for element in PROFILE["argv"]:
         if element != "{prompt}":
             argv.append(fill(element))
         elif use_stdin and PROVIDER == "codex":
             argv.append("-")
         elif not use_stdin:
-            argv.append(effective_prompt)
+            # Issue #121 lock-step: opencode carries a `--` sentinel so the
+            # argv parser (yargs) stops at option lookup and the prompt
+            # becomes an unambiguous positional. claude and codex have no
+            # sentinel; for them, a prompt that still starts with `-` after
+            # the system-prompt fold would be argv-parsed as a flag, so we
+            # prepend a fixed non-dash line (`Message:`) to the element
+            # itself. Both bridges (cli_bridge and mcp_bridge) apply the
+            # same fix in the same place so behaviour matches.
+            prompt_element = effective_prompt
+            if not terminator and prompt_element.startswith("-"):
+                prompt_element = "Message:\n" + prompt_element
+            if terminator:
+                argv.append(terminator)
+            argv.append(prompt_element)
     if PROVIDER == "claude" and system:
         if over_argv_limit(system):
             # Same E2BIG trap as the prompt (issue #29): --system-prompt is

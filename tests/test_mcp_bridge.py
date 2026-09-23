@@ -1005,6 +1005,140 @@ def test_a_prompt_over_the_argv_limit_travels_on_stdin():
     print(f"  {len(huge)}-char prompt stayed off argv and arrived whole on stdin")
 
 
+def test_argv_path_protects_dash_leading_prompts_for_all_providers_and_stdin_path_is_unchanged():
+    """Issue #121 hardening for the MCP bridge, every provider covered.
+
+    opencode's argv parser (yargs) greedily consumes a leading `-FLAG` prompt
+    as an option. claude's parser does the same against the value of `-p`,
+    and codex's parser does the same against its trailing positional. The
+    argv path must therefore stop that across all three providers:
+
+      * opencode -- profile carries `prompt_terminator: "--"`; build_argv
+        splices the sentinel element immediately before the prompt so yargs
+        treats the prompt as a positional.
+      * claude -- prompt slot is the value of `-p "{prompt}"` and there is no
+        sentinel option we can insert; build_argv prepends a `Message:\\n`
+        line to the prompt element so it cannot be consumed as a flag.
+      * codex -- `{prompt}` is the trailing positional in argv; same prefix
+        guard as claude.
+
+    The stdin path must remain untouched on every provider -- on that path
+    the prompt rides the pipe, not argv (or, for codex, the `"-"` placeholder
+    is already in argv), so there is no argv element to be misparsed as a
+    flag and the prefix guard does not run.
+
+    This is exercised directly on `mcp_bridge.build_argv` -- the same call
+    `start_session` makes per request. The PROFILE/PROVIDER module globals
+    are saved and restored around the case for each provider, so the rest of
+    the suite keeps running against the fixture (claude provider) once this
+    test returns. Mirrors `tests/test_cli_bridge.py`'s argv-path / stdin-path
+    layout, sibling-bridge for sibling-bridge per `sidecars/CLAUDE.md`.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-issue121-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    saved_provider, saved_profile = server.PROVIDER, server.PROFILE
+    try:
+        # ---- opencode: argv path carries `--` sentinel before the prompt ----
+        server.PROVIDER = "opencode"
+        server.PROFILE = server.MCP_PROFILES["opencode"]
+
+        # Argv path with a system that begins with `-`: the effective_prompt
+        # is the folded text (`"<system>\\n\\n<prompt>"`), and the element
+        # immediately before it in argv must be the `--` sentinel.
+        argv, stdin_data = server.build_argv(
+            "build", "--agent=build", "m", workdir, "sess", tools_path, "")
+        assert stdin_data is None, "argv path must not feed stdin"
+        # The sentinel must be present, and the element immediately after it
+        # must be the folded effective_prompt -- exactly what puts
+        # `--agent=build` in argv as a string the parser cannot consume.
+        assert "--" in argv, argv
+        assert argv.index("--") == len(argv) - 2, argv
+        assert argv[-1] == "--agent=build\n\nbuild", argv
+
+        # A short prompt with no system still picks up the same sentinel.
+        argv, stdin_data = server.build_argv(
+            "ship", None, "m", workdir, "sess", tools_path, "")
+        assert stdin_data is None, stdin_data
+        assert argv[argv.index("--")] == "--"
+        assert argv[argv.index("--") + 1] == "ship", argv
+
+        # Stdin path: an oversized prompt must NOT carry the `--` sentinel
+        # (it would have nothing to separate from -- the prompt is not in
+        # argv at all), and the prompt body must travel via stdin_data.
+        huge = "x" * (server.STDIN_PROMPT_LIMIT + 10)
+        argv, stdin_data = server.build_argv(
+            huge, None, "m", workdir, "sess", tools_path, "")
+        assert stdin_data == huge, "oversized prompt must travel on stdin"
+        assert "--" not in argv, argv
+        assert huge not in argv, "the prompt body must not appear in argv"
+
+        # ---- claude: argv path prepends `Message:\n` to the -p value ----
+        server.PROVIDER = "claude"
+        server.PROFILE = server.MCP_PROFILES["claude"]
+        # system goes through --system-prompt on the claude MCP path (claude
+        # has its own system-prompt flag, unlike opencode), so the argv-path
+        # prompt slot is the value of -p with the Message: prefix guarding it.
+        argv, stdin_data = server.build_argv(
+            "--agent=build", "--agent=build", "m", workdir, "sess",
+            tools_path, "")
+        assert stdin_data is None, "argv path must not feed stdin"
+        prompt_idx = argv.index("-p") + 1
+        assert not argv[prompt_idx].startswith("-"), argv
+        assert argv[prompt_idx].startswith("Message:"), argv
+        assert "--agent=build" in argv[prompt_idx], argv
+        # The sentinel element must NOT be present -- claude's profile has
+        # no prompt_terminator, only the Message: prefix guard.
+        assert "--" not in argv, argv
+
+        # ---- codex: argv path prepends `Message:\n` to the trailing positional ----
+        server.PROVIDER = "codex"
+        server.PROFILE = server.MCP_PROFILES["codex"]
+        # codex puts system in instructions.md (so it shows up as a trailing
+        # `-c model_instructions_file=...` in argv), but the prompt element
+        # itself is still a positional with the Message: prefix guarding it.
+        # Pass system as well so this mirrors cli_bridge's codex case.
+        argv, stdin_data = server.build_argv(
+            "--agent=build", "--agent=build", "m", workdir, "sess",
+            tools_path, "")
+        assert stdin_data is None, "argv path must not feed stdin"
+        # Search for the prompt element by its Message: prefix so the
+        # assertion does not depend on whether the trailing instructions
+        # -c override is appended (it is, when system is non-None).
+        prompt_idx = [i for i, a in enumerate(argv) if a.startswith("Message:")]
+        assert prompt_idx, argv
+        idx = prompt_idx[0]
+        assert not argv[idx].startswith("-"), argv
+        assert "--agent=build" in argv[idx], argv
+        # The sentinel element must NOT be present -- codex's profile has
+        # no prompt_terminator, only the Message: prefix guard.
+        assert "--" not in argv, argv
+
+        # Stdin path on the non-opencode providers: an oversized prompt must
+        # NOT carry the Message: prefix (the guard is argv-path only); for
+        # codex the `-` placeholder stays in argv at the prompt slot.
+        server.PROVIDER = "claude"
+        server.PROFILE = server.MCP_PROFILES["claude"]
+        argv, stdin_data = server.build_argv(
+            huge, None, "m", workdir, "sess", tools_path, "")
+        assert stdin_data is not None, "oversized prompt must travel on stdin"
+        assert huge not in argv, "the prompt body must not appear in argv"
+        assert not any(a.startswith("Message:") for a in argv), argv
+
+        server.PROVIDER = "codex"
+        server.PROFILE = server.MCP_PROFILES["codex"]
+        argv, stdin_data = server.build_argv(
+            huge, None, "m", workdir, "sess", tools_path, "")
+        assert stdin_data is not None, "oversized prompt must travel on stdin"
+        assert huge not in argv, "the prompt body must not appear in argv"
+        assert "-" in argv, "codex keeps the '-' placeholder at the prompt slot"
+        assert not any(a.startswith("Message:") for a in argv), argv
+    finally:
+        server.PROVIDER, server.PROFILE = saved_provider, saved_profile
+    print("  opencode argv: '--' sentinel; claude/codex argv: 'Message:\\n' "
+          "prefix; all three stdin paths unchanged")
+
+
 def test_run_session_fails_502_when_structured_parser_finds_no_answer():
     """The MCP-bridge path used to echo the raw event stream too.
 

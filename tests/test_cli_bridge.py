@@ -384,6 +384,112 @@ def test_an_oversized_prompt_travels_on_stdin():
     print(f"  {len(huge)}-char prompt kept off argv; small prompt unchanged")
 
 
+# ------------------------------------------------- issue #121: argv prompt hardening ---
+def test_argv_prompt_sentinel_keeps_dash_leading_prompts_unescaped():
+    """Issue #121: a prompt (or system block folded onto it) starting with '-'
+    can be parsed as a CLI flag. OpenCode uses yargs (verified on 1.18.31),
+    so a caller prompt of "--agent=build" would silently override the
+    `--agent switchyard` the bridge pinned and re-enable every tool the
+    harness suppressed.
+
+    Hardening on the argv path:
+      * opencode: build_argv splices a profile-driven 'prompt_terminator'
+        sentinel ('--') immediately before the prompt element; yargs treats
+        '--' as 'stop parsing flags', so the element that follows is a
+        positional no matter what it starts with.
+      * claude and codex: the prompt slot is an option value (`-p "{prompt}"`)
+        or a positional whose arg shape we do not own, so no sentinel. For
+        them, when the prompt starts with '-', build_argv prepends a fixed
+        'Message:' line     so the element can never look like a flag.
+    """
+    system = "--agent=build"
+    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
+    try:
+        # opencode: '--' lands immediately before the prompt.
+        server.PROVIDER = "opencode"
+        server.PROFILE = server.PROFILES["opencode"]
+        server.CLI = server.PROFILE["cli"]
+        argv, stdin_data = server.build_argv("--agent=build", system)
+        assert stdin_data is None, argv
+        idx = argv.index("--agent=build")
+        assert argv[idx - 1] == "--", argv
+
+        # claude: prompt slot is the value of -p; must not start with '-'.
+        server.PROVIDER = "claude"
+        server.PROFILE = server.PROFILES["claude"]
+        server.CLI = server.PROFILE["cli"]
+        argv, stdin_data = server.build_argv("--agent=build", system)
+        assert stdin_data is None, argv
+        prompt_idx = argv.index("-p") + 1
+        assert not argv[prompt_idx].startswith("-"), argv
+        assert argv[prompt_idx].startswith("Message:"), argv
+
+        # codex: prompt is a positional at the end; must not start with '-'.
+        server.PROVIDER = "codex"
+        server.PROFILE = server.PROFILES["codex"]
+        server.CLI = server.PROFILE["cli"]
+        argv, stdin_data = server.build_argv("--agent=build", system)
+        assert stdin_data is None, argv
+        prompt_idx = [i for i, a in enumerate(argv) if a.startswith("Message:")]
+        assert prompt_idx, argv
+        idx = prompt_idx[0]
+        assert not argv[idx].startswith("-"), argv
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
+
+
+def test_argv_prompt_sentinel_stdin_path_is_unchanged():
+    """Issue #121: the sentinel and prefix only apply on the argv path; the
+    stdin path (oversized prompt) must look exactly as before -- no extra
+    '--' splice for opencode, no 'Message:' prefix on the prompt slot for
+    any provider. The sentinel exists to stop argv parsers from misreading
+    a flag-shaped element; on the stdin path there is no argv element to
+    misread, so neither guard fires.
+    """
+    system = "--agent=build"
+    huge = "x" * (server.STDIN_PROMPT_LIMIT + 10)
+    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
+    try:
+        # opencode: {prompt} drops out of argv entirely on stdin path;
+        # argv ends with the last template element ("switchyard"), no extra
+        # '--' spliced between it and the previous element.
+        server.PROVIDER = "opencode"
+        server.PROFILE = server.PROFILES["opencode"]
+        server.CLI = server.PROFILE["cli"]
+        argv, stdin_data = server.build_argv(huge, system)
+        assert stdin_data is not None
+        assert huge not in argv, argv
+        # 'switchyard' is the last template element; nothing was appended after.
+        assert argv[-1] == "switchyard", argv
+        # And the agent flag the test cares about was NOT interpreted as a
+        # CLI flag -- the sentinel did not run, but the prompt is on stdin
+        # so there is no argv element to misread in the first place.
+        assert "--agent=build" not in argv, argv
+
+        # claude: same shape as before -- prompt not in argv, no Message:
+        # prefix anywhere (the guard is argv-path only).
+        server.PROVIDER = "claude"
+        server.PROFILE = server.PROFILES["claude"]
+        server.CLI = server.PROFILE["cli"]
+        argv, stdin_data = server.build_argv(huge, system)
+        assert stdin_data is not None
+        assert huge not in argv, argv
+        assert not any(a.startswith("Message:") for a in argv), argv
+
+        # codex: '-' placeholder stays in argv at the prompt slot; no
+        # Message: prefix anywhere.
+        server.PROVIDER = "codex"
+        server.PROFILE = server.PROFILES["codex"]
+        server.CLI = server.PROFILE["cli"]
+        argv, stdin_data = server.build_argv(huge, system)
+        assert stdin_data is not None
+        assert huge not in argv, argv
+        assert "-" in argv, argv
+        assert not any(a.startswith("Message:") for a in argv), argv
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
+
+
 CODEX_FIXTURE = os.path.join(HERE, "fixtures", "codex-events.jsonl")
 
 
