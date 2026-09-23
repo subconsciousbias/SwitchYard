@@ -236,6 +236,12 @@ class Settings:
     # own retry delay into the gateway. Cooled plans and cap==0 plans are
     # never waited on.
     pin_wait_seconds: float = 10.0
+    # The same wait for a session's NEW turn (the user typed, no tool result
+    # in flight). Zero keeps the old behaviour: a busy plan moves the session
+    # at once. Moving a long Claude Code session to another seat costs a full
+    # prompt-cache rewrite there, so a few seconds of waiting is usually far
+    # cheaper than the move. Cooled and cap==0 plans are never waited on.
+    affinity_wait_seconds: float = 0.0
     # Move inline <think>...</think> out of streamed content and into
     # reasoning_content, the way a buffered response already does.
     split_reasoning_tags: bool = True

@@ -4902,3 +4902,46 @@ if __name__ == "__main__":
             print(f"{name}:")
             fn()
     print("\nall routing tests passed")
+
+
+def test_an_unpinned_turn_waits_for_its_seat_when_affinity_wait_is_set():
+    """A new (unpinned) turn on a busy plan keeps its seat if one frees soon.
+
+    Default affinity_wait_seconds=0 keeps the old spill-at-once behaviour;
+    set above zero, the session waits for its own plan like a pinned
+    follow-up does, so its prompt cache is not rebuilt on another seat.
+    """
+    import time as _time
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker = build()
+        assert reg.settings.affinity_wait_seconds == 0.0
+        reg = replace(reg, settings=replace(reg.settings, affinity_wait_seconds=3.0))
+        picker.registry = reg
+        lane, session = "forge", "sess-unpinned-wait"
+        first = await picker.pick(lane, session)
+        plan = reg.plan_of(first.model)
+        filler = None
+        for n in range(plan.max_parallel * 2):
+            rid = f"aw-filler-{n}"
+            if await slots.try_claim(plan.key, plan.max_parallel, rid,
+                                     first.ref, first.model.max_parallel) != 1:
+                break
+            filler = rid
+        assert filler is not None
+
+        async def free_soon():
+            await asyncio.sleep(0.3)
+            await picker.release(plan.key, first.request_id, first.ref)
+
+        freer = asyncio.create_task(free_soon())
+        started = _time.monotonic()
+        again = await picker.pick(lane, session)          # NOT pinned
+        elapsed = _time.monotonic() - started
+        await freer
+        assert again.ref == first.ref, (again.ref, first.ref)
+        assert again.sticky
+        assert 0.3 <= elapsed < 2.5, elapsed
+
+    run(go())
