@@ -776,12 +776,28 @@ Nothing in config can suppress the `<env>` block (cwd, git state, platform, date
 or a discovered `AGENTS.md` / `~/.claude/CLAUDE.md`. The OpenCode sidecars do not
 mount `~/.claude`, so that file is not picked up here — worth knowing it would be.
 
-**`max_tokens` is not enforced on these lanes.** No CLI has a token cap — Claude
-Code offers `--max-turns`, not a token limit — so a caller's `max_tokens` is
-converted into a prompt instruction ("answer in at most roughly N words"). That
-genuinely shortens output and therefore saves subscription quota, but the model
-can exceed it; `/health` reports `enforces_max_tokens: false`. If you need a hard
-cap, use an API-keyed lane.
+**`max_tokens` is honored post-hoc on most of these lanes, refused on others.**
+None of the CLIs has a token-cap flag — Claude Code offers `--max-turns`, not a
+token limit — so the sidecar either truncates the answer to roughly
+`max_tokens * 4` UTF-8 bytes and reports `finish_reason: "length"`, or refuses
+the request with HTTP 400, depending on the lane:
+
+- **Claude (`claude -p`) and OpenCode (`opencode run`)** honor `max_tokens`
+  post-hoc: the sidecar truncates the answer to about `max_tokens * 4` bytes,
+  sets `finish_reason: "length"` on the cut, and reports the same billed
+  `completion_tokens` the CLI returned. The cut is at a byte boundary, so a
+  multi-byte character that crosses it is dropped silently; the model already
+  paid for the discarded tokens. Omitting `max_tokens` leaves the length to the
+  provider.
+- **Codex (`codex exec`)** refuses with HTTP 400 `max_tokens_unenforceable`
+  (`error.type: "max_tokens_unenforceable"`, message: `"max_tokens is not
+  enforceable on this lane"`). `codex exec` runs its own multi-turn agent loop,
+  so cutting its narration mid-stream is not an honest token cap: the CLI
+  will keep charging tokens to refill the cut on the next turn.
+
+`/health` reports the mode per lane: `enforces_max_tokens: true` on the
+honoring lanes, `false` plus `enforces_max_tokens_reason:
+"no-truncation-flag"` on codex. API-keyed lanes are unaffected.
 
 The one hazard of a shared credential store is a cold start where the token is
 due for refresh: every concurrent subprocess would race to refresh and rewrite

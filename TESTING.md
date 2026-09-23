@@ -1130,9 +1130,15 @@ account system from z.ai — not merely a different region of the same one.)
 
 Two related notes:
 
-- **`max_tokens` is advisory on the sidecar lanes.** The CLIs have no token cap,
-  so it becomes a prompt instruction rather than a hard limit. An API-keyed lane
-  enforces it properly.
+- **`max_tokens` is enforced post-hoc on most sidecar lanes and refused on others.**
+  The CLIs have no token-cap flag (issue #70). `claude -p` and `opencode run`
+  honor `max_tokens` by truncating the answer to roughly `max_tokens * 4`
+  UTF-8 bytes and returning `finish_reason: "length"`; `codex exec` refuses
+  with HTTP 400 `max_tokens_unenforceable` because cutting its multi-turn
+  narration mid-stream would not be an honest token cap. `4c`/`4d`/`4e` and
+  the oversized-prompt smoke send small `max_tokens` at the CLI lanes — expect
+  truncated output with `"length"` on Claude/OpenCode and 400 on Codex. API-
+  keyed lanes enforce it natively.
 - **GLM 4.6 is a reasoning model.** At `max_tokens: 8` it returned
   `finish_reason: length`, empty `content`, and its text in `reasoning_content` —
   the whole budget went on reasoning. The local Qwen behaves the same way. Give
