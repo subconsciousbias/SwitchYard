@@ -2807,9 +2807,10 @@ def test_run_session_subprocess_cwd_is_session_workdir():
 
         result = asyncio.run(scenario())
         assert result["type"] == "final", result
-        assert result["payload"]["result"] == str(workdir), (
-            f"expected inner CLI cwd == session.workdir {workdir!r}, "
-            f"got {result['payload']['result']!r}"
+        assert os.path.realpath(result["payload"]["result"]) == os.path.realpath(str(workdir)), (
+            f"expected inner CLI cwd == session.workdir "
+            f"{os.path.realpath(str(workdir))!r}, "
+            f"got {os.path.realpath(result['payload']['result'])!r}"
         )
         print(f"  inner CLI spawned with cwd={result['payload']['result']}")
     finally:

@@ -14,6 +14,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)  # so `import conftest` resolves under plain `python3`
+
+import conftest  # noqa: F401  (socket guard for plain-script mode)
 
 from switchyard import caller_env  # noqa: E402
 

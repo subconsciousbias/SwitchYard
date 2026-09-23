@@ -9,6 +9,8 @@ working, since a spec-loaded module carries its own __spec__.
 """
 from __future__ import annotations
 
+import conftest  # noqa: F401  (socket guard)
+
 import importlib.util
 import sys
 

@@ -11,7 +11,11 @@ from __future__ import annotations
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, HERE)  # so `import conftest` resolves under plain `python3`
+
+import conftest  # noqa: F401  (socket guard for plain-script mode)
 
 from switchyard.reasoning import ReasoningSplitter  # noqa: E402
 

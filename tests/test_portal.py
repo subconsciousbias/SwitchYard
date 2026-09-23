@@ -157,9 +157,17 @@ def test_pacing_fragment_carries_runtime_override_banner():
         # plans.example.yaml ships with pacing off, so flipping the runtime on
         # puts them out of step.
         client.post("/admin/pacing?enabled=on")
-        html = client.get("/fragments/pacing").text
-        assert "runtime override" in html, html
-        assert "plans.yaml says" in html, html
+        try:
+            html = client.get("/fragments/pacing").text
+            assert "runtime override" in html, html
+            assert "plans.yaml says" in html, html
+        finally:
+            # Reset the runtime override so the next test sees the configured
+            # default. Mirrors test_pacing_paints_tail_disabled_and_paced_to_zero_badges,
+            # which already used this pattern; without the reset the next test
+            # in sorted order (test_pacing_fragment_reflects_runtime_toggle)
+            # would see pacing still ON and fail at its first read.
+            client.post("/admin/pacing?enabled=default")
 
 
 def test_capacity_row_shows_failing_chip_when_streak_meets_alert():
@@ -955,6 +963,23 @@ def test_per_group_writer_writes_group_order_hash():
         # ultra (room 10). Subtract the 1e9 tier to recover the raw score.
         assert (scores["minimax-max/m3"] - 1e9) > (
             scores["minimax-ultra/m3"] - 1e9), scores
+        # `_recompute_group_orders` writes every perishable / lowest_util
+        # group's hash in the registry, not just ours -- so it also writes
+        # forge's perishable hash. The FakeRedis outlives this test and
+        # that stored ranking would otherwise show up as the first `→`
+        # in the next test's fragment read, hiding the per-board arrow we
+        # are about to assert against. Wipe every group-order key this
+        # call touched; the assertion above has already verified the
+        # writer wrote what we needed. Group-order keys are hash-backed,
+        # so the cleanup goes straight to `redis.hashes` rather than
+        # `redis.delete` (which only touches strings).
+        from switchyard.models import Group as _Group
+        for lane_key, nodes in new_reg.lane_nodes().items():
+            for node in nodes:
+                if isinstance(node, _Group) and node.strategy in (
+                        "perishable", "lowest_utilization"):
+                    ledger.redis.hashes.pop(
+                        f"sy:group-order:{node.gid}:{lane_key}", None)
         # Every entry carries a real score, not the default-zero fallback.
         for entry in order["members"]:
             assert entry["score"] > 0, entry
@@ -997,6 +1022,17 @@ def test_per_group_writer_drops_unknown_refs_from_hash():
         assert order is not None, order
         refs = [m["ref"] for m in order["members"]]
         assert refs == ["minimax-ultra/m3"], refs
+        # Wipe the group-order keys this call wrote (forge's perishable,
+        # etc.) so they don't leak into the next test as a stale `→` arrow.
+        # See test_per_group_writer_writes_group_order_hash for the full
+        # rationale; the keys are hash-backed, hence the direct pop.
+        from switchyard.models import Group as _Group
+        for lane_key, nodes in new_reg.lane_nodes().items():
+            for node in nodes:
+                if isinstance(node, _Group) and node.strategy in (
+                        "perishable", "lowest_utilization"):
+                    ledger.redis.hashes.pop(
+                        f"sy:group-order:{node.gid}:{lane_key}", None)
 
 
 def test_perishable_writer_treats_stale_target_and_gate_as_unknown():

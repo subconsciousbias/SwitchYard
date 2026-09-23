@@ -1374,12 +1374,24 @@ def test_text_path_no_tools_passthrough_with_metadata_still_parses():
             import asyncio as _asyncio
             _asyncio.run(server._handle_chat(body))
         except HTTPException as exc:
-            assert exc.status_code != 400 or \
-                (isinstance(exc.detail, dict) and
-                 exc.detail.get("error", {}).get("type") != "tools_unsupported"), \
-                f"text path must not 400 on tools when no tools present: {exc.detail}"
-        except Exception:
-            pass  # 429/502/etc. from gate / spawn is not under test here
+            # 400 with tools_unsupported detail is the regression this test
+            # is named for -- must not 400 on tools when no tools are
+            # present. The gate/spawn path also legitimately raises
+            # 429/502, and those stay tolerated. Any other HTTPException
+            # from _handle_chat is a regression we want to surface (e.g. a
+            # new error reason that doesn't fit the two contracts above).
+            # Non-HTTPException errors are deliberately NOT caught here, so
+            # a KeyError/TypeError regression fails the test loudly instead
+            # of being silently swallowed.
+            if (exc.status_code == 400 and isinstance(exc.detail, dict)
+                    and exc.detail.get("error", {}).get("type")
+                    == "tools_unsupported"):
+                raise AssertionError(
+                    f"text path must not 400 on tools when no tools present: "
+                    f"{exc.detail}")
+            assert exc.status_code in (429, 502), (
+                f"unexpected HTTPException from _handle_chat: "
+                f"{exc.status_code} {exc.detail}")
         print("  no-tools + metadata-stamped caller_env -> no tools_unsupported 400")
     finally:
         server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli

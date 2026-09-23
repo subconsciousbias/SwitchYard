@@ -8,7 +8,24 @@ import time
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, HERE)  # so `import conftest` resolves under plain `python3`
+
+# Pin LiteLLM to its bundled model-cost backup BEFORE the socket guard
+# installs. The hooks module imports LiteLLM at module load (via
+# `models.load` -> `litellm_known_vision_models`), and LiteLLM's default
+# behaviour is to fetch the live cost map from raw.githubusercontent.com
+# on first import. With the guard active in plain-script mode, that
+# fetch raises inside `models.load`, breaking every test that reaches
+# `switchyard.hooks` -- including the four `_prompt_completion_tokens`
+# tests at the bottom of this file. The bundled backup covers them.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+# Install the socket guard before any switchyard import so the guard is in
+# place if a switchyard module ever reaches for a non-loopback address at
+# import time (FakeRedis must be imported after conftest patches socket).
+import conftest  # noqa: F401  (socket guard for plain-script mode)
 
 # ``switchyard.models`` captures SWITCHYARD_PLANS at import time, and
 # ``switchyard.hooks`` instantiates ``SwitchyardHandler`` (which calls
@@ -16,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # file, but the four ``_prompt_completion_tokens`` tests below do, so point
 # the loader at the tracked example BEFORE anything imports either module.
 os.environ["SWITCHYARD_PLANS"] = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(HERE),
     "config", "plans.example.yaml",
 )
 

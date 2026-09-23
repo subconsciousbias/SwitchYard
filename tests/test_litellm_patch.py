@@ -26,6 +26,12 @@ from __future__ import annotations
 
 import ast
 import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)  # so `import conftest` resolves under plain `python3`
+
+import conftest  # noqa: F401  (socket guard for plain-script mode)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
