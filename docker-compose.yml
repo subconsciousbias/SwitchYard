@@ -222,6 +222,12 @@ services:
     environment:
       SWITCHYARD_PROVIDER: xai
       PROXY_PORT: "8090"
+      # Mirrored from PROXY_PORT so the drain loop's
+      # `scripts/health_idle.py` probe (apply.sh step 4) can reach
+      # /health on the same port the compose healthcheck uses. Without
+      # this, the probe takes the empty-port `unknown` path; with it,
+      # the doc's lack of `in_flight` is what classifies it `unknown`.
+      SIDECAR_PORT: "8090"
       SWITCHYARD_PLAN: grok
       SWITCHYARD_PLANS: /app/config/plans.yaml
     volumes:

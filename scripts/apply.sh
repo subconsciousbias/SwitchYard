@@ -35,12 +35,21 @@
 # Step 4 is the unload-first drain loop. Per sidecar (in unload-first order,
 # lowest ZCARD sy:inflight:{plan} first): flip the picker gate
 # (sy:drain:{plan}), hand off in-flight sessions to lane siblings via
-# `python -m switchyard.drain`, wait for in-flight slots to hit zero, honor
-# the grace window (so a 90s parked MCP call can land), stop+recreate the
-# sidecar, wait for its healthcheck, clear the drain flag, then a short settle
-# before the next sidecar. Sidecars share the picker gate with the gateway;
-# gateway and portal do not (they ARE the picker / board), so they are
-# recreated fold-on-at-a-time AFTER the sidecar loop, never all at once.
+# `python -m switchyard.drain`, wait for in-flight slots to hit zero, then
+# run a health-gated grace window — `scripts/health_idle.py` is piped into
+# the sidecar via `docker compose exec -T ... python3 -` and classifies the
+# `/health` doc as `idle`, `busy`, or `unknown`. When the sidecar is `idle`,
+# skip the grace — there is no work to land. When `busy` (the
+# mcp_bridge parked-but-released-slot case, where `/health` reports
+# `awaiting_followup > 0` rather than `in_flight`) or `unknown` (the probe
+# was inconclusive: the doc has no `in_flight` field — the token-proxy's
+# OAuth-only /health shape — or the endpoint was unreachable, or `timeout`
+# killed the exec at 5s), the grace waits the full remaining window so a
+# parked call still has time to land. After that: stop+recreate the
+# sidecar, wait for its healthcheck, clear the drain flag, then a short
+# settle before the next sidecar. Sidecars share the picker gate with the
+# gateway; gateway and portal do not (they ARE the picker / board), so they
+# are recreated fold-on-at-a-time AFTER the sidecar loop, never all at once.
 #
 # When reload.sh takes the policy-only hot-swap path, apply.sh does NOT also
 # force-recreate the gateway: the hot-swap is enough. The router signature is
@@ -406,7 +415,18 @@ else
       [ -n "$migrated" ] || migrated=0
       echo "    sessions migrated: ${migrated}"
     else
-      echo "    lease migration skipped (drain helper unavailable or no leases)"
+      # Surface the helper's output so the operator can tell "no leases
+      # to migrate" from "the gateway image predates switchyard/drain.py"
+      # (the latter is fixable with --build; the former is a no-op).
+      # set -euo pipefail is active, so every pipeline is guarded with
+      # || true — the rm below is fine, the tail+grep below would
+      # otherwise abort the script when $drain_out is empty.
+      echo "    WARN: lease migration skipped — drain helper exited non-zero; output (tail):"
+      tail -n 8 "$drain_out" 2>/dev/null \
+        | sed 's/^/        /' || true
+      if grep -q "No module named switchyard.drain" "$drain_out" 2>/dev/null; then
+        echo "        hint: the gateway image predates switchyard/drain.py — rerun with --build to rebuild it"
+      fi
     fi
     [ -n "$drain_out" ] && rm -f "$drain_out"
 
@@ -427,15 +447,57 @@ else
       sleep 1
       waited=$((waited + 1))
     done
-    # Honor the grace window even on a fast drain — mcp_bridge parks calls
-    # for up to 90s and the picker may have handed the worker off to the
-    # bridge already. Without this, a sidecar with in_flight=0 right now
-    # could still have a parked MCP call in flight.
-    if [ "$waited" -lt "$drain_grace_secs" ]; then
-      remaining=$((drain_grace_secs - waited))
-      echo "    grace: sleeping ${remaining}s for parked calls to land"
-      sleep "$remaining"
+    # Honor the grace window — but only when we have evidence that
+    # something is still parked. The drain flag is set, the ZCARD loop
+    # above saw in_flight hit zero: what might still be in flight is a
+    # parked MCP call (mcp_bridge/server.py releases the slot on park
+    # — see `park_session`), which `/health` reports via
+    # `awaiting_followup` rather than `in_flight`. Run health_idle.py
+    # INSIDE the container against $SIDECAR_PORT (every drain-able
+    # service in docker-compose.yml sets it — 8081/8082/8084/8085 for
+    # the sidecars, 8090 for the token-proxy, mirroring PROXY_PORT).
+    # The token-proxy's /health doc exposes OAuth status only, so its
+    # fetch returns a JSON body with no `in_flight` field; the
+    # classifier maps that to `unknown` and bash still waits. The exec
+    # is the same `python3 -` shape the compose healthchecks already
+    # use — both sidecar and token-proxy images ship python3.
+    # `timeout` guards the OUTER `docker compose exec`, which has no
+    # built-in deadline. `health_idle.py` itself bounds the urllib
+    # fetch at 2s, but a wedged docker daemon, mid-recreate container,
+    # or stuck network namespace would otherwise hang the drain loop
+    # indefinitely (the inner urllib timeout only fires after the exec
+    # has connected, so it doesn't help here). macOS has no
+    # `timeout(1)` (CLAUDE.md:179-180), so probe for it once per
+    # service and fall back to `gtimeout` (coreutils), then to
+    # unbounded per CLAUDE.md's documented last resort. When the
+    # timeout fires (or any other non-zero exit), the `|| echo
+    # unknown` fallback routes into the case statement's `unknown`
+    # arm — the conservative one that sleeps the remaining grace.
+    # Fail-open to patience.
+    timeout_cmd=""
+    if command -v timeout >/dev/null 2>&1; then
+      timeout_cmd="timeout 5"
+    elif command -v gtimeout >/dev/null 2>&1; then
+      timeout_cmd="gtimeout 5"
     fi
+    health_state="$(
+      $timeout_cmd docker compose exec -T "$svc" python3 - < scripts/health_idle.py \
+        2>/dev/null || echo unknown)"
+    case "$health_state" in
+      idle)
+        echo "    grace: skipped ($svc /health reports nothing in flight or parked)"
+        ;;
+      busy)
+        remaining=$((drain_grace_secs - waited))
+        echo "    grace: sleeping ${remaining}s for parked calls to land (busy: /health saw parked work)"
+        if [ "$remaining" -gt 0 ]; then sleep "$remaining"; fi
+        ;;
+      *)
+        remaining=$((drain_grace_secs - waited))
+        echo "    grace: sleeping ${remaining}s for parked calls to land (unknown: /health probe did not return idle)"
+        if [ "$remaining" -gt 0 ]; then sleep "$remaining"; fi
+        ;;
+    esac
 
     # (4) stop + recreate. --no-deps so we don't trigger the dependency
     # graph (redis/postgres) — they are not changing, and recreating them
