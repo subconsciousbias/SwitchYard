@@ -4,9 +4,5 @@
 environmentRecipes:
   - id: docker-task
     name: DTC
-    create: ~/.local/share/orca-tasks/recipe-create.sh
-    destroy: ~/.local/share/orca-tasks/recipe-destroy.sh
-  - id: docker-task-auto
-    name: DTC (auto-trigger)
     create: ~/.local/share/orca-tasks/recipe-create-auto-trigger.sh
     destroy: ~/.local/share/orca-tasks/recipe-destroy.sh
