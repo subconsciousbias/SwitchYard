@@ -1388,12 +1388,19 @@ def test_pre_call_hook_derives_needs_images_from_anthropic_image_block():
         log.removeHandler(handler)
         log.setLevel(prior_level)
 
+    # `picker.release` is typed -> None; the await only proves the call
+    # did not raise. Tie the assertion to observable side effects: the
+    # slot for the picked plan/request_id/model is gone, and the plan is
+    # back at zero in-flight.
+    assert await_release is None, await_release
+    assert asyncio.run(slots.in_flight(ctx["plan"])) == 0, ctx["plan"]
+    assert asyncio.run(slots.in_flight_model(ctx["model"])) == 0, ctx["model"]
     assert ctx["needs_images"] is True, ctx
     log_lines = [r.getMessage() for r in captured]
     routing_lines = [m for m in log_lines if m.startswith("lane=")]
     assert routing_lines, log_lines
     assert any("images" in line for line in routing_lines), routing_lines
-    print(f"  anthropic image block -> needs_images=True in ctx + ' images' tag in log")
+    print("  anthropic image block -> needs_images=True in ctx + ' images' tag in log")
 
 
 def test_pre_call_hook_derives_needs_images_from_openai_image_url_block():
@@ -1441,7 +1448,7 @@ def test_pre_call_hook_derives_needs_images_from_openai_image_url_block():
     asyncio.run(_release_picker(h, ctx))
 
     assert ctx["needs_images"] is True, ctx
-    print(f"  openai image_url block -> needs_images=True in ctx")
+    print("  openai image_url block -> needs_images=True in ctx")
 
 
 def test_pre_call_hook_derives_needs_images_from_openai_input_image_block():
@@ -1487,7 +1494,7 @@ def test_pre_call_hook_derives_needs_images_from_openai_input_image_block():
     asyncio.run(_release_picker(h, ctx))
 
     assert ctx["needs_images"] is True, ctx
-    print(f"  openai input_image block -> needs_images=True in ctx")
+    print("  openai input_image block -> needs_images=True in ctx")
 
 
 def test_pre_call_hook_leaves_needs_images_false_for_plain_text():
@@ -1537,7 +1544,7 @@ def test_pre_call_hook_leaves_needs_images_false_for_plain_text():
     asyncio.run(_release_picker(h, ctx))
 
     assert ctx["needs_images"] is False, ctx
-    print(f"  plain text-only body -> needs_images=False in ctx")
+    print("  plain text-only body -> needs_images=False in ctx")
 
 
 async def _release_picker(h, ctx):

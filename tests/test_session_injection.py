@@ -33,7 +33,6 @@ from plans_path import plans_path  # noqa: E402
 # someone's real config would otherwise silently become the fixture.
 os.environ["SWITCHYARD_PLANS"] = plans_path()
 
-from dataclasses import replace  # noqa: E402
 
 from switchyard import models                          # noqa: E402
 from switchyard.hooks import SwitchyardHandler, INJECTION_NOTE  # noqa: E402
@@ -239,7 +238,7 @@ def test_non_proxied_cli_gets_no_message():
     assert messages == [{"role": "user", "content": "hi"}], messages
     assert marker is None, (
         f"unknown cli must NOT write a {K_INJECTED!r} key, got {marker!r}")
-    print(f"  cli=openai-direct: messages untouched, no marker key")
+    print("  cli=openai-direct: messages untouched, no marker key")
 
 
 def test_no_session_identity_no_injection():

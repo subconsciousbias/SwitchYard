@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import ast
 import os
-import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

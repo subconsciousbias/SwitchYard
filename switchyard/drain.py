@@ -17,7 +17,7 @@ import sys
 
 from redis.asyncio import from_url as redis_from_url
 
-from .models import Registry, load as load_models
+from .models import load as load_models
 from .picker import Picker
 from .slots import SlotTable
 
@@ -69,12 +69,14 @@ async def migrate(plan_key: str, slots: SlotTable, picker: Picker,
                 placed = await picker.pick(
                     lane, session, exclude=drained_refs)
                 break
-            except Exception:
+            except Exception as exc:
                 # LaneSaturated, a Redis error, anything — the next lane
                 # in registry iteration order gets a turn. If every lane
                 # fails, the SKIP branch below records the session as
                 # left-behind without surfacing the (possibly low-value)
                 # last exception.
+                print(f"{session}: lane={lane} skipped ({type(exc).__name__}: {exc})",
+                      file=sys.stderr)
                 continue
         if placed is None:
             print(f"{session}: SKIP (no lane could place after drain)",

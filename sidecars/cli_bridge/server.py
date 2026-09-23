@@ -69,6 +69,7 @@ from pathlib import Path
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 import yaml
 
@@ -509,7 +510,9 @@ def read_config() -> Config:
                     caller_environment = CallerEnvironmentSettings(**ce_raw)
                 else:
                     caller_environment = None
-            except Exception:
+            except Exception as exc:
+                log.warning("could not load CallerEnvironmentSettings from %s: %s",
+                            PLANS_PATH, exc, exc_info=True)
                 caller_environment = None
         plan = (raw.get("plans") or {}).get(target) or {}
         if not plan:
@@ -518,7 +521,7 @@ def read_config() -> Config:
             raw_cap = plan.get("max_parallel", 1)
             cap = seed if str(raw_cap).lower() == "auto" else int(raw_cap)
             parked = int(plan.get("max_parked_sessions") or 0)
-            for key, body in (plan.get("models") or {}).items():
+            for _key, body in (plan.get("models") or {}).items():
                 body = body or {}
                 if body.get("enabled") is False:
                     continue
@@ -1226,7 +1229,7 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
     except asyncio.TimeoutError:
         proc.kill()
         shutil.rmtree(spawn_cwd, ignore_errors=True)
-        raise HTTPException(status_code=408, detail=f"{PROVIDER} cli timed out")
+        raise HTTPException(status_code=408, detail=f"{PROVIDER} cli timed out") from None
 
     stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
     blob = normalise(f"{stdout}\n{stderr}")
@@ -1597,7 +1600,7 @@ async def usage_report() -> dict:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         raise HTTPException(status_code=504,
-                            detail=f"/usage did not finish within {USAGE_TIMEOUT:.0f}s")
+                            detail=f"/usage did not finish within {USAGE_TIMEOUT:.0f}s") from None
     if proc.returncode != 0:
         raise HTTPException(
             status_code=502,
@@ -1700,7 +1703,7 @@ async def _handle_chat(body: dict):
     try:
         image_paths, img_dir = stage_or_fail(messages)
     except ImageUnsupportedError as exc:
-        raise exc.http()
+        raise exc.http() from exc
     try:
         prompt, system = flatten(messages)
         if not prompt:
@@ -1735,7 +1738,9 @@ async def _handle_chat(body: dict):
                 try:
                     from switchyard.models import CallerEnvironmentSettings
                     ce_cfg = CallerEnvironmentSettings()
-                except Exception:
+                except Exception as exc:
+                    log.warning("could not build default CallerEnvironmentSettings: %s",
+                                exc, exc_info=True)
                     ce_cfg = None
             # Downgrade `required` -> `auto` for the text path only. Done
             # via a tiny shim rather than mutating the dataclass so the

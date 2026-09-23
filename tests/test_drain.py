@@ -33,7 +33,7 @@ os.environ["SWITCHYARD_PLANS"] = plans_path()
 
 from switchyard import models                      # noqa: E402
 from switchyard.drain import migrate               # noqa: E402
-from switchyard.picker import LaneSaturated, Picker  # noqa: E402
+from switchyard.picker import Picker  # noqa: E402
 from switchyard.slots import SlotTable             # noqa: E402
 from tests.fake_redis import FakeRedis             # noqa: E402
 

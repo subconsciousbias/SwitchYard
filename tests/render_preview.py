@@ -354,7 +354,6 @@ def render_group_preview(env, flat_capacity):
     same strings against the live fragment, and this preview lets the
     operator eyeball the layout.
     """
-    reg = models.load()
     rows_by_ref = {}
     for lane in flat_capacity["lanes"]:
         rows_by_ref.update({r["ref"]: r for r in lane["plans"]})
@@ -386,10 +385,6 @@ def render_group_preview(env, flat_capacity):
         "weights": {"grok/grok-4.6": 3, "opencode-go/glm-5.3-flash": 1},
         "depth": 0,
     }
-    nested_flat = [
-        {"kind": "ref", "row": rr_members[0], "depth": 0},
-        {"kind": "ref", "row": rr_members[1], "depth": 0},
-    ]
     grouped_lane = {
         "lane": "preview-rr",
         "label": "Preview (round_robin)",

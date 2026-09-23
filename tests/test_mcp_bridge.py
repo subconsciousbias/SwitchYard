@@ -1361,8 +1361,8 @@ def test_run_session_only_text_lost_triggers_retry_other_failures_stay_single_at
         assert _read_counter(counter_path) == 1, \
             f"generic rc=1 must not retry (calls={_read_counter(counter_path)})"
 
-        print(f"  MCP retry-once: auth/quota/empty/generic each spawn once; "
-              f"no-text-with-usage is the ONLY retried shape")
+        print("  MCP retry-once: auth/quota/empty/generic each spawn once; "
+              "no-text-with-usage is the ONLY retried shape")
     finally:
         try:
             os.unlink(counter_path)
@@ -2046,6 +2046,14 @@ def test_followup_error_result_does_not_leak():
             else:
                 raise AssertionError("_continue_followup must 502 when "
                                      "the awaited turn returns an error")
+            # The parked register_tool_call future was set inside
+            # _continue_followup's resolve loop before the awaited turn 502'd.
+            # Drain it so its outcome is observed (a 502 in the follow-up
+            # path must NOT leak a never-awaited parked task).
+            tool_result = await parked
+            assert tool_result["content"] == [
+                {"type": "text", "text": '{"temp_c":-3}'}], tool_result
+            assert tool_result["isError"] is False, tool_result
             return session
         finally:
             server.await_turn = real_await_turn
@@ -2257,7 +2265,7 @@ def test_openai_tool_content_to_mcp_converts_anthropic_shaped_images():
     assert not is_error, (blocks, is_error)
     assert blocks == [{"type": "image", "mimeType": "image/png",
                        "data": base64.b64encode(PNG_MAGENTA).decode()}], blocks
-    print(f"  Anthropic-shaped image -> MCP image block (mimeType=image/png)")
+    print("  Anthropic-shaped image -> MCP image block (mimeType=image/png)")
 
 
 def test_openai_tool_content_to_mcp_marks_remote_url_as_is_error():
@@ -2287,7 +2295,7 @@ def test_openai_tool_content_to_mcp_keeps_text_in_a_list():
     assert not is_error, (blocks, is_error)
     assert blocks[0] == {"type": "text", "text": "the colour is "}, blocks
     assert blocks[1]["type"] == "image", blocks[1]
-    print(f"  text + image kept in order, image reached the CLI")
+    print("  text + image kept in order, image reached the CLI")
 
 
 def test_flatten_with_tool_history_includes_image_markers_after_staging():
@@ -2409,8 +2417,8 @@ def test_mcp_build_argv_keeps_full_disallowed_list_when_no_image():
         # And the MCP-tools allowlist is still wired up.
         assert "--allowed-tools" in argv, argv
         assert stdin_data is None
-        print(f"  mcp_bridge claude build_argv(text-only) -> "
-              f"--disallowed-tools includes Read; original 9 names preserved")
+        print("  mcp_bridge claude build_argv(text-only) -> "
+              "--disallowed-tools includes Read; original 9 names preserved")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -2587,7 +2595,12 @@ def test_probe_follow_up_strips_synthetic_exchange_and_starts_session():
             "probe-result text must not leak into the rebuilt prompt"
         assert "[SwitchYard: tools execute on Linux in /home/u/dir" in seen["prompt"], \
             seen["prompt"]
-        print(f"  follow-up: env parsed, synthetic exchange stripped, system has env block")
+        # The probe-and-resume flow must not leave a gate slot taken: it
+        # never started a real CLI (start_session was stubbed) and the
+        # resolved probe is in-memory state, not a concurrency seat.
+        assert server.cli_bridge._gate.in_flight == saved_gate_count, (
+            server.cli_bridge._gate.in_flight, saved_gate_count)
+        print("  follow-up: env parsed, synthetic exchange stripped, system has env block")
     finally:
         restore()
         server.SESSIONS.clear()
@@ -2667,8 +2680,8 @@ def test_probe_iserror_marks_failed_and_no_retry_on_second_attempt():
             seen = captured[-1]
             assert "Caller platform: unknown" in seen["system"], seen["system"]
             assert "Caller working directory: unknown" in seen["system"], seen["system"]
-        print(f"  isError probe -> FAILED_PROBES populated, "
-              f"no retry on second attempt, env rendered as 'unknown'")
+        print("  isError probe -> FAILED_PROBES populated, "
+              "no retry on second attempt, env rendered as 'unknown'")
     finally:
         restore()
         server.SESSIONS.clear()
@@ -2900,8 +2913,8 @@ def test_probe_required_unresolvable_returns_400_no_unknown_wording():
             assert not (exc.headers and "retry-after" in {k.lower() for k in exc.headers}), \
                 f"probe=required must NOT carry Retry-After (failure is not " \
                 f"transient), got headers={exc.headers!r}"
-            print(f"  probe=required + refused probe -> HTTP 400 "
-                  f"type=caller_environment_required, no Retry-After")
+            print("  probe=required + refused probe -> HTTP 400 "
+                  "type=caller_environment_required, no Retry-After")
             return
         raise AssertionError(
             f"probe=required must raise 400, but handle_tool_request returned "
@@ -2962,6 +2975,11 @@ def test_metadata_source_config_is_relabeled_to_request():
         response = asyncio.run(server.handle_tool_request(body, tools, None))
         # The CLI sees the env block; the values are honored (we don't
         # drop data) but at the REQUEST tier, not the config tier.
+        # The request ran end-to-end through `handle_fresh` -> stubbed
+        # `start_session` -> `{"stubbed": True}`; confirming the response
+        # shape pins the wiring (probe did NOT short-circuit, followup
+        # path was NOT taken).
+        assert response == {"stubbed": True}, response
         seen = captured[-1]
         env = seen["env"]
         assert env.source == "request", \
@@ -3160,8 +3178,8 @@ def test_concurrent_same_fingerprint_mints_only_one_probe():
         assert len(server.RESOLVED_PROBES) == 1, dict(server.RESOLVED_PROBES)
         assert next(iter(server.RESOLVED_PROBES.values())) is \
             server._PROBE_PENDING, dict(server.RESOLVED_PROBES)
-        print(f"  asyncio.gather(3x same-fingerprint) -> 1 probe + 2 stubbed; "
-              f"PENDING sentinel in RESOLVED_PROBES")
+        print("  asyncio.gather(3x same-fingerprint) -> 1 probe + 2 stubbed; "
+              "PENDING sentinel in RESOLVED_PROBES")
     finally:
         restore()
         server.SESSIONS.clear()

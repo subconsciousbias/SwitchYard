@@ -503,7 +503,7 @@ def _build_probe():
 
 
 def _make_router(api_base: str, model_name: str):
-    import litellm
+    import litellm  # noqa: F401  # import probe: verify litellm is importable
     from litellm import Router
 
     model_list = [{
@@ -523,7 +523,7 @@ def _make_router(api_base: str, model_name: str):
 
 
 async def _probe_once(router, model_name: str) -> tuple[bool, BaseException | None]:
-    import litellm
+    import litellm  # noqa: F401  # import probe: verify litellm is importable
     try:
         await router.acompletion(
             model=model_name,

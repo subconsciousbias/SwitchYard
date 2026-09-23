@@ -563,7 +563,6 @@ def test_round_robin_group_renders_pointer_and_members():
     renders exactly one `group-head` row, with the rotation metadata
     visible to the operator.
     """
-    from dataclasses import replace
     import asyncio
 
     with TestClient(portal_app.app) as client:
@@ -578,7 +577,6 @@ def test_round_robin_group_renders_pointer_and_members():
         ledger = portal_app.state["ledger"]
         # The gid is computed from lane + strategy + sorted refs, same way
         # the parser produces it.
-        from switchyard.models import _group_id, _leaf_refs
         body = new_reg.lane_nodes()["rr-board"]
         assert len(body) == 1 and body[0].strategy == "round_robin"
         gid = body[0].gid
@@ -690,9 +688,14 @@ def test_perishable_group_renders_stored_ranking():
             arrow_idx = html.find("→")
             assert arrow_idx != -1, "the ranking arrow must be present"
             ranking_segment = html[arrow_idx:arrow_idx + 200]
-            assert "openai/astra" in ranking_segment, ranking_segment
-            assert "claude-max/fable" in ranking_segment, ranking_segment
-            # And in score-desc order in the arrow segment.
+            # The first occurrences live in plan-share annotations on
+            # earlier lanes (claude-max/fable in `shares claude-max with`,
+            # openai/astra in `shares openai with`), well before the
+            # per-board panel that hosts the ranking. Use the saved
+            # offsets to assert the refs DO appear in the page at all --
+            # the .index() calls return -1 if the ref is missing -- and
+            # pin the authoritative ordering in the ranking segment.
+            assert i_astra >= 0 and i_fable >= 0, (i_astra, i_fable)
             assert ranking_segment.index("openai/astra") < \
                 ranking_segment.index("claude-max/fable"), ranking_segment
         finally:
@@ -709,7 +712,6 @@ def test_pacing_paints_tail_disabled_and_paced_to_zero_badges():
     patterns still match" requirement -- the smoke.py run past
     `tail disabled (pacing)` must continue to find a row carrying it.
     """
-    import asyncio
     with TestClient(portal_app.app) as client:
         client.post("/admin/pacing?enabled=on")
         try:
@@ -756,18 +758,18 @@ def test_flat_config_produces_same_render_as_before():
         new_lanes = {}
         for key, lane in reg.lanes.items():
             flat: list[str] = []
-            def walk(node):
+            def walk(node, flat=flat):
                 from switchyard.models import Group
                 if isinstance(node, Group):
                     if node.weights is not None:
                         flat.extend(node.weights.keys())
                     else:
                         for m in node.members:
-                            walk(m)
+                            walk(m, flat)
                     return
                 flat.append(node)
             for node in reg.lane_nodes()[key]:
-                walk(node)
+                walk(node, flat)
             new_lanes[key] = replace(lane, order=flat,
                                      strategy="fill", description="")
         flat_reg = models.Registry(settings=reg.settings, plans=reg.plans,
@@ -821,7 +823,6 @@ def test_hot_reload_picks_up_new_group_without_restart():
     so the test does not need a writable plans.yaml on disk; the same
     code path is what reload_config() uses.
     """
-    import asyncio
     from dataclasses import replace
     with TestClient(portal_app.app) as client:
         reg = models.load()
@@ -837,7 +838,6 @@ def test_hot_reload_picks_up_new_group_without_restart():
         # the swap is observable: nothing in the pre-swap fragment mentions
         # this lane's label.
         sentinel_key = "hot-reload-canary"
-        from switchyard.models import Group
         from switchyard.models import _parse_lane_order
         known = {m.ref for p in reg.plans.values() for m in p.models.values()}
         parsed = _parse_lane_order(sentinel_key,
@@ -897,7 +897,7 @@ def test_per_group_writer_writes_group_order_hash():
     """
     import asyncio
     import time
-    with TestClient(portal_app.app) as client:
+    with TestClient(portal_app.app) as _client:
         reg = models.load()
         # A perishable group on forge members. All three plans have probe
         # facts seeded, so all three refs land in the stored hash.
@@ -968,7 +968,7 @@ def test_per_group_writer_drops_unknown_refs_from_hash():
     """
     import asyncio
     import time
-    with TestClient(portal_app.app) as client:
+    with TestClient(portal_app.app) as _client:
         reg = models.load()
         new_reg = _force_lane(reg, "per-unknown",
                               [{"perishable": ["minimax-ultra/m3",
@@ -1026,7 +1026,6 @@ def test_perishable_writer_treats_stale_target_and_gate_as_unknown():
     from switchyard.policy import CapacityPolicy
     from switchyard.usage import Ledger
     from switchyard.portal.app import _recompute_perishable_for_plan
-    from switchyard.slots import SlotTable
 
     async def go():
         # Same fixture pattern as the perishable tests in test_routing.py:
@@ -1035,7 +1034,6 @@ def test_perishable_writer_treats_stale_target_and_gate_as_unknown():
         # rows; openai/sol has no rows and stays the unknown baseline.
         reg = models.load()
         redis = FakeRedis()
-        slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
         ledger = Ledger(redis)
         CapacityPolicy(redis, reg.settings, ledger)
         lanes = dict(reg.lanes)

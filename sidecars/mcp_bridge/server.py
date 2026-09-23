@@ -63,6 +63,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger("mcp_bridge")
 
@@ -486,7 +487,9 @@ def _caller_env_settings() -> Any:
         return settings
     try:
         return _caller_env.CallerEnvironmentSettings()
-    except Exception:
+    except Exception as exc:
+        log.warning("could not build default CallerEnvironmentSettings: %s",
+                    exc, exc_info=True)
         return None
 
 
@@ -568,19 +571,6 @@ def _strip_synthetic_assistant(messages: list[dict]) -> list[dict]:
                 continue
         out.append(msg)
     return out
-
-
-def _has_synthetic_probe(messages: list[dict]) -> bool:
-    if _caller_env is None:
-        return False
-    for msg in messages or []:
-        if msg.get("role") != "assistant":
-            continue
-        for tc in (msg.get("tool_calls") or []):
-            tid = tc.get("id") or ""
-            if tid.startswith(_caller_env.PROBE_PREFIX):
-                return True
-    return False
 
 
 def _maybe_probe(body: dict, tools: list[dict]) -> "asyncio.Future | None":
@@ -1254,7 +1244,7 @@ async def register_tool_call(session_id: str, name: str, arguments: dict) -> dic
     try:
         return await call.future
     except RuntimeError as exc:
-        raise HTTPException(status_code=504, detail=str(exc))
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
 
 
 @app.post("/internal/tools/call")
@@ -1404,7 +1394,7 @@ async def handle_fresh(body: dict, tools: list[dict],
     try:
         image_paths, img_dir = cli_bridge.stage_or_fail(messages)
     except cli_bridge.ImageUnsupportedError as exc:
-        raise exc.http()
+        raise exc.http() from exc
     # Mirror cli_bridge's _handle_chat: the img_dir is owned here until
     # start_session takes it. Any exception that escapes between now and
     # then (e.g. an unexpected failure in flatten / resolve_model / the
@@ -1449,7 +1439,7 @@ async def handle_fresh(body: dict, tools: list[dict],
                             + " Configure caller_environment.platform/cwd/shell "
                               "in plans.yaml, supply a passive environment in the "
                               "request body, or set probe=auto to fall back to "
-                              "the unknown-env wording.")}})
+                              "the unknown-env wording.")}}) from exc
         if env is None:
             env = _caller_env.CallerEnvironment.unknown() if _caller_env else None
 
@@ -1463,7 +1453,8 @@ async def handle_fresh(body: dict, tools: list[dict],
 
         return await start_session(body, mcp_tools, prompt, system, model, request,
                                    image_paths, img_dir, env=env)
-    except Exception:
+    except Exception as exc:
+        log.warning("handle_fresh failed before start_session: %s", exc, exc_info=True)
         if img_dir is not None:
             shutil.rmtree(img_dir, ignore_errors=True)
         raise
@@ -1521,7 +1512,8 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
         allowed = ",".join(PROFILE["tool_qualifier"](t["name"]) for t in mcp_tools)
         argv, stdin_data = build_argv(prompt, system, model, workdir, session_id,
                                       tools_path, allowed, image_paths)
-    except Exception:
+    except Exception as exc:
+        log.warning("start_session failed to build argv: %s", exc, exc_info=True)
         await cli_bridge._gate.release()
         cleanup_workdir(workdir)
         if img_dir is not None:
@@ -1664,7 +1656,7 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
     try:
         image_paths, img_dir = cli_bridge.stage_or_fail(messages)
     except cli_bridge.ImageUnsupportedError as exc:
-        raise exc.http()
+        raise exc.http() from exc
     # Same broadened cleanup as handle_fresh: anything that escapes between
     # here and start_session (a gate acquire failure past RESUME_WAIT, an
     # unexpected exception in flatten_with_tool_history) would otherwise
@@ -1703,7 +1695,7 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
                             + " Configure caller_environment.platform/cwd/shell "
                               "in plans.yaml, supply a passive environment in the "
                               "request body, or set probe=auto to fall back to "
-                              "the unknown-env wording.")}})
+                              "the unknown-env wording.")}}) from exc
         if env is None:
             env = _caller_env.CallerEnvironment.unknown() if _caller_env else None
 
@@ -1721,7 +1713,9 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
         # contract (issue #80) on this rebuild path too.
         return await start_session(body, mcp_tools, prompt, system, model, request,
                                     image_paths, img_dir, env=env, first_turn=True)
-    except Exception:
+    except Exception as exc:
+        log.warning("resume_gone_session failed before start_session: %s",
+                    exc, exc_info=True)
         if img_dir is not None:
             shutil.rmtree(img_dir, ignore_errors=True)
         raise

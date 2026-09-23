@@ -253,10 +253,10 @@ def test_expiring_plans_are_drained_first():
     order = [m for m in drained.lane_members(lane)
              if not drained.is_tail(lane, m.ref)]
     days = [drained.plan_of(m).days_left for m in order]
-    assert order[0].plan_key == victim.key, list(zip((m.ref for m in order), days))
+    assert order[0].plan_key == victim.key, list(zip((m.ref for m in order), days, strict=True))
     # And every plan with no end date sorts after it.
     keeping = [i for i, d in enumerate(days) if d is None]
-    assert not keeping or min(keeping) > 0, list(zip((m.ref for m in order), days))
+    assert not keeping or min(keeping) > 0, list(zip((m.ref for m in order), days, strict=True))
     print(f"  {victim.key} expiring in {days[0]}d jumps to the front: "
           + " -> ".join(m.ref for m in order))
 
@@ -1693,7 +1693,6 @@ def test_perishable_lane_routes_higher_room_first():
     perishable rank from the ledger.
     """
     from dataclasses import replace
-    from switchyard.policy import CapacityPolicy
 
     async def go():
         reg, slots, picker, ledger = build_with_policy()
@@ -2219,13 +2218,11 @@ def test_round_robin_rotates_one_to_one_while_affinity_holds():
     session that already has a plan stays there until its lease is dropped
     even when the rotation pointer has moved past it.
     """
-    from dataclasses import replace
     reg = models.load()
     redis = FakeRedis()
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     from switchyard.policy import CapacityPolicy
     policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-    picker = Picker(reg, slots, policy)
 
     new_reg = _build_lane(reg, slots,
                           key="rr-test",
@@ -2272,13 +2269,11 @@ def test_round_robin_skips_a_full_member_without_advancing():
     third pick's start = 2 % 2 = 0 = ultra. With ultra now free, ultra
     wins.
     """
-    from dataclasses import replace
     reg = models.load()
     redis = FakeRedis()
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     from switchyard.policy import CapacityPolicy
     policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-    picker = Picker(reg, slots, policy)
 
     new_reg = _build_lane(reg, slots,
                           key="rr-full-test",
@@ -2339,7 +2334,6 @@ def test_round_robin_pointer_not_advanced_when_group_spills():
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     from switchyard.policy import CapacityPolicy
     policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-    picker = Picker(reg, slots, policy)
 
     new_reg = _build_lane(reg, slots,
                           key="rr-spill-test",
@@ -2393,7 +2387,6 @@ def test_weighted_distribution_matches_ratios_within_tolerance():
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     from switchyard.policy import CapacityPolicy
     policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-    picker = Picker(reg, slots, policy)
 
     new_reg = _build_lane(reg, slots,
                           key="w-test",
@@ -2445,7 +2438,6 @@ def test_group_exhaustion_falls_through_to_next_stage():
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     from switchyard.policy import CapacityPolicy
     policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-    picker = Picker(reg, slots, policy)
 
     new_reg = _build_lane(reg, slots,
                           key="exhaust-test",
@@ -2496,7 +2488,6 @@ def test_nested_groups_outer_rotates_inner_picks_lowest_util():
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     from switchyard.policy import CapacityPolicy
     policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-    picker = Picker(reg, slots, policy)
 
     inner_a = {"lowest_utilization": ["claude-max/opus", "openai/sol"]}
     inner_b = {"lowest_utilization": ["claude-max/fable", "openai/astra"]}
@@ -2560,7 +2551,6 @@ def test_stale_or_missing_group_order_falls_back_to_config_order():
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     from switchyard.policy import CapacityPolicy
     policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-    picker = Picker(reg, slots, policy)
 
     new_reg = _build_lane(reg, slots,
                           key="stale-test",
@@ -2611,7 +2601,6 @@ def test_lane_level_perishable_matches_explicit_perishable_group():
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     from switchyard.policy import CapacityPolicy
     policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-    picker = Picker(reg, slots, policy)
 
     # Implicit: lane.strategy = "perishable", refs only.
     implicit_reg = _build_lane(reg, slots,
@@ -2685,7 +2674,6 @@ def test_per_member_gate_skipped_inside_group_without_advancing():
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     from switchyard.policy import CapacityPolicy
     policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-    picker = Picker(reg, slots, policy)
 
     new_reg = _build_lane(reg, slots,
                           key="gate-test",
@@ -2747,7 +2735,6 @@ def test_paced_to_zero_member_skipped_without_advancing_rotation():
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
     from switchyard.policy import CapacityPolicy
     policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-    picker = Picker(reg, slots, policy)
 
     new_reg = _build_lane(reg, slots,
                           key="paced-test",
@@ -2912,7 +2899,7 @@ def test_lane_nodes_returns_parsed_tree():
     assert set(nodes) == set(reg.lanes), set(nodes)
     # Body types match the parsed shape: bare strings for flat configs,
     # Group instances are not present in the shipped example.
-    for key, body in nodes.items():
+    for _key, body in nodes.items():
         assert isinstance(body, list)
         for node in body:
             assert isinstance(node, str) or hasattr(node, "strategy"), node
@@ -3025,8 +3012,6 @@ def test_routing_order_with_weighed_group_walks_weights_keys_in_order():
     ordering; the flat `routing_order` is the caller's flat view.
     """
     reg = models.load()
-    from dataclasses import replace
-    from switchyard.models import Group, _group_id
     new_reg = _build_lane(reg, slots=None,
                           key="w-order-test",
                           order=[{"weighted": {"minimax-ultra/m3": 5,
@@ -3039,7 +3024,7 @@ def test_routing_order_with_weighed_group_walks_weights_keys_in_order():
 
 
 def test_log_line_keeps_first_word_inside_brackets_when_group_lands():
-    """The gateway log line's `[reason]` regex `\[(\w+)\]` must continue
+    r"""The gateway log line's `[reason]` regex `\[(\w+)\]` must continue
     to extract the FIRST token even after the change adds `group=<gid>`
     inside the brackets. The test rebuilds the bracketed reason the same
     way hooks.py does and asserts the first word is the cap_reason, not
@@ -3055,14 +3040,6 @@ def test_log_line_keeps_first_word_inside_brackets_when_group_lands():
 
     reg = models.load()
     # A flat pick: no group, no metadata. Reason is the bare cap_reason.
-    flat_pick = replace(
-        reg.lane_members("local")[0].ref and (
-            # synthesize a flat pick with the bare-minimum surface
-            type("FakePick", (), {
-                "cap_reason": "configured",
-                "picked_group": None,
-            })()),
-        cap_reason="configured", picked_group=None) if False else None
 
     # Easier: construct the Pick directly.
     from switchyard.picker import Pick
@@ -3305,10 +3282,10 @@ def test_selfcheck_static_audit_runs_against_installed_litellm():
         raise AssertionError(
             f"installed litellm {litellm_pkg.__name__} failed a self-check "
             f"audit: {exc}"
-        )
-    print(f"  installed litellm: all four static audits (pre-routing-hook "
-          f"isolated, acompletion->fallbacks, num_retries<=0 short-circuit, "
-          f"proxy pre-call-hook present) pass")
+        ) from exc
+    print("  installed litellm: all four static audits (pre-routing-hook "
+          "isolated, acompletion->fallbacks, num_retries<=0 short-circuit, "
+          "proxy pre-call-hook present) pass")
 
 
 def test_the_generated_backstop_matches_what_the_picker_admits():
@@ -3471,7 +3448,7 @@ def test_backstop_is_an_upper_bound_under_learner_pull_down():
     diverge from the backstop on this plan.
     """
     from dataclasses import replace
-    from switchyard.models import Model, Quota
+    from switchyard.models import Model
     from switchyard.picker import Picker
     from switchyard.policy import CapacityPolicy
     from switchyard.slots import SlotTable
@@ -4034,14 +4011,13 @@ def test_perishable_lane_writer_single_family_is_byte_identical_to_pre_partition
     # microseconds apart), so the stored scores are not equal and the
     # sort is non-trivial. The order matches the stable sort the
     # pre-partition writer would produce.
-    expected_order = sorted(refs, key=lambda r: -(
-        50.0 / max(1.0, (reset - time.time()) / 3600.0)))
-    # NOTE: the sort key above is recomputed per-element; the production
-    # code computes each score independently at the time of its call.
-    # For the byte-identity test the meaningful assertions are: refs in
-    # the order the writer's stable sort produces; each score is the
-    # raw perishable_score with the same `now` drift the writer used;
-    # and the tier offset MUST NOT be applied (single bucket, tier 0).
+    # NOTE: the production code computes each score independently at the
+    # time of its call, so the per-element sort key would drift between
+    # the call and the assertion. For the byte-identity test the
+    # meaningful assertions are: refs in the order the writer's stable
+    # sort produces; each score is the raw perishable_score with the
+    # same `now` drift the writer used; and the tier offset MUST NOT be
+    # applied (single bucket, tier 0).
     assert set(refs) == {"claude-max/fable", "claude-max/opus"}, refs
     # Tier 0 invariant: score < 1e9 (i.e. no tier offset applied).
     # A regression that always stamps tier 1 would put every score
@@ -4345,7 +4321,6 @@ def test_image_routing_default_off_leaves_routing_unchanged_for_image_turns():
     the edit and `always` AFTER, to keep the pre-existing behaviour. Off
     has to mean "do nothing".
     """
-    from dataclasses import replace
 
     async def go():
         reg, slots, picker = build()
@@ -4579,7 +4554,7 @@ def test_affinity_spills_when_image_request_hits_text_only_lease_under_always():
         f"lease moved from {first_ref} to {held_after}; expected "
         f"{second_ref}")
     assert sticky is False, (
-        f"image-spill pick is not sticky: lease dropped, not honoured")
+        "image-spill pick is not sticky: lease dropped, not honoured")
     print(f"  affinity spill under always: {first_ref} (text lease dropped) "
           f"-> {second_ref} (sticky={sticky}, supports_images={supports})")
 
@@ -4671,7 +4646,6 @@ def test_lane_image_routing_default_is_off():
     dataclass default (`off`) and the loader's missing-key default agree.
     """
     import tempfile, os
-    reg = models.load()
 
     # Dataclass default: a freshly constructed Lane (no image_routing
     # supplied) is off.
@@ -4720,7 +4694,7 @@ def test_lane_image_routing_validates_mode():
     behaving as if `off`, with no signal that the operator intended
     something else.
     """
-    import tempfile, os, re as _re
+    import tempfile, os
     body = open(os.environ["SWITCHYARD_PLANS"]).read()
     # Replace the first `image_routing: "off"` line with a bogus value.
     # The shipped fixture sets `off` on every lane except the worked-example

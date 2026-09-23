@@ -25,7 +25,6 @@ from ..slots import SlotTable
 from ..periods import windows_remaining
 from ..usage import (
     Ledger,
-    effective_cost_per_mtok,
     family_partitioned_order,
     headroom,
     model_effective_cost_per_mtok,
@@ -590,7 +589,6 @@ async def collect_plans() -> list[dict]:
         month_tokens = sum(
             d["prompt_tokens"] + d["completion_tokens"] for d in series if d["day"].startswith(month)
         )
-        month_cost = sum(d["cost"] for d in series if d["day"].startswith(month))
         cooled, ttl, reason = await slots.cooldown_state(plan.key)
         in_flight = await slots.in_flight(plan.key)
         facts = await ledger.quota_facts(plan.key)

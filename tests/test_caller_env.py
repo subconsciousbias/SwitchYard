@@ -8,7 +8,6 @@ prove it.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import sys
 
@@ -281,7 +280,7 @@ def test_resolve_required_does_not_raise_when_forced_config_present():
     assert env.platform == "windows"
     assert env.cwd == r"C:\x"
     assert env.shell == "powershell"
-    print(f"  probe=required + forced config -> no raise, source=config")
+    print("  probe=required + forced config -> no raise, source=config")
 
 
 def test_resolve_required_does_not_raise_when_request_has_env():
@@ -301,7 +300,7 @@ def test_resolve_required_does_not_raise_when_request_has_env():
     assert env.source == "request"
     assert env.platform == "linux"
     assert env.cwd == "/u/alice/proj"
-    print(f"  probe=required + passive env -> no raise, source=request")
+    print("  probe=required + passive env -> no raise, source=request")
 
 
 def test_from_wire_metadata_rejects_config_claim():
@@ -486,7 +485,7 @@ def test_probe_command_contains_no_env_enumeration():
     assert "pwd" in caller_env.PROBE_COMMAND
     assert "uname" in caller_env.PROBE_COMMAND
     assert "$SHELL" in caller_env.PROBE_COMMAND
-    print(f"  PROBE_COMMAND only enumerates: pwd / uname / $SHELL")
+    print("  PROBE_COMMAND only enumerates: pwd / uname / $SHELL")
 
 
 def test_parse_probe_result_tolerates_shell_quoting_and_extra_lines():
@@ -694,7 +693,7 @@ def test_render_functions_are_pure_no_environment_substitution():
     # "caller environment unknown".
     assert "/app/" not in block
     assert "/app/" not in reminder
-    print(f"  render functions are pure (no host-env leakage)")
+    print("  render functions are pure (no host-env leakage)")
 
 
 if __name__ == "__main__":

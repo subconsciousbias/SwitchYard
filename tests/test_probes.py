@@ -530,7 +530,6 @@ def test_set_cookie_is_not_captured_on_a_reauth_response():
     a known-bad session would mask the reauth signal and keep polling a dead
     plan. needs_reauth semantics stay exactly as today."""
     import http.server
-    import json
     import threading
     from dataclasses import replace
 

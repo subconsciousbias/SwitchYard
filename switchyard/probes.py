@@ -29,7 +29,7 @@ from typing import Any
 import httpx
 from redis.asyncio import Redis
 
-from .models import Plan, Probe
+from .models import Plan
 from .usage import Ledger
 
 log = logging.getLogger("switchyard.probes")

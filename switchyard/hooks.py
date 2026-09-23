@@ -767,9 +767,10 @@ class SwitchyardHandler(CustomLogger):
             if isinstance(response, dict):
                 response["switchyard"] = stamp
             else:
-                setattr(response, "switchyard", stamp)
+                response.switchyard = stamp
         except Exception:                 # never fail a served request over a label
-            log.debug("could not stamp response with switchyard routing info")
+            log.debug("could not stamp response with switchyard routing info",
+                      exc_info=True)
 
         if ctx.get("call_type") in UNLOGGED_CALL_TYPES:
             kwargs = (data or {}).get("litellm_params") or {}
@@ -1057,7 +1058,7 @@ class SwitchyardHandler(CustomLogger):
         if isinstance(chunk, (bytes, bytearray)):
             try:
                 text = bytes(chunk).decode("utf-8", errors="ignore")
-            except Exception:
+            except (UnicodeDecodeError, TypeError):
                 return
         elif isinstance(chunk, str):
             text = chunk
@@ -1068,7 +1069,7 @@ class SwitchyardHandler(CustomLogger):
                     dumped = fn()
                     if isinstance(dumped, dict):
                         _collect_anthropic_event_usage(dumped, collected)
-                except Exception:
+                except (TypeError, ValueError, AttributeError):
                     return
             return
         if not text:
@@ -1236,7 +1237,7 @@ class SwitchyardHandler(CustomLogger):
 
 
 def _reason_with_group(pick) -> str:
-    """The bracketed reason in the gateway log line.
+    r"""The bracketed reason in the gateway log line.
 
     The base string is the picker's own cap_reason ("configured",
     "quota spent", "paced 2 of 4", ...). When the lane walked a group to
@@ -1354,7 +1355,7 @@ def _payload_of(response_obj: Any) -> Any:
                 out = fn()
                 if isinstance(out, (dict, str)):
                     return out
-            except Exception:
+            except (TypeError, ValueError, AttributeError):
                 continue
     hidden = getattr(response_obj, "_hidden_params", None)
     return hidden if isinstance(hidden, dict) else None
@@ -1373,7 +1374,7 @@ def _error_body(exc: Exception) -> Any:
             if callable(fn):
                 try:
                     return fn()
-                except Exception:
+                except (ValueError, AttributeError, OSError):
                     continue
             elif isinstance(fn, str):
                 return fn
@@ -1386,7 +1387,7 @@ def _retry_after(exc: Exception) -> float | None:
     headers = getattr(resp, "headers", None) or getattr(exc, "headers", None) or {}
     try:
         headers = {k.lower(): v for k, v in dict(headers).items()}
-    except Exception:
+    except (TypeError, AttributeError):
         return None
     return _as_float(headers.get("retry-after"))
 
@@ -1443,7 +1444,7 @@ def _prompt_completion_tokens(
     elif getattr(src, "switchyard_billed_prompt_tokens", None) is not None:
         billed_completion = getattr(src, "switchyard_billed_completion_tokens", None)
         return (
-            int(getattr(src, "switchyard_billed_prompt_tokens") or 0),
+            int(src.switchyard_billed_prompt_tokens or 0),
             int(billed_completion or 0),
         )
     if isinstance(src, dict):

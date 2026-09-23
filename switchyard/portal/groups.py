@@ -422,14 +422,3 @@ def _walk_groups(nodes):
             yield node
             if node.weights is None:
                 yield from _walk_groups(node.members)
-
-
-async def build_group_ranking(reg: Registry, ledger: Ledger, lane_key: str,
-                              group: Group) -> dict | None:
-    """The per-group ranking hash, for the board's display only.
-
-    Returns the same shape the picker reads, or None when the key is
-    missing/stale. The template uses it to surface `current order: a, b, c`
-    next to `lowest_utilization` / `perishable` group headers.
-    """
-    return await ledger.get_group_order(group.gid, lane_key)

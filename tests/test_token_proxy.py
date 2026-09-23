@@ -21,7 +21,6 @@ sys.path.insert(0, HERE)
 
 os.environ.setdefault("SWITCHYARD_PROVIDER", "xai")
 
-import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from _modules import load  # noqa: E402

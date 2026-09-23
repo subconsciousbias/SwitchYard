@@ -28,12 +28,10 @@ from switchyard.usage import (
     model_effective_cost_per_session,
     effective_cost_per_mtok,
     reported_is_current,
-    window_headroom,
     K_M_HOUR,
     K_M_DAY,
     K_M_SMONTH,
     K_HOUR,
-    K_DAY,
     K_WINDOW,
 )
 
