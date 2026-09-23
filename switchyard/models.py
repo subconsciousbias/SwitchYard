@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Any, Union
 
@@ -123,6 +123,12 @@ class Model:
     enabled: bool = True
     max_parallel: int | None = None   # narrows the plan's limit; never widens it
     context_window: int | None = None
+    # Whether the model can serve image-bearing requests. None means "unset":
+    # the loader pre-fills True for models litellm.model_cost marks as
+    # vision-capable, and the picker treats None as False so a missing field
+    # never grants vision. Operators can still set True or False explicitly
+    # on any model to override the litellm-suggested default.
+    supports_images: bool | None = None
 
     @property
     def ref(self) -> str:
@@ -465,6 +471,27 @@ class Lane:
     # explicit groups in `order`, the lane-level strategy is ignored — the
     # groups already say how to order their members.
     strategy: str = "fill"
+    # How to handle an image-bearing request on this lane.
+    #
+    #   off (default): image-bearing requests behave bit-for-bit like any
+    #     other request. No filtering, no affinity changes — the lane's own
+    #     strategy is the only thing that decides where a request lands.
+    #   always: the picker filters members whose `supports_images` is not
+    #     true, and an existing session lease on a non-image-capable model
+    #     is dropped so the next image turn lands on a member that can
+    #     serve it. When every image-capable member is at capacity or
+    #     cooled, the request gets the usual LaneSaturated 429 — the lane
+    #     never widens to text-only models to satisfy an image request.
+    #   only_first: image-bearing requests still see the full member set
+    #     (no member filtering), and the lane's existing affinity rules
+    #     stay unchanged. The flag exists so a future caller can opt into
+    #     "image-only first-time session" routing without breaking
+    #     follow-ups; today it is the same as off.
+    #
+    # In every mode the lane's strategy (round_robin / weighted / perishable
+    # / lowest_utilization / fill) is untouched — this only narrows the
+    # candidate set and adjusts the affinity check.
+    image_routing: str = "off"
 
 
 @dataclass
@@ -708,6 +735,11 @@ def _parse_models(plan_key: str, raw: Any) -> dict[str, Model]:
         body = dict(body or {})
         if "model" not in body:
             raise ValueError(f"model {plan_key}/{key} has no `model:` string")
+        supports_images_raw = body.get("supports_images")
+        if supports_images_raw is None:
+            supports_images: bool | None = None
+        else:
+            supports_images = bool(supports_images_raw)
         out[key] = Model(
             key=key,
             plan_key=plan_key,
@@ -716,7 +748,52 @@ def _parse_models(plan_key: str, raw: Any) -> dict[str, Model]:
             enabled=bool(body.get("enabled", True)),
             max_parallel=(int(body["max_parallel"]) if body.get("max_parallel") else None),
             context_window=(int(body["context_window"]) if body.get("context_window") else None),
+            supports_images=supports_images,
         )
+    return out
+
+
+# Modes accepted on a lane's `image_routing` key. Anything else is a loud
+# parse error in `load()` — operators typing "all" or "true" want loud
+# failure rather than silent no-op behaviour.
+_IMAGE_ROUTING_MODES = ("always", "only_first", "off")
+
+
+def litellm_known_vision_models() -> set[str]:
+    """Model names litellm reports as vision-capable in `litellm.model_cost`.
+
+    The lazy import + broad except is intentional: liteLLM may be absent (a
+    fresh checkout running only the offline suite), the import path may
+    shift across versions, or a malformed `model_cost` entry may blow up
+    during iteration. None of those failures should stop `load()` from
+    returning a Registry the rest of the gateway can use; they just mean
+    the auto-fill of `supports_images = True` is unavailable for that run,
+    and operators can still mark models explicitly in config.
+
+    Each entry in `model_cost` is `{name: {supports_vision: True|False, ...}}`;
+    we collect the names whose entry says `supports_vision` is True. The set
+    is then used in `load()` to pre-fill `Model.supports_images` for any
+    model whose key or `model:` string matches — but operator-set values
+    (True or False in YAML) always win.
+    """
+    try:
+        import litellm                                 # noqa: F401
+        from litellm import model_cost
+    except Exception:
+        return set()
+    out: set[str] = set()
+    try:
+        entries = model_cost.items()
+    except Exception:
+        return set()
+    for name, info in entries:
+        if not isinstance(info, dict):
+            continue
+        try:
+            if bool(info.get("supports_vision")):
+                out.add(str(name))
+        except Exception:
+            continue
     return out
 
 
@@ -898,6 +975,11 @@ def load(path: str | None = None) -> Registry:
             raise ValueError(
                 f"lane {key!r} strategy must be one of {_VALID_STRATEGIES}, "
                 f"got {strategy!r}")
+        image_routing = str(body.get("image_routing", "off"))
+        if image_routing not in _IMAGE_ROUTING_MODES:
+            raise ValueError(
+                f"lane {key!r} image_routing must be one of "
+                f"{_IMAGE_ROUTING_MODES}, got {image_routing!r}")
         order = _parse_lane_order(key, list(body.get("order") or []), known)
         lanes[key] = Lane(
             key=key,
@@ -906,6 +988,7 @@ def load(path: str | None = None) -> Registry:
             tail=list(body.get("tail") or []),
             description=body.get("description", ""),
             strategy=strategy,
+            image_routing=image_routing,
         )
 
     registry = Registry(settings=settings, plans=plans, lanes=lanes)
@@ -933,4 +1016,30 @@ def load(path: str | None = None) -> Registry:
                     f"{plan.key!r} is a subscription. A tail exists for when the "
                     "paid capacity is gone, so it must be a local or metered "
                     "plan — otherwise it is exhausted exactly when needed.")
+
+    # Pre-fill `supports_images = True` for any model the operator left unset
+    # and whose key or `model:` string matches a litellm.model_cost entry
+    # marked vision-capable. Operator values (True or False) are never
+    # overwritten — litellm is a hint, the operator is the source of truth.
+    # Models is a frozen dataclass, so a True pre-fill is a replacement;
+    # only the affected plans/keys are rebuilt, not the whole registry.
+    known_vision = litellm_known_vision_models()
+    if known_vision:
+        touched: dict[str, Plan] = {}
+        for plan_key, plan in registry.plans.items():
+            rebuilt: dict[str, Model] = {}
+            for model_key, model in plan.models.items():
+                if model.supports_images is not None:
+                    continue
+                if (model_key in known_vision
+                        or model.model in known_vision):
+                    rebuilt[model_key] = replace(model, supports_images=True)
+            if rebuilt:
+                merged = {**plan.models, **rebuilt}
+                touched[plan_key] = replace(plan, models=merged)
+        if touched:
+            plans = {**registry.plans, **touched}
+            registry = Registry(
+                settings=registry.settings, plans=plans, lanes=registry.lanes,
+            )
     return registry

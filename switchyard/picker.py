@@ -75,6 +75,12 @@ class _VisitCtx:
     exclude: frozenset[str]
     skipped: list[str] = field(default_factory=list)
     needs_tools: bool = False
+    # Whether the request carries an image content block. Combined with
+    # `image_mode` (the lane's resolved `image_routing` value), it tells the
+    # body walk and the affinity check whether to filter non-image-capable
+    # members (mode == "always") or let the lane's normal routing stand.
+    needs_images: bool = False
+    image_mode: str = "off"
     wait: float = 0.0
 
 
@@ -169,15 +175,32 @@ class Picker:
         remaining = facts.get("reported_remaining")
         return isinstance(remaining, float) and remaining <= 0
 
-    async def _members(self, lane: str, needs_tools: bool = False) -> list[Model]:
+    async def _members(self, lane: str, needs_tools: bool = False,
+                        needs_images: bool = False) -> list[Model]:
         """Lane order, minus the tail when pacing is on and minus members whose
-        plan cannot serve this request at all."""
+        plan cannot serve this request at all.
+
+        Image filtering applies only when the lane's `image_routing` is set to
+        "always" -- "off" and "only_first" leave the member set untouched so
+        the lane's own routing strategy stays load-bearing. The filter is
+        gated on `needs_images=True`, so a text-only request under `always`
+        sees the unchanged member set: image routing only kicks in when the
+        request itself carries image blocks.
+
+        `_members` re-resolves the lane's `image_routing` from the registry
+        rather than threading `ctx` (or `image_mode`) through, so a lane that
+        omits the key and a lane that sets it to `"off"` behave identically.
+        """
         members = self.registry.lane_members(lane)
         if self.policy is not None and not await self.policy.tail_enabled():
             members = [m for m in members if not self.registry.is_tail(lane, m.ref)]
         if needs_tools:
             members = [m for m in members
                        if self.registry.plan_of(m).can_use_tools]
+        if needs_images:
+            lane_cfg = self.registry.lanes.get(lane)
+            if lane_cfg is not None and lane_cfg.image_routing == "always":
+                members = [m for m in members if bool(m.supports_images)]
         return members
 
     # -- body for the picker ----------------------------------------------
@@ -226,8 +249,9 @@ class Picker:
                          picked_group: Group | None) -> Pick | None:
         """Try to claim a slot for one ref. All per-member gates apply here:
         exclude, supports_tools (filtered upstream), cooldown, spent-quota,
-        supports_tools (re-checked for safety), and (when called from inside a
-        perishable / lowest_utilization group) the 5h gate."""
+        supports_tools (re-checked for safety), supports_images (re-checked
+        under image_routing: always for safety), and (when called from inside
+        a perishable / lowest_utilization group) the 5h gate."""
         if ctx.exclude and ref in ctx.exclude:
             return None
         model = self.registry.model(ref)
@@ -236,6 +260,17 @@ class Picker:
             return None
         plan = self.registry.plan_of(model)
         if ctx.needs_tools and not plan.can_use_tools:
+            return None
+        # Image-capability recheck. _members already filtered upstream under
+        # image_routing: always, but the recheck here closes the gap for
+        # refs that arrive via exclude-set re-entry or via a tail member
+        # that was not in the lane_members body list. The skip reason names
+        # the filter explicitly so the capacity board / log shows why the
+        # candidate was rejected rather than reading as "coincidentally
+        # unavailable".
+        if ctx.needs_images and ctx.image_mode == "always" \
+                and not model.supports_images:
+            ctx.skipped.append(f"{ref}(no image support)")
             return None
         # Cooldown gate: a plan under an active cooldown cannot serve. Note
         # the same way `_members` does NOT — this is intentional: a ref nested
@@ -583,11 +618,19 @@ class Picker:
     # -- the public pick ---------------------------------------------------
     async def pick(self, lane: str, session: str | None,
                    needs_tools: bool = False, pinned: bool = False,
-                   exclude: frozenset[str] | None = None) -> Pick:
+                   exclude: frozenset[str] | None = None,
+                   needs_images: bool = False) -> Pick:
         rid = uuid.uuid4().hex
+        # Resolve the lane's image_routing here, where the lane is known to
+        # exist (the public call already proved `lane` was in the registry).
+        # A missing lane would have been caught by the caller; defending
+        # against it here keeps `image_mode` a non-Optional string.
+        lane_cfg = self.registry.lanes.get(lane)
+        image_mode = lane_cfg.image_routing if lane_cfg is not None else "off"
         ctx = _VisitCtx(
             lane=lane, rid=rid, session=session, pinned=pinned,
             exclude=exclude or frozenset(), needs_tools=needs_tools,
+            needs_images=needs_images, image_mode=image_mode,
             wait=(self.registry.settings.pin_wait_seconds
                   if pinned and session else 0.0),
         )
@@ -599,11 +642,16 @@ class Picker:
             # Nothing in the lane — every member is disabled or expired, or
             # the config didn't name anything. Match the existing detail
             # strings so the existing 429 messages are unchanged.
-            members = await self._members(lane, needs_tools)
-            detail = ("nothing in this lane can serve tool calls — every "
-                      "candidate plan is marked supports_tools: false"
-                      if needs_tools and not members
-                      else "no live models (all expired or disabled)")
+            members = await self._members(lane, needs_tools, needs_images)
+            detail: str
+            if needs_tools and not members:
+                detail = ("nothing in this lane can serve tool calls — every "
+                          "candidate plan is marked supports_tools: false")
+            elif needs_images and image_mode == "always" and not members:
+                detail = ("nothing in this lane can serve images — every "
+                          "candidate model is missing supports_images: true")
+            else:
+                detail = "no live models (all expired or disabled)"
             raise LaneSaturated(lane, detail)
 
         # 1. Affinity — a leased plan that is still in the lane and not
@@ -685,6 +733,17 @@ class Picker:
         if model is None:
             return None
         if ctx.needs_tools and not self.registry.plan_of(model).can_use_tools:
+            return None
+        # Image affinity spill. Under image_routing: always, a leased session
+        # whose model cannot serve images must drop its lease so the body
+        # walk re-places the session on a member that CAN serve the image
+        # turn. `only_first` keeps today's sticky behaviour on purpose: the
+        # first turn stays on the plan it leased on, and a new session is
+        # placed wherever the lane's normal routing lands it. `off` is the
+        # bit-for-bit legacy path and never touches affinity.
+        if ctx.needs_images and ctx.image_mode == "always" \
+                and not model.supports_images:
+            await self.slots.drop_lease(ctx.session)
             return None
         plan = self.registry.plan_of(model)
         cap, reason = await self._cap(model, allow_spent=ctx.pinned)

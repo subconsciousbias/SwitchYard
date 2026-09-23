@@ -669,15 +669,26 @@ plans:
       opus:
         model: openai/claude-opus-5
         max_parallel: 2
+        # Sidecar accepts image input natively. Set true explicitly so the
+        # picker routes image-bearing requests here under image_routing:
+        # always; omit to leave it unset, which the picker treats as "no
+        # image support" — but `load()` may pre-fill True from
+        # `litellm.model_cost` if the `model:` string matches a vision
+        # entry, so set false explicitly to opt out.
+        supports_images: true
       fable:
         # Fable 5.1 as served by the subscription, not the metered API.
         model: openai/claude-fable-5-1
         max_parallel: 1
+        # See opus above — same vision-capable subscription.
+        supports_images: true
       sonnet:
         # Direct-only: in no lane, so Claude quota stays reserved for the
         # judgement lanes unless you ask for this model by name.
         model: openai/claude-sonnet-5
         max_parallel: 2
+        # See opus above — same vision-capable subscription.
+        supports_images: true
 
   openai:
     label: "OpenAI $100 Plan (ChatGPT seat)"
@@ -729,15 +740,28 @@ plans:
       sol:
         model: openai/gpt-5.6-sol        # [13293] strongest of the 5.6 family
         max_parallel: 1
+        # Codex sidecar accepts image input natively. Set true explicitly so
+        # the picker routes image-bearing requests here under image_routing:
+        # always; omit to leave it unset, which the picker treats as "no
+        # image support" — but `load()` may pre-fill True from
+        # `litellm.model_cost` if the `model:` string matches a vision
+        # entry, so set false explicitly to opt out.
+        supports_images: true
       terra:
         model: openai/gpt-5.6-terra      # [13293] direct-only
         max_parallel: 1
+        # See sol above — same vision-capable Codex subscription.
+        supports_images: true
       luna:
         model: openai/gpt-5.6-luna       # [11728] weakest; direct-only
         max_parallel: 2
+        # See sol above — same vision-capable Codex subscription.
+        supports_images: true
       astra:
         model: openai/gpt-6-astra        # [14154] "Astra 6", the apex tier
         max_parallel: 1
+        # See sol above — same vision-capable Codex subscription.
+        supports_images: true
 
   grok:
     label: "Grok $300 Plan (SuperGrok)"
@@ -929,6 +953,15 @@ lanes:
     # strategy: perishable
     order: [claude-max/fable, openai/astra]
     tail: [local-box/qwen]
+    # Worked example for image routing: every member here is image-capable
+    # (claude-max/fable + openai/astra both have supports_images: true above),
+    # so under `always` the filter is a no-op for this lane — text requests
+    # serve as normal, and an image-bearing request narrows to the same
+    # two members. To see the filter actually drop a member, mix a text-only
+    # plan (e.g. local-box/qwen) into the order under `always`. When every
+    # image-capable member is out of capacity the request gets the usual
+    # LaneSaturated 429; the lane's own strategy is never bypassed.
+    image_routing: "always"   # off | always | only_first (default off)
 
   judge:
     label: "Judgement — Regular"
@@ -936,6 +969,12 @@ lanes:
     # strategy: perishable
     order: [claude-max/opus, openai/sol, glm/glm-5.3]
     tail: [local-box/qwen]
+    # image_routing only narrows the candidate set (and adjusts affinity under
+    # `always`); it never bypasses the lane's own routing strategy. When every
+    # image-capable member is out of capacity, the request gets the usual
+    # LaneSaturated 429. Default off: an image-bearing request behaves
+    # bit-for-bit the same as a text-only one.
+    image_routing: "off"     # off | always | only_first (default off)
 
   forge:
     label: "Coding Workhorse"
@@ -956,6 +995,12 @@ lanes:
       - opencode-go/glm-5.3-flash
       - openrouter/mimo
     tail: [local-box/qwen]
+    # image_routing only narrows the candidate set (and adjusts affinity under
+    # `always`); it never bypasses the lane's own routing strategy. When every
+    # image-capable member is out of capacity, the request gets the usual
+    # LaneSaturated 429. Default off: an image-bearing request behaves
+    # bit-for-bit the same as a text-only one.
+    image_routing: "off"     # off | always | only_first (default off)
 
   nest-demo:
     label: "Strategy Nesting (demo)"
@@ -970,6 +1015,12 @@ lanes:
           # Inner group B: same idea for the judgement-heavy tier.
           - lowest_utilization: [claude-max/fable, openai/astra]
     tail: [local-box/qwen]
+    # image_routing only narrows the candidate set (and adjusts affinity under
+    # `always`); it never bypasses the lane's own routing strategy. When every
+    # image-capable member is out of capacity, the request gets the usual
+    # LaneSaturated 429. Default off: an image-bearing request behaves
+    # bit-for-bit the same as a text-only one.
+    image_routing: "off"     # off | always | only_first (default off)
 
   local:
     label: "Local Only"
@@ -977,6 +1028,12 @@ lanes:
     # gets a 429 and backs off rather than silently spending money.
     order: [local-box/qwen, local-box/gemma]
     tail: []
+    # image_routing only narrows the candidate set (and adjusts affinity under
+    # `always`); it never bypasses the lane's own routing strategy. When every
+    # image-capable member is out of capacity, the request gets the usual
+    # LaneSaturated 429. Default off: an image-bearing request behaves
+    # bit-for-bit the same as a text-only one.
+    image_routing: "off"     # off | always | only_first (default off)
 
   bulk:
     label: "Basic"
@@ -984,3 +1041,9 @@ lanes:
     order: [local-box/gemma, local-box/qwen]
     # Already all local, so a tail would add nothing.
     tail: []
+    # image_routing only narrows the candidate set (and adjusts affinity under
+    # `always`); it never bypasses the lane's own routing strategy. When every
+    # image-capable member is out of capacity, the request gets the usual
+    # LaneSaturated 429. Default off: an image-bearing request behaves
+    # bit-for-bit the same as a text-only one.
+    image_routing: "off"     # off | always | only_first (default off)

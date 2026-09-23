@@ -1313,6 +1313,242 @@ def test_end_to_end_pick_then_finish_then_pick_again():
           "two requests back-to-back")
 
 
+# ============================================================================
+# Issue #75 — image detection on the inbound request body.
+#
+# The hook derives `needs_images` from the message list before passing it to
+# the picker. Three shapes must all report `needs_images=True`:
+#   - Anthropic:   {"type": "image", ...}
+#   - OpenAI Chat: {"type": "image_url", ...}
+#   - OpenAI Resp: {"type": "input_image", ...}
+#
+# A plain string content block is text-only; a malformed entry (non-dict,
+# missing content) is silently skipped. Without the right shape, an image
+# request lands on a text-only model and silently fails at the provider,
+# which is exactly the bug the picker image-routing filter exists to prevent.
+# ============================================================================
+
+
+def test_pre_call_hook_derives_needs_images_from_anthropic_image_block():
+    """An image-bearing request with the Anthropic shape (the protocol the
+    gateway's /v1/messages endpoints speak) drives `needs_images=True` and
+    passes that flag to the picker. The metadata stamped onto the request
+    must include `needs_images`, the picker must be called with the flag,
+    and the routing log line must include the " images" tag so a grep
+    across the gateway log finds every image-bearing request.
+    """
+    import logging as _logging
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    ledger = Ledger(redis)
+    policy = CapacityPolicy(redis, reg.settings, ledger)
+    picker = Picker(reg, slots, policy)
+    h = SwitchyardHandler.__new__(SwitchyardHandler)
+    h.__dict__["registry"] = reg
+    h.__dict__["_slots"] = slots
+    h.__dict__["_ledger"] = ledger
+    h.__dict__["_policy"] = policy
+    h.__dict__["_picker"] = picker
+    h.__dict__["_redis"] = redis
+    h.__dict__["_beats"] = {}
+
+    # Capture log records so the assertion about the " images" tag can
+    # grep exactly the line the operator reads.
+    captured: list[_logging.LogRecord] = []
+    handler = _logging.Handler()
+    handler.emit = captured.append
+    log = _logging.getLogger("switchyard")
+    prior_level = log.level
+    log.setLevel(_logging.INFO)
+    log.addHandler(handler)
+    try:
+        data = {
+            "model": "apex",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64",
+                                                 "media_type": "image/png",
+                                                 "data": "fakepng"}},
+                ]},
+            ],
+            "proxy_server_request": {"headers": {
+                "x-switchyard-session": "sess-image-anthropic",
+            }},
+        }
+        asyncio.run(h.async_pre_call_hook(
+            user_api_key_dict=None,
+            cache=None,
+            data=data,
+            call_type="anthropic_messages",
+        ))
+        ctx = data["metadata"][META_KEY]
+        await_release = asyncio.run(_release_picker(h, ctx))
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(prior_level)
+
+    assert ctx["needs_images"] is True, ctx
+    log_lines = [r.getMessage() for r in captured]
+    routing_lines = [m for m in log_lines if m.startswith("lane=")]
+    assert routing_lines, log_lines
+    assert any("images" in line for line in routing_lines), routing_lines
+    print(f"  anthropic image block -> needs_images=True in ctx + ' images' tag in log")
+
+
+def test_pre_call_hook_derives_needs_images_from_openai_image_url_block():
+    """The OpenAI Chat Completions shape uses `image_url` rather than `image`.
+    The hook must catch it too, otherwise an OpenAI-shaped image request
+    under a lane with `image_routing: always` would silently land on a
+    text-only model. Same flip-side as the Anthropic test, exercised end
+    to end through the pre-call hook so the metadata stamp and the log
+    line are both verified.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    ledger = Ledger(redis)
+    policy = CapacityPolicy(redis, reg.settings, ledger)
+    picker = Picker(reg, slots, policy)
+    h = SwitchyardHandler.__new__(SwitchyardHandler)
+    h.__dict__["registry"] = reg
+    h.__dict__["_slots"] = slots
+    h.__dict__["_ledger"] = ledger
+    h.__dict__["_policy"] = policy
+    h.__dict__["_picker"] = picker
+    h.__dict__["_redis"] = redis
+    h.__dict__["_beats"] = {}
+
+    data = {
+        "model": "apex",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "image_url",
+                 "image_url": {"url": "https://example.com/cat.png"}},
+            ]},
+        ],
+        "proxy_server_request": {"headers": {
+            "x-switchyard-session": "sess-image-openai",
+        }},
+    }
+    asyncio.run(h.async_pre_call_hook(
+        user_api_key_dict=None,
+        cache=None,
+        data=data,
+        call_type="acompletion",
+    ))
+    ctx = data["metadata"][META_KEY]
+    asyncio.run(_release_picker(h, ctx))
+
+    assert ctx["needs_images"] is True, ctx
+    print(f"  openai image_url block -> needs_images=True in ctx")
+
+
+def test_pre_call_hook_derives_needs_images_from_openai_input_image_block():
+    """The OpenAI Responses API shape uses `input_image`. The hook must
+    catch it the same way it catches `image` and `image_url` -- the three
+    names are the load-bearing image-bearing content block types across
+    the protocols the gateway fronts.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    ledger = Ledger(redis)
+    policy = CapacityPolicy(redis, reg.settings, ledger)
+    picker = Picker(reg, slots, policy)
+    h = SwitchyardHandler.__new__(SwitchyardHandler)
+    h.__dict__["registry"] = reg
+    h.__dict__["_slots"] = slots
+    h.__dict__["_ledger"] = ledger
+    h.__dict__["_policy"] = policy
+    h.__dict__["_picker"] = picker
+    h.__dict__["_redis"] = redis
+    h.__dict__["_beats"] = {}
+
+    data = {
+        "model": "apex",
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "input_image",
+                 "image_url": "data:image/png;base64,fakepng"},
+            ]},
+        ],
+        "proxy_server_request": {"headers": {
+            "x-switchyard-session": "sess-image-responses",
+        }},
+    }
+    asyncio.run(h.async_pre_call_hook(
+        user_api_key_dict=None,
+        cache=None,
+        data=data,
+        call_type="acompletion",
+    ))
+    ctx = data["metadata"][META_KEY]
+    asyncio.run(_release_picker(h, ctx))
+
+    assert ctx["needs_images"] is True, ctx
+    print(f"  openai input_image block -> needs_images=True in ctx")
+
+
+def test_pre_call_hook_leaves_needs_images_false_for_plain_text():
+    """The negative case: a plain text-only request MUST keep
+    `needs_images=False`, regardless of how many user/assistant turns the
+    conversation already contains. A misfire here would route every
+    text-only request through the image-capability filter and 429 a
+    any lane whose every member lacks `supports_images: true`.
+    """
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    ledger = Ledger(redis)
+    policy = CapacityPolicy(redis, reg.settings, ledger)
+    picker = Picker(reg, slots, policy)
+    h = SwitchyardHandler.__new__(SwitchyardHandler)
+    h.__dict__["registry"] = reg
+    h.__dict__["_slots"] = slots
+    h.__dict__["_ledger"] = ledger
+    h.__dict__["_policy"] = policy
+    h.__dict__["_picker"] = picker
+    h.__dict__["_redis"] = redis
+    h.__dict__["_beats"] = {}
+
+    # A multi-turn text conversation with NO image block. needs_images
+    # must come out False even though the messages list is non-trivial.
+    data = {
+        "model": "apex",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "no images here"},
+            ]},
+        ],
+        "proxy_server_request": {"headers": {
+            "x-switchyard-session": "sess-text-only",
+        }},
+    }
+    asyncio.run(h.async_pre_call_hook(
+        user_api_key_dict=None,
+        cache=None,
+        data=data,
+        call_type="acompletion",
+    ))
+    ctx = data["metadata"][META_KEY]
+    asyncio.run(_release_picker(h, ctx))
+
+    assert ctx["needs_images"] is False, ctx
+    print(f"  plain text-only body -> needs_images=False in ctx")
+
+
+async def _release_picker(h, ctx):
+    """Release a slot the pre-call hook just claimed, keeping the fake
+    redis state clean between tests. Defined locally rather than reusing
+    the inline `_release_picker` from other tests, because every test
+    needs a fresh release path on its own state.
+    """
+    await h.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

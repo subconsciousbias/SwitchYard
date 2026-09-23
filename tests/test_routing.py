@@ -4282,6 +4282,496 @@ def test_per_group_writer_recovers_raw_score_after_tier_change():
 
 
 # ============================================================================
+# Issue #75 — image routing in the picker (model `supports_images`, lane
+# `image_routing`, `needs_images` plumbed through `_members` / `_visit_ref`
+# / `_affinity`, and parser validation). The tests below were the regression
+# bars in the planner's design contract. They are inserted BEFORE the
+# `if __name__ == "__main__":` block so the runner's `globals()` discovery
+# picks them up — anything appended below the runner is defined too late to
+# be collected (see CLAUDE.md).
+#
+# The async picker plumbing used here parallels the existing `needs_tools`
+# tests, with one reusable `_image_lane(reg, slots, *, members, mode)` helper
+# that builds a fresh registry whose lane lists exactly the models the test
+# wants (some image-capable, some text-only) and whose `image_routing` is
+# whatever mode the test asks for. The helper returns the picker too, so the
+# tests stay one helper call away from running.
+# ============================================================================
+
+
+def _image_lane(reg, slots, *, members, mode):
+    """Build a Registry with a fresh lane whose `image_routing` is `mode`
+    and whose body is exactly the supplied `members` (refs of the form
+    ``plan/model``), then wire a picker against it. Returns
+    ``(reg, picker)``.
+
+    The members list is sourced from the loaded fixture's existing plans —
+    no fake models are minted here, because every member still needs a real
+    plan / quota / cap chain for ``try_claim`` to accept it. The plan's
+    image-capable members come from the live fixture's claude-max and
+    openai plans (the existing example config marks these ``supports_images:
+    true`` on every model), and the text-only members come from the
+    OpenCode-Go / Grok / Qwen models. Reusing real model refs keeps the
+    capacity logic exactly as it runs in production.
+
+    Mirror of `_build_lane` (round-robin / weighted / perishable section),
+    scoped to the image-routing tests so they keep their own lane config.
+    """
+    from dataclasses import replace as _replace
+    from switchyard.models import _parse_lane_order
+    lanes = dict(reg.lanes)
+    base = reg.lanes["apex"]
+    known = {m.ref for p in reg.plans.values() for m in p.models.values()}
+    parsed = _parse_lane_order("image-test", list(members), known)
+    lanes["image-test"] = _replace(
+        base, key="image-test", order=parsed, tail=[],
+        strategy="fill", description="", image_routing=mode,
+    )
+    new_reg = models.Registry(
+        settings=reg.settings, plans=reg.plans, lanes=lanes,
+    )
+    picker = Picker(new_reg, slots)
+    return new_reg, picker
+
+
+def test_image_routing_default_off_leaves_routing_unchanged_for_image_turns():
+    """Under image_routing: off (default), an image-bearing request picks
+    exactly what a plain text request would: the lane's strategy and member
+    set are unchanged. The hook's `needs_images=True` flag does not
+    influence the picker's candidate set when the lane's mode is `off`.
+
+    Without this guarantee, upgrading a lane to `image_routing: always`
+    would be a one-way button — operators would need to set `off` BEFORE
+    the edit and `always` AFTER, to keep the pre-existing behaviour. Off
+    has to mean "do nothing".
+    """
+    from dataclasses import replace
+
+    async def go():
+        reg, slots, picker = build()
+        # Pick fresh under `off` so we don't entangle with whatever lease
+        # state siblings left in FakeRedis.
+        plain = await picker.pick("forge", None)
+        await picker.release(plain.plan.key, plain.request_id, plain.ref)
+        # Need images=True here. The default mode is off, so the picker
+        # should serve the request identically: same first member.
+        with_images = await picker.pick("forge", None, needs_images=True)
+        await picker.release(
+            with_images.plan.key, with_images.request_id, with_images.ref)
+        return plain.ref, with_images.ref
+
+    plain_ref, image_ref = run(go())
+    assert plain_ref == image_ref, (
+        f"off mode is bit-for-bit legacy: text pick {plain_ref} vs "
+        f"image pick {image_ref}")
+    print(f"  image_routing=off: image-bearing pick ({image_ref}) "
+          f"matches text-only pick ({plain_ref})")
+
+
+def test_members_filters_to_image_capable_under_always():
+    """Under image_routing: always, `Picker._members` returns only the lane
+    members whose `supports_images` is True. This is the body-build step
+    the picker uses to seed its walk; without this filter, a non-image-
+    capable model would still be tried (and dropped at `_visit_ref`, but
+    only after a needless cold-cap probe that wastes capacity lookups).
+
+    Built on the existing forge lane (refactored through `_image_lane`):
+    two members, one image-capable (claude-max/opus) and one text-only
+    (grok/grok-4.6). With mode=always, only the image-capable member
+    survives the filter; without (mode=off), both do.
+    """
+    async def go():
+        reg, slots, picker = build()
+
+        # A text-only control: mode=off returns both members.
+        off_reg, off_picker = _image_lane(
+            reg, slots,
+            members=["claude-max/opus", "grok/grok-4.6"],
+            mode="off",
+        )
+        off_members = [m.ref for m in await off_picker._members("image-test")]
+
+        # The same lane under always, with needs_images=True: only image-
+        # capable members survive. claude-max/opus is image-capable in the
+        # fixture; grok/grok-4.6 is not.
+        always_reg, always_picker = _image_lane(
+            reg, slots,
+            members=["claude-max/opus", "grok/grok-4.6"],
+            mode="always",
+        )
+        plain = [m.ref for m in await always_picker._members("image-test")]
+        with_images = [m.ref for m in await always_picker._members(
+            "image-test", needs_images=True)]
+        return off_members, plain, with_images
+
+    off_members, plain_members, image_members = run(go())
+    assert set(off_members) == {"claude-max/opus", "grok/grok-4.6"}, off_members
+    assert set(plain_members) == {"claude-max/opus", "grok/grok-4.6"}, plain_members
+    assert image_members == ["claude-max/opus"], image_members
+    print(f"  off/_members: {sorted(off_members)} | "
+          f"always/_members(needs_images): {sorted(image_members)} "
+          "(only opus survives)")
+
+
+def test_image_routing_always_lets_a_lane_with_no_text_only_pick():
+    """The positive case: a lane whose every member supports images picks
+    an image-capable model under `always`. This is the property operators
+    actually configure for: a vision-capable route where every back-end
+    happens to support images, and an image-bearing request lands on the
+    best of them just like a text request would.
+    """
+    async def go():
+        reg, slots, picker = build()
+        all_capable, capable_picker = _image_lane(
+            reg, slots,
+            members=["claude-max/opus", "claude-max/fable", "openai/astra"],
+            mode="always",
+        )
+        pick = await capable_picker.pick(
+            "image-test", None, needs_images=True,
+        )
+        return pick.ref, pick.model.supports_images
+
+    ref, supports = run(go())
+    assert supports is True, f"picked {ref} but supports_images={supports}"
+    assert ref in {"claude-max/opus", "claude-max/fable", "openai/astra"}, ref
+    print(f"  always lane with all image-capable members: picked {ref} "
+          f"(supports_images={supports})")
+
+
+def test_text_only_lane_under_always_raises_lane_saturated_with_skip_reason():
+    """A lane whose every member's `supports_images` is False under
+    `image_routing: always` must refuse an image-bearing request with
+    the "(no image support)" skip note on the LaneSaturated exception.
+    The detail string is what the operator sees in the 429 body, so it
+    has to name image support explicitly rather than reading as
+    coincidental unavailability or "lane is full".
+
+    Built by constructing a lane whose only members are text-only models
+    (grok and the local box), then issuing `needs_images=True` under
+    `image_routing: always`. The body walk runs (the body has refs, so
+    the early-empty branch does not fire), each member is dropped at
+    `_visit_ref` with the "(no image support)" reason appended to
+    `ctx.skipped`, and the final LaneSaturated surfaces those skip
+    notes in its comma-joined detail. That join is the message the
+    caller reads.
+    """
+    async def go():
+        reg, slots, picker = build()
+        text_only_reg, text_only_picker = _image_lane(
+            reg, slots,
+            members=["grok/grok-4.6", "local-box/qwen"],
+            mode="always",
+        )
+        try:
+            await text_only_picker.pick("image-test", None, needs_images=True)
+        except LaneSaturated as exc:
+            return str(exc)
+        raise AssertionError(
+            "an image request on a lane with zero image-capable members "
+            "must refuse rather than pick a text model")
+
+    msg = run(go())
+    assert "no image support" in msg, msg
+    assert "grok/grok-4.6" in msg, msg
+    assert "local-box/qwen" in msg, msg
+    print(f"  text-only lane under always refused: {msg}")
+
+
+def test_visit_ref_per_leaf_skips_text_only_under_always_with_explicit_reason():
+    """The per-leaf-skip path: when a lane's body still has refs after
+    `_members` filters (some are image-capable, some are text-only),
+    `_visit_ref` drops the text-only ones in the walk rather than via
+    the early-empty branch. The skipped entry must name image support
+    explicitly: "(no image support)". This is what the capacity board
+    and the log line surface, so the reason has to read as a filter,
+    not as "coincidentally unavailable".
+
+    Built by calling `_visit_ref` directly with a text-only ref on a
+    ctx that has `needs_images=True` and `image_mode="always"`. The
+    direct call avoids the early-empty-body branch altogether and
+    exercises the same per-leaf drop the body walk would emit.
+    """
+    async def go():
+        reg, slots, picker = build()
+        # Any lane wiring is fine here -- we drive _visit_ref directly.
+        _, text_only_picker = _image_lane(
+            reg, slots,
+            members=["claude-max/opus"],
+            mode="always",
+        )
+        from switchyard.picker import _VisitCtx as _Ctx
+        ctx = _Ctx(
+            lane="image-test", rid="rid-test", session=None, pinned=False,
+            exclude=frozenset(), needs_images=True, image_mode="always",
+        )
+        await text_only_picker._visit_ref(
+            "grok/grok-4.6", ctx, picked_group=None,
+        )
+        return ctx.skipped
+
+    skipped = run(go())
+    assert any("no image support" in s for s in skipped), skipped
+    assert any(s.startswith("grok/grok-4.6") for s in skipped), skipped
+    print(f"  per-leaf reject under always+needs_images: "
+          f"skipped={skipped}")
+
+
+def test_affinity_spills_when_image_request_hits_text_only_lease_under_always():
+    """A leased session whose current model cannot serve images must
+    re-place when an image-bearing request lands, under `image_routing:
+    always`. The old lease is dropped by the picker, the body walk
+    re-routes the session onto an image-capable peer, and the new pick
+    is NOT sticky (`sticky=False` because the lease was dropped rather
+    than honoured). The session token stays the same, so the caller
+    still sees one continuous conversation — only the underlying plan
+    changes.
+
+    This is the design property the issue's affinity section calls out:
+    "mode `always` drops the old lease" — the body walk then re-places
+    the session, returning a fresh lease on the new model.
+    """
+    async def go():
+        reg, slots, picker = build()
+        # Build a lane with one text-only member and one image-capable
+        # member, mode=always, where claude-max/opus is image-capable and
+        # grok/grok-4.6 is not.
+        new_reg, new_picker = _image_lane(
+            reg, slots,
+            members=["grok/grok-4.6", "claude-max/opus"],
+            mode="always",
+        )
+
+        session = "sess-image-affinity"
+
+        # First pick: a text-only request (no image) seeds the lease on
+        # whichever member is first — grok leads by config order, so the
+        # lease lands on grok. Even without the image flag, that's where
+        # affinity pins us.
+        first = await new_picker.pick("image-test", session)
+        await new_picker.release(
+            first.plan.key, first.request_id, first.ref)
+        held = await slots.get_lease(session)
+        assert held == "grok/grok-4.6", held
+
+        # Now image-bearing request under always: the lease on grok (text-
+        # only) must be dropped and the body walk must re-place the
+        # session on claude-max/opus.
+        second = await new_picker.pick(
+            "image-test", session, needs_images=True,
+        )
+        held_after = await slots.get_lease(session)
+        await new_picker.release(
+            second.plan.key, second.request_id, second.ref)
+        return (
+            first.ref, second.ref, second.sticky, held_after,
+            bool(second.model.supports_images),
+        )
+
+    first_ref, second_ref, sticky, held_after, supports = run(go())
+    assert first_ref == "grok/grok-4.6", first_ref
+    # The image-bearing pick went somewhere else — NOT the leased grok —
+    # and landed on an image-capable member.
+    assert second_ref != first_ref, (
+        f"image request should have spilled off {first_ref}; stayed there")
+    assert supports is True, f"second pick {second_ref} must support images"
+    assert held_after == second_ref, (
+        f"lease moved from {first_ref} to {held_after}; expected "
+        f"{second_ref}")
+    assert sticky is False, (
+        f"image-spill pick is not sticky: lease dropped, not honoured")
+    print(f"  affinity spill under always: {first_ref} (text lease dropped) "
+          f"-> {second_ref} (sticky={sticky}, supports_images={supports})")
+
+
+def test_only_first_keeps_sticky_pick_on_text_only_for_image_request():
+    """Under `image_routing: only_first`, affinity is unchanged from
+    today's behaviour: a session leased to a text-only model stays there
+    even for an image-bearing request. The mode exists for a future
+    caller opt-in ("image-only first-time session" routing); today it is
+    effectively a synonym for off on the affinity path, so the existing
+    sticky / leased-leave-alone contract is preserved bit-for-bit.
+    """
+    async def go():
+        reg, slots, picker = build()
+        new_reg, new_picker = _image_lane(
+            reg, slots,
+            members=["grok/grok-4.6", "claude-max/opus"],
+            mode="only_first",
+        )
+        session = "sess-only-first"
+
+        # Pin the session to the text-only model.
+        first = await new_picker.pick("image-test", session)
+        await new_picker.release(
+            first.plan.key, first.request_id, first.ref)
+        held = await slots.get_lease(session)
+        assert held == "grok/grok-4.6", held
+
+        # An image-bearing request hits the same session. Under
+        # only_first, the lease is honoured: the pick lands on the
+        # text-only model and reports `sticky=True`.
+        second = await new_picker.pick(
+            "image-test", session, needs_images=True,
+        )
+        held_after = await slots.get_lease(session)
+        await new_picker.release(
+            second.plan.key, second.request_id, second.ref)
+        return first.ref, second.ref, second.sticky, held_after
+
+    first_ref, second_ref, sticky, held_after = run(go())
+    assert first_ref == "grok/grok-4.6", first_ref
+    assert second_ref == first_ref, (
+        f"only_first should keep the sticky lease: first={first_ref} "
+        f"second={second_ref}")
+    assert sticky is True, f"expected sticky=True on the leased model; got {sticky}"
+    assert held_after == first_ref, held_after
+    print(f"  only_first kept sticky pick on text-only lease: "
+          f"{second_ref} (sticky={sticky}, lease unchanged)")
+
+
+def test_supports_images_parser_handles_true_false_and_missing():
+    """The Model parser must read `supports_images` as a tri-state:
+    True / False / None (unset). None is critical because it is what the
+    loader uses to recognise "operator didn't say, litellm might fill it
+    in" — a model whose YAML explicitly says `false` must NOT be
+    overridden by the litellm pre-fill, and a model whose YAML says
+    `true` MUST be set to True even if litellm doesn't know about it.
+
+    Built on a tiny synthetic model registry: one model with each shape,
+    parsed through `_parse_models` directly so the loader-time litellm
+    pre-fill does not interfere.
+    """
+    from switchyard.models import _parse_models
+
+    raw = {
+        "yes_model":  {"model": "x/y", "supports_images": True},
+        "no_model":   {"model": "x/y", "supports_images": False},
+        "unset_model": {"model": "x/y"},
+    }
+    parsed = _parse_models("synthetic_plan", raw)
+    assert parsed["yes_model"].supports_images is True, parsed["yes_model"]
+    assert parsed["no_model"].supports_images is False, parsed["no_model"]
+    assert parsed["unset_model"].supports_images is None, parsed["unset_model"]
+
+    # A non-empty `supports_images: something_else` is coerced to bool,
+    # matching the existing pattern for max_parallel / context_window.
+    weird = _parse_models("weird_plan", {
+        "model": {"model": "x/y", "supports_images": "yes"},
+    })
+    assert weird["model"].supports_images is True, weird["model"]
+    print("  parser: explicit True/False kept, unset -> None, "
+          "truthy strings coerced to True")
+
+
+def test_lane_image_routing_default_is_off():
+    """A lane that does not say `image_routing` lands on the default
+    value `off`. The default matters: operators who do not know about
+    the feature (yet) must still get bit-for-bit legacy behaviour. The
+    dataclass default (`off`) and the loader's missing-key default agree.
+    """
+    import tempfile, os
+    reg = models.load()
+
+    # Dataclass default: a freshly constructed Lane (no image_routing
+    # supplied) is off.
+    from switchyard.models import Lane
+    lane_no_field = Lane(
+        key="default-test", label="Default", order=[], tail=[],
+        description="",
+    )
+    assert lane_no_field.image_routing == "off", lane_no_field.image_routing
+
+    # Loader default: a YAML lane that omits the image_routing key is
+    # parsed as `off` too.
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    try:
+        body = open(os.environ["SWITCHYARD_PLANS"]).read()
+        # Drop the image_routing key (plus its preceding comment block) from
+        # the first lane and confirm `off`. The shipped fixture sets it on
+        # every lane; the worked-example lane is `always` while the others
+        # are `off`, so the regex below has to accept any quoted value and
+        # any number of comment lines above the field.
+        import re as _re
+        stripped = _re.sub(
+            r"    (?:#[^\n]*\n)*    image_routing:\s*\"[a-z_]+\".*?\n",
+            "", body, count=1,
+        )
+        # The regex strips every comment line above the field for the
+        # matched lane plus the `image_routing:` field itself. Apex is the
+        # first lane in the file, so the assertion below pins the missing-
+        # key default behaviour on apex.
+        with os.fdopen(fd, "w") as fh:
+            fh.write(stripped)
+        new_reg = models.load(path)
+        assert new_reg.lanes["apex"].image_routing == "off", (
+            new_reg.lanes["apex"].image_routing)
+    finally:
+        os.unlink(path)
+
+    print("  lane image_routing default 'off': dataclass + loader agree")
+
+
+def test_lane_image_routing_validates_mode():
+    """An unknown `image_routing` value fails the load loudly with a
+    ValueError naming the bad value and the set of accepted modes. A
+    silent no-op would be worse than a stack trace here: a typo (`all`
+    vs `always`) on a production config would otherwise leave the lane
+    behaving as if `off`, with no signal that the operator intended
+    something else.
+    """
+    import tempfile, os, re as _re
+    body = open(os.environ["SWITCHYARD_PLANS"]).read()
+    # Replace the first `image_routing: "off"` line with a bogus value.
+    # The shipped fixture sets `off` on every lane except the worked-example
+    # apex (which is `always`), so the replacement lands on whichever lane
+    # comes first with `off` -- which lane is irrelevant to the test, only
+    # the bogus value matters.
+    modified = body.replace(
+        'image_routing: "off"', 'image_routing: "always_we_mean_it"',
+        1,
+    )
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(modified)
+        try:
+            models.load(path)
+        except ValueError as exc:
+            assert "image_routing" in str(exc), str(exc)
+            assert "always_we_mean_it" in str(exc), str(exc)
+            return str(exc)
+        raise AssertionError("expected ValueError on bogus image_routing")
+    finally:
+        os.unlink(path)
+
+
+def test_litellm_known_vision_returns_a_set_with_vision_models():
+    """The litellm auto-fill helper returns a `set[str]`; in this
+    environment (litellm is installed) that set is non-empty and
+    contains at least one well-known vision model name. In an offline
+    environment without litellm, the helper returns an empty set; that
+    branch is covered in `models.py`'s try/except.
+
+    Without this sanity, a regression in the litellm pre-fill would not
+    surface in tests: the helper would silently return {} and operators
+    would have to set `supports_images: true` on every model themselves.
+    """
+    from switchyard.models import litellm_known_vision_models
+    known = litellm_known_vision_models()
+    assert isinstance(known, set), type(known)
+    # gpt-4o is a well-known vision model and is in litellm.model_cost
+    # with supports_vision=True. We don't pin to it -- a future litellm
+    # version could rename entries -- but the set should not be empty.
+    assert len(known) > 0, "expected litellm.model_cost to populate a non-empty set"
+    # Every name should be a string (defensive -- litellm could in
+    # principle mix types across versions).
+    assert all(isinstance(n, str) for n in known), known
+    print(f"  litellm_known_vision_models(): {len(known)} vision-capable "
+          f"name(s); sample={sorted(known)[:3]}")
+
+
+# ============================================================================
 # Issue #81 (WS-A) — learned cap on a model whose own `max_parallel` matches
 # the learned number still counts as model-owned; one below it does not.
 #

@@ -330,6 +330,14 @@ class SwitchyardHandler(CustomLogger):
         # whose `tools` was emptied here.
         needs_tools = bool(data.get("tools"))
 
+        # An image-bearing request cannot land on a model that cannot serve
+        # images, under a lane whose image_routing is `always`. The check
+        # has to inspect the message list directly because the presence of
+        # an image is data-dependent — providers differ on what wire shape
+        # they accept, and no top-level request key flags it. See
+        # Picker._members / Picker._affinity for the matching gates.
+        needs_images = _has_image_block(data.get("messages"))
+
         # A request carrying tool *results* is mid-loop. While its session
         # lease is alive it returns to the plan that minted its tool_call_ids
         # -- the prompt cache and the loop's quota are both there. Past the
@@ -340,7 +348,8 @@ class SwitchyardHandler(CustomLogger):
 
         try:
             pick = (await self.picker.pick_direct(direct, session) if direct
-                    else await self.picker.pick(lane, session, needs_tools, pinned))
+                    else await self.picker.pick(
+                        lane, session, needs_tools, pinned, None, needs_images))
         except LaneSaturated as exc:
             # Surfacing this as a 429 is what lets clients back off instead of
             # hammering a lane whose paid capacity is genuinely gone.
@@ -372,6 +381,7 @@ class SwitchyardHandler(CustomLogger):
             # pick against whatever cooldowns the previous attempt set.
             "direct": bool(direct),
             "needs_tools": needs_tools,
+            "needs_images": needs_images,
             "pinned": pinned,
             # Group that produced the pick, when the lane walked one. Affinity
             # pins (picked_group is None) leave the field blank so a pinned
@@ -409,9 +419,10 @@ class SwitchyardHandler(CustomLogger):
         except Exception:                       # never fail the request over a label
             log.debug("caller_env resolution skipped for this request", exc_info=True)
         log.info(
-            "lane=%s -> %s [%s]%s%s%s",
+            "lane=%s -> %s [%s]%s%s%s%s",
             lane, pick.model.ref, _reason_with_group(pick),
             " tools" if needs_tools else "",
+            " images" if needs_images else "",
             " (sticky)" if pick.sticky else "",
             f" skipped={','.join(pick.considered)}" if pick.considered else "",
         )
@@ -1270,6 +1281,44 @@ def _carries_tool_results(messages: Any) -> bool:
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     return True
+    return False
+
+
+def _has_image_block(messages: Any) -> bool:
+    """Does any message carry an image content block, in EITHER wire format?
+
+    Mirrors the dual-shape stance of `_carries_tool_results`: the protocols
+    name image blocks differently, and the image-routing filter must catch
+    every known shape. The known shapes are:
+
+      Anthropic:          {"type": "image",      ...}
+      OpenAI Chat:        {"type": "image_url",   ...}
+      OpenAI Responses:   {"type": "input_image", ...}
+
+    `input_image` does not literally start with "image", but it is an image
+    content block, so the check is a substring match on the type rather
+    than a strict prefix. A custom block whose type happens to contain
+    "image" (e.g. "image_metadata") would also match — that is acceptable
+    here, because the picker only filters members whose model does NOT
+    support images, and a non-standard block type carrying visual content
+    is exactly the kind of thing the filter should treat as an image.
+
+    A plain string content block counts as text only — providers that
+    have embedded image URLs in older shapes wrap them in a list. The
+    hook checks the `messages` list defensively, so a malformed message
+    (non-dict, missing role) is silently skipped rather than poisoning
+    the request.
+    """
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    btype = block.get("type")
+                    if isinstance(btype, str) and "image" in btype:
+                        return True
     return False
 
 
