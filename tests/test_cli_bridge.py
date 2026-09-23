@@ -1883,6 +1883,76 @@ def test_spawn_sites_pass_only_the_allowlisted_env_to_the_cli():
           f"{planted} absent")
 
 
+# ------------------------------------------ issue #127: envelope -> error ----
+def test_exit_zero_envelope_error_is_classified_via_http_surface():
+    """Issue #127 pin: cli_bridge's HTTP surface for the exit-0-but-erroring
+    JSON envelope must not change when the inline check is replaced by
+    ``check_result_envelope``. A usage-limit envelope is a 429 (with
+    Retry-After); an error_max_turns envelope is a 502.
+
+    The fixture parses via ``claude_json`` (``json.loads(stdout)``) so the
+    envelope survives verbatim into ``check_result_envelope``; the opencode
+    parser used by this file's default fixture strips unknown events.
+    """
+    import asyncio
+    from fastapi import HTTPException
+
+    def make_fake(*, stdout: str) -> str:
+        f = tempfile.NamedTemporaryFile(
+            "w", suffix=".py", prefix="clib-env-", delete=False)
+        f.write("import sys\n"
+                f"sys.stdout.write({stdout!r})\n")
+        f.close()
+        return f.name
+
+    real_cli, real_bare, real_args, real_parser = (
+        server.CLI, server.BARE, server.PROFILE["args"], server.PROFILE["parser"])
+    try:
+        server.CLI = sys.executable
+        server.BARE = False
+        # claude_json preserves the envelope verbatim; events_json/codex_jsonl
+        # would strip is_error/subtype and rebuild result/usage from events.
+        server.PROFILE["parser"] = "claude_json"
+
+        # --- exit-0 with is_error=true + usage-limit text -> 429 ---
+        limited = ('{"type":"result","is_error":true,'
+                   '"result":"Claude AI usage limit reached|1760000000",'
+                   '"usage":{"input_tokens":0,"output_tokens":0}}')
+        limited_fake = make_fake(stdout=limited)
+        server.PROFILE["args"] = [limited_fake]
+        try:
+            try:
+                asyncio.run(server._run_cli("hi", None, "xai/grok-4.6", []))
+            except HTTPException as exc:
+                assert exc.status_code == 429, (exc.status_code, exc.detail)
+                assert exc.headers and "Retry-After" in exc.headers, exc.headers
+            else:
+                raise AssertionError("expected a 429 HTTPException")
+        finally:
+            os.unlink(limited_fake)
+
+        # --- exit-0 with error_max_turns subtype -> 502, no Retry-After ---
+        max_turns = '{"subtype":"error_max_turns","result":"max turns exceeded"}'
+        max_turns_fake = make_fake(stdout=max_turns)
+        server.PROFILE["args"] = [max_turns_fake]
+        try:
+            try:
+                asyncio.run(server._run_cli("hi", None, "xai/grok-4.6", []))
+            except HTTPException as exc:
+                assert exc.status_code == 502, (exc.status_code, exc.detail)
+                assert "Retry-After" not in (exc.headers or {}), exc.headers
+            else:
+                raise AssertionError("expected a 502 HTTPException")
+        finally:
+            os.unlink(max_turns_fake)
+
+        print("  cli_bridge HTTP surface: exit-0 is_error+limit -> 429, "
+              "error_max_turns -> 502 (no Retry-After)")
+    finally:
+        server.CLI, server.BARE, server.PROFILE["args"], server.PROFILE["parser"] = \
+            real_cli, real_bare, real_args, real_parser
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

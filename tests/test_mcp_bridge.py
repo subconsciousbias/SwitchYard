@@ -3852,6 +3852,121 @@ def test_codex_mcp_profile_argv_carries_disable_overrides_after_bypass():
           f"{len(mcp_fragments)} mcp_servers.switchyard.* keys intact")
 
 
+# ------------------------------------------ issue #127: envelope -> error ----
+def test_run_session_resolves_is_error_usage_limit_envelope_as_429():
+    """Issue #127: mcp_bridge used to ignore the CLI's exit-0 envelope when it
+    carried ``is_error=true`` plus a usage-limit string, so the session ended
+    up resolved as a "final" payload (i.e. answered as 200 to the caller).
+    The bridge now calls cli_bridge.check_result_envelope -- the same helper
+    cli_bridge raises from -- and resolves the turn_future as a 429 carrying
+    ``Retry-After``.
+    """
+    payload = ('{"type":"result","is_error":true,'
+               '"result":"Claude AI usage limit reached|1760000000",'
+               '"usage":{"input_tokens":0,"output_tokens":0}}')
+    fake_cli = _write_fake_cli(
+        "import sys\n"
+        f"sys.stdout.write({payload!r})\n")
+    session = _new_session()
+
+    async def scenario():
+        session.new_turn()
+        await server.run_session(session, [sys.executable, fake_cli])
+        return session.turn_future.result()
+
+    try:
+        result = asyncio.run(scenario())
+        assert result["type"] == "error", result
+        assert result["status"] == 429, result
+        assert result.get("headers", {}).get("Retry-After"), result
+        print(f"  MCP session: exit-0 is_error + usage-limit text -> "
+              f"{result['status']} (Retry-After="
+              f"{result['headers'].get('Retry-After')})")
+    finally:
+        _drop(session)
+        try:
+            os.unlink(fake_cli)
+        except OSError:
+            pass
+        try:
+            os.unlink(os.path.dirname(fake_cli))
+        except OSError:
+            pass
+
+
+def test_run_session_resolves_error_max_turns_envelope_as_502():
+    """Issue #127 sibling case: an error_max_turns subtype (no limit wording)
+    must resolve as a 502, never a "final" payload. The plain JSON envelope
+    used to flow through the session driver unchanged.
+    """
+    payload = '{"subtype":"error_max_turns","result":"max turns exceeded"}'
+    fake_cli = _write_fake_cli(
+        "import sys\n"
+        f"sys.stdout.write({payload!r})\n")
+    session = _new_session()
+
+    async def scenario():
+        session.new_turn()
+        await server.run_session(session, [sys.executable, fake_cli])
+        return session.turn_future.result()
+
+    try:
+        result = asyncio.run(scenario())
+        assert result["type"] == "error", result
+        assert result["status"] == 502, result
+        assert "Retry-After" not in (result.get("headers") or {}), result
+        print(f"  MCP session: exit-0 error_max_turns -> {result['status']}")
+    finally:
+        _drop(session)
+        try:
+            os.unlink(fake_cli)
+        except OSError:
+            pass
+        try:
+            os.unlink(os.path.dirname(fake_cli))
+        except OSError:
+            pass
+
+
+def test_check_result_envelope_helper_classifies_four_payload_shapes():
+    """Pin cli_bridge.check_result_envelope directly. The shared helper is the
+    single source of truth for both bridges, so a regression here would
+    break them together. mcp_bridge calls it via server.cli_bridge, the
+    same way _run_session_attempt does.
+    """
+    cb = server.cli_bridge
+
+    # Clean answer with usage: not an error.
+    clean = {"result": "42", "usage": {"input_tokens": 1, "output_tokens": 1}}
+    assert cb.check_result_envelope(clean) is None, clean
+
+    # Usage-limit envelope: 429 with Retry-After.
+    limited = {"type": "result", "is_error": True,
+               "result": "Claude AI usage limit reached|1760000000",
+               "usage": {"input_tokens": 0, "output_tokens": 0}}
+    exc = cb.check_result_envelope(limited)
+    assert exc is not None and exc.status_code == 429, exc
+    assert exc.headers and "Retry-After" in exc.headers, exc.headers
+
+    # error_during_execution: 502, no Retry-After.
+    bad = {"subtype": "error_during_execution", "result": "boom"}
+    exc = cb.check_result_envelope(bad)
+    assert exc is not None and exc.status_code == 502, exc
+
+    # Limit text only, no is_error / subtype / usage: still 429 + Retry-After.
+    # This is the second branch of check_result_envelope (the ``_LIMIT`` regex
+    # match on ``result`` with no ``usage`` field); the event-stream parsers
+    # strip ``is_error``/``subtype`` before parse_output returns, so a real
+    # CLI's limit message can land here even when nothing else flags it.
+    text_only = {"result": "Claude AI usage limit reached|1760000000"}
+    exc = cb.check_result_envelope(text_only)
+    assert exc is not None and exc.status_code == 429, exc
+    assert exc.headers and "Retry-After" in exc.headers, exc.headers
+    print("  cli_bridge.check_result_envelope: None / 429+Retry-After / 502 / "
+          "429+Retry-After across clean / usage-limit / error_during_execution"
+          " / limit-text-only")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

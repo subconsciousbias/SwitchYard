@@ -1065,6 +1065,17 @@ async def _run_session_attempt(session: Session, argv: list[str],
                                               f"parsed answer: {exc}"})
             return None
         payload = {"result": stdout.strip()}
+
+    # Some CLIs exit 0 while reporting a limit or error inside the JSON
+    # envelope (is_error=true / error_max_turns / usage-limit text). cli_bridge
+    # raises the same shape in _run_cli_attempt; here we have no HTTPException
+    # layer, so we read the exception's fields and resolve the turn_future as
+    # an error -- never as a "final" payload (issue #127).
+    if (exc := cli_bridge.check_result_envelope(
+            payload, PROFILE["default_retry_after"])) is not None:
+        session.resolve_final({"type": "error", "status": exc.status_code,
+                                "detail": exc.detail, "headers": exc.headers})
+        return None
     return payload
 
 

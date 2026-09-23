@@ -1371,13 +1371,10 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
             payload = {"result": stdout.strip()}
 
         # The CLI can exit 0 while reporting a limit inside the JSON envelope.
-        if payload.get("is_error") or payload.get("subtype") in ("error_max_turns", "error_during_execution"):
-            text = json.dumps(payload)
-            if _LIMIT.search(text):
-                raise _limit_error(text)
-            raise HTTPException(status_code=502, detail=f"{PROVIDER} cli error: {text[:300]}")
-        if _LIMIT.search(str(payload.get("result", ""))) and not payload.get("usage"):
-            raise _limit_error(str(payload.get("result")))
+        # check_result_envelope is shared with mcp_bridge (same logic; see
+        # that module's call site in _run_session_attempt).
+        if (exc := check_result_envelope(payload)) is not None:
+            raise exc
 
         return payload
     finally:
@@ -1445,6 +1442,34 @@ def error_from_events(stdout: str) -> tuple[int | None, str]:
                         messages.append(err["message"])
     unique = list(dict.fromkeys(m for m in messages if not m.startswith("{")))
     return status, " | ".join(unique)[:500]
+
+
+def check_result_envelope(payload: dict, default_retry_after: int | None = None) -> HTTPException | None:
+    """Classify a CLI's exit-0 JSON envelope as a real answer or a terminal error.
+
+    Some CLI versions exit 0 even when the underlying run failed, putting the
+    error inside the JSON body: ``is_error=true``,
+    ``subtype in {"error_max_turns","error_during_execution"}``, or a
+    usage-limit string in ``result``. The cli_bridge call site raises the
+    returned exception directly; mcp_bridge reads it field-by-field
+    (``status_code`` / ``detail`` / ``headers``) and resolves the session's
+    ``turn_future`` instead. Returns ``None`` when the payload is a genuine
+    answer.
+
+    The ``default_retry_after`` mirrors ``_limit_error``'s: limit errors must
+    carry ``Retry-After`` headers, and mcp_bridge passes its own provider
+    profile's window because its PROFILE may front a different provider than
+    this module was imported under (see ``_limit_error`` for the same caveat).
+    """
+    # The CLI can exit 0 while reporting a limit inside the JSON envelope.
+    if payload.get("is_error") or payload.get("subtype") in ("error_max_turns", "error_during_execution"):
+        text = json.dumps(payload)
+        if _LIMIT.search(text):
+            return _limit_error(text, default_retry_after)
+        return HTTPException(status_code=502, detail=f"{PROVIDER} cli error: {text[:300]}")
+    if _LIMIT.search(str(payload.get("result", ""))) and not payload.get("usage"):
+        return _limit_error(str(payload.get("result")), default_retry_after)
+    return None
 
 
 def _limit_error(blob: str, default_retry_after: int | None = None) -> HTTPException:
