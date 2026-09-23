@@ -19,6 +19,7 @@ logging out of MiniMax, which invalidates the session.
 from __future__ import annotations
 
 import hashlib
+import http.cookies
 import logging
 import os
 import time
@@ -43,6 +44,16 @@ K_PROBE = "sy:probe:{plan}"
 # successful response would otherwise flag a perfectly good cookie as dead.
 REAUTH_MARKERS = ("cookie is missing", "log in again", "not logged in",
                   "unauthorized")
+
+# Set-Cookie attribute names — never cookie names themselves. The pre-PR
+# capture stored the raw Set-Cookie header verbatim, so a stored value from
+# a provider that sent attributes looked like
+# `session=foo; Path=/; HttpOnly`. Stripping these on the next capture is
+# what stops `Path=` from round-tripping as a cookie pair.
+_SET_COOKIE_ATTRS = frozenset({
+    "Path", "Domain", "Expires", "Max-Age", "Secure", "HttpOnly",
+    "SameSite", "Priority", "Partitioned",
+})
 
 
 @dataclass
@@ -222,6 +233,59 @@ class Prober:
             return None
         return raw.decode() if isinstance(raw, bytes) else raw
 
+    async def _capture_set_cookie(self, plan_key: str,
+                                  raw_headers: list[str]) -> None:
+        """Parse Set-Cookie headers and merge into the stored jar by name.
+
+        The capture is opt-in (`probe.capture_set_cookie`), runs only when the
+        caller has already classified the response as verified-good, and never
+        overwrites the rest of the jar — only the names the server sent get
+        updated. Attributes (`Path=/`, `HttpOnly`, `Expires=…`) are dropped so
+        a comma in `Expires=Wed, …` cannot corrupt the parse; httpx's plain
+        `get("set-cookie")` joins multiple headers with `, `, which is why we
+        read them with `get_list` first. `status()` only surfaces the
+        fingerprint and added_at, never the cookie itself.
+
+        Pre-PR stored values are raw Set-Cookie strings (with attributes like
+        `Path=/; HttpOnly`), so on the very first capture we strip the known
+        attribute pairs before merging — otherwise a stored `Path=/` would
+        round-trip as a cookie name and the next request would send
+        `Cookie: session=newval; Path=/`. `SimpleCookie.load()` raises
+        `CookieError` on illegal cookie names (e.g. a comma in the name from a
+        misbehaving server), so each header is loaded in isolation and a
+        single bad header is skipped without killing the verified-good probe.
+        """
+        jar = http.cookies.SimpleCookie()
+        for entry in raw_headers:
+            try:
+                jar.load(entry)
+            except http.cookies.CookieError as exc:
+                log.warning("skipping malformed Set-Cookie (plan=%s): %s",
+                            plan_key, exc)
+                continue
+        parsed = {m.key: m.value for m in jar.values()}
+        if not parsed:
+            return
+        existing = await self._cookie(plan_key)
+        stored: dict[str, str] = {}
+        if existing:
+            for pair in existing.split("; "):
+                if "=" in pair:
+                    n, v = pair.split("=", 1)
+                    n = n.strip()
+                    if n in _SET_COOKIE_ATTRS:
+                        continue
+                    stored[n] = v.strip()
+        stored.update(parsed)
+        joined = "; ".join(f"{n}={v}" for n, v in stored.items())
+        await self.redis.hset(K_CRED.format(plan=plan_key), mapping={
+            "cookie": joined,
+            "fingerprint": _fingerprint(joined),
+            "added_at": time.time(),
+        })
+        log.info("cookie rotated by provider (plan=%s, fingerprint=%s)",
+                 plan_key, _fingerprint(joined))
+
     async def status(self, plan_key: str) -> dict:
         """Safe to show and safe to serialise: never includes the cookie."""
         cred = await self.redis.hgetall(K_CRED.format(plan=plan_key)) or {}
@@ -332,26 +396,6 @@ class Prober:
         if resp.status_code >= 400:
             return await self._fail(plan, f"HTTP {resp.status_code}", False, raw=body[:1500])
 
-        # Opt-in sliding capture of the session cookie: when the probe is
-        # configured to capture Set-Cookie and we have a verified-good response
-        # (2xx, no reauth marker — those guards are already past us here — and
-        # the server returns one), overwrite the stored credential so the
-        # portal never has to ask you to paste a fresh one. A 4xx/5xx, a
-        # reauth-marked body, or a missing Set-Cookie header must NEVER
-        # overwrite a working credential — those branches all returned above
-        # or fall through this `if` without a header. `status()` only surfaces
-        # the fingerprint and added_at, never the cookie itself.
-        if probe.capture_set_cookie and probe.kind == "cookie":
-            new_cookie = resp.headers.get("set-cookie")
-            if resp.status_code < 300 and new_cookie:
-                await self.redis.hset(K_CRED.format(plan=plan.key), mapping={
-                    "cookie": new_cookie,
-                    "fingerprint": _fingerprint(new_cookie),
-                    "added_at": time.time(),
-                })
-                log.info("cookie rotated by provider (plan=%s, fingerprint=%s)",
-                         plan.key, _fingerprint(new_cookie))
-
         if not doc_valid:
             return await self._fail(plan, "response was not JSON", False, raw=body[:1500])
 
@@ -393,6 +437,20 @@ class Prober:
             return await self._fail(
                 plan, "could not find a remaining value — map the fields from the raw response",
                 False, raw=body[:1500])
+
+        # Opt-in sliding capture of the session cookie: when the probe is
+        # configured to capture Set-Cookie and we have a verified-good response
+        # (2xx, no reauth marker — those guards are already past us here — and
+        # the server returns one), overwrite the stored credential so the
+        # portal never has to ask you to paste a fresh one. A 4xx/5xx, a
+        # reauth-marked body, or a missing Set-Cookie header must NEVER
+        # overwrite a working credential — those branches all returned above
+        # or fall through this `if` without a header. `status()` only surfaces
+        # the fingerprint and added_at, never the cookie itself.
+        if probe.capture_set_cookie and probe.kind == "cookie":
+            raw_headers = resp.headers.get_list("set-cookie")
+            if raw_headers:
+                await self._capture_set_cookie(plan.key, raw_headers)
 
         # A window the provider did not report is not an error: a plan may
         # publish its weekly allowance but not its burst window. Say which.

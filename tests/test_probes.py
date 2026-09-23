@@ -828,6 +828,280 @@ def test_non_json_body_with_unauthorized_still_triggers_reauth():
     print("  non-JSON 200 'unauthorized' -> needs_reauth via prose path")
 
 
+def test_capture_skipped_on_non_json_response():
+    """When the response is not valid JSON, the probe fails with 'response was
+    not JSON' and the capture block never runs — even though a Set-Cookie
+    header is present. Capture only fires on a verified-good response."""
+    import http.server
+    import threading
+    from dataclasses import replace
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<!DOCTYPE html><html><body>not json</body></html>"
+            self.send_response(200)
+            self.send_header("content-type", "text/html")
+            self.send_header("set-cookie", "session=anonymous-victim")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/not-json"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        probe = replace(plan.probe, url=url, capture_set_cookie=True)
+        plan = replace(plan, probe=probe)
+
+        original = "session=original-cookie-value-1234567890"
+        await prober.set_cookie(plan.key, original)
+        before = dict(redis.hashes["sy:cred:minimax-ultra"])
+        result = await prober.run(plan)
+        return result, redis.hashes["sy:cred:minimax-ultra"], before
+
+    result, cred, before = run(go())
+    srv.shutdown()
+
+    assert not result.ok, result
+    assert "response was not JSON" in result.detail, result.detail
+    # Credential completely unchanged: capture never ran.
+    assert cred.get("cookie") == "session=original-cookie-value-1234567890", cred
+    assert cred.get("fingerprint") == before.get("fingerprint"), (
+        cred.get("fingerprint"), before.get("fingerprint"))
+    assert cred.get("added_at") == before.get("added_at"), (
+        cred.get("added_at"), before.get("added_at"))
+    print("  non-JSON + Set-Cookie -> capture skipped, credential untouched")
+
+
+def test_capture_merges_multiple_set_cookie_headers():
+    """When the server sends two Set-Cookie headers (one per cookie),
+    get_list returns both verbatim and SimpleCookie parses each independently.
+    The jar merge overwrites matching names and preserves the rest."""
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+
+    payload = {"data": {"remains": 7000, "total": 10000}}
+    windows = {"weekly": {"remaining": ["data.remains"], "total": ["data.total"]}}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("set-cookie", "a=4")
+            self.send_header("set-cookie", "b=3; Path=/; HttpOnly")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/multi-cookie"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        probe = replace(plan.probe, url=url, capture_set_cookie=True,
+                        windows=windows, fields={})
+        plan = replace(plan, probe=probe)
+
+        await prober.set_cookie(plan.key, "a=1; b=2")
+        result = await prober.run(plan)
+        return result, redis.hashes["sy:cred:minimax-ultra"]
+
+    result, cred = run(go())
+    srv.shutdown()
+
+    assert result.ok, result
+    # b overwritten by server (3), a merged from server (4)
+    assert cred.get("cookie") == "a=4; b=3", cred
+    print(f"  two Set-Cookie headers -> merged cookie {cred.get('cookie')!r}")
+
+
+def test_capture_handles_comma_in_expires_attribute():
+    """A Set-Cookie header with Expires=Wed, 21 Oct 2026 ... contains a comma
+    that naive header joining would corrupt. get_list returns the raw header
+    and SimpleCookie's internal parser correctly isolates the Expires value,
+    so only the key=value pair is extracted and the attribute is dropped."""
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+
+    payload = {"data": {"remains": 7000, "total": 10000}}
+    windows = {"weekly": {"remaining": ["data.remains"], "total": ["data.total"]}}
+    new_cookie = ("login=WzqUz; Path=/; HttpOnly; "
+                  "Expires=Wed, 21 Oct 2026 07:28:00 GMT")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("set-cookie", new_cookie)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/expires-comma"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        probe = replace(plan.probe, url=url, capture_set_cookie=True,
+                        windows=windows, fields={})
+        plan = replace(plan, probe=probe)
+
+        await prober.set_cookie(plan.key, "auth=1; login=old; extra=k")
+        result = await prober.run(plan)
+        status = await prober.status(plan.key)
+        return result, redis.hashes["sy:cred:minimax-ultra"], status
+
+    result, cred, status = run(go())
+    srv.shutdown()
+
+    assert result.ok, result
+    # login overwritten, auth and extra preserved
+    assert cred.get("cookie") == "auth=1; login=WzqUz; extra=k", cred
+    # status() never leaks the cookie value
+    blob = repr(status)
+    assert "WzqUz" not in blob, blob
+    assert "login=WzqUz" not in blob, blob
+    print(f"  Expires with comma -> parsed correctly, "
+          f"cookie {cred.get('cookie')!r}")
+
+
+def test_capture_skips_malformed_set_cookie_header():
+    """A malformed Set-Cookie from the server (illegal name with a comma)
+    raises http.cookies.CookieError on `SimpleCookie.load()`. The capture
+    must skip that one header and keep the rest of the jar — a verified-good
+    probe must never crash on a single bad header from the provider."""
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+
+    payload = {"data": {"remains": 7000, "total": 10000}}
+    windows = {"weekly": {"remaining": ["data.remains"], "total": ["data.total"]}}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            # Illegal cookie name (comma is not allowed) — SimpleCookie.load
+            # would raise CookieError on this string.
+            self.send_header("set-cookie", "foo,bar=value")
+            self.send_header("set-cookie", "session=ok")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/malformed-cookie"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        probe = replace(plan.probe, url=url, capture_set_cookie=True,
+                        windows=windows, fields={})
+        plan = replace(plan, probe=probe)
+
+        await prober.set_cookie(plan.key, "auth=1")
+        result = await prober.run(plan)
+        return result, redis.hashes["sy:cred:minimax-ultra"]
+
+    result, cred = run(go())
+    srv.shutdown()
+
+    assert result.ok, result
+    # Malformed header skipped, good header merged, existing auth preserved.
+    assert cred.get("cookie") == "auth=1; session=ok", cred
+    print(f"  malformed Set-Cookie -> skipped, "
+          f"cookie {cred.get('cookie')!r}")
+
+
+def test_capture_strips_legacy_set_cookie_attributes():
+    """The pre-PR capture stored the raw Set-Cookie header verbatim, so a
+    stored value with attributes looked like `session=foo; Path=/; HttpOnly`.
+    On the first capture after upgrade, the attribute pairs must be dropped
+    so `Path=` doesn't round-trip as a cookie name and the next request
+    doesn't send `Cookie: session=newval; Path=/`."""
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+
+    payload = {"data": {"remains": 7000, "total": 10000}}
+    windows = {"weekly": {"remaining": ["data.remains"], "total": ["data.total"]}}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("set-cookie", "session=newval; Path=/; HttpOnly")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/legacy-attrs"
+
+    async def go():
+        redis = FakeRedis()
+        prober = Prober(redis, Ledger(redis))
+        plan = models.load().plans["minimax-ultra"]
+        probe = replace(plan.probe, url=url, capture_set_cookie=True,
+                        windows=windows, fields={})
+        plan = replace(plan, probe=probe)
+
+        # Pre-PR-shaped stored value: raw Set-Cookie with attributes baked in.
+        # `Path=` and `HttpOnly` must be stripped, `session` overwritten by
+        # the server's `newval`.
+        await prober.set_cookie(plan.key, "session=foo; Path=/; HttpOnly")
+        result = await prober.run(plan)
+        return result, redis.hashes["sy:cred:minimax-ultra"]
+
+    result, cred = run(go())
+    srv.shutdown()
+
+    assert result.ok, result
+    # Attribute pairs gone, session merged from server.
+    assert cred.get("cookie") == "session=newval", cred
+    assert "Path" not in cred.get("cookie"), cred
+    assert "HttpOnly" not in cred.get("cookie"), cred
+    print(f"  legacy attrs stripped -> {cred.get('cookie')!r}")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
