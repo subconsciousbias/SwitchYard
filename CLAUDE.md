@@ -84,8 +84,7 @@ the way.
 What "done on the worktree" looks like:
 
   * `git status` clean, `git log` shows the new commit on the worktree branch.
-  * Offline test suite (`for t in tests/test_*.py; do python3 "$t" >/dev/null ...`)
-    green.
+  * Offline test suite (`scripts/test.sh`) green.
   * The user has the new commit hash and the branch name; the rebuild/redeploy
     (`scripts/apply.sh --build` from the main checkout) is theirs to run.
 

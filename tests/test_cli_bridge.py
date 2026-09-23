@@ -633,7 +633,7 @@ def test_e2big_from_the_spawn_is_413_and_other_spawn_errors_are_502():
                     f"expected an HTTPException for errno={errno_val}, got none")
         finally:
             asyncio.create_subprocess_exec = real_exec
-    print(f"  E2BIG -> 413, other spawn OSError -> 502 (no 500 leak)")
+    print("  E2BIG -> 413, other spawn OSError -> 502 (no 500 leak)")
 
 
 def test_the_claude_file_flags_carry_an_oversized_system_prompt():
@@ -844,7 +844,7 @@ def test_codex_argv_carries_one_minus_i_per_image():
         i_args = [argv[i + 1] for i, a in enumerate(argv) if a == "-i"]
         assert i_args == [str(img)], argv
         assert stdin_data is None
-        print(f"  codex argv carries -i for the staged image")
+        print("  codex argv carries -i for the staged image")
     finally:
         server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
         shutil.rmtree(img.parent, ignore_errors=True)
@@ -867,7 +867,7 @@ def test_opencode_argv_carries_one_minus_f_per_image():
         f_args = [argv[i + 1] for i, a in enumerate(argv) if a == "-f"]
         assert f_args == [str(img)], argv
         assert stdin_data is None
-        print(f"  opencode argv carries -f for the staged image")
+        print("  opencode argv carries -f for the staged image")
     finally:
         server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
         shutil.rmtree(img.parent, ignore_errors=True)
@@ -1646,10 +1646,5 @@ def test_health_reports_max_tokens_mode():
 
 
 if __name__ == "__main__":
-    n = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            print(f"{name}:")
-            fn()
-            n += 1
-    print(f"\n{n} cli-bridge tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

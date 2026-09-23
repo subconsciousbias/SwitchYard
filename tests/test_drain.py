@@ -384,9 +384,5 @@ def test_set_lease_writes_lease_and_reverse_index_in_one_round_trip():
 
 
 if __name__ == "__main__":
-    test_funcs = [(name, fn) for name, fn in sorted(globals().items())
-                  if name.startswith("test_") and callable(fn)]
-    for name, fn in test_funcs:
-        print(f"{name}:")
-        fn()
-    print(f"\nall drain tests passed ({len(test_funcs)})")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

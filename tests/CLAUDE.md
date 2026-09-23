@@ -7,34 +7,42 @@ provider.
 
 `tests/*.py` are designed to be runnable by anyone, on any machine, with no
 credentials, no Docker and no subscriptions. The runner block lives at the
-bottom of each file:
+bottom of each file and delegates to a shared helper:
 
 ```python
 if __name__ == "__main__":
-    failures = 0
-    for name, fn in list(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            ...
-    if failures:
-        raise SystemExit(f"{failures} failed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))
 ```
 
-It discovers test functions from `globals()`, so anything appended *after* that
-block is defined too late to be collected — the suite still reports "N tests
-passed" with your new test absent. **Insert before the runner, and check the
-count went up.**
+`tests/_runner.run(globals())` discovers test functions from `globals()` in
+definition order, runs each inside a per-test try/except, prints `  ok  name`
+or ` FAIL name: ...`, and exits non-zero on any failure or on zero tests
+collected. `tests/render_preview.py`'s `__main__` is not a test runner; it is
+the layout-preview script and stays as `raise SystemExit(main())`.
 
-The standard loop, run from the repo root:
+It also carries a mechanical guard against the silent-skip trap: `run()`
+walks the call-site module's compiled `co_consts`, finds `test_*` code
+objects whose `co_firstlineno` is greater than the call site's, and exits
+non-zero naming them. Anything appended *after* that block is defined too
+late to be collected, and the guard turns the silent-skip case into a hard
+failure at import time so the suite cannot report "N tests passed" with a
+new test absent. **Insert before the runner, and check the count went up.**
+
+The single documented entry point is `scripts/test.sh`:
 
 ```bash
-python3 tests/test_routing.py tests/test_classify.py 2>/dev/null; \
-for t in tests/test_*.py; do python3 "$t" >/dev/null || echo "FAIL $t"; done
-python3 tests/render_preview.py
+bash scripts/test.sh
 ```
 
-Keep it that way — anything needing a live provider belongs in
-`scripts/smoke.py` (which checks a running deployment and says so), or as a
-manual step in `TESTING.md`.
+which runs `python3 -m pytest -q` then `python3 tests/render_preview.py`
+and exits non-zero on any failure. For a quick smoke run on a single file
+or to iterate on a fix, the same tests work as plain scripts — `python3
+tests/test_*.py` runs the `__main__` block, which delegates to `_runner`.
+`tests/render_preview.py`'s `__main__` is not a test runner; it is the
+layout-preview script. Keep it that way — anything needing a live provider
+belongs in `scripts/smoke.py` (which checks a running deployment and says
+so), or as a manual step in `TESTING.md`.
 
 ## Adding a new test file
 
@@ -42,7 +50,8 @@ manual step in `TESTING.md`.
      helpers that are not worth a fixture.
   2. Put all `test_*` functions in the file **before** the
      `if __name__ == "__main__":` runner block at the bottom. Append-only edits
-     below the runner silently don't run.
+     below the runner are caught by the mechanical guard in
+     `tests/_runner.py` (see "Plain-script runner" above).
   3. Set `SWITCHYARD_PLANS` to `tests/plans_path.plans_path()` early (before
      importing `switchyard.*`), not via `os.environ.setdefault`. The module
      captures the env var at import time, and a stray export from a real shell
@@ -52,7 +61,7 @@ manual step in `TESTING.md`.
   5. Stub the network. `127.0.0.1` is allowed (stub servers and subprocess
      bridges run there on purpose); anything else is blocked under the pytest
      path (see below).
-  6. Run the plain-script loop above and check your test count.
+  6. Run `bash scripts/test.sh` and check your test count.
 
 ## The conftest socket guard — and its real scope
 

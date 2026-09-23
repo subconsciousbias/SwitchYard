@@ -281,10 +281,5 @@ def test_extract_no_text_tokens_returns_none_for_unrelated_prose():
 
 
 if __name__ == "__main__":
-    passed = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            fn()
-            print(f"  ok  {name}")
-            passed += 1
-    print(f"\n{passed} classifier tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

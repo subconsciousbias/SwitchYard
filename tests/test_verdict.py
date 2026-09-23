@@ -279,7 +279,7 @@ def test_double_count_guard_skips_second_call_with_same_request_id():
     assert s2 == 1, (
         f"same request_id must NOT bump the streak again -- got {s2}; "
         "the guard is the only thing keeping a single 5xx from looking like two")
-    assert s3 == 2, f"a fresh request_id must be allowed to bump the streak"
+    assert s3 == 2, "a fresh request_id must be allowed to bump the streak"
     # And the guard's bookkeeping is exactly what makes (1) and (2) diverge:
     # the marker is written with the request_id it short-circuited on.
     assert marker == "req-D", marker
@@ -288,10 +288,5 @@ def test_double_count_guard_skips_second_call_with_same_request_id():
 
 
 if __name__ == "__main__":
-    n = 0
-    for name, fn in sorted(list(globals().items())):
-        if name.startswith("test_") and callable(fn):
-            print(f"{name}:")
-            fn()
-            n += 1
-    print(f"\n{n} verdict tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

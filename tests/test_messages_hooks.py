@@ -1557,20 +1557,5 @@ async def _release_picker(h, ctx):
 
 
 if __name__ == "__main__":
-    failures = 0
-    for name, fn in list(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"  ok  {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f" FAIL {name}\n    {exc}")
-            except Exception as exc:
-                failures += 1
-                print(f" FAIL {name}\n    {type(exc).__name__}: {exc}")
-    if failures:
-        raise SystemExit(f"{failures} failed")
-    n = sum(1 for k, v in globals().items()
-            if k.startswith("test_") and callable(v))
-    print(f"\n{n} messages-hook tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

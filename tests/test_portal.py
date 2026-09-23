@@ -1073,17 +1073,5 @@ if __name__ == "__main__":
     # Plain-script runner: discovers tests from globals(), like the rest of
     # tests/*.py. See CLAUDE.md — appending below this block would silently
     # skip a test that the suite still reports as "all green".
-    failures = 0
-    for name, fn in list(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"  {name}: ok")
-            except AssertionError as exc:
-                failures += 1
-                print(f"  {name}: FAIL\n    {exc}")
-            except Exception as exc:
-                failures += 1
-                print(f"  {name}: ERROR\n    {type(exc).__name__}: {exc}")
-    if failures:
-        raise SystemExit(1)
+    import _runner
+    raise SystemExit(_runner.run(globals()))

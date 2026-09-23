@@ -1,0 +1,27 @@
+# Development-only dependencies. Installed on top of requirements.txt for
+# running tests, linting, and the pre-commit hooks. The offline test suite
+# (`scripts/test.sh`) uses pytest; ruff is the project's linter; hypothesis
+# is in here for property-based testing on classes that opt in.
+#
+# Issue #145: pytest>=8.4,<9 keeps us on a single major while letting CI pick up
+# patch releases, ruff>=0.6 matches the version that ships the rules we select
+# in pyproject.toml, and hypothesis>=6.100 is the minimum that supports the
+# generator APIs our property-based tests rely on.
+#
+# litellm>=1.101.0,<2 is needed by the offline test suite: several
+# tests/test_*.py modules do `from switchyard.hooks import ...` at the
+# top of the file, and switchyard/hooks.py imports
+# `litellm.integrations.custom_logger.CustomLogger` at module scope.
+# Without it pytest fails collection with ModuleNotFoundError before a
+# single test runs. The lower bound matches the gateway image's
+# Dockerfile.gateway pin (ghcr.io/berriai/litellm:v1.101.0), so a test
+# environment and a live gateway are talking to the same litellm
+# major. Note: litellm at import time fetches its model_cost map from
+# raw.githubusercontent.com; conftest.py blocks that socket per the
+# "tests never call a real provider" policy, so the CI workflow and
+# scripts/test.sh both export LITELLM_LOCAL_MODEL_COST_MAP=True to
+# keep collection from erroring out on the network fetch.
+pytest>=8.4,<9
+ruff>=0.6
+hypothesis>=6.100
+litellm>=1.101.0,<2

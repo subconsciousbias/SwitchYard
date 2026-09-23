@@ -658,10 +658,5 @@ def test_set_cookie_is_captured_on_a_verified_good_response():
 
 
 if __name__ == "__main__":
-    n = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            print(f"{name}:")
-            fn()
-            n += 1
-    print(f"\n{n} probe tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

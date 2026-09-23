@@ -51,6 +51,8 @@ a transient blip and the lane would keep feeding requests to dead capacity.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import asyncio
 import base64
 import binascii
@@ -69,7 +71,6 @@ from pathlib import Path
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 import yaml
 

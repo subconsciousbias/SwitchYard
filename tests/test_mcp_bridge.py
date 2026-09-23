@@ -2595,7 +2595,7 @@ def test_probe_follow_up_strips_synthetic_exchange_and_starts_session():
             "probe-result text must not leak into the rebuilt prompt"
         assert "[SwitchYard: tools execute on Linux in /home/u/dir" in seen["prompt"], \
             seen["prompt"]
-        # The probe-and-resume flow must not leave a gate slot taken: it
+# The probe-and-resume flow must not leave a gate slot taken: it
         # never started a real CLI (start_session was stubbed) and the
         # resolved probe is in-memory state, not a concurrency seat.
         assert server.cli_bridge._gate.in_flight == saved_gate_count, (
@@ -3534,10 +3534,5 @@ def test_no_inner_transcript_keeps_old_usage_and_bills_mirror_it():
 
 
 if __name__ == "__main__":
-    n = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            print(f"{name}:")
-            fn()
-            n += 1
-    print(f"\n{n} mcp-bridge tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

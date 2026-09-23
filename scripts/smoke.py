@@ -6,7 +6,7 @@ credentials present, and it consumes capacity — local models by default, and
 paid subscription quota with --paid. Nothing here is mocked; that is the point,
 and it is why it lives in scripts/ rather than tests/.
 
-The offline suite is `python3 -m pytest -q`: no network, no credentials, no
+The offline suite is `scripts/test.sh`: no network, no credentials, no
 Docker, and it refuses to reach anything but loopback (see tests/conftest.py).
 Run that constantly; run this when you have changed the deployment.
 

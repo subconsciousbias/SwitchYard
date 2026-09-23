@@ -43,17 +43,21 @@ member that served the request, the slot counts before and after, the tool call
 that came back. The prose below explains what each check means and how to
 diagnose a failure; it is not a list of commands to retype.
 
+To get the same lint gate locally that CI runs (`.pre-commit-config.yaml`):
+
+```bash
+pip install pre-commit && pre-commit install
+```
+
 ## 0. Offline checks (no credentials needed, ~30 seconds)
 
 ```bash
-python3 tests/test_routing.py && python3 tests/test_classify.py \
-  && python3 tests/test_policy.py && python3 tests/test_probes.py \
-  && python3 tests/render_preview.py
+bash scripts/test.sh
 ```
 
-**Expect:** four "tests passed" lines and a rendered preview. Open
-`/tmp/switchyard-preview.html` in a browser to see the portal layout before
-anything is live.
+**Expect:** pytest's all-pass summary and a rendered preview at
+`/tmp/switchyard-preview.html`. Open it in a browser to see the portal layout
+before anything is live.
 
 ### 0a. Real-Lua slot-table suite (`tests/test_slots_lua.py`)
 
@@ -737,7 +741,7 @@ The cheapest check, and the one that runs in CI: both real payload shapes are
 served by a stub and driven through the actual `Prober`.
 
 ```bash
-python3 -m pytest -q tests/test_probes.py
+bash scripts/test.sh tests/test_probes.py
 ```
 
 **Expect** 9 passed, including `minimax_remains_percent_payload_is_read_as_percentages`
@@ -1247,7 +1251,7 @@ that case, which is the resilience contract.
 
 ### 10c. What the offline suite cannot prove
 
-The offline test suite (`for t in tests/test_*.py`) covers the parsers,
+The offline test suite (`scripts/test.sh`) covers the parsers,
 the probe-id round-trip and the synthetic probe response shape -- but it
 cannot prove that LiteLLM's proxy actually forwards
 `metadata.switchyard.caller_env` to the sidecar over HTTP. That transport

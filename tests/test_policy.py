@@ -571,10 +571,5 @@ def test_cap_reason_mentions_gate_headroom():
 
 
 if __name__ == "__main__":
-    n = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            print(f"{name}:")
-            fn()
-            n += 1
-    print(f"\n{n} policy tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

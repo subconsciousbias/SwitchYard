@@ -38,7 +38,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -496,7 +495,7 @@ def test_opencode_json_mirrors_deny_intent():
         f"the rest of the config; review finding 5 (was 'ask', which made "
         f"every bash command trigger an operator prompt). "
         f"got {bash_rules['*']!r}")
-    print(f"  .opencode/opencode.json: read/edit/bash deny mirrors the rules")
+    print("  .opencode/opencode.json: read/edit/bash deny mirrors the rules")
 
 
 # Test (e): opencode wildcard runtime semantics --------------------------

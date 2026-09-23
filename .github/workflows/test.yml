@@ -1,0 +1,38 @@
+# Offline CI: lint + the unit suite. Mirrors `scripts/test.sh` so a green
+# gate matches a green local run, and runs on every push and PR.
+#
+# No services, no providers, no docker-in-docker: conftest.py blocks every
+# non-loopback socket, so the suite is fast and free.
+name: test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install requirements
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Lint (ruff)
+        run: ruff check .
+      - name: Unit tests (pytest)
+        # LITELLM_LOCAL_MODEL_COST_MAP forces litellm to use its bundled
+        # cost-map backup instead of fetching raw.githubusercontent.com at
+        # import time. The same policy that keeps tests honest (no real
+        # provider calls) would otherwise block the import-time fetch and
+        # abort collection.
+        env:
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+        run: python -m pytest -q
+      - name: Render preview
+        env:
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+        run: python tests/render_preview.py

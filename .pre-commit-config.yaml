@@ -1,0 +1,19 @@
+# Pre-commit hooks for SwitchYard.
+#
+# Only ruff is wired in here today: it is the project linter (pyproject.toml
+# `[tool.ruff]`) and it is what CI runs, so a `--fix` on the local hook is
+# the right "stop me from pushing a lint regression" bar.
+#
+# The rev is pinned to v0.16.8 of astral-sh/ruff-pre-commit. A pre-commit rev
+# tracks the ruff CLI version it ships, so pinning the hook pins the lint
+# version -- moving it forward should be a deliberate commit, not a silent
+# supply-chain change.
+#
+# Install with:
+#     pip install pre-commit && pre-commit install
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.8
+    hooks:
+      - id: ruff
+        args: [--fix]

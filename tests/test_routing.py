@@ -3040,8 +3040,7 @@ def test_log_line_keeps_first_word_inside_brackets_when_group_lands():
 
     reg = models.load()
     # A flat pick: no group, no metadata. Reason is the bare cap_reason.
-
-    # Easier: construct the Pick directly.
+# Easier: construct the Pick directly.
     from switchyard.picker import Pick
     bare_pick = Pick(
         lane="local", model=reg.lane_members("local")[0],
@@ -3347,8 +3346,7 @@ def test_the_generated_backstop_matches_what_the_picker_admits():
     reg = models.load()
     redis = FakeRedis()
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
-    ledger = Ledger(redis)
-    policy = CapacityPolicy(redis, reg.settings, ledger)
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
     picker = Picker(reg, slots, policy)
 
     cfg = gen_litellm.build(os.environ["SWITCHYARD_PLANS"])
@@ -4011,7 +4009,7 @@ def test_perishable_lane_writer_single_family_is_byte_identical_to_pre_partition
     # microseconds apart), so the stored scores are not equal and the
     # sort is non-trivial. The order matches the stable sort the
     # pre-partition writer would produce.
-    # NOTE: the production code computes each score independently at the
+# NOTE: the production code computes each score independently at the
     # time of its call, so the per-element sort key would drift between
     # the call and the assertion. For the byte-identity test the
     # meaningful assertions are: refs in the order the writer's stable
@@ -4871,8 +4869,5 @@ def test_a_learned_cap_below_model_max_parallel_loses_model_owned():
 
 
 if __name__ == "__main__":
-    for name, fn in sorted(list(globals().items())):
-        if name.startswith("test_") and callable(fn):
-            print(f"{name}:")
-            fn()
-    print("\nall routing tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

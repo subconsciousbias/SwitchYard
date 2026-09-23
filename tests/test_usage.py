@@ -878,15 +878,5 @@ def test_prompt_completion_tokens_billed_completion_optional():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    passed = 0
-    failed = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"  ok  {name}")
-                passed += 1
-            except Exception as exc:
-                print(f" FAIL {name}: {exc}")
-                failed += 1
-    print(f"\n{passed} passed, {failed} failed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

@@ -1243,7 +1243,7 @@ def _reason_with_group(pick) -> str:
     "quota spent", "paced 2 of 4", ...). When the lane walked a group to
     reach this pick, the group's gid (and strategy, when distinct from the
     plain per-lane shape) is appended INSIDE the brackets, so a script that
-    grep'd the previous `\[(\w+)\]` regex still extracts the FIRST token —
+    grep'd the previous r`\[(\w+)\]` regex still extracts the FIRST token —
     the original cap_reason — and now also gets the routing context.
 
     A flat lane (no group walk) produces the same bracketed reason it always

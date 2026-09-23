@@ -47,6 +47,8 @@ production.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import asyncio
 import collections
 import contextlib
@@ -63,7 +65,6 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 log = logging.getLogger("mcp_bridge")
 

@@ -176,8 +176,5 @@ def test_env_bak_suffix_snapshots_are_ignored():
 
 
 if __name__ == "__main__":
-    fns = [v for k, v in sorted(globals().items())
-           if k.startswith("test_") and callable(v)]
-    for fn in fns:
-        fn()
-    print(f"{len(fns)} tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

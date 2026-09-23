@@ -447,8 +447,5 @@ def _shrink_inflight_window(raw):
 
 
 if __name__ == "__main__":
-    for name, fn in sorted(list(globals().items())):
-        if name.startswith("test_") and callable(fn):
-            print(f"{name}:")
-            fn()
-    print("\nall hot-reload tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

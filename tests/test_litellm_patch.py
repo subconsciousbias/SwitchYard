@@ -253,10 +253,5 @@ def test_selfcheck_wires_audit_token_counter_patch():
 
 
 if __name__ == "__main__":
-    n = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            print(f"{name}:")
-            fn()
-            n += 1
-    print(f"\n{n} litellm_patch tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))

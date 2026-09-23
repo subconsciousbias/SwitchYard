@@ -81,10 +81,5 @@ def test_nothing_is_held_back_indefinitely():
 
 
 if __name__ == "__main__":
-    n = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            print(f"{name}:")
-            fn()
-            n += 1
-    print(f"\n{n} reasoning tests passed")
+    import _runner
+    raise SystemExit(_runner.run(globals()))
