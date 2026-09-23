@@ -52,6 +52,17 @@ from switchyard import models                              # noqa: E402
 from switchyard.portal import app as portal_app  # noqa: E402
 
 
+# The portal's Host/Origin middleware rejects requests whose Host header
+# is not in the allowlist. TestClient defaults to `base_url=http://testserver`,
+# which fails that check, so every test instantiates the client through
+# this helper -- it pins `base_url` to the portal's expected loopback so
+# the Host header reads `localhost:4001`. Tests that exercise the
+# middleware itself (bad host, bad origin) build their own client with a
+# different base_url or override the headers per-request.
+def _make_client() -> TestClient:
+    return TestClient(portal_app.app, base_url="http://localhost:4001")
+
+
 def _off(html: str) -> bool:
     return "Pacing mode off" in html and 'aria-pressed="false"' in html \
         and "Turn on" in html
@@ -87,14 +98,16 @@ def test_pacing_fragment_reflects_runtime_toggle():
     disagreed. The fix wires /fragments/pacing to poll and to be refreshed by
     the toggle's after-request handler.
     """
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         # The example plans file leaves pacing off, so the first read of the
         # fragment should be the off state — both the label and aria-pressed.
         first = client.get("/fragments/pacing")
         assert first.status_code == 200, first.text
         assert _off(first.text), first.text
 
-        toggled = client.post("/admin/pacing?enabled=toggle")
+        toggled = client.post(
+            "/admin/pacing?enabled=toggle",
+            headers={"Origin": "http://localhost:4001"})
         assert toggled.status_code == 200, toggled.text
         assert toggled.json()["pacing"] is True
 
@@ -104,7 +117,9 @@ def test_pacing_fragment_reflects_runtime_toggle():
         assert _on(second.text), second.text
 
         # And back off again — the toggle action is the same button either way.
-        toggled = client.post("/admin/pacing?enabled=toggle")
+        toggled = client.post(
+            "/admin/pacing?enabled=toggle",
+            headers={"Origin": "http://localhost:4001"})
         assert toggled.json()["pacing"] is False
         third = client.get("/fragments/pacing")
         assert _off(third.text), third.text
@@ -123,7 +138,7 @@ def test_pacing_button_is_actually_a_button():
     The CSS side lives in base.html and is asserted by reading the file
     directly — it's not part of the fragment response.
     """
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         html = client.get("/fragments/pacing").text
         # The button element, not a span or div pretending to be one.
         assert 'class="toggle"' in html, html
@@ -153,10 +168,12 @@ def test_pacing_fragment_carries_runtime_override_banner():
     fragment has to say so — otherwise it looks like plans.yaml is being
     ignored rather than overridden.
     """
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         # plans.example.yaml ships with pacing off, so flipping the runtime on
         # puts them out of step.
-        client.post("/admin/pacing?enabled=on")
+        client.post(
+            "/admin/pacing?enabled=on",
+            headers={"Origin": "http://localhost:4001"})
         try:
             html = client.get("/fragments/pacing").text
             assert "runtime override" in html, html
@@ -166,8 +183,12 @@ def test_pacing_fragment_carries_runtime_override_banner():
             # default. Mirrors test_pacing_paints_tail_disabled_and_paced_to_zero_badges,
             # which already used this pattern; without the reset the next test
             # in sorted order (test_pacing_fragment_reflects_runtime_toggle)
-            # would see pacing still ON and fail at its first read.
-            client.post("/admin/pacing?enabled=default")
+            # would see pacing still ON and fail at its first read. The
+            # matching-Origin header is required by the WS1 Host/Origin
+            # middleware in switchyard/portal/app.py.
+            client.post(
+                "/admin/pacing?enabled=default",
+                headers={"Origin": "http://localhost:4001"})
 
 
 def test_capacity_row_shows_failing_chip_when_streak_meets_alert():
@@ -178,7 +199,7 @@ def test_capacity_row_shows_failing_chip_when_streak_meets_alert():
     ladder has tripped: a working picker would otherwise quietly bounce
     traffic off the plan with no warning on the board.
     """
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         # plans.example.yaml ships with transient_breaker.streak_alert: 3,
         # so a streak of 3 is exactly the alert threshold.
         settings = portal_app.state["registry"].settings
@@ -223,7 +244,7 @@ def test_capacity_row_chip_threshold_follows_streak_alert_setting():
     streak 5. This test raises the threshold to 5 and asserts the chip is
     absent at streak 3 and present at streak 5.
     """
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         registry = portal_app.state["registry"]
         original = registry.settings
         # Default must remain 3 — render_preview.py depends on that.
@@ -274,7 +295,7 @@ def test_capacity_fragment_hides_withheld_for_model_narrowed_rows():
     """
     import asyncio
 
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         # The local-box/gemma row is the canonical fixture: model cap 1 on a
         # plan cap 2, with no policy narrowing it further. The view must show
         # exactly one reachable slot, no "withheld" title, and no "model
@@ -382,7 +403,7 @@ def test_capacity_row_renders_learned_cap_equal_to_model_limit():
     read the row as "2 of 4 slots gone" — which would be a regression
     of the same shape issue #81 fixed for model-narrowed rows.
     """
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         fake = _seed_openrouter_learn_cap(2)
         try:
             html = client.get("/fragments/capacity").text
@@ -424,7 +445,7 @@ def test_capacity_row_renders_withheld_squares_for_learned_cap_below_model():
     own narrowing surface. The board, then, reads as "1 free, 1
     learner-withheld" rather than "1 free, 3 plan-withheld".
     """
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         fake = _seed_openrouter_learn_cap(1)
         try:
             html = client.get("/fragments/capacity").text
@@ -484,7 +505,7 @@ def test_probes_panel_renders_needs_reauth_badge_with_last_good_time():
     window resets.
     """
     import asyncio
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         # Pick the first cookie-needing plan in the example config and mark
         # it as cookie-expired with a known last-good timestamp.
         reg = models.load()
@@ -520,7 +541,7 @@ def test_probes_panel_renders_active_badge_for_healthy_plan():
     regression bar for the conditional in `_probes.html`. The WS2 change
     must not regress the healthy path.
     """
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         html = client.get("/fragments/probes").text
         # Cookie plans in the example: at least one is healthy in the
         # default state (the live probe status is whatever FakeRedis
@@ -573,7 +594,7 @@ def test_round_robin_group_renders_pointer_and_members():
     """
     import asyncio
 
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         reg = models.load()
         # Build a fresh registry with a round_robin lane on the same two
         # forge members the picker already uses.
@@ -620,7 +641,7 @@ def test_round_robin_group_renders_pointer_and_members():
 def test_weighted_group_renders_weights():
     """A weighted group renders every key with its weight inline, in the
     same insertion order the picker walks."""
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         reg = models.load()
         new_reg = _force_lane(reg, "w-board",
                               [{"weighted": {"minimax-ultra/m3": 5,
@@ -661,7 +682,7 @@ def test_perishable_group_renders_stored_ranking():
     """
     import asyncio
     import time
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         reg = models.load()
         new_reg = _force_lane(reg, "per-board",
                               [{"perishable": ["claude-max/fable",
@@ -720,8 +741,10 @@ def test_pacing_paints_tail_disabled_and_paced_to_zero_badges():
     patterns still match" requirement -- the smoke.py run past
     `tail disabled (pacing)` must continue to find a row carrying it.
     """
-    with TestClient(portal_app.app) as client:
-        client.post("/admin/pacing?enabled=on")
+    with _make_client() as client:
+        client.post(
+            "/admin/pacing?enabled=on",
+            headers={"Origin": "http://localhost:4001"})
         try:
             html = client.get("/fragments/capacity").text
             # Smoke.py greps the gateway log AND the board for this string.
@@ -740,7 +763,9 @@ def test_pacing_paints_tail_disabled_and_paced_to_zero_badges():
             # is `tail disabled (pacing)`. Both strings must round-trip.
             assert ("paced" in html) or ("tail disabled" in html), html
         finally:
-            client.post("/admin/pacing?enabled=default")
+            client.post(
+                "/admin/pacing?enabled=default",
+                headers={"Origin": "http://localhost:4001"})
 
 
 def test_flat_config_produces_same_render_as_before():
@@ -758,7 +783,7 @@ def test_flat_config_produces_same_render_as_before():
     legacy flat output did.
     """
     from dataclasses import replace
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         # Build a flat registry: every lane's body is just its routing
         # order, no groups. Walk `lane_nodes()` and replace every Group
         # node with its flattened refs.
@@ -832,7 +857,7 @@ def test_hot_reload_picks_up_new_group_without_restart():
     code path is what reload_config() uses.
     """
     from dataclasses import replace
-    with TestClient(portal_app.app) as client:
+    with _make_client() as client:
         reg = models.load()
         # Before the swap: the shipped config may already have groups
         # (the demo `forge` lane uses round_robin / weighted / perishable).
@@ -905,7 +930,7 @@ def test_per_group_writer_writes_group_order_hash():
     """
     import asyncio
     import time
-    with TestClient(portal_app.app) as _client:
+    with _make_client() as _client:
         reg = models.load()
         # A perishable group on forge members. All three plans have probe
         # facts seeded, so all three refs land in the stored hash.
@@ -993,7 +1018,7 @@ def test_per_group_writer_drops_unknown_refs_from_hash():
     """
     import asyncio
     import time
-    with TestClient(portal_app.app) as _client:
+    with _make_client() as _client:
         reg = models.load()
         new_reg = _force_lane(reg, "per-unknown",
                               [{"perishable": ["minimax-ultra/m3",
@@ -1103,6 +1128,238 @@ def test_perishable_writer_treats_stale_target_and_gate_as_unknown():
     assert stored is None, stored
     print("  stale target + stale gate: writer drops the entry, "
           "picker falls back to config order")
+
+
+# ============================================================================
+# Issue #119 — Workstream 1 (same-origin / Host enforcement + htmx SRI).
+#
+# The portal's Host/Origin middleware rejects requests that fail either:
+#
+#   * Host header not in {localhost, 127.0.0.1, PORTAL_ALLOWED_ORIGINS}
+#     and on PORTAL_PORT — defeats DNS rebinding.
+#   * POST to /admin/* without an Origin (or Referer) header whose scheme,
+#     host and port match the allowlist — defeats CSRF, where a form on
+#     `evil.example` POSTs to the portal at http://localhost:4001.
+#
+# The htmx SRI test pins the integrity= attribute on the CDN script tag
+# in base.html so a silent CDN swap (or a typo'd hash) breaks the page
+# visibly, rather than letting an attacker pivot through a substituted
+# script. Read base.html directly for that one — render_preview.py does
+# not exercise the script tag.
+#
+# Inserted BEFORE the `if __name__ == "__main__":` runner so the
+# discovery loop picks them up. See tests/CLAUDE.md -- anything appended
+# after the runner is defined too late and silently does not run.
+# ============================================================================
+
+
+def test_security_middleware_rejects_admin_post_with_evil_origin():
+    """A POST to /admin/* from a foreign Origin is rejected with 403.
+
+    Without this guard, a form on `evil.example` could POST to
+    `http://localhost:4001/admin/pacing?enabled=off` and silently turn
+    the operator's pacing off. The Origin header is what browsers add
+    to cross-site POSTs -- same-origin POSTs from the operator's tab
+    are still allowed (they carry Origin: http://localhost:4001),
+    cross-site ones are rejected.
+    """
+    with _make_client() as client:
+        # Host is correct (testserver's _make_client pins it), but Origin
+        # is a foreign site. The middleware has to drop this before any
+        # route runs.
+        resp = client.post(
+            "/admin/pacing?enabled=off",
+            headers={"Origin": "http://evil.example"})
+        assert resp.status_code == 403, resp.text
+        assert "Forbidden" in resp.text, resp.text
+
+
+def test_security_middleware_accepts_admin_post_with_matching_origin():
+    """A POST to /admin/* from a same-origin Origin returns 200.
+
+    The positive case for the CSRF guard. Pacing toggle is the canonical
+    fixture -- a successful POST flips the runtime state, so the test
+    can assert the toggle actually ran (not just that the request did
+    not 403).
+    """
+    with _make_client() as client:
+        # Plan starts with whatever the example ships; flip and confirm.
+        resp = client.post(
+            "/admin/pacing?enabled=toggle",
+            headers={"Origin": "http://localhost:4001"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["pacing"] is True
+
+
+def test_security_middleware_rejects_request_with_evil_host():
+    """Any request whose Host header is not in the allowlist gets 403.
+
+    DNS rebinding: an attacker's domain resolves to the portal's
+    loopback IP for the duration of the operator's browser session,
+    and a `<script src="http://portal/">` injected from
+    `attacker.example` reads the response as `attacker.example`
+    (because the Host header matches the page that initiated the
+    fetch). The cookie goes with it, and the operator's session is
+    theirs to lose. Without this guard, the portal would happily
+    serve from any hostname the resolver hands back.
+    """
+    # Build a fresh client whose base_url puts `evil.example:4001`
+    # into the Host header. The middleware sees Host=evil.example:4001
+    # and rejects before any route runs.
+    client = TestClient(portal_app.app, base_url="http://evil.example:4001")
+    resp = client.get("/")
+    assert resp.status_code == 403, resp.text
+
+
+def test_base_template_htmx_script_carries_sri_integrity():
+    """The htmx CDN script must carry `integrity=` and `crossorigin=`.
+
+    A silent CDN swap (or a typo in the hash) breaks the page visibly
+    rather than letting an attacker pivot through a substituted script.
+    The attribute is set in base.html itself; reading the file directly
+    is the only way to pin it, since render_preview.py renders index.html
+    through the layout and so strips the script tag's body before any
+    assertion could see it.
+    """
+    base_path = os.path.join(ROOT, "switchyard", "portal",
+                             "templates", "base.html")
+    with open(base_path) as fh:
+        html = fh.read()
+    # The htmx script tag itself, not any other script the page might
+    # grow later -- the regression bar is that THIS tag carries the
+    # integrity + crossorigin pair, in that order.
+    script_open = re.search(
+        r'<script\s+src="https://cdnjs\.cloudflare\.com/ajax/libs/htmx/[^"]+"\s*[^>]*>',
+        html)
+    assert script_open is not None, "htmx CDN <script> tag missing in base.html"
+    tag = script_open.group(0)
+    # Pin the FULL hash, not just the `sha384-` prefix — a typo'd
+    # base64 payload would still match `integrity="sha384-…"` and the
+    # browser would fail-closed at runtime, which is the worst place to
+    # discover it. The value below is the SHA-384 of the live CDN
+    # payload (downloaded and recomputed out-of-band when this test
+    # was written); updating it is the explicit signal a CDN bump
+    # happened.
+    EXPECTED_INTEGRITY = (
+        'integrity="sha384-'
+        'ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2"')
+    assert EXPECTED_INTEGRITY in tag, tag
+    assert 'crossorigin="anonymous"' in tag, tag
+
+
+def test_security_middleware_accepts_mixed_case_host():
+    """Mixed-case Host header (e.g. `Localhost:4001`) must still pass.
+
+    Cycle-1 added `hostname.lower() in hosts` so a reverse proxy that
+    re-emits `Host` without lowercasing (Caddy with the `host`
+    directive set to the request's original case) does not 403 every
+    request through the portal. RFC 9110 §4.1.2: the Host value is a
+    URI host and is case-insensitive. Without this test, a future
+    "simplify the lookup back to `hostname in hosts`" tidy-up would
+    ship green until the operator actually deployed behind one of
+    those proxies.
+    """
+    with _make_client() as client:
+        # base_url is http://localhost:4001, so the synthesized Host is
+        # `localhost:4001`; override it with a mixed-case variant and
+        # assert the middleware lets the request through (i.e. not 403).
+        # The page is a render of the board, not a redirect target, so
+        # any non-403 status is acceptable evidence the middleware
+        # passed the request to the router.
+        resp = client.get("/", headers={"Host": "Localhost:4001"})
+        assert resp.status_code != 403, resp.text
+
+
+def test_security_middleware_accepts_origin_with_implicit_default_port():
+    """Origin without a `:port` suffix (the browser default-port form)
+    must still pass when the portal runs on the scheme default.
+
+    Cycle-1 added the default-port fallback so an HTTPS reverse-proxy
+    deployment on :443 stops 403'ing every admin POST. Browsers
+    explicitly strip default ports (RFC 6454 §7.1), so the operator's
+    browser sends `Origin: https://portal.lan` even though the portal
+    itself is on :443. Without this test, a future "simplify the port
+    comparison back to `str(parsed.port) != port`" tidy-up would ship
+    green until the operator actually fronted the portal with nginx
+    or Caddy.
+    """
+    # Flip the env so the middleware picks up the new port + allowlist
+    # at request time (it reads PORTAL_PORT / PORTAL_ALLOWED_ORIGINS
+    # per request, not at import — that's the whole point of the
+    # test_localhost pattern). Save and restore manually so the test
+    # also runs under `python3 tests/test_portal.py`, where pytest's
+    # monkeypatch fixture isn't injected.
+    saved_port = os.environ.get("PORTAL_PORT")
+    saved_origins = os.environ.get("PORTAL_ALLOWED_ORIGINS")
+    try:
+        os.environ["PORTAL_PORT"] = "443"
+        os.environ["PORTAL_ALLOWED_ORIGINS"] = "https://portal.lan"
+        # TestClient synthesises the Host header from base_url and, like
+        # httpx generally, strips the default port. Force the explicit
+        # `Host: portal.lan:443` via the TestClient default headers so
+        # the middleware sees what a real browser would send, while the
+        # Origin we send on the request itself is the browser-side
+        # default-port form (no port) — which is what triggers the
+        # cycle-1 fix.
+        with TestClient(
+                portal_app.app,
+                base_url="https://portal.lan:443",
+                headers={"Host": "portal.lan:443"}) as client:
+            resp = client.post(
+                "/admin/pacing?enabled=toggle",
+                headers={"Origin": "https://portal.lan"})
+            # 200 = middleware let it through + the route ran. The exact
+            # post-toggle value depends on whatever state prior tests
+            # left in the FakeRedis-backed `state` dict, so we don't
+            # assert on the boolean — only that the request reached the
+            # route, which is what this regression bar is about.
+            assert resp.status_code == 200, resp.text
+    finally:
+        # Restore prior env state so the next test sees the loopback
+        # defaults the rest of the suite was written against.
+        if saved_port is None:
+            os.environ.pop("PORTAL_PORT", None)
+        else:
+            os.environ["PORTAL_PORT"] = saved_port
+        if saved_origins is None:
+            os.environ.pop("PORTAL_ALLOWED_ORIGINS", None)
+        else:
+            os.environ["PORTAL_ALLOWED_ORIGINS"] = saved_origins
+
+
+def test_allowlist_normalises_uppercase_bare_hostname_entries():
+    """Uppercase bare-hostname entries in PORTAL_ALLOWED_ORIGINS work.
+
+    Cycle-1 lowercased the request side (`hostname.lower() in hosts`)
+    but left the entry side case-sensitive in the bare-hostname
+    branch of `_portal_host_allowlist` (the full-origin branch gets
+    normalisation free from `urlparse(...).hostname`). A previously-
+    working deployment like `PORTAL_ALLOWED_ORIGINS=PORTAL.LAN`
+    silently 403'd every request after cycle-1. This test pins the
+    fix: the allowlist normalises both branches to lowercase, so an
+    uppercase entry lets the matching request through.
+    """
+    saved_port = os.environ.get("PORTAL_PORT")
+    saved_origins = os.environ.get("PORTAL_ALLOWED_ORIGINS")
+    try:
+        os.environ["PORTAL_PORT"] = "4001"
+        os.environ["PORTAL_ALLOWED_ORIGINS"] = "PORTAL.LAN"
+        # base_url http://portal.lan:4001 sends Host=portal.lan:4001 (lower),
+        # which should match the allowlist entry `PORTAL.LAN` (now lowercased).
+        with TestClient(portal_app.app,
+                        base_url="http://portal.lan:4001") as client:
+            resp = client.get(
+                "/", headers={"Origin": "http://portal.lan:4001"})
+            assert resp.status_code != 403, resp.text
+    finally:
+        if saved_port is None:
+            os.environ.pop("PORTAL_PORT", None)
+        else:
+            os.environ["PORTAL_PORT"] = saved_port
+        if saved_origins is None:
+            os.environ.pop("PORTAL_ALLOWED_ORIGINS", None)
+        else:
+            os.environ["PORTAL_ALLOWED_ORIGINS"] = saved_origins
 
 
 if __name__ == "__main__":

@@ -8,14 +8,16 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import asyncio
 import contextlib
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from redis.asyncio import Redis
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import models
 from ..picker import Picker
@@ -38,6 +40,190 @@ import logging
 BASE = os.path.dirname(__file__)
 app = FastAPI(title="SwitchYard")
 templates = Jinja2Templates(directory=os.path.join(BASE, "templates"))
+
+
+def _portal_host_allowlist() -> tuple[str, set[str]]:
+    """The (port, hostnames) pair the portal will serve for.
+
+    `PORTAL_PORT` is read at request time so tests can flip it per-case
+    without re-importing the app; `PORTAL_ALLOWED_ORIGINS` is a
+    comma-separated list of full origins (`https://admin.example.com`) or
+    bare hostnames (`admin.example.com`) the operator wants to add to the
+    default `{localhost, 127.0.0.1}` set. The Host header must match one
+    of these on the configured port; anything else gets a 403 before the
+    request reaches the router, so DNS-rebinding cannot reach a route by
+    tricking the resolver into serving the loopback IP under an attacker's
+    hostname.
+
+    Entries are lowercased on both branches — the full-origin branch
+    gets it free via `urlparse(...).hostname`, and the bare-hostname
+    branch must match explicitly. `_host_allowed` lowercases the
+    incoming Host header (RFC 9110 §4.1.2), so an uppercase entry like
+    `PORTAL_ALLOWED_ORIGINS=PORTAL.LAN` would otherwise 403 every
+    request — the request-side fix from the cycle-1 review would have
+    silently broken a previously-working deployment.
+    """
+    port = os.environ.get("PORTAL_PORT", "4001")
+    hosts: set[str] = {"localhost", "127.0.0.1"}
+    for entry in os.environ.get("PORTAL_ALLOWED_ORIGINS", "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "://" in entry:
+            parsed = urlparse(entry)
+            host = parsed.hostname
+        else:
+            host = entry.split(":", 1)[0].lower()
+        if host:
+            hosts.add(host)
+    return port, hosts
+
+
+def _host_allowed(host_header: str, port: str, hosts: set[str]) -> bool:
+    """True iff `host_header` is `{host}:{port}` with `host` in `hosts`.
+
+    IPv6 bracketed hosts are tolerated (`[::1]:4001`), as is a missing
+    port on `Host:` headers shaped by older proxies. A missing port never
+    matches — the middleware is fail-closed and would rather drop a
+    request than serve it on a port the operator did not opt into.
+
+    Hostname matching is case-insensitive (RFC 9110 §4.1.2: the `Host`
+    header value is a URI host, which is case-insensitive). A reverse
+    proxy that re-emits `Host` without lowercasing — Caddy with the
+    `host` directive set to the request's original case, for example —
+    would otherwise hard-403 every request. `_origin_allowed` is
+    already case-insensitive because `urlparse(...).hostname` lowercases.
+    """
+    if not host_header:
+        return False
+    if host_header.startswith("["):
+        bracket = host_header.find("]")
+        if bracket == -1:
+            return False
+        hostname = host_header[1:bracket]
+        rest = host_header[bracket + 1:]
+        if not rest.startswith(":"):
+            return False
+        port_str = rest[1:]
+    elif ":" in host_header:
+        hostname, port_str = host_header.rsplit(":", 1)
+    else:
+        # No port at all -> fail closed.
+        return False
+    if port_str != port:
+        return False
+    return hostname.lower() in hosts
+
+
+def _origin_allowed(origin_or_referer: str | None, port: str,
+                    hosts: set[str]) -> bool:
+    """True iff `origin_or_referer`'s scheme, host, and port match.
+
+    A request that POSTs to `/admin/*` from `Origin: http://localhost:4001`
+    passes; one from `Origin: http://evil.example:4001` does not. Used by
+    the same-origin / CSRF guard, and (optionally) by the HX-Request guard
+    to whitelist the legitimate callers — every admin form on the board
+    is htmx-driven, so the operator's browser sends Origin on every POST.
+
+    The port check tolerates Origin with no explicit port. Browsers
+    explicitly strip default ports (RFC 6454 §7.1), so an HTTPS
+    reverse-proxy deployment on :443 sends `Origin: https://portal.lan`
+    with `parsed.port is None`. `urlparse(...).hostname` already
+    lowercases, so the hostname match is case-insensitive.
+    """
+    if not origin_or_referer:
+        return False
+    parsed = urlparse(origin_or_referer)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if parsed.hostname not in hosts:
+        return False
+    # Default ports per RFC 1700 / WHATWG URL: http=80, https=443. An
+    # Origin that omits the port (the browser-side default) is treated
+    # as if it had included the scheme default. Fail-closed for schemes
+    # we don't recognise — they were already rejected above, but the
+    # `or` default keeps the comparison well-formed either way.
+    default_port = {"http": "80", "https": "443"}.get(parsed.scheme, "")
+    effective_port = str(parsed.port) if parsed.port is not None \
+        else default_port
+    if effective_port != port:
+        return False
+    return True
+
+
+class _PortalSecurityMiddleware:
+    """Reject requests whose Host is unknown, or whose admin POSTs come
+    from a foreign Origin.
+
+    Two checks, run before any route:
+
+    1. `Host` must end with `:PORTAL_PORT` and have hostname in the
+       allowlist — defeats DNS rebinding, where an attacker's domain
+       resolves to the portal's loopback IP for the duration of the
+       operator's browser session. Without this check, the portal would
+       happily serve from any hostname the resolver hands back, and a
+       pasted session cookie would leak with the next cross-origin GET.
+    2. POST to `/admin/*` must carry `Origin` (or `Referer`) whose
+       scheme, host and port match the allowlist — defeats CSRF, where
+       a form on `evil.example` POSTs to the portal at
+       `http://localhost:4001/admin/...`. Browsers add Origin to
+       cross-site POSTs; same-origin POSTs do not need it, but we
+       require it anyway so an attacker cannot replay a captured
+       request from a script that has no Origin.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive,
+                        send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        port, hosts = _portal_host_allowlist()
+        # Pull the Host header out of the raw scope: a Starlette Request
+        # would also do this, but building a Request here just to read
+        # one header is wasteful, and the middleware needs to run before
+        # any route or dependency that builds a Request for itself.
+        headers = scope.get("headers") or []
+        host_header = ""
+        origin = ""
+        referer = ""
+        # ASGI mandates lowercased header names. We never compare `value`
+        # to anything case-sensitive — scheme/host/port matching goes
+        # through urlparse, which is itself case-insensitive on scheme.
+        for name, value in headers:
+            if name == b"host":
+                host_header = value.decode("latin-1")
+            elif name == b"origin":
+                origin = value.decode("latin-1")
+            elif name == b"referer":
+                referer = value.decode("latin-1")
+
+        if not _host_allowed(host_header, port, hosts):
+            response = PlainTextResponse(
+                "Forbidden: Host not in allowlist", status_code=403)
+            await response(scope, receive, send)
+            return
+
+        # Admin POSTs need Origin (or Referer fallback). GETs to /admin/*
+        # are not state-changing, so we let them through — the spec
+        # says "state-changing POSTs", which is exactly this branch.
+        path = scope.get("path", "")
+        method = scope.get("method", "GET")
+        if method == "POST" and path.startswith("/admin/"):
+            if not _origin_allowed(origin or referer, port, hosts):
+                response = PlainTextResponse(
+                    "Forbidden: cross-origin POST to /admin/*",
+                    status_code=403)
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_PortalSecurityMiddleware)
 
 
 def _connect_info(request) -> dict:
