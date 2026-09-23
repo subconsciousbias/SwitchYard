@@ -24,22 +24,28 @@ Rules, without exception:
 schema, a new key or a new plan shape has to land in the EXAMPLE as well, or a
 fresh clone gets a config that cannot express it.
 
-
-
 Caps, cost, expiry, lane order, quota windows, credentials-by-env-var-name and
 sidecar model aliases all come from that one file. `docker-compose.yml` must not
 duplicate any of them — the sidecars read `plans.yaml` themselves. If you find
 yourself setting the same number in two places, the config is the source of
 truth and the other place is a bug.
 
-## This checkout is a worktree — commit here, never build or deploy from it
+## This checkout may be a worktree — commit here, never build or deploy from it
 
-Agent sessions run in `git worktree`s of this repo; the live stack runs from the
-**main checkout** (`~/Documents/GitHub/switchyard`). The worktree is where the
-work *finishes*: edit, run the offline test suite, and **commit on the
-worktree's branch** when the change is ready. The main checkout is where the
-work *ships*: the rebuild and redeploy happen there after the worktree branch
-is merged.
+Agent sessions may run in a `git worktree` of this repo. The way to tell is
+mechanical, not heuristic:
+
+```sh
+git rev-parse --git-dir        # the worktree's private git dir
+git rev-parse --git-common-dir  # the shared .git (main checkout's)
+```
+
+If the two differ, this is a worktree. In the main checkout they are identical,
+and the build/deploy commands below are correct to run there. The rest of this
+section is about the worktree case: edit, run the offline test suite, and
+**commit on the worktree's branch** when the change is ready. The main checkout
+is where the work *ships*: the rebuild and redeploy happen there after the
+worktree branch is merged.
 
 Two things must not happen on a worktree:
 
@@ -68,10 +74,39 @@ What "done on the worktree" looks like:
 Read-only diagnosis from a worktree is fine: `docker compose ps`, `docker logs`,
 the portal board. None of those mutate the live stack.
 
-## `switchyard/` is baked into three images, not mounted
+## `switchyard/` is baked into four images, not mounted
 
-Only `./config` is mounted. `switchyard/*.py` is COPYed into the gateway, the
-portal and the sidecar images, so after editing it, rebuild and redeploy **from
+Only `./config` is mounted. What ends up baked in each image depends on the
+image — partial copies matter:
+
+  * `Dockerfile.gateway:122` — `COPY switchyard /switchyard/switchyard`. The
+    gateway image carries the **whole `switchyard/` package**.
+  * `Dockerfile.portal:5` — `COPY switchyard /app/switchyard`. The portal image
+    also carries the **whole package**.
+  * `Dockerfile.token_proxy:17-18` — only `switchyard/oauth.py` and
+    `switchyard/__init__.py`. The token-proxy image carries **only the OAuth
+    refresh path** — nothing else in the package is reachable there.
+  * `Dockerfile.sidecar:39-40` — only `switchyard/caller_env.py` and
+    `switchyard/__init__.py`. The sidecar image carries **only `caller_env`**
+    — the rest of the package (`models.py`, `picker.py`, `usage.py`, ...) is
+    not in that image. (The sidecar's missing `models.py` is the
+    `caller_environment` bug filed separately.)
+
+So a whole-package edit invalidates the gateway and portal images, and an edit
+to a partially-copied module has to be re-checked against what that image
+actually copies. Editing `switchyard/oauth.py` invalidates gateway + portal +
+token-proxy (the gateway and portal have the whole package; the token-proxy
+copies just oauth). Editing `switchyard/caller_env.py` invalidates gateway +
+portal + sidecar. Editing `switchyard/models.py` invalidates only gateway +
+portal — the sidecar/token-proxy images do not see it.
+
+The sidecar image is shared: one `switchyard-sidecar:latest` image serves
+`claude-max-sidecar`, `codex-sidecar`, and `opencode-go-sidecar` /
+`opencode-go2-sidecar`. `claude-max-sidecar` is the only service with a
+`build:` line in `docker-compose.yml`; the rest reference the tag it produced
+so compose does not build the same image four times.
+
+After editing code that is baked into an image, rebuild and redeploy **from
 the main checkout** (see the worktree section above — never from a worktree):
 
 ```bash
@@ -79,55 +114,59 @@ docker compose build gateway portal claude-max-sidecar xai-token-proxy
 docker compose up -d
 ```
 
+Only `claude-max-sidecar` declares `build:` for the sidecar image; rebuilding
+the sidecar image rebuilds all four sidecar services. Rebuilding
+`xai-token-proxy` is independent. Editing a partially-copied module does not
+require rebuilding the gateway/portal images for that module alone, but those
+images are also invalidated by *any* edit to a file inside the
+`switchyard/` package because they COPY the whole directory.
+
 `docker compose restart` re-runs the OLD code and looks like the change did
-nothing — or worse, half the stack picks it up and the other half does not, which
-reads as an inconsistent bug. This has already cost three debugging detours: a
-`hooks.py` change that "had no effect", a `models.py` schema addition that
-crashed the portal on a config only it had, and a headroom calculation that was
-right in the gateway and wrong on the board.
+nothing — or worse, half the stack picks it up and the other half does not,
+which reads as an inconsistent bug. This has already cost three debugging
+detours: a `hooks.py` change that "had no effect", a `models.py` schema
+addition that crashed the portal on a config only it had, and a headroom
+calculation that was right in the gateway and wrong on the board.
 
 Two related traps in the same family:
 
 - `.env` is read when a container is **created**. A value added afterwards needs
   `up -d --force-recreate <service>`, not `restart`.
-- `config/litellm.generated.yaml` in the repo is a stale artifact. The gateway
-  generates its own at `/tmp/litellm.generated.yaml` on startup; read that one.
+- `config/litellm.generated.yaml` is **gitignored** (see `.gitignore:14`); the
+  gateway regenerates it as `/tmp/litellm.generated.yaml` on every container
+  start (`docker/gateway-entrypoint.sh:9`), so reading it on the host reads a
+  stale file. Read it inside the gateway container instead. To apply an edit to
+  `config/plans.yaml` against the running stack, use `scripts/reload.sh`: it
+  validates first, then asks the gateway whether its router can follow the edit;
+  on a policy-only change (caps, quotas, lane order, settings) the gateway
+  hot-swaps its registry within ~5s, and only a router-shaped change forces
+  `docker compose restart gateway`. The script then refreshes the portal board
+  via `POST /admin/reload` (portal-board-only effect — the sidecars re-read
+  the file themselves within 30 seconds).
 
 ## Don't touch credential stores
 
-Same reasoning as `.env`: never run `docker login`/`docker logout`, never write to
-the keychain, and never delete a stored token. Diagnose read-only, then give the
-user the exact command to run themselves. Print `KEY=<set>` or a length, never a
-secret's value.
+Same reasoning as `.env`: never run `docker login`/`docker logout`, never write
+to the keychain, and never delete a stored token. Diagnose read-only, then give
+the user the exact command to run themselves. Print `KEY=<set>` or a length,
+never a secret's value.
 
 Also: macOS has no `timeout(1)`. Use `gtimeout` if coreutils is installed, or
 leave the command unbounded.
 
-## Appending to a test file
+## Per-directory CLAUDE.md
 
-`tests/*.py` end with an `if __name__ == "__main__":` runner that discovers tests
-from `globals()`. Anything appended *after* that block is defined too late to be
-collected, so it silently does not run — the suite still reports "N tests passed"
-with your new test absent. Insert before the runner, and check the count went up.
+Repo-wide safety rules live here. Test conventions, sidecar/bridge details, and
+portal parity rules have moved to per-directory files:
 
-## Tests never call a real provider
+  * `sidecars/CLAUDE.md` — image contents, sidecar env/tunables, the
+    bridge-siblings rule.
+  * `tests/CLAUDE.md` — the plain-script runner, conftest's socket guard and
+    its real scope, `tests/fake_redis.py`, how to add a new test file.
+  * `switchyard/portal/CLAUDE.md` — board/gateway parity rule and Jinja2
+    template conventions.
 
-`tests/conftest.py` blocks every socket to a non-loopback address, so a test
-that reaches api.x.ai, api.z.ai or a local Ollama fails instead of spending
-capacity. Loopback is allowed on purpose: stub servers and subprocess bridges
-run on 127.0.0.1, which is how the real protocol gets exercised against a fake
-peer. Anything that genuinely needs a provider belongs in `scripts/smoke.py`,
-which checks a running deployment and says so.
-
-## Tests run without services
-
-`tests/*.py` are plain scripts, no pytest plugins, no Redis, no network:
-
-```bash
-python3 tests/test_routing.py tests/test_classify.py 2>/dev/null; \
-for t in tests/test_*.py; do python3 "$t" >/dev/null || echo "FAIL $t"; done
-python3 tests/render_preview.py
-```
-
-Keep it that way — anything needing a live provider belongs in `TESTING.md` as a
-manual step instead.
+Where a mechanical guard already exists, those files point to it instead of
+restating prose (notably `tests/conftest.py`). Where none exists yet
+(bridge-sibling diff, example-parity), the rule lives in prose as the interim
+form.

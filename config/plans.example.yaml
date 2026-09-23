@@ -72,43 +72,42 @@ settings:
   # array before the picker runs. The harness's native file/shell tools reach
   # the sidecar's container, not the caller's workspace, so a successful
   # "edit" call there silently does the wrong thing — worse than failing
-  # loudly. Uncomment to override the in-code defaults below; absent, the
-  # gateway uses the values shown.
-  #
-  # The header `x-switchyard-cli` is operator-set (same governance as
-  # `x-switchyard-session`); no client sets it today, so the new behaviour
-  # is inert until opted in. Keys are matched against the lowercased header
-  # value — keep config keys lowercase.
-  #
-  # Defaults (kept in switchyard/models.py:_DEFAULT_CLI_TOOL_BLOCK):
-  #
-  #   cli_tool_block:
-  #     opencode:
-  #       - bash
-  #       - edit
-  #       - write
-  #       - read
-  #       - grep
-  #       - glob
-  #       - list
-  #       - patch
-  #       - todowrite
-  #       - todoread
-  #       - webfetch
-  #       - websearch
-  #       - task
-  #       - multiedit
-  #     claude-code:
-  #       - Bash
-  #       - Edit
-  #       - Write
-  #       - Read
-  #       - Glob
-  #       - Grep
-  #       - WebFetch
-  #       - WebSearch
-  #       - NotebookEdit
-  #     codex: []
+  # loudly. The mapping below mirrors the in-code defaults in
+  # switchyard/models.py:_DEFAULT_CLI_TOOL_BLOCK and is shown verbatim so a
+  # fresh-clone user can see what is blocked today. Edit a list to opt in or
+  # out of individual tools; leave the mapping absent to fall back to the
+  # defaults silently. Keys are matched against the lowercased
+  # `x-switchyard-cli` header value — keep config keys lowercase. The header
+  # itself is operator-set (same governance as `x-switchyard-session`); no
+  # client sets it today, so the filter is inert until opted in.
+  # --------------------------------------------------------------------------
+  cli_tool_block:
+    opencode:
+      - bash
+      - edit
+      - write
+      - read
+      - grep
+      - glob
+      - list
+      - patch
+      - todowrite
+      - todoread
+      - webfetch
+      - websearch
+      - task
+      - multiedit
+    claude-code:
+      - Bash
+      - Edit
+      - Write
+      - Read
+      - Glob
+      - Grep
+      - WebFetch
+      - WebSearch
+      - NotebookEdit
+    codex: []
 
   # --------------------------------------------------------------------------
   # Learn the parallelism each plan really tolerates instead of trusting a
@@ -200,16 +199,19 @@ settings:
     # Forced values, when set, beat everything else — passive detection and
     # probing are both skipped. Useful for a kiosk with a single fixed
     # caller, or for testing the env-block rendering without a real caller.
-    # platform: windows
-    # cwd: C:\Users\demo\project
-    # shell: powershell
+    # Set all four to `null` here (rather than omitting) so the field is
+    # documented; override one or all to a real value to force a config
+    # resolution (source=config in switchyard/caller_env.py).
+    platform: null
+    cwd: null
+    shell: null
     # Last-resort platform hint when nothing else gave us one. Never a cwd:
     # the directory `docker compose up` was launched from has no reliable
     # relationship to the directory a caller opens in their editor an hour
     # later. Use `macos` if the deployment is known to run on macOS hardware
     # and a Windows / Linux caller will be detected passively anyway; leave
     # it unset for a Linux container serving mixed callers.
-    # fallback_platform: macos
+    fallback_platform: null
 
 # ============================================================================
 # PLANS — what you pay for. Credentials, quota, connection limit, cost, expiry.
@@ -503,12 +505,17 @@ plans:
       # THIS endpoint actually returns a new Set-Cookie on each successful
       # request — a 401/reauth body with a Set-Cookie still does NOT overwrite,
       # but a route that does not slide will just stay on its current cookie.
-      # capture_set_cookie: true
+      # Left false here — opencode-go's status route does not rotate.
+      capture_set_cookie: false
       url: https://opencode.ai/console/api/go/status
       method: GET
       window: monthly
       interval_seconds: 120
       referer: https://opencode.ai/console
+      # Override the User-Agent only when the provider fingerprints the request.
+      # Absent, the loader uses the same Chrome string every other probe uses
+      # (see switchyard/models.py:Probe.user_agent).
+      user_agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36
       headers:
         # Required: the route answers {"code":"org_required"} without it. Not a
         # credential, but account-identifying, so it lives in .env rather than
@@ -619,7 +626,13 @@ plans:
     # Sessions parked awaiting a caller's tool result. They run no inference and
     # hold no connection slot, but each is a live CLI process, so they are
     # capped separately. Omit for the default of twice max_parallel.
-    # max_parked_sessions: 4
+    max_parked_sessions: 4
+    # Tool capability. Default is True (None in this file maps to True at
+    # load time). Set false for any plan whose path cannot run a caller's
+    # tool definitions — most CLI-backed plans needed that override while
+    # shelled-out harnesses had no way to invoke them, and a few still do
+    # today.
+    supports_tools: true
     quotas:
       - name: 5h
         role: constraint          # do not blow the burst window
@@ -728,10 +741,14 @@ plans:
       method: GET
       window: weekly
       interval_seconds: 120
-      windows:
-        weekly:
-          used_percent: [rate_limits.primary.used_percent]
-          reset_at: [rate_limits.primary.resets_at]
+      # Single-window shorthand: `fields:` describes the paths for whichever
+      # window `window:` names above, and is folded into `windows:` at load time
+      # so the rest of the code reads one shape. Use `windows:` directly when a
+      # provider publishes multiple windows in one response, like minimax-ultra
+      # and glm further up.
+      fields:
+        used_percent: [rate_limits.primary.used_percent]
+        reset_at: [rate_limits.primary.resets_at]
     notes: "Every model on this seat shares its 2 connections and its quota."
     models:
       # Verified ids on a ChatGPT seat, in capability order — sol strongest, then
@@ -950,7 +967,7 @@ lanes:
       Escalations where Opus-class judgement was not enough. Note that both
       members ride plans whose other models serve `judge`, so the connection
       limits are shared — by design.
-    # strategy: perishable
+    strategy: perishable
     order: [claude-max/fable, openai/astra]
     tail: [local-box/qwen]
     # Worked example for image routing: every member here is image-capable
@@ -1026,6 +1043,7 @@ lanes:
     label: "Local Only"
     # No tail and no cloud members on purpose: if the box is busy the caller
     # gets a 429 and backs off rather than silently spending money.
+    strategy: fill
     order: [local-box/qwen, local-box/gemma]
     tail: []
     # image_routing only narrows the candidate set (and adjusts affinity under
