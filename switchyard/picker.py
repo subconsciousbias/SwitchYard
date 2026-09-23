@@ -211,6 +211,17 @@ class Picker:
     # group whose ranking is read from K_LANE_ORDER (the existing key). The
     # implicit wrap happens here, not in the parser, so flat configs parse
     # unchanged.
+    #
+    # Flat `fill` lanes additionally receive a drain-urgency sort: a member
+    # whose plan expires within `drain_within_days` is promoted ahead of
+    # members on plans that are not expiring, soonest death first. The key
+    # matches `Registry.lane_members()` (see models.py:594-598), and the
+    # sort is stable, so a lane with nothing expiring keeps config order
+    # bit-for-bit. Flat `perishable` lanes are NOT re-sorted here (the
+    # implicit sugar wrap already owns the ordering via its score hash),
+    # and any body that contains an explicit group is NOT re-sorted here
+    # either -- group strategies (round_robin / weighted / perishable /
+    # lowest_utilization) own their own member ordering.
     def _effective_body(self, lane: str) -> tuple[list[Any], Group | None]:
         lane_cfg = self.registry.lanes.get(lane)
         if lane_cfg is None:
@@ -231,6 +242,17 @@ class Picker:
                 gid=_group_id(lane, "perishable", _member_refs_of(nodes)),
             )
             return [implicit], implicit
+        if not has_groups and lane_cfg.strategy == "fill":
+            window = self.registry.settings.drain_within_days
+
+            def urgency(ref: str) -> tuple[int, int]:
+                model = self.registry.model(ref)
+                if model is None:
+                    return (1, 0)
+                days = self.registry.plan_of(model).days_left
+                return (0, days) if (days is not None and days <= window) else (1, 0)
+
+            nodes = sorted(nodes, key=urgency)
         return nodes, None
 
     # -- recursive visit ---------------------------------------------------
@@ -259,6 +281,15 @@ class Picker:
             ctx.skipped.append(f"{ref}(unknown)")
             return None
         plan = self.registry.plan_of(model)
+        # Liveness gate: a dead plan or model is never a candidate. The tail
+        # walk (picker's last stage) and every group strategy route through
+        # `_visit_ref`, so this single check covers body, groups and tail.
+        if plan.expired:
+            ctx.skipped.append(f"{ref}(expired)")
+            return None
+        if not plan.enabled or not model.enabled:
+            ctx.skipped.append(f"{ref}(disabled)")
+            return None
         if ctx.needs_tools and not plan.can_use_tools:
             return None
         # Image-capability recheck. _members already filtered upstream under
@@ -721,6 +752,19 @@ class Picker:
         held_model = self.registry.model(held)
         if held_model is not None:
             held_plan = self.registry.plan_of(held_model)
+            # Liveness gate mirrors `_visit_ref`: a dead held plan must NOT
+            # keep its lease. Lane membership and liveness are separate
+            # concerns, so the reachable check below stays intact; the
+            # explicit dead check is what drops the lease and lets the body
+            # walk re-place the session.
+            if held_plan.expired:
+                await self.slots.drop_lease(ctx.session)
+                ctx.skipped.append(f"{held}(expired)")
+                return None
+            if not held_plan.enabled or not held_model.enabled:
+                await self.slots.drop_lease(ctx.session)
+                ctx.skipped.append(f"{held}(disabled)")
+                return None
             if await self.slots.is_draining(held_plan.key):
                 await self.slots.drop_lease(ctx.session)
                 ctx.skipped.append(f"{held}(draining)")
@@ -787,10 +831,25 @@ class Picker:
 
         There is no spill here by design. A lane means "the best of these"; a
         deployment means "this one", so a full or cooled plan is an honest 429
-        rather than a quiet substitution the caller did not ask for.
+        rather than a quiet substitution the caller did not ask for. The same
+        principle covers a plan that has died: an expired or disabled deployment
+        is a wasted 401/402 plus a cooldown, never a quiet success, so the
+        liveness gate below mirrors `_visit_ref` and refuses before the slot
+        claim.
         """
         rid = uuid.uuid4().hex
         plan = self.registry.plan_of(model)
+        # Liveness gate mirrors `_visit_ref`: a dead deployment is never a
+        # candidate, no matter how the caller named it. The body walk is the
+        # common case, but `pick_direct` is reached by hooks.py:350 when the
+        # caller addressed a specific model by name; without this gate that
+        # path still served requests to plans the operator turned off or let
+        # lapse, and the wasted 401/402 plus cooldown is the exact failure
+        # mode issue #106 set out to remove.
+        if plan.expired:
+            raise LaneSaturated(model.ref, f"{model.ref}(expired)")
+        if not plan.enabled or not model.enabled:
+            raise LaneSaturated(model.ref, f"{model.ref}(disabled)")
         cap, reason = await self._cap(model)
         if cap <= 0:
             raise LaneSaturated(model.ref, f"{model.ref} unavailable: {reason}")

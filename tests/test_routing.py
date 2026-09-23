@@ -4868,6 +4868,429 @@ def test_a_learned_cap_below_model_max_parallel_loses_model_owned():
           f"(template chip suppresses; render = sibling)")
 
 
+# ============================================================================
+# Liveness gates in the picker body walk + affinity (issue: picker body walk
+# routes to expired / disabled plans; the affinity pin survives a plan's death
+# instead of re-placing; flat fill lanes do not promote soonest-death-first).
+# ============================================================================
+
+
+def test_expired_plan_never_picked_from_body_group_or_tail():
+    """An expired plan's refs are never picked, in any of the three lanes
+    the picker walks: flat body, round_robin group, tail.
+
+    Built with `dataclasses.replace` on a single plan's `expires` so the
+    shipped example config is left untouched. The dead ref is positioned
+    FIRST in every shape so the liveness gate, not the urgency sort, is
+    what keeps it off the wire: a regression that left the gate out
+    would pick the dead ref under every shape.
+    """
+    from dataclasses import replace
+    from datetime import date, timedelta
+
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+
+    # Replace claude-max's expiry with "yesterday". `claude-max/opus` is the
+    # dead ref; `openai/sol` is the sibling on the openai plan (distinct
+    # plan, healthy).
+    plans = dict(reg.plans)
+    plans["claude-max"] = replace(
+        plans["claude-max"], expires=date.today() - timedelta(days=1))
+    base = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+
+    # (a) flat body: dead FIRST so the urgency sort is irrelevant to the
+    # outcome and the gate is what keeps it off the wire.
+    flat_reg = _build_lane(base, slots,
+                           key="exp-flat",
+                           order=["claude-max/opus", "openai/sol"],
+                           tail=[], strategy="fill")
+    # (b) inside a round_robin group: rotation walks clockwise from start=0,
+    # dead first, then live wins.
+    rr_reg = _build_lane(base, slots,
+                         key="exp-rr",
+                         order=[{"round_robin":
+                                 ["claude-max/opus", "openai/sol"]}],
+                         tail=[], strategy="fill")
+    # (c) tail only: empty body forces the tail walk; dead first, live last.
+    tail_reg = _build_lane(base, slots,
+                           key="exp-tail",
+                           order=[],
+                           tail=["claude-max/opus", "openai/sol"],
+                           strategy="fill")
+    flat = Picker(flat_reg, slots, policy)
+    rr = Picker(rr_reg, slots, policy)
+    tail = Picker(tail_reg, slots, policy)
+
+    async def go():
+        f = await flat.pick("exp-flat", None)
+        await flat.release(f.plan.key, f.request_id, f.ref)
+        r = await rr.pick("exp-rr", None)
+        await rr.release(r.plan.key, r.request_id, r.ref)
+        t = await tail.pick("exp-tail", None)
+        await tail.release(t.plan.key, t.request_id, t.ref)
+        return f.ref, f.considered, r.ref, r.considered, t.ref, t.considered
+
+    f_ref, f_con, r_ref, r_con, t_ref, t_con = run(go())
+    assert f_ref == "openai/sol", (f_ref, f_con)
+    assert r_ref == "openai/sol", (r_ref, r_con)
+    assert t_ref == "openai/sol", (t_ref, t_con)
+    exp_skip = "claude-max/opus(expired)"
+    assert any(c.startswith(exp_skip) for c in f_con), f_con
+    assert any(c.startswith(exp_skip) for c in r_con), r_con
+    assert any(c.startswith(exp_skip) for c in t_con), t_con
+    print("  expired (claude-max) skipped in body, group, and tail: "
+          "all three landed on openai/sol")
+
+
+def test_disabled_model_on_enabled_plan_never_picked():
+    """A disabled model on a live plan is never picked, in body, group, and
+    tail. Same three-lane shape as the expired-plan test, so a regression
+    that touched only one of the three walker stages would show up here.
+
+    The plan stays enabled and unexpired on purpose: this is the
+    "model.enabled=False" branch of the liveness gate, not the
+    "plan.expired" branch.
+    """
+    from dataclasses import replace
+
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+
+    # Disable claude-max/opus on an otherwise-live claude-max plan.
+    plans = dict(reg.plans)
+    cm = plans["claude-max"]
+    plans["claude-max"] = replace(
+        cm, models={**cm.models,
+                   "opus": replace(cm.models["opus"], enabled=False)})
+    base = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+
+    flat_reg = _build_lane(base, slots,
+                           key="dis-flat",
+                           order=["claude-max/opus", "openai/sol"],
+                           tail=[], strategy="fill")
+    rr_reg = _build_lane(base, slots,
+                         key="dis-rr",
+                         order=[{"round_robin":
+                                 ["claude-max/opus", "openai/sol"]}],
+                         tail=[], strategy="fill")
+    tail_reg = _build_lane(base, slots,
+                           key="dis-tail",
+                           order=[],
+                           tail=["claude-max/opus", "openai/sol"],
+                           strategy="fill")
+    flat = Picker(flat_reg, slots, policy)
+    rr = Picker(rr_reg, slots, policy)
+    tail = Picker(tail_reg, slots, policy)
+
+    async def go():
+        f = await flat.pick("dis-flat", None)
+        await flat.release(f.plan.key, f.request_id, f.ref)
+        r = await rr.pick("dis-rr", None)
+        await rr.release(r.plan.key, r.request_id, r.ref)
+        t = await tail.pick("dis-tail", None)
+        await tail.release(t.plan.key, t.request_id, t.ref)
+        return f.ref, f.considered, r.ref, r.considered, t.ref, t.considered
+
+    f_ref, f_con, r_ref, r_con, t_ref, t_con = run(go())
+    assert f_ref == "openai/sol", (f_ref, f_con)
+    assert r_ref == "openai/sol", (r_ref, r_con)
+    assert t_ref == "openai/sol", (t_ref, t_con)
+    dis_skip = "claude-max/opus(disabled)"
+    assert any(c.startswith(dis_skip) for c in f_con), f_con
+    assert any(c.startswith(dis_skip) for c in r_con), r_con
+    assert any(c.startswith(dis_skip) for c in t_con), t_con
+    print("  disabled model (claude-max/opus on live claude-max) skipped "
+          "in body, group, and tail: all three landed on openai/sol")
+
+
+def test_lease_on_expired_plan_is_dropped_and_replaced():
+    """A session whose lease is on a now-expired plan has the lease
+    dropped by the affinity gate and is re-placed on a sibling. The
+    returned Pick is `sticky=False` (the lease was dropped, not honoured)
+    and a brand-new session can never reach the dead ref either.
+    """
+    from dataclasses import replace
+    from datetime import date, timedelta
+
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+
+    # Flat fill lane: dead ref FIRST so the body sort happens to push it
+    # to the front, but the liveness gate keeps it off regardless.
+    plans = dict(reg.plans)
+    plans["claude-max"] = replace(
+        plans["claude-max"], expires=date.today() - timedelta(days=1))
+    base = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+    lane = _build_lane(base, slots,
+                       key="affinity-expired",
+                       order=["claude-max/opus", "openai/sol"],
+                       tail=[], strategy="fill")
+    picker = Picker(lane, slots, policy)
+
+    async def go():
+        # Seed the lease BEFORE expiring the plan. The picker would do
+        # this itself on a successful pick; doing it manually lets us
+        # flip expiry underneath a known lease.
+        sess = "aff-exp-sess"
+        await slots.set_lease(
+            sess, "claude-max/opus", reg.settings.lease_ttl_seconds,
+            "claude-max")
+        held_before = await slots.get_lease(sess)
+        # Affinity path must drop the lease and re-place.
+        first = await picker.pick("affinity-expired", sess)
+        await picker.release(
+            first.plan.key, first.request_id, first.ref)
+        held_after = await slots.get_lease(sess)
+        # A fresh session confirms the dead ref is unreachable period.
+        second = await picker.pick("affinity-expired", None)
+        await picker.release(
+            second.plan.key, second.request_id, second.ref)
+        return (held_before, first.ref, first.sticky, first.considered,
+                held_after, second.ref, second.considered)
+
+    (held_before, first_ref, first_sticky, first_con,
+     held_after, second_ref, second_con) = run(go())
+    assert held_before == "claude-max/opus", held_before
+    assert first_ref == "openai/sol", (first_ref, first_con)
+    # Affinity dropped the lease (skip reason named it); the body walk
+    # re-leased onto the live sibling, so the returned pick is sticky=False.
+    assert first_sticky is False, first_sticky
+    assert any(c.startswith("claude-max/opus(expired)") for c in first_con), first_con
+    # The lease is the live sibling now (set by the new lease in _visit_ref).
+    assert held_after == "openai/sol", held_after
+    # Second pick (fresh session) also cannot land on the dead ref.
+    assert second_ref == "openai/sol", (second_ref, second_con)
+    assert not any("claude-max/opus" in c and "(expired)" not in c
+                   for c in second_con), second_con
+    print(f"  lease on expired plan dropped, re-placed on {first_ref}, "
+          f"sticky={first_sticky}; fresh session also -> {second_ref}")
+
+
+def test_plan_within_drain_window_tried_first_in_flat_lane():
+    """Flat `fill` lanes promote a soonest-death-first member to the front
+    of the order via the urgency sort in `_effective_body`. With nothing
+    expiring, the sort is stable so config order is preserved bit-for-bit.
+    """
+    from dataclasses import replace
+    from datetime import date, timedelta
+
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+
+    # Two distinct plans; B's plan expires tomorrow (well inside the
+    # default 21-day drain window). Without the sort, A leads; with the
+    # sort, B jumps ahead.
+    plans = dict(reg.plans)
+    plans["claude-max"] = replace(
+        plans["claude-max"],
+        expires=date.today() + timedelta(days=1))
+    soon = models.Registry(
+        settings=reg.settings, plans=plans, lanes=reg.lanes)
+    soon_lane = _build_lane(soon, slots,
+                            key="drain-soon",
+                            order=["claude-max/opus", "openai/sol"],
+                            tail=[], strategy="fill")
+    soon_picker = Picker(soon_lane, slots, policy)
+
+    # Stability leg: same lane shape, neither plan expires. The sort key
+    # has no (0, days) elements, so every entry lands at (1, 0) and the
+    # stable sort keeps config order verbatim.
+    none = models.Registry(settings=reg.settings, plans=reg.plans,
+                           lanes=reg.lanes)
+    none_lane = _build_lane(none, slots,
+                            key="drain-stable",
+                            order=["claude-max/opus", "openai/sol"],
+                            tail=[], strategy="fill")
+    none_picker = Picker(none_lane, slots, policy)
+
+    async def go():
+        first = await soon_picker.pick("drain-soon", None)
+        await soon_picker.release(
+            first.plan.key, first.request_id, first.ref)
+        first_stable = await none_picker.pick("drain-stable", None)
+        await none_picker.release(
+            first_stable.plan.key, first_stable.request_id, first_stable.ref)
+        # Stability: every ref collapses to (1, 0) when no expiry, so the
+        # stable sort must preserve config order verbatim. Inspected
+        # directly on `_effective_body` (the picker never reaches the
+        # second member on a fresh session here because cap=1 on the
+        # first member suffices; the body order is the property the test
+        # pins).
+        stable_body = none_picker._effective_body("drain-stable")[0]
+        return first.ref, first_stable.ref, stable_body
+
+    drain_ref, stable_a, stable_body = run(go())
+    assert drain_ref == "claude-max/opus", drain_ref
+    assert stable_a == "claude-max/opus", stable_a
+    assert stable_body == ["claude-max/opus", "openai/sol"], stable_body
+    print(f"  drain window: B (claude-max, 1d left) jumped ahead of "
+          f"openai/sol; stable sort preserved config order: "
+          f"{stable_body}")
+
+
+def test_disabled_plan_with_enabled_model_never_picked():
+    """A disabled plan's refs are never picked, in body, group, and tail.
+
+    Pins the `not plan.enabled` disjunct of `_visit_ref`'s liveness gate
+    (`not plan.enabled or not model.enabled`). The sibling test
+    `test_disabled_model_on_enabled_plan_never_picked` already covers
+    `not model.enabled` on a live plan; together they pin each half of the
+    OR so a regression that mistakenly dropped one branch would not
+    silently pass under the shared `(disabled)` skip reason.
+
+    Same three-lane shape (flat body / round_robin group / tail) so a
+    regression that touched only one of the three walker stages would
+    show up here too.
+    """
+    from dataclasses import replace
+
+    reg = models.load()
+    redis = FakeRedis()
+    slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+    from switchyard.policy import CapacityPolicy
+    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+
+    # Disable the claude-max plan itself; opus stays enabled on it. The
+    # `not plan.enabled` branch is what fires, not the `not model.enabled`
+    # branch -- the test guards against dropping the plan disjunct
+    # specifically.
+    plans = dict(reg.plans)
+    plans["claude-max"] = replace(plans["claude-max"], enabled=False)
+    base = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+
+    flat_reg = _build_lane(base, slots,
+                           key="plan-dis-flat",
+                           order=["claude-max/opus", "openai/sol"],
+                           tail=[], strategy="fill")
+    rr_reg = _build_lane(base, slots,
+                         key="plan-dis-rr",
+                         order=[{"round_robin":
+                                 ["claude-max/opus", "openai/sol"]}],
+                         tail=[], strategy="fill")
+    tail_reg = _build_lane(base, slots,
+                           key="plan-dis-tail",
+                           order=[],
+                           tail=["claude-max/opus", "openai/sol"],
+                           strategy="fill")
+    flat = Picker(flat_reg, slots, policy)
+    rr = Picker(rr_reg, slots, policy)
+    tail = Picker(tail_reg, slots, policy)
+
+    async def go():
+        f = await flat.pick("plan-dis-flat", None)
+        await flat.release(f.plan.key, f.request_id, f.ref)
+        r = await rr.pick("plan-dis-rr", None)
+        await rr.release(r.plan.key, r.request_id, r.ref)
+        t = await tail.pick("plan-dis-tail", None)
+        await tail.release(t.plan.key, t.request_id, t.ref)
+        return f.ref, f.considered, r.ref, r.considered, t.ref, t.considered
+
+    f_ref, f_con, r_ref, r_con, t_ref, t_con = run(go())
+    assert f_ref == "openai/sol", (f_ref, f_con)
+    assert r_ref == "openai/sol", (r_ref, r_con)
+    assert t_ref == "openai/sol", (t_ref, t_con)
+    dis_skip = "claude-max/opus(disabled)"
+    assert any(c.startswith(dis_skip) for c in f_con), f_con
+    assert any(c.startswith(dis_skip) for c in r_con), r_con
+    assert any(c.startswith(dis_skip) for c in t_con), t_con
+    print("  disabled plan (claude-max, opus still enabled) skipped in "
+          "body, group, and tail: all three landed on openai/sol")
+
+
+def test_pick_direct_refuses_expired_and_disabled():
+    """`pick_direct` mirrors the body-walk liveness gate: a caller that
+    names a dead deployment by ref gets an honest refusal, not a wasted
+    401/402 plus a cooldown. Covers three shapes that share the same
+    `(reason)` message format hooks.py surfaces as a 429:
+
+    * expired plan (`(expired)`);
+    * disabled plan, model still enabled (`(disabled)`);
+    * live plan, model disabled (`(disabled)`).
+
+    The slot must NOT be claimed in any of these: a follow-up live
+    `pick_direct` succeeds, so callers can retry onto a different
+    deployment without competing with the dead one.
+    """
+    from dataclasses import replace
+    from datetime import date, timedelta
+
+    def make(reg, *, plan_enabled=True, plan_expires=None, model_enabled=True):
+        plans = dict(reg.plans)
+        plans["claude-max"] = replace(
+            plans["claude-max"],
+            enabled=plan_enabled,
+            expires=plan_expires)
+        cm = plans["claude-max"]
+        plans["claude-max"] = replace(
+            cm,
+            models={**cm.models,
+                    "opus": replace(cm.models["opus"],
+                                    enabled=model_enabled)})
+        return models.Registry(settings=reg.settings, plans=plans,
+                               lanes=reg.lanes)
+
+    async def one(reg, expected_skip: str) -> str:
+        redis = FakeRedis()
+        slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+        from switchyard.policy import CapacityPolicy
+        policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
+        picker = Picker(reg, slots, policy)
+        # Point directly at the claude-max/opus Model object off the
+        # registry's plan; `lane_members(...)` is lane-shaped and may not
+        # name this ref at all.
+        target = reg.plans["claude-max"].models["opus"]
+
+        try:
+            await picker.pick_direct(target)
+        except LaneSaturated as exc:
+            refused = str(exc)
+        else:
+            raise AssertionError(
+                f"pick_direct on a {expected_skip!r} deployment "
+                f"must refuse, not claim a slot")
+
+        assert expected_skip in refused, (expected_skip, refused)
+        # The slot table must not have been touched. A follow-up pick on
+        # a live deployment still claims a fresh slot.
+        live = Picker(reg, slots, policy)
+        live_target = (reg.plans["openai"].models[next(iter(reg.plans["openai"].models))]
+                       if "openai" in reg.plans else target)
+        try:
+            live_pick = await live.pick_direct(live_target)
+            await live.release(live_pick.plan.key, live_pick.request_id,
+                              live_pick.ref)
+        except LaneSaturated as exc:
+            raise AssertionError(
+                f"follow-up live pick_direct failed after the dead "
+                f"refusal: {exc}") from exc
+        return refused
+
+    reg = models.load()
+    # (a) expired plan.
+    expired = make(reg, plan_expires=date.today() - timedelta(days=1))
+    a_refused = run(one(expired, "(expired)"))
+    # (b) disabled plan, model still enabled.
+    plan_off = make(reg, plan_enabled=False, model_enabled=True)
+    b_refused = run(one(plan_off, "(disabled)"))
+    # (c) live plan, model disabled.
+    model_off = make(reg, plan_enabled=True, model_enabled=False)
+    c_refused = run(one(model_off, "(disabled)"))
+    print(f"  pick_direct refused: {a_refused} | {b_refused} | {c_refused}")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
