@@ -17,6 +17,13 @@ Rules, without exception:
 - Read `.env` only when the user asks you to debug it, and never echo a secret's
   value into the transcript — print `KEY=<set>` instead.
 
+These rules are enforced mechanically now: `.claude/settings.json` denies
+`Read(.env)` / `Edit(.env)` / `Write(.env)`, and `.claude/hooks/guard.sh`
+fires as a PreToolUse hook to block `cp`/`mv`/`tee`/`sed -i`/redirects to
+`.env` before they run. A block is a guard, not the prose — the prose is
+here for humans, the guards are here so the prose is never the only thing
+in the way.
+
 ## Config lives in `config/plans.yaml` — which is gitignored
 
 `config/plans.yaml` is the operator's live portfolio and is NOT tracked.
@@ -50,18 +57,29 @@ worktree branch is merged.
 Two things must not happen on a worktree:
 
   1. **Never `docker compose build` / `up -d` / `up -d --force-recreate` here.**
-     `docker-compose.yml` pins `name: switchyard`, so every worktree addresses
-     the *same* compose project: building or recreating from a worktree does
-     not spin up an isolated copy — it rebuilds and recreates the **live**
-     containers from branch code, and mounts that worktree's `./config` into
-     them. This was nearly done once from the issue-11 worktree and aborted
-     by the user.
+     `docker-compose.yml` declares the project name with
+     `${SWITCHYARD_PROJECT:?…}` (sourced from the operator's `.env` via
+     `scripts/sync-env.sh`), so worktrees without `.env` fail closed at
+     parse time with "run compose from the main checkout". Even when the
+     project name does resolve, every worktree addresses the *same* compose
+     project: building or recreating from a worktree does not spin up an
+     isolated copy — it rebuilds and recreates the **live** containers from
+     branch code, and mounts that worktree's `./config` into them. This
+     was nearly done once from the issue-11 worktree and aborted by the
+     user.
 
   2. **Never merge the worktree branch into main here.** The main checkout
      owns that handoff — running `git merge` from a worktree drags the
      worktree's branch into the main checkout's working tree, which then has
      to be rebuilt anyway. Just commit; let the merge happen at the main
      checkout (or via a PR).
+
+`scripts/apply.sh` and `scripts/reload.sh` refuse to run from a worktree at
+the top of the script (exit 2, before any Docker call), and
+`.claude/hooks/guard.sh` blocks the same worktree-only commands as a
+PreToolUse hook. A block is a guard, not the prose — the prose is here
+for humans, the guards are here so the prose is never the only thing in
+the way.
 
 What "done on the worktree" looks like:
 
@@ -150,6 +168,14 @@ Same reasoning as `.env`: never run `docker login`/`docker logout`, never write
 to the keychain, and never delete a stored token. Diagnose read-only, then give
 the user the exact command to run themselves. Print `KEY=<set>` or a length,
 never a secret's value.
+
+These rules are enforced mechanically now: `.claude/settings.json` denies
+`Bash(docker login:*)` / `Bash(docker logout:*)` /
+`Bash(security add-*)` / `Bash(security delete-*)`, and
+`.claude/hooks/guard.sh` fires as a PreToolUse hook to block the same
+shapes (including `security(1)` keychain writes) before they run. A
+block is a guard, not the prose — the prose is here for humans, the
+guards are here so the prose is never the only thing in the way.
 
 Also: macOS has no `timeout(1)`. Use `gtimeout` if coreutils is installed, or
 leave the command unbounded.

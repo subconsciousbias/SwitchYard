@@ -52,6 +52,18 @@
 # still routes the old config.
 set -euo pipefail
 
+# Refuse to run from a git worktree. docker-compose.yml pins the project name
+# to ${SWITCHYARD_PROJECT}, so every worktree addresses the SAME compose
+# project — building or recreating here rebuilds and recreates the LIVE
+# containers and mounts this worktree's ./config into them. The guard has to
+# run before the `cd` and the arg parse: --git-dir and --git-common-dir
+# differ only inside a worktree, and `2>/dev/null` makes a non-repo invocation
+# fail the comparison and exit 2 as well.
+if [ "$(git rev-parse --git-dir 2>/dev/null)" != "$(git rev-parse --git-common-dir 2>/dev/null)" ]; then
+  echo "refusing: this is a git worktree — run from the main checkout (see CLAUDE.md)" >&2
+  exit 2
+fi
+
 cd "$(dirname "$0")/.."
 
 force_build=0

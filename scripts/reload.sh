@@ -21,6 +21,17 @@
 # session leases and usage all live in Redis.
 set -euo pipefail
 
+# Refuse to run from a git worktree. See CLAUDE.md — same reason as apply.sh:
+# docker-compose.yml pins the project name to ${SWITCHYARD_PROJECT}, so every
+# worktree addresses the same compose project and `docker compose restart`
+# here would bounce the LIVE gateway and portal from this worktree's branch.
+# Exit 2 to match the script's usage-error convention; `2>/dev/null` makes a
+# non-repo invocation fail the comparison too.
+if [ "$(git rev-parse --git-dir 2>/dev/null)" != "$(git rev-parse --git-common-dir 2>/dev/null)" ]; then
+  echo "refusing: this is a git worktree — run from the main checkout (see CLAUDE.md)" >&2
+  exit 2
+fi
+
 cd "$(dirname "$0")/.."
 
 plans="config/plans.yaml"

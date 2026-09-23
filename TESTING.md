@@ -1426,3 +1426,15 @@ them first if something misbehaves:
    cannot count vendor tokens without spending a turn on it, so the local
    fallback is the honest number rather than a wrong one; no sidecar
    change is planned.
+9. **Live worktree refusal of `apply.sh` / `reload.sh`.** The offline suite
+   in `tests/test_guards.py` already creates a real `git worktree add`,
+   runs both scripts from it, and asserts rc==2 + the refusal message. To
+   repeat it by hand from a worktree: `bash scripts/apply.sh --dry-run`
+   prints `refusing: this is a git worktree — run from the main checkout
+   (see CLAUDE.md)` and exits 2; `bash scripts/reload.sh` does the same.
+10. **Live compose failure on unset `SWITCHYARD_PROJECT`.** `docker-compose.yml`
+    declares `name: ${SWITCHYARD_PROJECT:?…}` so a worktree (or any checkout
+    without `.env`) errors at parse time. The text form is asserted
+    offline; to reproduce end-to-end, run `docker compose config` from
+    inside a worktree and expect the `run compose from the main checkout`
+    message.

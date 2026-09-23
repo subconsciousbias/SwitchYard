@@ -17,7 +17,14 @@
 # Local models are expected on the host; LOCAL_API_BASE defaults to
 # host.docker.internal so Ollama/LM Studio work without extra config.
 
-name: switchyard
+# The project name is sourced from the operator's .env, not hardcoded —
+# every worktree has its own ./config/ but addresses the same compose project
+# by name, so a worktree that hardcodes `name: switchyard` would build and
+# recreate the LIVE containers from branch code. Fail closed instead: a
+# missing SWITCHYARD_PROJECT errors out at compose parse time. The main
+# checkout's .env (synced by scripts/sync-env.sh from .env.example) sets it
+# to `switchyard`; worktrees have no .env (gitignored) so they fail.
+name: ${SWITCHYARD_PROJECT:?run compose from the main checkout — see CLAUDE.md}
 
 x-common: &common
   restart: unless-stopped
