@@ -218,6 +218,281 @@ def test_status_has_one_shape_whether_or_not_a_grant_exists():
     print(f"  identical keys either way: {sorted(missing)}")
 
 
+def test_concurrent_access_token_calls_do_not_deadlock():
+    """N concurrent `access_token` callers serialise through `_store_lock` and
+    return without deadlock or stray exception.
+
+    With the cross-process flock in place, the load-decide-refresh-save
+    critical section in `access_token` is a single critical section. The
+    first caller refreshes (the seed token is near expiry), pushes the
+    expiry out by 3600 s, and every subsequent caller that re-enters the
+    lock just re-reads the now-fresh entry and skips the refresh. The
+    interesting properties the test pins are:
+
+      - no thread deadlocks on the flock (a join timeout would fail first),
+      - no unexpected exception escapes the critical section — in
+        particular, no FileNotFoundError from a half-renamed tmp file,
+        which was the symptom of the unlocked write on the old code path.
+
+    What this test does NOT pin is a "newest refresh token survives under
+    two near-simultaneous rotations" contract: with the lock in place that
+    property is structurally unobservable from a single process (each caller
+    is gated by `expires > time.time() - REFRESH_MARGIN`, so the second
+    caller bails before calling `_refresh`). The lost-update property is
+    covered by the lock's design — a sibling process that holds the flock
+    during the load is the only way two writes could collide — not by
+    this test.
+    """
+    import threading
+
+    oauth.STORE = _fresh_store()
+    # Seed with a near-expiry token so the first caller takes the refresh
+    # path; subsequent callers in the same race see the fresh expiry and
+    # return without re-refreshing.
+    oauth._store_tokens("xai", {"access_token": "seed-access",
+                                "refresh_token": "r0", "expires_in": 10})
+
+    counter = {"n": 0}
+    counter_lock = threading.Lock()
+    errors: list[BaseException] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        with counter_lock:
+            counter["n"] += 1
+            seq = counter["n"]
+        return httpx.Response(200, json={"access_token": f"at-{seq}",
+                                         "refresh_token": f"r{seq}",
+                                         "expires_in": 3600})
+
+    original = oauth.httpx.Client
+    _stub_client(handler)
+
+    def worker():
+        try:
+            oauth.access_token("xai")
+        except BaseException as exc:           # noqa: BLE001 — collect every error
+            errors.append(exc)
+
+    try:
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+            assert not t.is_alive(), "thread hung — likely a deadlock in _store_lock"
+    finally:
+        _restore_client(original)
+
+    assert not errors, f"concurrent access_token raised: {errors!r}"
+    # At least one refresh ran — otherwise the test would have exercised
+    # only the no-refresh-needed branch and not the lock+save critical
+    # section at all. With the lock in place, exactly one refresh is the
+    # expected outcome; the other seven callers see the fresh token and
+    # skip the refresh.
+    assert counter["n"] >= 1, counter
+    final = oauth._load()["xai"]
+    assert final["refresh_token"].startswith("r"), final
+    assert final["refresh_token"] != "r0", final
+    print(f"  8 concurrent access_token calls, refresh endpoint hit "
+          f"{counter['n']} time(s), store holds "
+          f"r{final['refresh_token'][1:]}")
+
+
+def test_save_writes_tmp_file_with_mode_0600():
+    """The temp file holding the live bearer tokens must be created 0600, not
+    the 0644 mkstemp defaults to on a umask-022 box. We assert that by
+    patching os.replace to stat the tmp path right before swapping it in;
+    the post-rename STORE must also be 0600 (belt-and-braces against a
+    pre-existing 0644-era file)."""
+    import stat as stat_mod
+
+    oauth.STORE = _fresh_store()
+    real_replace = oauth.os.replace
+    seen_modes: list[int] = []
+
+    def replace_with_check(src, dst):
+        # Stat the temp file BEFORE the rename: this is the only window in
+        # which its mode is observable at the on-disk path the rename will
+        # leave behind. _save has already fchmod'd the fd to 0600; an
+        # accident like `os.chmod(tmp, 0o644)` between mkstemp and replace
+        # would show up here.
+        seen_modes.append(stat_mod.S_IMODE(os.stat(src).st_mode))
+        return real_replace(src, dst)
+
+    oauth.os.replace = replace_with_check
+    try:
+        oauth._save({"xai": {"access_token": "secret", "refresh_token": "r",
+                             "expires_at": time.time() + 600}})
+    finally:
+        oauth.os.replace = real_replace
+
+    assert seen_modes, "test bug: os.replace was never called"
+    assert all(m == 0o600 for m in seen_modes), seen_modes
+    assert stat_mod.S_IMODE(os.stat(oauth.STORE).st_mode) == 0o600
+    print(f"  tmp file modes seen by os.replace: {seen_modes} (== 0o600)")
+
+
+def test_refresh_endpoint_failure_raises_only_when_token_is_already_expired():
+    """A 500 from the refresh endpoint with the token already past expiry
+    must raise -- that is the failure mode the proxy's 503 maps. The same
+    500 with the token still inside REFRESH_MARGIN keeps returning the
+    current token, which is the preserved fallback contract from
+    `test_a_failed_refresh_falls_back_to_the_current_token`."""
+    # ---- branch A: token already expired -> raise ----------------------
+    oauth.STORE = _fresh_store()
+    oauth._store_tokens("xai", {"access_token": "expired-but-not-yet-known",
+                                "refresh_token": "r1", "expires_in": -10})
+
+    def failing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="upstream is on fire")
+
+    original = oauth.httpx.Client
+    _stub_client(failing)
+    try:
+        try:
+            oauth.access_token("xai")
+        except RuntimeError as exc:
+            assert "expired and refresh failed" in str(exc), str(exc)
+            print(f"  expired + 500 -> raises: {exc}")
+        else:
+            raise AssertionError("expected RuntimeError for an expired + failing refresh")
+    finally:
+        _restore_client(original)
+
+    # ---- branch B: token still valid -> fall back to current ---------
+    oauth.STORE = _fresh_store()
+    oauth._store_tokens("xai", {"access_token": "still-good",
+                                "refresh_token": "r1", "expires_in": 10})
+    _stub_client(failing)
+    try:
+        token = oauth.access_token("xai")
+    finally:
+        _restore_client(original)
+    assert token == "still-good", token
+    print("  live + 500 -> falls back to the current token (regression preserved)")
+
+
+def test_refresh_response_missing_access_token_does_not_raise_keyerror():
+    """A 200 with a JSON body that lacks `access_token` would otherwise crash
+    `_store_tokens` with KeyError and bubble up as a hard failure. The
+    widened exception net in `_refresh` must swallow it; the only question
+    for `access_token` is whether the token was already expired (raise)
+    or still good (return the existing one). Never a KeyError out."""
+    oauth.STORE = _fresh_store()
+    oauth._store_tokens("xai", {"access_token": "current",
+                                "refresh_token": "r1", "expires_in": -5})
+
+    def missing_access_token(request: httpx.Request) -> httpx.Response:
+        # HTTP 200, valid JSON, but the access_token key is not present.
+        # `_store_tokens` does `body["access_token"]`, which is a KeyError.
+        return httpx.Response(200, json={"expires_in": 3600,
+                                         "refresh_token": "r2"})
+
+    original = oauth.httpx.Client
+    _stub_client(missing_access_token)
+    try:
+        try:
+            oauth.access_token("xai")
+        except KeyError as exc:
+            raise AssertionError(f"KeyError leaked from _refresh: {exc!r}") from exc
+        except RuntimeError as exc:
+            # Expired-and-refresh-failed is the right outcome here -- the
+            # KeyError was swallowed and turned into a None from _refresh.
+            assert "expired and refresh failed" in str(exc), str(exc)
+            print(f"  200 with no access_token + expired -> RuntimeError: {exc}")
+        else:
+            raise AssertionError("expected either the current token or a "
+                                 "RuntimeError, neither happened")
+    finally:
+        _restore_client(original)
+
+
+def test_refresh_response_non_dict_json_does_not_raise_typeerror():
+    """A 200 with a JSON body that is valid JSON but not a dict (a list, a
+    scalar, or `null`) makes `resp.json()` return that value, and the next
+    line in `_store_tokens_locked` does `body["access_token"]`, which is
+    a `TypeError` on a list/scalar (not a `KeyError`). The widened
+    exception net must catch `TypeError` too -- otherwise the proxy maps
+    the bubble-up to a 500 instead of the 'expired and refresh failed'
+    503 the docstring at `access_token` promises.
+
+    Pins the TypeError branch of `_refresh`'s exception net specifically
+    (sibling test to `test_refresh_response_missing_access_token_does_not_raise_keyerror`,
+    which pins the KeyError branch).
+    """
+    oauth.STORE = _fresh_store()
+    oauth._store_tokens("xai", {"access_token": "expired",
+                                "refresh_token": "r1", "expires_in": -10})
+
+    def list_body(request: httpx.Request) -> httpx.Response:
+        # Valid JSON, but not a dict: `_store_tokens_locked` does
+        # `body["access_token"]`, which on a list raises TypeError, not
+        # KeyError. A scalar (`42`, `"ok"`, `null`) hits the same path
+        # -- a list is the most likely real-world shape (a buggy
+        # provider returning its token as `[...]`).
+        return httpx.Response(200, json=["not", "a", "dict"])
+
+    original = oauth.httpx.Client
+    _stub_client(list_body)
+    try:
+        try:
+            oauth.access_token("xai")
+        except TypeError as exc:
+            raise AssertionError(
+                f"TypeError leaked from _refresh: {exc!r}") from exc
+        except RuntimeError as exc:
+            assert "expired and refresh failed" in str(exc), str(exc)
+            print(f"  200 with non-dict JSON + expired -> RuntimeError: {exc}")
+        else:
+            raise AssertionError(
+                "expected a RuntimeError (expired + refresh-failed)")
+    finally:
+        _restore_client(original)
+
+
+def test_refresh_swallows_json_decode_error_and_save_oserror():
+    """Both `resp.json()` (a ValueError on a non-JSON body) and an OSError
+    from `_save` (disk full, read-only mount, etc.) must be caught inside
+    `_refresh` and returned as None, never escaping to `access_token`.
+
+    The token here is already expired so a successful refresh would have
+    raised 'expired and refresh failed' -- but the test is about the absence
+    of ValueError / OSError, so we just check no other exception type leaks.
+    """
+    oauth.STORE = _fresh_store()
+    oauth._store_tokens("xai", {"access_token": "expired",
+                                "refresh_token": "r1", "expires_in": -10})
+
+    def not_json(request: httpx.Request) -> httpx.Response:
+        # Plain text body: resp.json() will raise ValueError inside _refresh.
+        return httpx.Response(200, text="<html>oops</html>")
+
+    original = oauth.httpx.Client
+    real_save = oauth._save
+
+    def save_oserror(data):
+        raise OSError("simulated disk failure inside _save")
+
+    _stub_client(not_json)
+    oauth._save = save_oserror
+    try:
+        try:
+            oauth.access_token("xai")
+        except (ValueError, OSError) as exc:
+            raise AssertionError(
+                f"{type(exc).__name__} leaked out of _refresh: {exc!r}") from exc
+        except RuntimeError as exc:
+            # Both branches end up returning None from _refresh; the expired
+            # token then raises the 'expired and refresh failed' message.
+            assert "expired and refresh failed" in str(exc), str(exc)
+            print(f"  ValueError+OSError swallowed -> RuntimeError: {exc}")
+        else:
+            raise AssertionError("expected a RuntimeError (expired + refresh-failed)")
+    finally:
+        _restore_client(original)
+        oauth._save = real_save
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

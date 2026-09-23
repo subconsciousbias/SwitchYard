@@ -32,6 +32,7 @@ about a grant, and it never includes the token either.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -170,7 +171,14 @@ async def _forward(request: Request, path_attr: str, path_name: str) -> Streamin
             raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     try:
-        token = oauth.access_token(PROVIDER)
+        # `oauth.access_token` takes a cross-process `flock` around the token
+        # store, may do a refresh HTTP call, and may write the result back to
+        # disk -- all blocking I/O on the event loop. Push it onto a worker
+        # thread so an in-flight refresh on a slow upstream does not stall
+        # other requests. RuntimeError still bubbles up unchanged and is
+        # mapped to 503 below; HTTP errors raised by `_refresh` are swallowed
+        # there (it returns None on httpx errors) and never reach this handler.
+        token = await asyncio.to_thread(oauth.access_token, PROVIDER)
     except RuntimeError as exc:
         # No grant, or an unrefreshable expired one — a setup problem, not a
         # transient upstream failure. 503 so SwitchYard's classifier treats it
@@ -280,7 +288,11 @@ async def usage() -> JSONResponse:
         raise HTTPException(status_code=501,
                             detail=f"no usage endpoint known for {PROVIDER!r}")
     try:
-        token = oauth.access_token(PROVIDER)
+        # Same off-loop rationale as `_forward`: `oauth.access_token` may take
+        # the cross-process store lock and do a refresh HTTP call. A blocking
+        # call here would stall every other request this process is serving
+        # while a refresh is in flight.
+        token = await asyncio.to_thread(oauth.access_token, PROVIDER)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 

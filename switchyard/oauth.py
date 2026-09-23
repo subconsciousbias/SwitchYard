@@ -25,13 +25,20 @@ Usage:
 """
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import json
+import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+
+log = logging.getLogger(__name__)
 
 def _default_store() -> str:
     """Where the token store lives, host or container.
@@ -167,12 +174,115 @@ def _load() -> dict[str, Any]:
         return {}
 
 
+# How the lock file is named. Lives next to STORE inside the same secrets/
+# directory so it inherits the mount's permissions and never escapes it.
+_LOCK_SUFFIX = ".lock"
+
+
+def _lock_path() -> str:
+    return STORE + _LOCK_SUFFIX
+
+
+@contextlib.contextmanager
+def _store_lock():
+    """Exclusive cross-process lock around the token store's read-modify-write.
+
+    Concurrent writers (proxy refresh + `python -m switchyard.oauth login`)
+    would otherwise each `load -> mutate -> save` and the second writer's save
+    would clobber the first's update -- the classic lost-update, with the only
+    visible symptom being that the refresh token flips between two different
+    strings every few minutes until the proxy re-rotates one. `fcntl.flock` is
+    the portable choice and is released automatically by the kernel on process
+    exit, so a crashed writer cannot wedge subsequent ones.
+
+    The lock file itself is created in the same secrets/ dir as STORE and
+    chmodded 0600 at create time so it never briefly appears world-readable --
+    secrets/ may be mounted onto a host volume, and a transient 0644 lock file
+    is a token-store-shaped leak even if the store itself is sound.
+
+    The caller is expected to re-read the store inside the `with` block --
+    flock serialises *writers*; another process's completed write is only
+    visible to the next `_load()` call.
+    """
+    os.makedirs(os.path.dirname(STORE) or ".", exist_ok=True)
+    path = _lock_path()
+    # Create the lock file via `open(..., "a")` so it exists for flock even on
+    # the very first run, then chmod it before handing it to the lock call.
+    # `os.O_CREAT | os.O_EXCL` would race against a parallel first-runner
+    # creating the same name and is not worth a retry loop here.
+    try:
+        fh = open(path, "a")
+    except OSError:
+        # Worst case: the dir does not exist and makedirs above failed (a read-
+        # only mount, say). Surface that rather than swallowing it -- the caller
+        # is about to fail on `_load()` anyway, and a swallowed lock failure
+        # would only delay the same error by a single hop.
+        raise
+    try:
+        os.fchmod(fh.fileno(), 0o600)
+    except OSError:
+        # Some filesystems (e.g. /proc-mounted tmpfs on certain hosts) reject
+        # fchmod; the lock file still serialises writers even if its mode is
+        # not strictly 0600, and STORE's own mode is what governs access to the
+        # tokens themselves.
+        pass
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    except OSError as exc:
+        fh.close()
+        if exc.errno == errno.EINTR:
+            # flock retry-on-EINTR is conventionally handled at the call site,
+            # not inside the wrapper. Re-raise and let the surrounding try/
+            # except decide whether to retry -- a single EINTR is rare enough
+            # that the simplest correct behaviour is "fail loud, the caller
+            # retries on the next request".
+            raise
+        raise
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
+
+
 def _save(data: dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(STORE), exist_ok=True)
-    tmp = STORE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(data, fh, indent=2)
-    os.replace(tmp, STORE)
+    """Atomic, 0600 write of the token store.
+
+    The temp file is created with `tempfile.mkstemp` in the same directory as
+    STORE so the eventual `os.replace` is a same-filesystem rename (atomic on
+    POSIX) and so the temp file inherits the directory's mode. The fd is
+    fchmod'd to 0600 *before* any bytes are written, eliminating the brief
+    window where a 0644 temp file would contain a live bearer token. The
+    post-rename `os.chmod(STORE, 0o600)` is belt-and-braces for stores left
+    over from before this change, which were written with the older code path.
+    """
+    store_dir = os.path.dirname(STORE) or "."
+    os.makedirs(store_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(STORE) + ".", suffix=".tmp",
+                                dir=store_dir)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            # Some filesystems reject fchmod; the directory's mount mode is
+            # still our line of defence, and STORE's post-rename chmod is the
+            # third belt.
+            pass
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, STORE)
+    except BaseException:
+        # If anything between mkstemp and the rename fails, do not leave a
+        # stray tmp file behind -- mkstemp's name is unguessable to the
+        # caller, so leaking it would just be litter in secrets/.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     try:
         os.chmod(STORE, 0o600)
     except OSError:
@@ -362,7 +472,22 @@ def finish_login(provider: str, started: dict[str, Any],
     raise TimeoutError("device authorisation expired before it was approved")
 
 
-def _store_tokens(provider: str, body: dict[str, Any]) -> None:
+def _store_tokens_locked(provider: str, body: dict[str, Any]) -> None:
+    """Merge `body` into STORE for `provider` and persist. Must be called
+    inside `_store_lock()` -- the lock is what serialises concurrent writers,
+    so the load -> merge -> save inside this function is the critical
+    section.
+
+    Split out from `_store_tokens` so callers that already hold the store
+    lock (`access_token` -> `_refresh`) can do their work without re-opening
+    the lock file; `fcntl.flock` on a fresh fd against the same lock file
+    would deadlock rather than recurse.
+    """
+    # Re-read inside the lock: a concurrent refresh from another process
+    # (proxy + login, or two proxies) may have just rotated the refresh
+    # token. Merging on top of the locked view means the *newer* refresh
+    # token survives -- the load->merge->save here is the critical section,
+    # not the call to _save() alone.
     data = _load()
     entry = data.get(provider) or {}
     entry.update({
@@ -370,8 +495,10 @@ def _store_tokens(provider: str, body: dict[str, Any]) -> None:
         "token_type": body.get("token_type", "Bearer"),
         "scope": body.get("scope", getattr(FLOWS.get(provider), "scopes", "")),
     })
-    # A refresh token is only issued once in some flows; never overwrite a good
-    # one with nothing, or the grant becomes unrenewable.
+    # A refresh token is only issued once in some flows; never overwrite a
+    # good one with nothing, or the grant becomes unrenewable. The same
+    # rule applies inside the critical section: do not blank a refresh
+    # token the parallel writer just installed.
     if body.get("refresh_token"):
         entry["refresh_token"] = body["refresh_token"]
     if body.get("expires_in"):
@@ -383,6 +510,11 @@ def _store_tokens(provider: str, body: dict[str, Any]) -> None:
     _save(data)
 
 
+def _store_tokens(provider: str, body: dict[str, Any]) -> None:
+    with _store_lock():
+        _store_tokens_locked(provider, body)
+
+
 # ---------------------------------------------------------------- refresh ----
 def access_token(provider: str) -> str:
     """A currently-valid access token, refreshed if close to expiry.
@@ -390,20 +522,50 @@ def access_token(provider: str) -> str:
     Raises when there is no grant, so a misconfigured lane fails loudly instead
     of sending an empty Authorization header — which would arrive as an auth
     error and be classified as a dead credential rather than a setup mistake.
+    Raises when the token is already expired and a best-effort refresh
+    failed — the proxy maps that RuntimeError to 503 ("this plan cannot
+    serve right now"), which is the right shape: a stale token would 401
+    upstream and get classified as a dead credential, hiding the real cause.
     """
-    entry = _load().get(provider) or {}
-    token = entry.get("access_token")
-    if not token:
-        raise RuntimeError(
-            f"no OAuth grant for {provider!r}; run "
-            f"`python -m switchyard.oauth login {provider}`")
+    # The whole read-decide-refresh-read-again dance happens under the store
+    # lock. Without it, a parallel refresh from another process could rotate
+    # the access token out from under us between the `_load()` here and the
+    # `_store_tokens()` inside `_refresh`, and the in-flight request would
+    # get handed a token that has already been invalidated upstream. The
+    # re-read inside the lock is what makes the whole thing correct under
+    # concurrency.
+    with _store_lock():
+        entry = _load().get(provider) or {}
+        token = entry.get("access_token")
+        if not token:
+            raise RuntimeError(
+                f"no OAuth grant for {provider!r}; run "
+                f"`python -m switchyard.oauth login {provider}`")
 
-    expires = entry.get("expires_at") or 0
-    if expires and time.time() > expires - REFRESH_MARGIN:
-        refreshed = _refresh(provider, entry)
-        if refreshed:
-            return refreshed
-    return token
+        expires = entry.get("expires_at") or 0
+        now = time.time()
+        if expires and now > expires - REFRESH_MARGIN:
+            # Re-check *inside* the lock: a sibling process may have just
+            # refreshed and pushed the expiry well past REFRESH_MARGIN. If
+            # so, return the now-fresh token instead of stampeding the
+            # refresh endpoint with one HTTP call per in-flight request.
+            entry = _load().get(provider) or {}
+            token = entry.get("access_token") or token
+            expires = entry.get("expires_at") or expires
+            if expires and time.time() > expires - REFRESH_MARGIN:
+                refreshed = _refresh(provider, entry)
+                if refreshed:
+                    return refreshed
+                if time.time() > expires:
+                    # Refresh failed AND the token is already past expiry.
+                    # Best-effort refresh is fine when the token has margin
+                    # left, but returning a stale token here would just push
+                    # a 401 upstream -- the caller would see a hard auth
+                    # error and never learn the refresh path is broken.
+                    raise RuntimeError(
+                        f"OAuth token for {provider!r} is expired and "
+                        f"refresh failed")
+        return token
 
 
 def account_id(provider: str) -> str | None:
@@ -418,7 +580,17 @@ def account_id(provider: str) -> str | None:
 
 def _refresh(provider: str, entry: dict[str, Any]) -> str | None:
     """Best-effort refresh. Returns None to let the caller use what it has:
-    a failed refresh is not proof the current token has expired."""
+    a failed refresh is not proof the current token has expired.
+
+    The exception net is intentionally broad: a refresh that crashes the
+    surrounding `access_token` would turn a momentary network blip into a
+    hard failure, which is the opposite of "best-effort". The widened set
+    covers (a) transport failures, (b) malformed response payloads, (c)
+    a 200 body that is valid JSON but not a dict (a list, scalar, or
+    `null` makes `body["access_token"]` raise `TypeError`), and (d)
+    disk-write failures during `_save`. The token itself is never
+    included in the warning -- the refresh token is the credential.
+    """
     refresh = entry.get("refresh_token")
     if not refresh:
         return None
@@ -433,10 +605,20 @@ def _refresh(provider: str, entry: dict[str, Any]) -> str | None:
                 headers={"Accept": "application/json"},
             )
         if resp.status_code != 200:
+            log.warning("refresh for %r failed: HTTP %s", provider, resp.status_code)
             return None
-        _store_tokens(provider, resp.json())
+        body = resp.json()
+        # The caller (access_token) holds the store lock already, so go through
+        # the lock-free helper -- taking the lock again would deadlock on the
+        # fresh fd that `_store_lock` opens.
+        _store_tokens_locked(provider, body)
         return (_load().get(provider) or {}).get("access_token")
-    except httpx.HTTPError:
+    except (httpx.HTTPError, KeyError, ValueError, TypeError, OSError) as exc:
+        # Never log `exc` itself: it can carry the response body or, in the
+        # case of a ConnectionError, parts of the URL. Provider name +
+        # exception class are enough to correlate against the upstream
+        # provider's status page.
+        log.warning("refresh for %r failed: %s", provider, type(exc).__name__)
         return None
 
 
