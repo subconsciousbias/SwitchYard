@@ -3515,6 +3515,53 @@ def test_no_inner_transcript_keeps_old_usage_and_bills_mirror_it():
     print("  no transcript: today's usage kept; billed keys mirror it")
 
 
+def test_followup_racing_the_idle_reaper_rebuilds_instead_of_500():
+    """A follow-up arrives just as the idle reaper fires on its session:
+    reap_session fails the turn_future with RuntimeError('session reaped').
+    The follow-up must rebuild from its own request, not surface a 500."""
+
+    async def scenario():
+        loop = asyncio.get_event_loop()
+        sid = "reap-race-1"
+        import tempfile
+        sess = server.Session(id=sid, provider="p", model="m",
+                              workdir=tempfile.mkdtemp(prefix="reap-"))
+        sess.pending["call_a"] = server.ParkedCall(
+            id="call_a", name="t", arguments={}, future=loop.create_future())
+        server.SESSIONS[sid] = sess
+
+        async def fake_unpark(session):
+            return None
+
+        rebuilt: list = []
+
+        async def fake_resume(body, tools, session_id, request, why):
+            rebuilt.append((session_id, why))
+            return {"rebuilt": True}
+
+        async def reaper():
+            await asyncio.sleep(0.05)
+            await server.reap_session(sess)
+
+        saved = (server.unpark_session, server.resume_gone_session)
+        server.unpark_session = fake_unpark
+        server.resume_gone_session = fake_resume
+        try:
+            r = asyncio.create_task(reaper())
+            body = {"model": "m", "tools": [], "messages": []}
+            out = await asyncio.wait_for(server._continue_followup(
+                body, sid, [{"tool_call_id": "call_a", "content": "ok"}], None), 5)
+            await r
+            assert out == {"rebuilt": True}, out
+            assert rebuilt == [(sid, "reaped as the follow-up arrived")], rebuilt
+        finally:
+            server.unpark_session, server.resume_gone_session = saved
+            server.SESSIONS.pop(sid, None)
+
+    asyncio.run(scenario())
+    print("  a follow-up racing the idle reaper rebuilds instead of 500")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):

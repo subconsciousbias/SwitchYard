@@ -254,10 +254,15 @@ class SwitchyardHandler(CustomLogger):
         # a sequence of assignments rather than a half-built state. The slot
         # table and ledger carry over: they are plan-keyed Redis state, not
         # registry state, and a request in flight is using them right now.
-        if self._slots is not None:
-            fresh_ttl = fresh.settings.inflight_max_age_seconds
-            if self._slots.inflight_max_age != fresh_ttl:
-                self._slots = SlotTable(self.redis, fresh_ttl)
+        # A reload can land before the first request has ever touched
+        # `self.slots` (the watcher starts in __init__). The old code then
+        # handed Picker slots=None, and since _picker was now set the lazy
+        # property never ran: every request 500'd with "'NoneType' object has
+        # no attribute 'get_lease'" until the next reload (2026-09-23: 21 x 500
+        # in 16 s on a replica restarted right after a plans.yaml edit).
+        fresh_ttl = fresh.settings.inflight_max_age_seconds
+        if self._slots is None or self._slots.inflight_max_age != fresh_ttl:
+            self._slots = SlotTable(self.redis, fresh_ttl)
         fresh_slots = self._slots
         fresh_ledger = self._ledger or Ledger(self.redis)
         policy = CapacityPolicy(self.redis, fresh.settings, fresh_ledger)

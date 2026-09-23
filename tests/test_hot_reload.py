@@ -452,3 +452,26 @@ if __name__ == "__main__":
             print(f"{name}:")
             fn()
     print("\nall hot-reload tests passed")
+
+
+def test_a_reload_before_the_first_request_still_gives_the_picker_slots():
+    """The watcher starts in __init__, so a plans.yaml edit can be reloaded
+    before any request has built the lazy slot table. The swap must build it
+    then, not hand Picker slots=None (every request 500'd with "'NoneType'
+    object has no attribute 'get_lease'")."""
+    if hooks is None:
+        print(f"  skipped: switchyard.hooks unavailable ({_HOOKS_UNAVAILABLE})")
+        return
+    policy_only = _write_copy(_retune_pin_wait)
+    try:
+        with _config_path(policy_only):
+            h = _bare_handler(policy_only)
+            h._slots = None          # nothing has touched `self.slots` yet
+            h._picker = None
+            h._swap_registry(models.load(policy_only))
+            assert h._slots is not None
+            assert h._picker.slots is h._slots
+            assert h.slots is h._slots
+        print("  swap before first request: picker got a real slot table")
+    finally:
+        os.unlink(policy_only)

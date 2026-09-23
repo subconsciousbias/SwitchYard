@@ -320,15 +320,24 @@ PROFILES: dict[str, dict] = {
         "system_file_args_replace": ["--system-prompt-file", "{path}"],
         # Strip the inner harness's own tools: they would act on the sidecar's
         # container, not the caller's workspace, and the caller never sees them.
-        "bare_args": ["--max-turns", "1", "--disallowed-tools",
-                      "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit"],
+        #
+        # Agent / Task / Skill / ToolSearch / TodoWrite are blocked too, and
+        # --strict-mcp-config drops any connector MCP servers the login
+        # carries: with --max-turns 1, ANY tool call ends the run as
+        # error_max_turns (exit 1 -> 502) after the turn was already paid for.
+        # Measured on four seats: 124 such 502s in ~6h (100 Agent,
+        # 22 ToolSearch, 2 Skill), ~$0.05-0.13 of quota each.
+        "bare_args": ["--max-turns", "1", "--strict-mcp-config", "--disallowed-tools",
+                      "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit,"
+                      "Agent,Task,Skill,ToolSearch,TodoWrite"],
         # Image requests need Read for the staged files (see image_note) and
         # more than one turn -- reading the image and then answering is two
         # agentic turns, and --max-turns 1 would kill the answer with
         # error_max_turns. Every other tool stays stripped.
-        "bare_args_images": ["--max-turns", "4", "--disallowed-tools",
+        "bare_args_images": ["--max-turns", "4", "--strict-mcp-config",
+                             "--disallowed-tools",
                              "Bash,Edit,Write,Glob,Grep,WebFetch,WebSearch,"
-                             "NotebookEdit"],
+                             "NotebookEdit,Agent,Task,Skill,ToolSearch,TodoWrite"],
         # Only valid alongside --system-prompt. Drops the CLI's dynamically
         # injected sections (working directory, git state, environment), which
         # are pure noise when the caller supplies its own prompt — and which the

@@ -1894,7 +1894,7 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
             await end_session(session)
         else:
             await park_session(session)
-    except BaseException:
+    except BaseException as exc:
         # Same teardown contract as start_session: every CLI failure mode
         # makes render_turn raise HTTPException, which used to escape here
         # without running end_session -- the session stayed in SESSIONS
@@ -1909,6 +1909,17 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
         # reaper stays the last-resort backstop. (PR #82 review round 1.)
         with contextlib.suppress(BaseException):
             await end_session(session)
+        # The caller came back just as the idle reaper fired (idle ~SESSION_TTL):
+        # reap_session failed our turn_future with "session reaped". The request
+        # still carries the whole history, so rebuild it like any lost session
+        # instead of surfacing a 500.
+        if isinstance(exc, RuntimeError) and str(exc) == "session reaped":
+            log.warning(
+                "mcp_bridge session %s was reaped as this follow-up arrived; "
+                "rebuilding it from its own request", session.id)
+            return await resume_gone_session(
+                body, body.get("tools") or [], session.id, request,
+                why="reaped as the follow-up arrived")
         raise
     return response
 
