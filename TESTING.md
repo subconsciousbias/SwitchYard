@@ -55,6 +55,44 @@ python3 tests/test_routing.py && python3 tests/test_classify.py \
 `/tmp/switchyard-preview.html` in a browser to see the portal layout before
 anything is live.
 
+### 0a. Real-Lua slot-table suite (`tests/test_slots_lua.py`)
+
+The Lua scripts in `switchyard/slots.py` are the source of truth for the slot
+table — `tests/test_routing.py` only exercises them through the in-process
+Python shadow in `tests/fake_redis.py`. `tests/test_slots_lua.py` runs the
+real Lua against every script in `SlotTable` and compares its observable
+state with the shadow, so a broken `KEYS`/`ARGV` slot, a Lua typo, or a
+drifted mirror all fail loudly. The in-flight zset TTL under heartbeat
+([#107](https://github.com/Fledgewing/SwitchYard/issues/107)) is pinned as
+loud `xfail` until that routing-core bug lands.
+
+The fast run uses an embedded Lua-capable backend — install `fakeredis`
+with its optional Lua dependency:
+
+```bash
+pip install 'fakeredis[lua]'
+python3 tests/test_slots_lua.py
+```
+
+**Expect:** `scenario matrix: 16 scenarios, identical on Lua (...) and fake
+backends`, the Lua-only TTL assertions, and a labelled `xfail (#107)` line
+saying the heartbeat does not yet refresh the zset TTL. Exits 0 (xfail is
+informational today).
+
+To run against a real Redis instead, spin one up and point the suite at it:
+
+```bash
+docker run --rm -d -p 6379:6379 redis:7
+SWITCHYARD_TEST_REDIS_URL=redis://127.0.0.1:6379/9 python3 tests/test_slots_lua.py
+```
+
+If neither `SWITCHYARD_TEST_REDIS_URL` is set nor `fakeredis[lua]` is
+importable, the suite prints a loud `[SKIP]` line and exits 0 (the offline
+test loop `for t in tests/test_*.py; do python3 "$t" ...; done` stays green).
+The CI service container that makes the real-Redis path the default in CI
+is wired by the CI issue ([#136](https://github.com/Fledgewing/SwitchYard/issues/136))
+and is out of scope for this suite.
+
 ---
 
 ## 1. Credentials in `.env`

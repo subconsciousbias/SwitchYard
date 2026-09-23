@@ -1,12 +1,33 @@
 """Just enough async Redis to exercise the routing brain in-process.
 
-`register_script` returns a Python reference implementation of the Lua claim
-script in switchyard/slots.py. The two must stay in step; the integration test
-against a real Redis (tests/test_live_redis.py) is what catches drift.
+`register_script` returns a Python reference implementation of the Lua scripts
+imported from `switchyard.slots` (CLAIM, BUMP_STREAK, BUMP_AND_COOL,
+TOUCH_LEASE, DROP_LEASE, SET_LEASE). The two must stay in step; the integration
+test against a real Redis (`tests/test_slots_lua.py`) is what catches drift.
+
+TTL: one expiry map `_expiries: key -> absolute deadline` covers every key
+type. `set(..., ex=n)` writes it; `expire` updates it for any key type;
+`delete` clears it. Every accessor purges the key when its deadline has passed,
+so a touched-after-expiry behaves like a miss. The clock is injectable so
+tests can advance time without `asyncio.sleep`.
+
+A handful of older tests still poke the legacy `(value, expiry)` tuple shape
+directly into `fake.strings`; the string accessors tolerate that shape so the
+public TTL semantics stay correct without forcing those tests to migrate.
 """
 from __future__ import annotations
 
+import re
 import time
+
+from switchyard.slots import (
+    _BUMP_AND_COOL,
+    _BUMP_STREAK,
+    _CLAIM,
+    _DROP_LEASE,
+    _SET_LEASE,
+    _TOUCH_LEASE,
+)
 
 
 class FakePipeline:
@@ -40,7 +61,7 @@ class FakePipeline:
         self.ops.append(("pfcount", keys)); return self
 
     def expire(self, key, ttl):
-        return self
+        self.ops.append(("expire", key, ttl)); return self
 
     async def execute(self):
         """Returns one result per queued command, in order, like a real pipeline.
@@ -51,39 +72,51 @@ class FakePipeline:
         """
         results = []
         for op in self.ops:
-            if op[0] == "hincrbyfloat":
+            name = op[0]
+            if name == "hincrbyfloat":
                 _, key, field, amount = op
+                # Direct store mutation: purge first so a write to an
+                # expired-and-collected key recreates it instead of resurrecting
+                # the old value. The TTL on an existing key survives — HSET /
+                # HINCRBYFLOAT in real Redis neither refresh nor clear it.
+                self.store._purge_expired(key)
                 h = self.store.hashes.setdefault(key, {})
                 h[field] = float(h.get(field, 0)) + float(amount)
                 results.append(h[field])
-            elif op[0] == "hgetall":
+            elif name == "hgetall":
                 _, key = op
+                self.store._purge_expired(key)
                 results.append(self.store.hashes.get(key, {}))
-            elif op[0] == "hset":
+            elif name == "hset":
                 _, key, mapping = op
+                self.store._purge_expired(key)
                 self.store.hashes.setdefault(key, {}).update(
                     {k: str(v) for k, v in mapping.items()}
                 )
                 results.append(len(mapping))
-            elif op[0] == "zadd":
+            elif name == "zadd":
                 _, key, mapping, xx, ch = op
                 results.append(await self.store.zadd(key, mapping, xx=xx, ch=ch))
-            elif op[0] == "incr":
+            elif name == "incr":
                 _, key = op
                 results.append(await self.store.incr(key))
-            elif op[0] == "pfadd":
+            elif name == "pfadd":
                 _, key, members = op
                 results.append(await self.store.pfadd(key, *members))
-            elif op[0] == "pfcount":
+            elif name == "pfcount":
                 _, keys = op
                 results.append(await self.store.pfcount(*keys))
+            elif name == "expire":
+                _, key, ttl = op
+                results.append(await self.store.expire(key, ttl))
         self.ops.clear()
         return results
 
 
 class FakeRedis:
-    def __init__(self):
-        self.strings: dict[str, tuple[str, float | None]] = {}
+    def __init__(self, clock=None):
+        self.clock = clock if clock is not None else time.time
+        self.strings: dict[str, str | tuple[str, float | None]] = {}
         self.zsets: dict[str, dict[str, float]] = {}
         self.hashes: dict[str, dict[str, str]] = {}
         # HLL fake: each key is a set of distinct members added via pfadd.
@@ -96,39 +129,108 @@ class FakeRedis:
         # drain flow's reverse lease index (sy:lease_plan:{plan}) and any other
         # SMEMBERS-shaped surface that lands in tests.
         self.sets: dict[str, set[str]] = {}
+        # One expiry map covers every key type. A key's presence here means
+        # "has a TTL"; the value is the absolute deadline (epoch seconds). The
+        # key itself is removed from its store when the deadline passes; the
+        # expiry map entry is removed at the same time so a later EXPIRE on
+        # the same name starts fresh rather than reporting a stale deadline.
+        self._expiries: dict[str, float] = {}
+
+    def _now(self) -> float:
+        return float(self.clock())
+
+    def _purge_expired(self, key: str) -> None:
+        """Drop the key from every store if its TTL has fired.
+
+        Centralising the check here keeps the accessors tiny: each one calls
+        this before touching its store, so an expired-and-collected key reads
+        as a miss instead of resurrecting the old value.
+        """
+        deadline = self._expiries.get(key)
+        if deadline is None or deadline > self._now():
+            return
+        self.strings.pop(key, None)
+        self.zsets.pop(key, None)
+        self.hashes.pop(key, None)
+        self.sets.pop(key, None)
+        self.hlls.pop(key, None)
+        self._expiries.pop(key, None)
+
+    def _has_key(self, key: str) -> bool:
+        """True iff the key lives in at least one store. TTL does not count."""
+        return (key in self.strings or key in self.zsets
+                or key in self.hashes or key in self.sets
+                or key in self.hlls)
+
+    @staticmethod
+    def _string_value(stored):
+        """Unwrap a string entry. New writes are plain strings; older tests
+        that poke `fake.strings[k] = (value, expiry)` for setup still rely
+        on this accessor returning just the value.
+        """
+        if isinstance(stored, tuple):
+            return stored[0]
+        return stored
 
     # -- strings -----------------------------------------------------------
     async def set(self, key, value, ex=None):
-        self.strings[key] = (value, time.time() + ex if ex else None)
+        # Strings now store the bare value; the deadline lives in the shared
+        # `_expiries` map so non-string TTLs read through the same code path.
+        self.strings[key] = value
+        if ex:
+            self._expiries[key] = self._now() + float(ex)
+        else:
+            self._expiries.pop(key, None)
 
     async def get(self, key):
-        v = self.strings.get(key)
-        if not v:
-            return None
-        value, expires = v
-        if expires and expires < time.time():
-            del self.strings[key]
-            return None
-        return value
+        self._purge_expired(key)
+        return self._string_value(self.strings.get(key))
 
     async def ttl(self, key):
-        v = self.strings.get(key)
-        if not v or not v[1]:
+        # Real Redis semantics: -2 = key does not exist, -1 = key exists but
+        # has no TTL, N = seconds remaining. The only production caller
+        # (`slots.cooldown_state`) already clamps via `max(0, ttl)`, so the
+        # difference between "no TTL" and "expired this instant" is benign for
+        # the existing call sites; the strict shape lets future callers
+        # distinguish without surprise.
+        self._purge_expired(key)
+        if not self._has_key(key):
+            return -2
+        deadline = self._expiries.get(key)
+        if deadline is None:
             return -1
-        return max(0, int(v[1] - time.time()))
+        return max(0, int(deadline - self._now()))
 
     async def delete(self, key):
         self.strings.pop(key, None)
+        self.zsets.pop(key, None)
+        self.hashes.pop(key, None)
+        self.sets.pop(key, None)
+        self.hlls.pop(key, None)
+        self._expiries.pop(key, None)
 
     async def expire(self, key, ttl):
-        if key in self.strings:
-            self.strings[key] = (self.strings[key][0], time.time() + ttl)
+        """Real EXPIRE semantics: 1 if the key exists and got a TTL, else 0.
+
+        Works for every key type — strings, zsets, hashes, sets, HLLs — because
+        the TTL lives in the shared `_expiries` map and the store lookups all
+        read through it. Production callers (policy.note_pressure,
+        usage pipelines) hand us TTLs in hours/days, so they were silently
+        string-only before; the constraint is that those keys live in hashes,
+        which means the old implementation was a no-op against real usage.
+        """
+        self._purge_expired(key)
+        if not self._has_key(key):
+            return 0
+        self._expiries[key] = self._now() + float(ttl)
+        return 1
 
     # -- zsets -------------------------------------------------------------
     async def zadd(self, key, mapping, xx=False, ch=False, **_):
         """Real ZADD counts members *added*; with CH it counts added OR updated.
         The difference is the whole liveness signal behind touch(), so the fake
         has to model it or a broken heartbeat looks fine in tests."""
+        self._purge_expired(key)
         z = self.zsets.setdefault(key, {})
         changed = 0
         for member, score in mapping.items():
@@ -142,12 +244,15 @@ class FakeRedis:
         return changed
 
     async def zrem(self, key, member):
+        self._purge_expired(key)
         self.zsets.get(key, {}).pop(member, None)
 
     async def zcard(self, key):
+        self._purge_expired(key)
         return len(self.zsets.get(key, {}))
 
     async def zrange(self, key, start, stop):
+        self._purge_expired(key)
         members = sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])
         if stop == -1:
             stop = len(members)
@@ -156,29 +261,45 @@ class FakeRedis:
         return [m for m, _ in members[start:stop]]
 
     async def zremrangebyscore(self, key, lo, hi):
+        self._purge_expired(key)
         z = self.zsets.get(key, {})
         for m in [m for m, s in z.items() if s <= float(hi)]:
             del z[m]
 
     # -- hashes ------------------------------------------------------------
     async def hgetall(self, key):
+        self._purge_expired(key)
         return dict(self.hashes.get(key, {}))
 
     async def hset(self, key, mapping=None, **_):
+        self._purge_expired(key)
         self.hashes.setdefault(key, {}).update({k: str(v) for k, v in (mapping or {}).items()})
+        # Plain HSET is not a TTL reset in real Redis; the deadline on an
+        # existing key survives untouched. EXPIRE has to come from a separate
+        # op if the caller wants the key to age out (or refresh).
+        # (No _expiries mutation here on purpose.)
 
     async def hget(self, key, field):
+        self._purge_expired(key)
         return self.hashes.get(key, {}).get(field)
 
     async def hdel(self, key, field):
+        self._purge_expired(key)
         return 1 if self.hashes.get(key, {}).pop(field, None) is not None else 0
 
     async def incr(self, key):
-        val = int(float((await self.get(key)) or 0)) + 1
-        await self.set(key, str(val))
+        self._purge_expired(key)
+        existing = self.strings.get(key)
+        base = self._string_value(existing) if existing is not None else "0"
+        val = int(float(base)) + 1
+        self.strings[key] = str(val)
+        # Real INCR does not refresh TTL on an existing key, and does not set
+        # one on a fresh one. Honour that so an INCR-and-EXPIRE pair has to
+        # be two ops, the same as in real Redis.
         return val
 
     async def hincrbyfloat(self, key, field, amount):
+        self._purge_expired(key)
         h = self.hashes.setdefault(key, {})
         h[field] = str(float(h.get(field, 0)) + float(amount))
         return float(h[field])
@@ -196,6 +317,7 @@ class FakeRedis:
         # the canonical "did I add something" check would silently read a
         # count > 1 and behave wrong. Align here while only one PFADD caller
         # exists and the only test surface that cares is the cardinalities.
+        self._purge_expired(key)
         s = self.hlls.setdefault(key, set())
         added = 0
         for m in members:
@@ -209,6 +331,8 @@ class FakeRedis:
         # the union of the HLLs in a single call. The fake is exact, so the
         # union is set.union over the underlying sets (with absent keys
         # treated as empty sets, same as single-key behaviour).
+        for k in keys:
+            self._purge_expired(k)
         if len(keys) == 1:
             return len(self.hlls.get(keys[0], set()))
         return len(set().union(*(self.hlls.get(k, set()) for k in keys)))
@@ -220,6 +344,7 @@ class FakeRedis:
         # count. The drain flow's reverse lease index ignores the return
         # value, but keep the count right so anything branching on it later
         # (e.g. "did this session make it into the index") reads honestly.
+        self._purge_expired(key)
         s = self.sets.setdefault(key, set())
         added = 0
         for m in members:
@@ -229,6 +354,7 @@ class FakeRedis:
         return added
 
     async def srem(self, key, *members):
+        self._purge_expired(key)
         s = self.sets.get(key, set())
         removed = 0
         for m in members:
@@ -238,12 +364,15 @@ class FakeRedis:
         return removed
 
     async def smembers(self, key):
+        self._purge_expired(key)
         return list(self.sets.get(key, set()))
 
     async def scard(self, key):
+        self._purge_expired(key)
         return len(self.sets.get(key, set()))
 
     async def sismember(self, key, member):
+        self._purge_expired(key)
         return 1 if member in self.sets.get(key, set()) else 0
 
     def pipeline(self):
@@ -252,13 +381,47 @@ class FakeRedis:
     async def ping(self):
         return True
 
-    # -- the claim script --------------------------------------------------
+    # -- the Lua shadows ---------------------------------------------------
+    # Real Redis compiles each script once; the fake matches by exact-source
+    # identity against the constants in `switchyard.slots`. The fast suite
+    # already requires redis-py via slots.py, so importing the constants here
+    # is safe. Anything else raises loudly rather than silently falling through
+    # to the CLAIM fallback — a typo in a script constant or a renamed copy
+    # should never look like a working claim.
     def register_script(self, src):
-        # Dispatch on the Lua source so the fake can shadow both the original
-        # claim script, the two transient-failure scripts added in slots.py,
-        # and the two lease scripts added for the drain flow. Real Redis
-        # compiles each script once; the fake has to match by hand.
-        if "BUMP_AND_COOL" in src:
+        if src is _CLAIM:
+            async def claim(keys, args):
+                inflight_key, cool_key, model_key, lane_key = keys
+                rid, now, plan_cap, stale_before, ttl, model_cap, lane = args
+                if await self.get(cool_key) is not None:
+                    return -1
+                await self.zremrangebyscore(inflight_key, "-inf", stale_before)
+                await self.zremrangebyscore(model_key, "-inf", stale_before)
+                plan_z = self.zsets.setdefault(inflight_key, {})
+                if len(plan_z) >= int(plan_cap):
+                    return 0
+                mcap = int(model_cap)
+                model_z = self.zsets.setdefault(model_key, {})
+                if mcap >= 0 and len(model_z) >= mcap:
+                    return -2
+                plan_z[rid] = float(now)
+                model_z[rid] = float(now)
+                if lane:
+                    self.hashes.setdefault(lane_key, {})[rid] = str(lane)
+                # Mirror the Lua's ZADD-then-EXPIRE ordering: TTL the plan
+                # zset, the model zset, and the lane hash (when a lane is
+                # set) only after the writes succeed. A failed claim must
+                # not leave a TTL behind, and a successful one must, the
+                # same way the real Redis EVAL does it.
+                ttl = int(ttl)
+                await self.expire(inflight_key, ttl)
+                await self.expire(model_key, ttl)
+                if lane:
+                    await self.expire(lane_key, ttl)
+                return 1
+            return claim
+
+        if src is _BUMP_AND_COOL:
             async def bump_and_cool(keys, args):
                 streak_key, cool_key = keys
                 streak_ttl, base, cap, reason, now = args
@@ -275,31 +438,39 @@ class FakeRedis:
                                ex=max(1, int(cooldown)))
                 return v
             return bump_and_cool
-        if "BUMP_STREAK" in src:
+
+        if src is _BUMP_STREAK:
             async def bump_streak(keys, args):
                 streak_key = keys[0]
                 v = await self.incr(streak_key)
                 await self.expire(streak_key, int(args[0]))
                 return v
             return bump_streak
-        if "TOUCH_LEASE" in src:
+
+        if src is _TOUCH_LEASE:
             async def touch_lease(keys, args):
-                # Mirror the Lua: GET lease, return 0 if absent (and skip
-                # the SET TTL refresh, the exact contract a "lease was just
-                # dropped under us" caller wants); otherwise EXPIRE both
-                # the lease and the per-plan SET.
+                # Mirror the Lua: GET lease, return 0 if absent (and skip the
+                # EXPIRE refresh on either key — the exact contract a "lease
+                # was just dropped under us" caller wants); otherwise EXPIRE
+                # the lease AND the per-plan reverse-index SET.
                 lease_key = keys[0]
                 ttl = int(args[0])
                 v = await self.get(lease_key)
                 if v is None:
                     return 0
                 await self.expire(lease_key, ttl)
-                # The SET is just a Python set in this fake; the real Redis
-                # SET TTL is what the Lua EXPIRE on `sy:lease_plan:{plan}`
-                # would touch. Nothing for the fake to do here.
+                # Mirror Lua's `string.match(v, '^([^/]+)/')` exactly: only
+                # refresh the per-plan reverse-index SET when the lease value
+                # carries a `plan/` prefix. A bare lease value with no slash
+                # yields no match in real Redis (no EXPIRE on the SET); `split`
+                # would have refreshed a wrong SET key instead.
+                m = re.match(r"^([^/]+)/", v)
+                if m:
+                    await self.expire(f"sy:lease_plan:{m.group(1)}", ttl)
                 return 1
             return touch_lease
-        if "DROP_LEASE" in src:
+
+        if src is _DROP_LEASE:
             async def drop_lease(keys, args):
                 # Mirror the Lua: GET lease (to learn the plan), then
                 # DEL lease + DEL injection marker + SREM from the SET.
@@ -309,50 +480,32 @@ class FakeRedis:
                 await self.delete(lease_key)
                 await self.delete(inject_key)
                 if v is not None:
-                    plan_key = v.split("/", 1)[0]
-                    await self.srem(f"sy:lease_plan:{plan_key}", session)
+                    # Same Lua-vs-split drift as the touch_lease shadow: only
+                    # SREM the per-plan SET when the lease value carries a
+                    # `plan/` prefix.
+                    m = re.match(r"^([^/]+)/", v)
+                    if m:
+                        await self.srem(f"sy:lease_plan:{m.group(1)}", session)
                 return 1
             return drop_lease
-        if "SET_LEASE" in src:
+
+        if src is _SET_LEASE:
             async def set_lease(keys, args):
                 # Mirror the Lua: SADD to the SET, SET the lease with EX,
-                # EXPIRE the SET. The fake's `expire` only updates string
-                # keys today — same pre-existing gap the TOUCH_LEASE shadow
-                # already calls out. Adding SET-key TTL tracking would let
-                # a future test simulate a partial-failure mid-script; for
-                # now the fake faithfully reproduces the *bug* shape (the
-                # membership lands but the SET TTL is a no-op in the fake),
-                # so any test that wants the "atomicity holds across
-                # failures" property needs to assert the script's behaviour
-                # in real Redis. The test we add here pins the membership
-                # contract only.
+                # EXPIRE the SET. Now that `expire` works for every key type
+                # (not just strings) the SET TTL is honored end-to-end, so
+                # the membership and its bound TTL land together — the
+                # property the real Lua script exists to guarantee.
                 lease_key, set_key = keys
                 session, ref, ttl = args
                 added = await self.sadd(set_key, session)
                 await self.set(lease_key, ref, ex=int(ttl))
-                # SET EXPIRE — see comment above; the fake's expire is
-                # string-only and silently does nothing for SET keys today.
-                # The contract under test is the membership, not the TTL.
+                await self.expire(set_key, int(ttl))
                 return added
             return set_lease
 
-        async def claim(keys, args):
-            inflight_key, cool_key, model_key, lane_key = keys
-            rid, now, plan_cap, stale_before, _ttl, model_cap, lane = args
-            if await self.get(cool_key) is not None:
-                return -1
-            await self.zremrangebyscore(inflight_key, "-inf", stale_before)
-            await self.zremrangebyscore(model_key, "-inf", stale_before)
-            plan_z = self.zsets.setdefault(inflight_key, {})
-            if len(plan_z) >= int(plan_cap):
-                return 0
-            mcap = int(model_cap)
-            model_z = self.zsets.setdefault(model_key, {})
-            if mcap >= 0 and len(model_z) >= mcap:
-                return -2
-            plan_z[rid] = float(now)
-            model_z[rid] = float(now)
-            if lane:
-                self.hashes.setdefault(lane_key, {})[rid] = str(lane)
-            return 1
-        return claim
+        raise ValueError(
+            f"FakeRedis.register_script: unknown Lua source ({len(src)} chars). "
+            "Add an exact-source shadow in tests/fake_redis.py before importing "
+            "the new script into slots.py."
+        )
