@@ -31,7 +31,7 @@ fi
 # cannot be added is better than one that must be remembered.
 backup_dir="${SWITCHYARD_ENV_BACKUPS:-$HOME/.switchyard/env-backups}"
 mkdir -p "$backup_dir"
-backup="$backup_dir/env.$(date +%Y%m%d-%H%M%S)"
+backup="$backup_dir/env.$(date +%Y%m%d-%H%M%S).$$"
 cp "$target" "$backup"
 chmod 600 "$backup" 2>/dev/null || true
 
@@ -46,12 +46,16 @@ if [ -s "$target" ] && [ "$(tail -c1 "$target" | od -An -tx1 | tr -d ' \n')" != 
 fi
 
 added=0
-while IFS= read -r line; do
+while IFS= read -r line || [ -n "$line" ]; do
+  line=${line%$'\r'}
   case "$line" in
     ''|\#*) continue ;;
   esac
-  key="${line%%=*}"
-  if ! grep -q "^${key}=" "$target"; then
+  case "$line" in
+    export\ *) key="${line#export }" ; key="${key%%=*}" ;;
+    *)          key="${line%%=*}" ;;
+  esac
+  if ! grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$target"; then
     printf '%s\n' "$line" >> "$target"
     echo "  + $key"
     added=$((added + 1))
@@ -66,7 +70,7 @@ else
 fi
 
 # Report keys that exist but have no value, so nothing silently stays blank.
-empty=$(grep -E '^[A-Z0-9_]+=$' "$target" | cut -d= -f1 || true)
+empty=$(tr -d '\r' < "$target" | grep -E '^[A-Z0-9_]+=$' | cut -d= -f1 || true)
 if [ -n "$empty" ]; then
   echo
   echo "still empty (fill these in):"
