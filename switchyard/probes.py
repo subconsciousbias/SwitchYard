@@ -30,7 +30,7 @@ from typing import Any
 import httpx
 from redis.asyncio import Redis
 
-from .models import Plan
+from .models import Plan, Probe
 from .usage import Ledger
 
 log = logging.getLogger("switchyard.probes")
@@ -400,34 +400,7 @@ class Prober:
             return await self._fail(plan, "response was not JSON", False, raw=body[:1500])
 
         target = probe.window or plan.quota.label
-        scale = probe.scale or 1.0
-        readings: list[WindowReading] = []
-        for name, paths in (probe.windows or {}).items():
-            name = name or target
-            remaining = first_number(doc, paths.get("remaining", []))
-            total = first_number(doc, paths.get("total", []))
-            used = first_number(doc, paths.get("used", []))
-            used_pct = first_percent(doc, paths.get("used_percent", []))
-            if used_pct is None:
-                remaining_pct = first_percent(doc, paths.get("remaining_percent", []))
-                if remaining_pct is not None:
-                    used_pct = max(0.0, 100.0 - remaining_pct)
-            # Most consoles publish headroom; some publish spend against a limit
-            # instead (OpenCode's Go meters give usedMicroCents/limitMicroCents),
-            # so derive the one we need rather than reporting nothing.
-            if remaining is None and used is not None and total is not None:
-                remaining = max(0.0, total - used)
-            reading = WindowReading(
-                window=name,
-                remaining=None if remaining is None else remaining * scale,
-                total=None if total is None else total * scale,
-                used=None if used is None else used * scale,
-                used_percent=used_pct,
-                reset_at=first_timestamp(doc, paths.get("reset_at", [])),
-            )
-            if reading.reset_at and reading.reset_at > 1e12:      # milliseconds
-                reading.reset_at /= 1000.0
-            readings.append(reading)
+        readings = self._readings(probe, plan, doc)
 
         found = [r for r in readings
                  if r.remaining is not None or r.used_percent is not None]
@@ -490,6 +463,48 @@ class Prober:
         detail = "ok" if not missing else f"ok; no data for {', '.join(missing)}"
         return ProbeResult(True, detail, primary.remaining, primary.total,
                            primary.reset_at, raw=body[:1500], windows=readings)
+
+    def _readings(self, probe: Probe, plan: Plan, doc: Any) -> list[WindowReading]:
+        """Pure parse: response body + probe config -> WindowReading list.
+
+        Extracted from `run()` to bring its mccabe complexity below the
+        `[tool.ruff.lint.mccabe]` ceiling (25) without raising the limit;
+        the project's policy is to refactor rather than relax the
+        threshold (see pyproject.toml for the rationale). No behavior
+        change: every window-parsing branch lives here exactly as it
+        did inline, and the surrounding `run()` callers/consumers are
+        unchanged.
+        """
+        target = probe.window or plan.quota.label
+        scale = probe.scale or 1.0
+        readings: list[WindowReading] = []
+        for name, paths in (probe.windows or {}).items():
+            name = name or target
+            remaining = first_number(doc, paths.get("remaining", []))
+            total = first_number(doc, paths.get("total", []))
+            used = first_number(doc, paths.get("used", []))
+            used_pct = first_percent(doc, paths.get("used_percent", []))
+            if used_pct is None:
+                remaining_pct = first_percent(doc, paths.get("remaining_percent", []))
+                if remaining_pct is not None:
+                    used_pct = max(0.0, 100.0 - remaining_pct)
+            # Most consoles publish headroom; some publish spend against a limit
+            # instead (OpenCode's Go meters give usedMicroCents/limitMicroCents),
+            # so derive the one we need rather than reporting nothing.
+            if remaining is None and used is not None and total is not None:
+                remaining = max(0.0, total - used)
+            reading = WindowReading(
+                window=name,
+                remaining=None if remaining is None else remaining * scale,
+                total=None if total is None else total * scale,
+                used=None if used is None else used * scale,
+                used_percent=used_pct,
+                reset_at=first_timestamp(doc, paths.get("reset_at", [])),
+            )
+            if reading.reset_at and reading.reset_at > 1e12:      # milliseconds
+                reading.reset_at /= 1000.0
+            readings.append(reading)
+        return readings
 
     async def _fail(self, plan: Plan, detail: str, needs_reauth: bool,
                     raw: str = "") -> ProbeResult:

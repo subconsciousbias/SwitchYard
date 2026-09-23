@@ -1388,7 +1388,7 @@ def test_text_path_no_tools_passthrough_with_metadata_still_parses():
                     == "tools_unsupported"):
                 raise AssertionError(
                     f"text path must not 400 on tools when no tools present: "
-                    f"{exc.detail}")
+                    f"{exc.detail}") from exc
             assert exc.status_code in (429, 502), (
                 f"unexpected HTTPException from _handle_chat: "
                 f"{exc.status_code} {exc.detail}")
