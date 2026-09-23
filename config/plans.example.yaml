@@ -272,6 +272,19 @@ plans:
         5h:
           used_percent: [model_remains.model_name=general.current_interval_used_percent]
           reset_at: [model_remains.model_name=general.end_time]
+      # Just-in-time login ceremony (issue #227). When true, an operator can
+      # run `python3 -m switchyard.ceremony minimax-ultra` on the host to open
+      # `login_url` in a headful Chromium with an ephemeral profile, type
+      # credentials into the real browser (they never reach SwitchYard), and
+      # on reaching the post-auth console POST the harvested cookies to the
+      # portal's `POST /admin/probes/minimax-ultra/cookie`. The CLI refuses
+      # plans without this opt-in. `login_url` host MUST match `url` host —
+      # the loader raises otherwise, so a typo here fails fast at config
+      # load rather than silently logging into one site and POSTing cookies
+      # for another. Left disabled here; flip to `true` and set `login_url`
+      # to opt the plan in.
+      login_ceremony: false
+      login_url: ""
     notes: "Good at coding when the instructions are explicit."
     models:
       m3:

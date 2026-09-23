@@ -1064,6 +1064,36 @@ await fetch("/console/api/go/status", {credentials: "include",
   .then(r => r.json()).then(d => d.access.meters)
 ```
 
+#### Or: run the login ceremony on the host
+
+Pasting the cookie by hand works, but the header is long, easy to truncate, and
+puts the operator's hands on raw session material. For plans that opt in
+(`probe.login_ceremony: true` plus a matching `probe.login_url` whose host
+equals `probe.url`'s — see the commented example under `minimax-ultra` in
+`config/plans.example.yaml`), SwitchYard ships a host-side CLI that does the
+same thing end to end, with the credential handled by a real browser you own:
+
+```bash
+python3 -m switchyard.ceremony minimax-ultra   # or opencode-go, etc.
+```
+
+The **Real usage** panel on the portal shows the same command next to each
+cookie-probe row, copy-and-paste ready. The CLI opens the plan's login page in
+a local Chromium with an ephemeral profile (deleted on exit — nothing persists
+to disk), you type username / password / 2FA into the real browser, and on
+reaching the post-auth console the CLI POSTs the harvested cookie back to the
+existing `POST /admin/probes/{plan}/cookie` endpoint. The portal then runs the
+probe, and the new fingerprint shows up in the row.
+
+**Credentials never leave the ceremony.** The CLI never reads, logs or
+forwards a password — SwitchYard is the host for the cookie the browser keeps
+after login, not for the form fields the browser saw. Cookie domains are
+allowlisted against `probe.url`'s host at harvest time, so a cookie that does
+not belong to the probe's site is rejected before the POST, and the login URL
+is checked at config load against `probe.url` for the same reason. The CLI
+refuses plans that have not set `login_ceremony: true`. Paste remains the
+fallback for everything else.
+
 #### What you get
 
 - **minimax**: both windows as percentages, e.g. `5h 37% used · weekly 12% used`.

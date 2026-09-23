@@ -69,6 +69,30 @@
                    border-radius:6px;background:var(--bg);color:var(--ink)">
             <button class="tag" type="submit">save &amp; test</button>
           </form>
+          {# Login ceremony (issue #227): the portal container cannot launch a
+             browser on the host, so the affordance is the command itself --
+             copy and run it on the workstation that already has Chromium.
+             Paste remains the fallback when the plan has not opted in.
+             Shown on every cookie-probe row so the command is discoverable
+             even before `login_ceremony: true` is set. #}
+          <div class="muted" style="font-size:11px;margin-top:8px">
+            or run on the host:
+          </div>
+          <code class="mono" style="display:block;font-size:12px;margin-top:3px;
+               padding:5px 7px;border:1px solid var(--line);border-radius:6px;
+               background:var(--track);user-select:all;cursor:text">python3 -m switchyard.ceremony {{ p.plan.key }}</code>
+          <div class="muted" style="font-size:11px;margin-top:4px">
+            {% if p.plan.probe.login_ceremony %}
+              Opens the plan's login page in your local Chromium and POSTs
+              the harvested cookie back here. Your password never reaches
+              SwitchYard -- it stays in the browser you typed it into.
+            {% else %}
+              Plan not opted in -- set
+              <span class="mono">login_ceremony: true</span> and a matching
+              <span class="mono">login_url</span> in the plan's
+              <span class="mono">probe:</span> block to enable.
+            {% endif %}
+          </div>
         </td>
         <td class="nowrap">
           <button class="tag" hx-post="/admin/probes/{{ p.plan.key }}/test"

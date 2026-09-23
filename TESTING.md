@@ -1061,6 +1061,31 @@ A successful probe run with `capture_set_cookie: true` will print one
 line per rotation, with `plan=…` and `fingerprint=…` only — never the
 cookie value.
 
+### 8e. The login ceremony as an alternative to pasting
+
+When `capture_set_cookie` cannot help — the endpoint does not slide, and
+no refresh route fires on page load — the operator still has to put a
+cookie into Redis. The **Real usage** panel on the portal shows a copyable
+`python3 -m switchyard.ceremony <plan>` line next to every cookie-probe
+row (see the README's "Real numbers from a browser session" section for
+the setup, the trust note, and the `login_ceremony` / `login_url` opt-in
+in `config/plans.example.yaml`). The CLI opens the plan's login page in a
+local Chromium with an ephemeral profile, the operator types credentials
+into the real browser, and on reaching the post-auth console the CLI
+POSTs the harvested cookie back to `POST /admin/probes/{plan}/cookie`.
+**Credentials never leave the ceremony**: the CLI never reads or logs a
+password, the harvested cookies are allowlisted against `probe.url`'s
+host, and `login_url` host must equal `probe.url` host (validated at
+config load). Pasting the cookie by hand remains the fallback for plans
+that have not opted in.
+
+The portal container cannot launch a host browser, so the affordance is
+the command itself — copy it from the panel and run it on the workstation
+that already has Chromium installed. This sub-section exists as a pointer;
+the live behaviour lives in `switchyard/ceremony.py`, and the offline
+regression bar is `python3 tests/render_preview.py`, which renders the
+panel against both an opted-in and a non-opted-in cookie plan.
+
 ---
 
 ## 9. Post-deploy check: the token-counter patch

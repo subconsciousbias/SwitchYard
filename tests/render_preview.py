@@ -185,6 +185,15 @@ def probe_fixture(reg):
     status dict so the panel can render "last good HH:MM" on a stale row.
     The preview matches the real shape so the template path that uses it
     is exercised.
+
+    WS2 (issue #227): the panel's per-row ceremony command must render for
+    cookie probes regardless of whether `login_ceremony: true` is set, so
+    both an opted-in and a non-opted-in probe are exercised here. The
+    `login_ceremony` flag is wired onto the first cookie plan via
+    `dataclasses.replace` (the dataclass is frozen), so the conditional
+    inside `_probes.html` hits both branches offline -- a Jinja typo in the
+    opted-in branch would fail this fixture's render before reaching the
+    board.
     """
     out = []
     cookie_plans = [p for p in reg.plans.values()
@@ -194,6 +203,19 @@ def probe_fixture(reg):
         last_ok = time.time() - 120 if healthy else None
         last_ok_hhmm = (time.strftime("%H:%M", time.gmtime(last_ok))
                         if last_ok else "—")
+        # The first cookie plan in the example is opted into the ceremony
+        # so the trust note ("password never reaches SwitchYard") is
+        # rendered. Every other cookie plan stays non-opted-in, exercising
+        # the hint branch ("set login_ceremony: true … to enable"). The
+        # login URL mirrors the probe URL so the loader's host-equality
+        # check would also pass if this fixture were loaded as plans.yaml.
+        if i == 0:
+            import dataclasses as _dc
+            opted_probe = _dc.replace(
+                plan.probe,
+                login_ceremony=True,
+                login_url=plan.probe.url)
+            plan = _dc.replace(plan, probe=opted_probe)
         out.append({
             "plan": plan,
             "status": {"has_cookie": True, "fingerprint": "412 chars, #9f2a1c3d",

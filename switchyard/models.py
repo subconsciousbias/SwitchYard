@@ -111,6 +111,24 @@ class Probe:
     # behaviour — capture only fires on plans that explicitly opt in and where
     # the console actually rotates the cookie on each successful request.
     capture_set_cookie: bool = False
+    # Opt-in just-in-time login ceremony (issue #227). When True, an operator
+    # can run `python3 -m switchyard.ceremony <plan>` on the host to open
+    # `login_url` in a headful Chromium with an ephemeral profile, type
+    # credentials into the real browser (they never reach SwitchYard), and on
+    # reaching the post-auth console POST the harvested cookies to the portal's
+    # existing `POST /admin/probes/{plan}/cookie` endpoint. Default False keeps
+    # today's exact behaviour — the ceremony only fires on plans that explicitly
+    # opt in, and the CLI itself refuses plans without the opt-in flag. The
+    # login URL must share its host with `url` (validated at load time) so the
+    # ceremony cannot exfiltrate cookies for a different site than the probe
+    # already polls.
+    login_ceremony: bool = False
+    # Where `python3 -m switchyard.ceremony <plan>` opens the headful browser.
+    # Required when `login_ceremony: true`; ignored otherwise. The host of this
+    # URL must match the host of `url` — checked at load — so an operator
+    # cannot point the ceremony at one provider and have it POST cookies to a
+    # different plan's allowlist.
+    login_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -724,7 +742,57 @@ def _parse_probe(raw: Any) -> Probe | None:
     # to know which form the config used.
     if fields and not windows:
         windows = {body.get("window") or "": fields}
-    return Probe(fields=fields, windows=windows, **body)
+    login_ceremony = bool(body.pop("login_ceremony", False))
+    login_url = str(body.pop("login_url", "") or "")
+    if login_ceremony:
+        # `login_ceremony: true` without a target URL is the worst kind of
+        # mistake — the CLI would refuse the plan at runtime, but a plan
+        # whose probe silently broke because the operator forgot to fill
+        # in the URL is worse. Loud-parse at load, matching the rest of
+        # the probe checks (kind: cookie without `url`, etc.).
+        if not login_url:
+            raise ValueError(
+                "probe.login_ceremony: true requires probe.login_url to be set")
+        # Host pinning: the ceremony's allowlist is derived from `url`'s
+        # host, so a `login_url` on a different host would silently let the
+        # operator type credentials into one site and POST cookies for
+        # another. Force the two URLs to share a host at load.
+        url_host = _url_host(body.get("url", ""))
+        login_host = _url_host(login_url)
+        if not url_host or not login_host:
+            raise ValueError(
+                f"probe.login_ceremony requires both probe.url and "
+                f"probe.login_url to be parseable URLs with hosts; got "
+                f"url={body.get('url')!r}, login_url={login_url!r}")
+        if url_host != login_host:
+            raise ValueError(
+                f"probe.login_ceremony requires login_url host to match "
+                f"probe.url host (so the cookie allowlist matches the page "
+                f"the operator is logging into); got url host {url_host!r} "
+                f"and login_url host {login_host!r}")
+    return Probe(fields=fields, windows=windows,
+                 login_ceremony=login_ceremony, login_url=login_url, **body)
+
+
+def _url_host(value: Any) -> str:
+    """Host of an http(s) URL, or "" if the URL is unparseable.
+
+    Used by the loader to pin `probe.login_url` to `probe.url`'s host when
+    `probe.login_ceremony: true`. Local import: this function only fires
+    when an operator sets `login_ceremony: true`, which is opt-in, so
+    keeping `from urllib.parse import urlparse` out of the module's
+    top-level import surface means a probe-less load path doesn't pay
+    the cost. Returns the host lower-cased so a `URL` vs `url` casing
+    difference in config does not split validation.
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(value).hostname or "").lower()
+    except Exception:
+        return ""
+    return host
 
 
 def _parse_model_max_parallel(plan_key: str, model_key: str, raw: Any) -> int | None:
