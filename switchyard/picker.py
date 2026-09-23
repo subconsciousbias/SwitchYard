@@ -245,11 +245,11 @@ class Picker:
         if cooled:
             ctx.skipped.append(f"{ref}(cooled: {reason})")
             return None
-        # Drain gate: a plan with the drain flag set refuses NEW requests.
-        # apply.sh migrates existing leases before flipping the flag, so the
-        # affinity path can ignore this — the only way a NEW request reaches a
-        # drained plan is through this body walk, and falling through to the
-        # sibling is exactly what the migration is meant to make happen.
+        # Drain gate: a plan with the drain flag set refuses to be picked.
+        # The picker is safe regardless of apply.sh's order of operations;
+        # the affinity path has its own is_draining check (see _affinity),
+        # and this body-walk gate catches every NEW request so falling
+        # through to the sibling is the only path a drained ref can take.
         if await self.slots.is_draining(plan.key):
             ctx.skipped.append(f"{ref}(draining)")
             return None
@@ -658,6 +658,25 @@ class Picker:
         if held in ctx.exclude:
             await self.slots.drop_lease(ctx.session)
             return None
+        # Drain gate: refuse to honour a lease on any plan that is currently
+        # draining, regardless of apply.sh's order of operations. apply.sh
+        # sets `sy:drain:{plan}` BEFORE it runs `python -m switchyard.drain`,
+        # so the migrator walks `sessions_on_plan(plan)` while the flag is on;
+        # `picker.pick(lane, session, exclude=drained_refs)` reaches this
+        # path with the held lease still on the drained plan, drops it via
+        # the `held in ctx.exclude` branch above, and re-leases onto a
+        # sibling. The defensive check here covers the opposite direction:
+        # a fresh request (no exclude set) arriving for a session whose
+        # lease is still on a drained plan — which happens between the
+        # flag flip and the migrate's SREM finishing — must NOT honour
+        # that lease either. Drop it; the body walk below lands on a sibling.
+        held_model = self.registry.model(held)
+        if held_model is not None:
+            held_plan = self.registry.plan_of(held_model)
+            if await self.slots.is_draining(held_plan.key):
+                await self.slots.drop_lease(ctx.session)
+                ctx.skipped.append(f"{held}(draining)")
+                return None
         reachable = set(self.registry.routing_order(ctx.lane))
         reachable.update(self.registry.lanes[ctx.lane].tail)
         if held not in reachable:

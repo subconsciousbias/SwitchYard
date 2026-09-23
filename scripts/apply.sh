@@ -383,9 +383,16 @@ else
     drain_out="$(mktemp -t switchyard-drain.XXXXXX.txt 2>/dev/null || true)"
     if docker compose exec -T gateway python -m switchyard.drain "$plan" \
          >"$drain_out" 2>&1; then
-      migrated="$(tr -d '\r\n' < "$drain_out" | tail -n 1 \
-                    | grep -oE '[0-9]+' || echo 0)"
-      echo "    sessions migrated: ${migrated:-0}"
+      # Parse ONLY the final summary line — `drain.migrate` prints per-session
+      # audit lines above it ("{session}: {plan}/{label} -> {ref}"), and a
+      # naive `grep -oE '[0-9]+'` would pull digits from session ids, plan
+      # labels and refs (a `5g` plan's first match is the plan name, not the
+      # count). The summary line has the exact shape
+      #   `migrated <count> session(s) off <plan>`
+      # so awk on `^migrated ` with $2 as the count is the safe shape.
+      migrated="$(awk '/^migrated [0-9]+ session/ {print $2; exit}' "$drain_out")"
+      [ -n "$migrated" ] || migrated=0
+      echo "    sessions migrated: ${migrated}"
     else
       echo "    lease migration skipped (drain helper unavailable or no leases)"
     fi

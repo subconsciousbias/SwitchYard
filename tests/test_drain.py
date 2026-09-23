@@ -254,6 +254,54 @@ def test_drain_migrate_rewrites_n_leases_to_the_sibling_ref():
           f"sibling untouched ({sibling_lease}); drained SET cleared")
 
 
+def test_affinity_drops_lease_when_held_plan_is_draining():
+    """A session whose lease is on a draining plan must NOT be honoured by
+    affinity, even on a fresh request whose `ctx.exclude` does NOT name the
+    drained ref. apply.sh sets the flag BEFORE the migrator runs, so a
+    request can arrive between flag-flip and migrate's SREM; the affinity
+    path is the safety net (see picker.py `_affinity`).
+
+    Without this gate, the lease would be honoured, the body walk would
+    be skipped, and the request would land on the draining ref — exactly
+    what the drain flag is meant to prevent.
+    """
+    async def go():
+        reg, slots, picker = _build()
+        lane = "forge"
+        target = next(m for m in reg.lane_members(lane)
+                      if m.plan_key == "minimax-ultra")
+        sibling = next(m for m in reg.lane_members(lane)
+                       if m.plan_key != target.plan_key
+                       and not reg.is_tail(lane, m.ref))
+        ttl = reg.settings.lease_ttl_seconds
+
+        # Lease the session to the target ref the way a live conversation
+        # would. Then flip the drain flag on the target's plan — this is
+        # what apply.sh:375 does, before apply.sh:384 runs the migrator.
+        await slots.set_lease("affinity-drain", target.ref, ttl, target.plan_key)
+        await slots.set_drain(target.plan_key)
+
+        # Pick with the SAME session id. ctx.exclude is empty (a fresh
+        # request, not the migrator): the affinity path is the only thing
+        # that can stop the lease being honoured.
+        pick = await picker.pick(lane, "affinity-drain")
+        lease_after = await slots.get_lease("affinity-drain")
+        return pick, lease_after, target, sibling
+
+    pick, lease_after, target, sibling = _run(go())
+    assert pick.ref != target.ref, (
+        f"affinity on a draining {target.ref} must NOT land on the drained "
+        f"ref; got {pick.ref}")
+    assert pick.ref == sibling.ref, (
+        f"the body walk after the affinity drop should land on the live "
+        f"sibling {sibling.ref}; got {pick.ref}")
+    assert lease_after == sibling.ref, (
+        f"the affinity drop must RE-LEASE the session onto the sibling "
+        f"so future picks honour the new pin; got {lease_after!r}")
+    print(f"  drained lease held on {target.ref}; affinity dropped, "
+          f"re-leased onto {pick.ref}; future pick pins {lease_after}")
+
+
 if __name__ == "__main__":
     test_funcs = [(name, fn) for name, fn in sorted(globals().items())
                   if name.startswith("test_") and callable(fn)]

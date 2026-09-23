@@ -17,11 +17,15 @@ K_INFLIGHT = "sy:inflight:{plan}"
 K_INFLIGHT_MODEL = "sy:inflight:m:{ref}"
 K_COOL = "sy:cool:{plan}"
 K_LEASE = "sy:lease:{session}"
-# Drain flag: when set on a plan, every ref whose plan is `plan` is treated as
-# out of service for NEW requests — the picker adds "(draining)" to its
-# considered list and moves on to the lane's next sibling. Affinity does NOT
-# read this flag (apply.sh migrates leases BEFORE draining, so a live lease
-# pointing at a drained ref is one apply.sh didn't migrate, not a normal state).
+# Drain flag: when set on a plan, the picker refuses to honour any lease on
+# it AND refuses to claim a fresh slot on it. The body-walk gate surfaces
+# the ref as "(draining)" in `considered` and falls through to the lane's
+# next sibling; the affinity path drops the lease so a fresh request that
+# arrives while a lease is still on the drained plan also lands on a sibling.
+# apply.sh sets this flag BEFORE running the migrate helper, so the picker
+# must enforce both gates itself; the flag is the contract, not apply.sh's
+# ordering. A future maintainer who reorders apply.sh (or narrows the
+# affinity drop) does not change that contract.
 K_DRAIN = "sy:drain:{plan}"
 # Reverse lease index: per-plan SET of session ids whose lease currently
 # points at a ref on this plan. Backs `sessions_on_plan(plan)`, which the
@@ -128,6 +132,55 @@ redis.call('SET', KEYS[2], reason .. '|' .. until_ts, 'EX', math.max(1, math.flo
 return streak
 """
 
+# Refresh lease TTL + per-plan reverse-index TTL atomically. The reverse
+# index is keyed by the lease's plan prefix (`sy:lease_plan:{plan}`), so the
+# script reads the lease value BEFORE refreshing — and crucially, the
+# previous two-step Python sequence (EXPIRE then GET) could observe the
+# lease after a concurrent drop / TTL fire / failover, and the EXPIRE of
+# the SET would never run, leaving the SET to age out against a still-live
+# (on a stale-primary) lease. Single-script: read, conditionally refresh
+# both, no race.
+#
+# KEYS[1] lease key
+# ARGV[1] ttl
+# -> 1 refreshed | 0 lease gone (nothing to refresh against)
+_TOUCH_LEASE = """
+-- TOUCH_LEASE
+local v = redis.call('GET', KEYS[1])
+if not v then return 0 end
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+local plan = string.match(v, '^([^/]+)/')
+if plan then
+  redis.call('EXPIRE', 'sy:lease_plan:' .. plan, ARGV[1])
+end
+return 1
+"""
+
+# Drop lease + injection marker + per-plan reverse-index membership
+# atomically. Reads the lease BEFORE deleting it so the SREM targets the
+# right plan key; if the lease was already gone (TTL fired, prior drop,
+# failover to a primary that didn't have it), the SREM is a silent no-op.
+# Injection marker rides on the lease — see drop_lease's docstring for why
+# clearing it here covers the three lease-drop sites.
+#
+# KEYS[1] lease key
+# KEYS[2] injection marker key
+# ARGV[1] session id (for SREM against the per-plan SET)
+# -> always 1
+_DROP_LEASE = """
+-- DROP_LEASE
+local v = redis.call('GET', KEYS[1])
+redis.call('DEL', KEYS[1])
+redis.call('DEL', KEYS[2])
+if v then
+  local plan = string.match(v, '^([^/]+)/')
+  if plan then
+    redis.call('SREM', 'sy:lease_plan:' .. plan, ARGV[1])
+  end
+end
+return 1
+"""
+
 
 @dataclass
 class Claim:
@@ -143,6 +196,8 @@ class SlotTable:
         self._claim = redis.register_script(_CLAIM)
         self._bump_streak = redis.register_script(_BUMP_STREAK)
         self._bump_and_cool = redis.register_script(_BUMP_AND_COOL)
+        self._touch_lease = redis.register_script(_TOUCH_LEASE)
+        self._drop_lease = redis.register_script(_DROP_LEASE)
 
     # -- capacity ----------------------------------------------------------
     async def try_claim(self, plan: str, cap: int, request_id: str,
@@ -272,32 +327,35 @@ class SlotTable:
         await self.redis.expire(K_LEASE_PLAN.format(plan=plan_key), ttl)
 
     async def touch_lease(self, session: str, ttl: int) -> None:
-        await self.redis.expire(K_LEASE.format(session=session), ttl)
-        # The reverse index follows the lease TTL too — if the lease is
-        # still alive, the session is still a candidate for the drain flow.
-        # Reading the lease is cheaper than threading the plan through every
-        # touch_lease call site, and the ref's plan key is on it.
-        lease = await self.redis.get(K_LEASE.format(session=session))
-        if lease:
-            ref = lease.decode() if isinstance(lease, bytes) else lease
-            plan_key = ref.split("/", 1)[0]
-            await self.redis.expire(K_LEASE_PLAN.format(plan=plan_key), ttl)
+        # Atomic: the script reads the lease value first, so a concurrent
+        # drop / TTL fire / failover between the read and the EXPIRE is
+        # impossible. The reverse-index TTL only refreshes when the lease
+        # was actually present — exactly the contract a "lost the lease"
+        # caller wants (no phantom SET refresh against a dead mapping).
+        await self._touch_lease(
+            keys=[K_LEASE.format(session=session)],
+            args=[ttl],
+        )
 
     async def drop_lease(self, session: str) -> None:
-        # Read the lease BEFORE deleting it so the reverse index knows which
-        # plan's SET to remove the session from. If the lease was already
-        # gone (TTL fired, prior drop), the SREM is a silent no-op.
-        lease = await self.redis.get(K_LEASE.format(session=session))
-        # The injection marker rides on the lease: clearing it here covers the
-        # three lease-drop sites (hooks.py post-call failure, picker.py held-
-        # but-unservable, picker.py pinned-but-no-slot) so a hard plan rejection
-        # that re-leases the session re-enables injection on the next turn.
-        await self.redis.delete(K_LEASE.format(session=session))
-        await self.redis.delete(K_INJECTED.format(session=session))
-        if lease:
-            ref = lease.decode() if isinstance(lease, bytes) else lease
-            plan_key = ref.split("/", 1)[0]
-            await self.redis.srem(K_LEASE_PLAN.format(plan=plan_key), session)
+        # Atomic: read lease, DEL lease, DEL injection marker, SREM from
+        # the per-plan reverse index — all in one script. The previous
+        # two-step (GET then DEL + SREM) was subject to the same race as
+        # touch_lease: between the GET and the SREM, the lease could be
+        # re-created with a different plan and the SREM would target the
+        # wrong SET. Single-script: read once, SREM against the same
+        # snapshot the read returned.
+        #
+        # The injection marker rides on the lease: clearing it here covers
+        # the three lease-drop sites (hooks.py post-call failure, picker.py
+        # held-but-unservable, picker.py pinned-but-no-slot) so a hard plan
+        # rejection that re-leases the session re-enables injection on the
+        # next turn.
+        await self._drop_lease(
+            keys=[K_LEASE.format(session=session),
+                  K_INJECTED.format(session=session)],
+            args=[session],
+        )
 
     # -- plan drain gate ----------------------------------------------------
     # A drained plan refuses new work without unmounting anything — apply.sh

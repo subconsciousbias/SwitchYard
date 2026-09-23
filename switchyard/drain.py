@@ -2,13 +2,11 @@
 
 Running `python -m switchyard.drain <plan>` migrates every session currently
 leased to that plan onto a sibling, so no lease is left pointing at the
-drained ref when apply.sh recreates the containers behind it. The flag the
-picker reads to refuse new traffic on a drained plan (`sy:drain:{plan}`) is
-set AFTER migration completes; flipping it first would just make the
-re-pick inside the migrator fall through to the same siblings anyway, but
-keeping the order drain-after-migrate means a session that gets re-leased
-during the migration lands somewhere useful rather than waiting on a
-fresh pick against a now-flagged plan.
+drained ref when apply.sh recreates the containers behind it. The picker
+already refuses new work on a drained plan (the body-walk gate in
+`_visit_ref` and the affinity drop on a draining held plan in `_affinity`),
+so the migrator's contract is just "no lease points at the drained ref
+after this runs" — apply.sh's order of operations is the operator's call.
 """
 from __future__ import annotations
 
@@ -34,10 +32,19 @@ async def migrate(plan_key: str, slots: SlotTable, picker: Picker,
     line per migrated session and a final count.
 
     The lane argument comes from the registry: a session is migrated through
-    the first lane that names a ref on the drained plan (the lane the
-    session was reachable from before draining started). A session whose
-    only lane has no non-drained capacity is left untouched — the caller
-    sees the SKIP line and can decide whether to retry or accept the loss.
+    any lane that names a ref on the drained plan; the first lane in
+    registry iteration order whose `pick` succeeds wins. A ref shared by
+    several lanes (e.g. one `claude-max/fable` named in both `forge` and
+    `tools`) lets a session that originated on lane A be re-leased onto a
+    sibling reachable only via lane B — both legs are valid siblings, but
+    the lane identity on the capacity board can change. If you need a
+    stricter "same lane" contract, look up `slots.get_lease(session)` first
+    and pin the candidate lane set to lanes whose `lane_members` covers the
+    held ref; today that is not done.
+
+    A session whose every candidate lane has no non-drained capacity is
+    left untouched — the caller sees the SKIP line and can decide whether
+    to retry or accept the loss.
 
     Returns (count_migrated, list_of_session_ids_migrated). The list is in
     the order sessions were processed (which is the SET iteration order).
@@ -62,8 +69,12 @@ async def migrate(plan_key: str, slots: SlotTable, picker: Picker,
                 placed = await picker.pick(
                     lane, session, exclude=drained_refs)
                 break
-            except Exception as exc:
-                last_exc = exc
+            except Exception:
+                # LaneSaturated, a Redis error, anything — the next lane
+                # in registry iteration order gets a turn. If every lane
+                # fails, the SKIP branch below records the session as
+                # left-behind without surfacing the (possibly low-value)
+                # last exception.
                 continue
         if placed is None:
             print(f"{session}: SKIP (no lane could place after drain)",
