@@ -91,6 +91,11 @@ class FakeRedis:
         # the test surface only cares about "how many distinct sessions this
         # model saw this month" so an exact set is the right semantics to fake.
         self.hlls: dict[str, set[str]] = {}
+        # Sets: exact membership (real Redis SETs use a hash table internally;
+        # the test surface only needs set semantics, not encoding). Backs the
+        # drain flow's reverse lease index (sy:lease_plan:{plan}) and any other
+        # SMEMBERS-shaped surface that lands in tests.
+        self.sets: dict[str, set[str]] = {}
 
     # -- strings -----------------------------------------------------------
     async def set(self, key, value, ex=None):
@@ -207,6 +212,39 @@ class FakeRedis:
         if len(keys) == 1:
             return len(self.hlls.get(keys[0], set()))
         return len(set().union(*(self.hlls.get(k, set()) for k in keys)))
+
+    # -- sets --------------------------------------------------------------
+    async def sadd(self, key, *members):
+        # Real SADD returns the number of members that were ADDED (i.e. were
+        # not already present). Members that were already members do not
+        # count. The drain flow's reverse lease index ignores the return
+        # value, but keep the count right so anything branching on it later
+        # (e.g. "did this session make it into the index") reads honestly.
+        s = self.sets.setdefault(key, set())
+        added = 0
+        for m in members:
+            if m not in s:
+                s.add(m)
+                added += 1
+        return added
+
+    async def srem(self, key, *members):
+        s = self.sets.get(key, set())
+        removed = 0
+        for m in members:
+            if m in s:
+                s.discard(m)
+                removed += 1
+        return removed
+
+    async def smembers(self, key):
+        return list(self.sets.get(key, set()))
+
+    async def scard(self, key):
+        return len(self.sets.get(key, set()))
+
+    async def sismember(self, key, member):
+        return 1 if member in self.sets.get(key, set()) else 0
 
     def pipeline(self):
         return FakePipeline(self)

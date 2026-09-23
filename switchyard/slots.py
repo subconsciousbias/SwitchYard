@@ -17,6 +17,19 @@ K_INFLIGHT = "sy:inflight:{plan}"
 K_INFLIGHT_MODEL = "sy:inflight:m:{ref}"
 K_COOL = "sy:cool:{plan}"
 K_LEASE = "sy:lease:{session}"
+# Drain flag: when set on a plan, every ref whose plan is `plan` is treated as
+# out of service for NEW requests — the picker adds "(draining)" to its
+# considered list and moves on to the lane's next sibling. Affinity does NOT
+# read this flag (apply.sh migrates leases BEFORE draining, so a live lease
+# pointing at a drained ref is one apply.sh didn't migrate, not a normal state).
+K_DRAIN = "sy:drain:{plan}"
+# Reverse lease index: per-plan SET of session ids whose lease currently
+# points at a ref on this plan. Backs `sessions_on_plan(plan)`, which the
+# drain migration walks to find what to re-pick. Maintained by set_lease /
+# touch_lease / drop_lease so a stale SET is impossible — every state change
+# to a lease updates the index in the same code path. TTL matched to the
+# lease so the index self-heals when a session's lease expires on its own.
+K_LEASE_PLAN = "sy:lease_plan:{plan}"
 # Marks a session whose first turn has had the "you are running through
 # SwitchYard, your native tools are unavailable" system note appended. Sticky
 # for the lease TTL so a resumed CLI session after a server restart still
@@ -246,19 +259,70 @@ class SlotTable:
         v = await self.redis.get(K_LEASE.format(session=session))
         return (v.decode() if isinstance(v, bytes) else v) if v else None
 
-    async def set_lease(self, session: str, plan: str, ttl: int) -> None:
-        await self.redis.set(K_LEASE.format(session=session), plan, ex=ttl)
+    async def set_lease(self, session: str, ref: str, ttl: int,
+                        plan_key: str | None = None) -> None:
+        # `ref` is the model ref (e.g. `claude-max/fable`); the plan key is
+        # the prefix before `/`. Callers in the picker pass it explicitly so
+        # the plan lookup is done once, but it is optional for tests that
+        # already have the ref and don't want to thread a registry through.
+        if plan_key is None:
+            plan_key = ref.split("/", 1)[0]
+        await self.redis.set(K_LEASE.format(session=session), ref, ex=ttl)
+        await self.redis.sadd(K_LEASE_PLAN.format(plan=plan_key), session)
+        await self.redis.expire(K_LEASE_PLAN.format(plan=plan_key), ttl)
 
     async def touch_lease(self, session: str, ttl: int) -> None:
         await self.redis.expire(K_LEASE.format(session=session), ttl)
+        # The reverse index follows the lease TTL too — if the lease is
+        # still alive, the session is still a candidate for the drain flow.
+        # Reading the lease is cheaper than threading the plan through every
+        # touch_lease call site, and the ref's plan key is on it.
+        lease = await self.redis.get(K_LEASE.format(session=session))
+        if lease:
+            ref = lease.decode() if isinstance(lease, bytes) else lease
+            plan_key = ref.split("/", 1)[0]
+            await self.redis.expire(K_LEASE_PLAN.format(plan=plan_key), ttl)
 
     async def drop_lease(self, session: str) -> None:
+        # Read the lease BEFORE deleting it so the reverse index knows which
+        # plan's SET to remove the session from. If the lease was already
+        # gone (TTL fired, prior drop), the SREM is a silent no-op.
+        lease = await self.redis.get(K_LEASE.format(session=session))
         # The injection marker rides on the lease: clearing it here covers the
         # three lease-drop sites (hooks.py post-call failure, picker.py held-
         # but-unservable, picker.py pinned-but-no-slot) so a hard plan rejection
         # that re-leases the session re-enables injection on the next turn.
         await self.redis.delete(K_LEASE.format(session=session))
         await self.redis.delete(K_INJECTED.format(session=session))
+        if lease:
+            ref = lease.decode() if isinstance(lease, bytes) else lease
+            plan_key = ref.split("/", 1)[0]
+            await self.redis.srem(K_LEASE_PLAN.format(plan=plan_key), session)
+
+    # -- plan drain gate ----------------------------------------------------
+    # A drained plan refuses new work without unmounting anything — apply.sh
+    # is free to recreate the containers while traffic has already moved to
+    # the sibling. The flag is just a sentinel; the gate lives in the picker
+    # next to the cooldown gate.
+    async def set_drain(self, plan: str) -> None:
+        await self.redis.set(K_DRAIN.format(plan=plan), "1")
+
+    async def clear_drain(self, plan: str) -> None:
+        await self.redis.delete(K_DRAIN.format(plan=plan))
+
+    async def is_draining(self, plan: str) -> bool:
+        return bool(await self.redis.get(K_DRAIN.format(plan=plan)))
+
+    async def sessions_on_plan(self, plan: str) -> list[str]:
+        """Session ids currently leased to a ref on `plan`, in SET order.
+
+        Used by `switchyard/drain.py` to walk every session that needs
+        migrating before a drained plan is taken out of service. The reverse
+        index is maintained by set_lease / touch_lease / drop_lease, so this
+        is the live picture — no stale keys, no scans.
+        """
+        raw = await self.redis.smembers(K_LEASE_PLAN.format(plan=plan))
+        return [m.decode() if isinstance(m, bytes) else m for m in raw]
 
     async def injected(self, session: str) -> bool:
         v = await self.redis.get(K_INJECTED.format(session=session))

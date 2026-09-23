@@ -245,6 +245,14 @@ class Picker:
         if cooled:
             ctx.skipped.append(f"{ref}(cooled: {reason})")
             return None
+        # Drain gate: a plan with the drain flag set refuses NEW requests.
+        # apply.sh migrates existing leases before flipping the flag, so the
+        # affinity path can ignore this — the only way a NEW request reaches a
+        # drained plan is through this body walk, and falling through to the
+        # sibling is exactly what the migration is meant to make happen.
+        if await self.slots.is_draining(plan.key):
+            ctx.skipped.append(f"{ref}(draining)")
+            return None
         # 5h gate: a perishable or lowest_utilization group may have gated this
         # ref on the 5h constraint window. The flag is read from the SAME hash
         # the ranking lives in, so a missing/stale hash means "no gate", which
@@ -276,7 +284,8 @@ class Picker:
             return None
         if ctx.session:
             await self.slots.set_lease(
-                ctx.session, model.ref, self.registry.settings.lease_ttl_seconds)
+                ctx.session, model.ref,
+                self.registry.settings.lease_ttl_seconds, plan.key)
         return Pick(ctx.lane, model, plan, ctx.rid, ctx.session, False,
                     list(ctx.skipped), cap, cap_reason, picked_group)
 

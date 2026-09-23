@@ -1213,6 +1213,136 @@ sidecar is written so that field is optional: passive re-resolution is
 the primary source, the stamp is belt-and-braces, and the system never
 fails because the stamp is missing.
 
+---
+
+## 11. Live zero-downtime apply.sh drain (issue #86)
+
+The test that the offline suite cannot replace: while `scripts/apply.sh`
+is mid-restart, the gateway stays live, and each drained sidecar's lane
+shows at most a sub-second blip. This belongs here (not in `tests/`)
+because it needs a running stack and a workload that's actually flowing
+through the picker — exactly what `tests/conftest.py` blocks.
+
+### 11a. The repro
+
+1. Start a steady trickle of `forge` calls. A 4-line loop on a second
+   terminal does it; `X-Session-Id` keeps each on the same plan so the
+   picker is forced to read the lease and the slot counter:
+
+   ```bash
+   for i in $(seq 1 600); do
+     curl -s -o /dev/null -w '%{http_code}\n' $GW/v1/chat/completions \
+       -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+       -H "X-Session-Id: drain-trickle" \
+       -H 'Content-Type: application/json' \
+       -d '{"model":"forge","max_tokens":40,
+            "messages":[{"role":"user","content":"say hi"}]}' &
+     sleep 0.5
+   done; wait
+   ```
+
+   The exact cadence doesn't matter; the point is to keep the picker
+   busy so a recreate isn't trivially invisible.
+
+2. In a third terminal, hammer the gateway's liveliness endpoint at
+   ~5 Hz for the duration of the apply:
+
+   ```bash
+   while :; do
+     printf '%s  %s\n' "$(date +%T.%3N)" \
+       "$(curl -s -o /dev/null -w '%{http_code}' $GW/health/liveliness)"
+   done
+   ```
+
+   Capture the output to a file — a `tee` is fine. A 200 every line for
+   the entire apply is the bar. Anything else (000, 502, 503, a missing
+   line) is a real outage at that timestamp and worth investigating
+   before the change merges.
+
+3. Trigger the change. The drain flow runs whenever `apply.sh` needs to
+   recreate a sidecar, the token proxy, the gateway, or the portal —
+   i.e. when `env_added > 0`, when an image is stale (see step 3 of
+   `scripts/apply.sh`), or when `--build` is passed. The smallest
+   trigger that exercises the sidecar loop is to add a harmless key to
+   `.env.example` (so `sync-env.sh` adds it and `env_added` becomes
+   non-zero), then run from the main checkout:
+
+   ```bash
+   # from the main checkout, NOT this worktree:
+   scripts/apply.sh
+   ```
+
+   Or, to exercise the build path without touching config:
+   `scripts/apply.sh --build`. A config-only edit (no `env_added`, no
+   stale image) makes the drain loop a no-op; that is the intended
+   outcome, not a regression.
+
+4. Read the apply output. Each drained sidecar should appear in the
+   order it was ranked by `ZCARD sy:inflight:{plan}` ascending (lowest
+   first), with one `==> draining <svc>` line per sidecar, a `grace:
+   sleeping ...` line, then a `waiting for <svc> — healthy` line.
+   `==> recreating portal` and `==> recreating gateway` come AFTER the
+   sidecar loop, never interleaved. `reload.sh` runs at the end as
+   usual.
+
+### 11b. What success looks like
+
+- The liveliness trace from step 2 shows `200` every line. A 200 after
+  the `==> recreating gateway` line proves the gateway came back, a 200
+  in the *gap* before it proves the gateway stayed up through the
+  sidecar recreate.
+- On the portal's `forge` lane board, each drained sidecar's row goes
+  to grey for no more than a sub-second blip while its container is
+  recreating. The lane's lane-level availability does NOT dip — the
+  picker has skipped the drained plan, so the lane's other members
+  carry the load.
+- `docker compose logs gateway | grep -E 'drain|reloaded' | tail -30`
+  shows the router hot-swap line (`reloaded in place`) for policy-only
+  edits, OR the `KEEPING the current` / restart pair for router-shaped
+  ones. No `KEEPING` line followed by an apply-driven gateway recreate
+  is the interplay the `--skip-reload` policy preserves.
+
+### 11c. The dry-run check
+
+Before any of the above, `scripts/apply.sh --dry-run` should print the
+planned drain order with each sidecar's `in_flight` count and lease
+count, plus a predicted total drain time:
+
+```bash
+scripts/apply.sh --dry-run
+```
+
+**Expect** a block like:
+
+```
+==> (dry-run) planned drain order
+    claude-max-sidecar       plan=claude-max     in_flight=0   leases=1
+    opencode-go-sidecar      plan=opencode-go   in_flight=2   leases=0
+    xai-token-proxy          plan=grok           in_flight=0   leases=0
+    predicted total drain time: 460s (incl. 120s grace per sidecar)
+    portal: skip (up to date)
+    gateway: skip (up to date or policy-only hot-swap)
+    (dry-run: not writing Redis state, not touching containers)
+```
+
+The order (lowest in-flight first) and the absence of any Redis writes
+are the contract. A predicted time that's wildly different from real
+wall-clock during 11a is feedback for the heuristic — adjust the
+`30s per in-flight` constant in `predict_total_secs`, not the rest of
+the loop.
+
+### 11d. Adjusting the grace window
+
+`--drain-grace-secs N` overrides the default 120s. The default covers
+`mcp_bridge`'s 90s parked-call timeout; lower it only when you know the
+sidecar's longest realistic call (e.g. an `api.x.ai` request without
+tool calls will fit in tens of seconds). A value that's too low lets
+the recreate happen mid-call, which is the bug the grace window exists
+to prevent. The script logs a `WARN: <plan> still has N in-flight
+after Xs — proceeding` when the grace is exhausted; one or two of
+those during a busy apply is fine, a stream of them means the value
+should go up.
+
 
 
 ## Not verified here, and what to watch
