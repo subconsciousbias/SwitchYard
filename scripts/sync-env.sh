@@ -35,6 +35,16 @@ backup="$backup_dir/env.$(date +%Y%m%d-%H%M%S)"
 cp "$target" "$backup"
 chmod 600 "$backup" 2>/dev/null || true
 
+# Issue #217: if the target does not end in a newline, a `>>` append
+# would merge into the last line, corrupting a real credential. Ensure
+# a terminator before appending. (`tail -c1` of a file ending in \n
+# prints just the newline, which od renders as `0a`; a file ending in
+# any other byte prints that byte. `xxd` is not installed everywhere —
+# `od` is POSIX.)
+if [ -s "$target" ] && [ "$(tail -c1 "$target" | od -An -tx1 | tr -d ' \n')" != "0a" ]; then
+  printf '\n' >> "$target"
+fi
+
 added=0
 while IFS= read -r line; do
   case "$line" in

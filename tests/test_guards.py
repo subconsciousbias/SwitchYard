@@ -373,6 +373,166 @@ def test_env_example_defines_switchyard_project():
     print("  .env.example carries SWITCHYARD_PROJECT=switchyard")
 
 
+# Test (c'): sync-env.sh newline-guard (issue #217) ----------------------
+#
+# Regression for the bug where `scripts/sync-env.sh` appended missing keys
+# with `>>` against a target whose last line lacked a trailing newline,
+# merging the new key into the existing credential
+# (e.g. `LOCAL_API_KEY=sk-fooSWITCHYARD_PROJECT=switchyard`). Each test
+# stages a sandbox tempdir — copy the script into `tmp/scripts/` with its
+# exec bit, write `tmp/.env` and `tmp/.env.example` as bytes — so the
+# script's `cd "$(dirname "$0")/.."` lands in a sandbox tree and the
+# operator's real `.env` is never read or written. Belongs under (c) by
+# subject (the `.env` ↔ `.env.example` hand-off) but split off so its
+# regression focus reads at a glance.
+
+
+def _stage_sync_env_sandbox(env_bytes, example_bytes):
+    """Copy sync-env.sh into a tempdir tree and write .env + .env.example.
+
+    Returns (sandbox, scripts_dir, env_path, cleanup). The sandbox is the
+    script's effective working directory after its own `cd`; `cwd=sandbox`
+    is passed to subprocess for clarity. Backup snapshots go under
+    `sandbox/bu` via `SWITCHYARD_ENV_BACKUPS` (the test runner sets that
+    env var on the subprocess so the real `$HOME/.switchyard/env-backups`
+    is never touched).
+    """
+    tmp = tempfile.mkdtemp(prefix="sy-sync-env-")
+    scripts_dir = os.path.join(tmp, "scripts")
+    os.makedirs(scripts_dir, exist_ok=True)
+    src = os.path.join(ROOT, "scripts", "sync-env.sh")
+    with open(src, "rb") as fh:
+        data = fh.read()
+    dst = os.path.join(scripts_dir, "sync-env.sh")
+    with open(dst, "wb") as fh:
+        fh.write(data)
+    st = os.stat(src)
+    os.chmod(dst, st.st_mode)
+    env_path = os.path.join(tmp, ".env")
+    with open(env_path, "wb") as fh:
+        fh.write(env_bytes)
+    with open(os.path.join(tmp, ".env.example"), "wb") as fh:
+        fh.write(example_bytes)
+
+    def cleanup():
+        subprocess.run(["rm", "-rf", tmp], capture_output=True, text=True)
+    return tmp, scripts_dir, env_path, cleanup
+
+
+def test_sync_env_appends_key_on_a_new_line_when_target_lacks_trailing_newline():
+    """Issue #217: when the target's last line has no trailing newline,
+    the script must terminate the file with `\n` BEFORE its `>>` append,
+    so the missing-key merge (`LOCAL_API_KEY=sk-fooSWITCHYARD_PROJECT=…`)
+    cannot happen. The grep check is a real subprocess so a Python-only
+    matcher cannot paper over the bug.
+    """
+    sandbox, scripts_dir, env_path, cleanup = _stage_sync_env_sandbox(
+        env_bytes=b"LOCAL_API_KEY=sk-foo",
+        example_bytes=b"LOCAL_API_KEY=sk-foo\nSWITCHYARD_PROJECT=switchyard\n",
+    )
+    try:
+        res = subprocess.run(
+            ["bash", os.path.join(scripts_dir, "sync-env.sh")],
+            env={**os.environ,
+                 "SWITCHYARD_ENV_BACKUPS": os.path.join(sandbox, "bu")},
+            cwd=sandbox, capture_output=True, text=True,
+        )
+        assert res.returncode == 0, \
+            f"sync-env.sh should exit 0, got {res.returncode}; " \
+            f"stdout={res.stdout!r} stderr={res.stderr!r}"
+        grep = subprocess.run(
+            ["grep", "-q", "^SWITCHYARD_PROJECT=switchyard$", env_path],
+            capture_output=True, text=True,
+        )
+        assert grep.returncode == 0, (
+            f"appended SWITCHYARD_PROJECT must sit on its own line; "
+            f"grep rc={grep.returncode}; "
+            f"stdout={grep.stdout!r} stderr={grep.stderr!r}")
+        with open(env_path, "rb") as fh:
+            text = fh.read()
+        # The credential must not have grown — i.e. the merge did NOT
+        # happen. `b"LOCAL_API_KEY=sk-foo\n"` is the exact line; if the
+        # merge had fired, the file would read
+        # `b"LOCAL_API_KEY=sk-fooSWITCHYARD_PROJECT=switchyard\n"` and the
+        # substring wouldn't be present.
+        assert b"LOCAL_API_KEY=sk-foo\n" in text, (
+            f"the original credential must remain on its own line, "
+            f"got file: {text!r}")
+        assert text.endswith(b"\n"), (
+            f"the file must terminate with a newline after append, "
+            f"got: {text!r}")
+    finally:
+        cleanup()
+    print("  sync-env.sh appends missing keys on a new line (issue #217)")
+
+
+def test_sync_env_does_not_double_append_across_runs_when_target_lacks_trailing_newline():
+    """Idempotency contract for the corruption compounding (issue #217):
+
+    On a target whose last line lacks a trailing newline, the script's
+    `>>` append used to merge into the credential
+    (`LOCAL_API_KEY=sk-fooSWITCHYARD_PROJECT=switchyard`). The duplicate
+    check `grep -q "^KEY="` only matches a key at line start, so on the
+    NEXT run the merged key is invisible to it and the script appends
+    again — the corruption compounds on every run.
+
+    The test runs the script TWICE in a row against a `.env` without a
+    trailing newline and asserts SWITCHYARD_PROJECT appears exactly
+    once on its own line at the end of the sequence:
+
+      - With the fix: the first run appends a newline terminator and
+        then `SWITCHYARD_PROJECT=switchyard` on its own line; the file
+        now ends in `\\n` so the second run's `grep "^SWITCHYARD_PROJECT="`
+        matches and the loop is a no-op.
+      - Without the fix: the first run merges the key into the
+        credential; the second run's `grep "^SWITCHYARD_PROJECT="`
+        still finds nothing and appends a SECOND copy on a fresh line —
+        count=2. So the assertion fires on the broken script.
+    """
+    sandbox, scripts_dir, env_path, cleanup = _stage_sync_env_sandbox(
+        env_bytes=b"LOCAL_API_KEY=sk-foo",
+        example_bytes=b"LOCAL_API_KEY=sk-foo\nSWITCHYARD_PROJECT=switchyard\n",
+    )
+    try:
+        for _ in range(2):
+            res = subprocess.run(
+                ["bash", os.path.join(scripts_dir, "sync-env.sh")],
+                env={**os.environ,
+                     "SWITCHYARD_ENV_BACKUPS": os.path.join(sandbox, "bu")},
+                cwd=sandbox, capture_output=True, text=True,
+            )
+            assert res.returncode == 0, \
+                f"sync-env.sh should exit 0 on each run, got " \
+                f"{res.returncode}; stdout={res.stdout!r} " \
+                f"stderr={res.stderr!r}"
+        with open(env_path, "rb") as fh:
+            text = fh.read()
+        assert text.count(b"SWITCHYARD_PROJECT=switchyard") == 1, (
+            f"key must appear exactly once after two runs (no "
+            f"double-append via the corrupted-line merge path); "
+            f"got file: {text!r}")
+        # And it must sit on its own line, not merged into the credential —
+        # a Python-only `text.count` would still pass the count assertion
+        # above if the bug merged a single copy; a real `grep` confirms
+        # the structural shape.
+        grep = subprocess.run(
+            ["grep", "-q", "^SWITCHYARD_PROJECT=switchyard$", env_path],
+            capture_output=True, text=True,
+        )
+        assert grep.returncode == 0, (
+            f"SWITCHYARD_PROJECT must sit on its own line after two "
+            f"runs; grep rc={grep.returncode}; "
+            f"stdout={grep.stdout!r} stderr={grep.stderr!r}")
+        # And the credential must not have grown — the side effect that
+        # broke LOCAL_API_KEY authentication in the live incident.
+        assert b"LOCAL_API_KEY=sk-foo\n" in text, (
+            f"the original credential must remain on its own line; "
+            f"got file: {text!r}")
+    finally:
+        cleanup()
+    print("  sync-env.sh does not compound the corruption across runs (issue #217)")
+
+
 # Test (d): settings files -----------------------------------------------
 
 def test_claude_settings_json_has_deny_rules():
