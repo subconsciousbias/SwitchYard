@@ -2,7 +2,6 @@
 
 Work through this in order. Each step has a command and **what you should see**.
 Stop at the first step that does not match, since later steps depend on it.
-GitHub issues in this repo are dispatched automatically to Orca worktrees by the SwitchYard issue watcher (~/.local/share/switchyard-issue-watcher), so the branch and worktree for an issue may already exist before you start one.
 
 Set these once in your shell:
 
