@@ -37,7 +37,13 @@ Then point anything at `http://<host>:4000` with `LITELLM_MASTER_KEY` as the key
 
 ```bash
 # Claude Code (Anthropic protocol)
-ANTHROPIC_BASE_URL=http://host:4000  ANTHROPIC_AUTH_TOKEN=$LITELLM_MASTER_KEY  ANTHROPIC_MODEL=forge  claude
+ANTHROPIC_BASE_URL=http://host:4000 \
+ANTHROPIC_AUTH_TOKEN=$LITELLM_MASTER_KEY \
+ANTHROPIC_MODEL=forge \
+ANTHROPIC_DEFAULT_OPUS_MODEL=judge \
+ANTHROPIC_DEFAULT_SONNET_MODEL=forge \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=bulk \
+claude
 
 # Codex / Cursor / Cline / aider / Zed (OpenAI protocol)
 OPENAI_BASE_URL=http://host:4000/v1  OPENAI_API_KEY=$LITELLM_MASTER_KEY   # model: forge
@@ -140,6 +146,18 @@ Most clients can be told where to send those. OpenCode takes a `small_model` in
 Substitute the provider id you gave SwitchYard. `bulk` and `local` exist for
 exactly this: local models, no subscription quota, no competition with real
 work for a plan's connections.
+
+Claude Code routes the same calls through three variables that line up with its
+built-in haiku/sonnet/opus aliases — `ANTHROPIC_DEFAULT_HAIKU_MODEL`,
+`ANTHROPIC_DEFAULT_SONNET_MODEL` and `ANTHROPIC_DEFAULT_OPUS_MODEL`. Those are
+what Explore subagents, any agent you tag with `model: haiku` / `sonnet` /
+`opus`, and a few background calls actually resolve to; the older
+`ANTHROPIC_SMALL_FAST_MODEL` does not cover them. With the three unset the CLI
+falls back to built-in ids like `claude-haiku-4-5`, which are not lanes — the
+gateway either 400s the request or routes it without going through the lane
+picker. Point `ANTHROPIC_DEFAULT_HAIKU_MODEL` at `bulk` (or `local` if your box
+is freer than your quota) and the helper agents stop competing with real work
+for the subscription's slots.
 
 Context-window fallbacks are a separate mechanism from the lane order: a prompt
 too large for the chosen model is handed to the largest-context model available.
