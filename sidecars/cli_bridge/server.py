@@ -1497,6 +1497,14 @@ def _dig_key(node, key: str):
 
 CODEX_SESSIONS = Path(os.environ.get(
     "CODEX_SESSIONS_DIR", str(Path.home() / ".codex" / "sessions")))
+CODEX_AUTH = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"
+
+
+def codex_logged_in() -> bool:
+    try:
+        return CODEX_AUTH.is_file() and CODEX_AUTH.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def _codex_rate_limits() -> dict | None:
@@ -1576,6 +1584,16 @@ async def usage_report() -> dict:
     are read.
     """
     if PROVIDER == "codex":
+        # A sidecar that was never logged in has no rate_limits either, and
+        # used to answer the same 503 "send one request first" forever - which
+        # sends whoever reads the portal off to send a request that can only
+        # 401. Say what is actually wrong.
+        if not codex_logged_in():
+            raise HTTPException(
+                status_code=401,
+                detail="codex cli is not logged in for this plan (no "
+                       f"{CODEX_AUTH}); run `codex login --device-auth` "
+                       "in this sidecar")
         report = _codex_rate_limits()
         if report is None:
             raise HTTPException(

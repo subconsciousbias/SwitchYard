@@ -1645,6 +1645,35 @@ def test_health_reports_max_tokens_mode():
           "codex health -> False, reason='no-truncation-flag'")
 
 
+def test_codex_usage_says_not_logged_in_instead_of_no_data_yet():
+    """No auth.json -> 401 naming the login step, not a 503 'send a request'."""
+    import asyncio
+    import tempfile
+    from pathlib import Path
+    from fastapi import HTTPException
+    saved = (server.PROVIDER, server.CODEX_AUTH, server.CODEX_SESSIONS)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            server.PROVIDER = "codex"
+            server.CODEX_AUTH = Path(d) / "auth.json"
+            server.CODEX_SESSIONS = Path(d) / "sessions"
+            try:
+                asyncio.run(server.usage_report())
+                raise AssertionError("expected HTTPException")
+            except HTTPException as exc:
+                assert exc.status_code == 401, exc.status_code
+                assert "codex login" in str(exc.detail)
+            server.CODEX_AUTH.write_text("{}")
+            try:
+                asyncio.run(server.usage_report())
+                raise AssertionError("expected HTTPException")
+            except HTTPException as exc:
+                assert exc.status_code == 503, exc.status_code
+        finally:
+            server.PROVIDER, server.CODEX_AUTH, server.CODEX_SESSIONS = saved
+    print("  codex /usage: 401 when never logged in, 503 when logged in with no data")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):
