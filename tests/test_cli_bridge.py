@@ -238,11 +238,41 @@ def test_structured_parser_failure_is_a_502_not_a_raw_passthrough():
 
 
 def test_max_tokens_becomes_an_instruction():
-    """No CLI has a token cap, so it must not be dropped silently."""
-    assert server.fold_max_tokens(None, None) is None
-    hint = server.fold_max_tokens("Be terse.", 60)
-    assert "42 words" in hint and "Be terse." in hint, hint
-    print(f"  max_tokens=60 -> {hint.splitlines()[-1][:60]!r}...")
+    """The post-hoc enforcer must round-trip an over-budget payload:
+    estimate_tokens says it is too long, enforce_max_tokens cuts it to
+    max_tokens*4 bytes, the unchanged-overage path stays untouched, and
+    finish_reason flips between "length" and "stop" accordingly.
+
+    The old fold-into-prompt shape is gone (see test_fold_max_tokens_is_gone);
+    this test now exercises the replacement: a real cut on real bytes, with
+    the helper's "stop" / "length" contract spelled out.
+    """
+    # estimate_tokens: 4 bytes/token, ceil. ASCII 4 bytes -> 1 token.
+    assert server.estimate_tokens("") == 0
+    assert server.estimate_tokens("abcd") == 1
+    assert server.estimate_tokens("abcde") == 2    # 5 bytes ceil(/4) = 2
+
+    # enforce_max_tokens round-trip on the over-budget path.
+    payload = {"result": "x" * 256, "usage": {"output_tokens": 64}}
+    cut, fr = server.enforce_max_tokens(payload, 50)   # 50 tokens -> 200 byte cap
+    assert fr == "length"
+    assert len(cut["result"]) == 200
+    assert cut["usage"] == payload["usage"]    # usage left alone
+    assert payload["result"] == "x" * 256        # original untouched
+
+    # Under-cap is a no-op with finish_reason "stop".
+    small = {"result": "x" * 40, "usage": {}}    # 40 bytes -> 10 tokens
+    kept, fr2 = server.enforce_max_tokens(small, 50)
+    assert fr2 == "stop"
+    assert kept["result"] == "x" * 40
+
+    # No max_tokens (None / 0 / negative) is the unchanged pass-through.
+    for mt in (None, 0, -1):
+        passthrough, fr3 = server.enforce_max_tokens(payload, mt)
+        assert fr3 == "stop", (mt, fr3)
+        assert passthrough["result"] == payload["result"]
+    print(f"  estimate_tokens rounds 4 bytes/token; over -> 'length' at "
+          f"{len(cut['result'])} bytes, usage preserved; under + no-cap -> 'stop'")
 
 
 # --------------------------------------------------------------------- codex ---
@@ -1419,6 +1449,200 @@ def test_text_path_system_mode_replace_argv_unchanged_apart_from_system():
         os.environ.clear()
         os.environ.update(old)
         _modules.reload(server)
+
+
+# ----------------------------------------- issue #70: enforce max_tokens post-hoc ---
+def test_max_tokens_truncated_with_length_reason():
+    """The post-hoc enforcement contract: over-budget content is cut to
+    ~max_tokens*4 bytes with finish_reason "length", usage is left alone
+    (the caller paid for the real tokens), an estimate <= cap leaves the
+    content byte-identical with finish_reason "stop", no max_tokens is a
+    pass-through with "stop", and sse_from_completion frames the truncated
+    answer in the order delta -> terminal -> [DONE].
+    """
+    import asyncio
+    # (a) over-budget: content cut to ~max_tokens*4 bytes; usage untouched.
+    big = "x" * 1024
+    payload = {"result": big,
+               "usage": {"input_tokens": 5, "output_tokens": 200, "total_tokens": 205}}
+    cut, fr = server.enforce_max_tokens(payload, 50)   # 50 tokens -> 200 byte cap
+    assert fr == "length", fr
+    assert len(cut["result"]) <= 200, len(cut["result"])
+    assert cut["result"] == "x" * 200, len(cut["result"])
+    # Usage stays exactly what the CLI reported -- the ledger books real tokens.
+    assert cut["usage"] == payload["usage"], cut["usage"]
+    # Original payload untouched.
+    assert payload["result"] == big
+
+    # (b) multibyte: cutting on a byte boundary must not raise UnicodeDecodeError.
+    # Each '\u4e00' is 3 UTF-8 bytes. 200 copies -> 600 bytes -> estimate 150.
+    cjk = "\u4e00" * 200
+    payload2 = {"result": cjk, "usage": {"input_tokens": 0, "output_tokens": 150}}
+    cut2, fr2 = server.enforce_max_tokens(payload2, 50)   # 200 byte cap
+    assert fr2 == "length", fr2
+    assert len(cut2["result"].encode("utf-8")) <= 200
+    # Decode was errors="ignore"; the leading 200 bytes are a whole number of
+    # 3-byte chars, so no splitting occurred. That is the test the plan calls
+    # for ("multibyte cuts on a byte boundary").
+    assert cut2["result"] == "\u4e00" * (200 // 3), cut2["result"]
+
+    # (c) estimate <= cap: content untouched, finish_reason "stop".
+    small = "x" * 100   # 100 bytes -> 25 tokens by ceil/4
+    payload3 = {"result": small, "usage": {"output_tokens": 25}}
+    unchanged, fr3 = server.enforce_max_tokens(payload3, 50)
+    assert fr3 == "stop", fr3
+    assert unchanged["result"] == small
+    # Byte-for-byte identity: this is the path the unchanged-output behaviour
+    # depends on, and any caching keyed on the result.
+    assert unchanged["result"] is payload3["result"] or \
+        unchanged["result"] == payload3["result"]
+
+    # (d) no max_tokens: pass-through with "stop".
+    payload4 = {"result": "anything", "usage": {}}
+    no_cap, fr4 = server.enforce_max_tokens(payload4, None)
+    assert fr4 == "stop", fr4
+    no_cap2, fr4b = server.enforce_max_tokens(payload4, 0)
+    assert fr4b == "stop", fr4b
+    no_cap3, fr4c = server.enforce_max_tokens(payload4, -1)
+    assert fr4c == "stop", fr4c
+    assert no_cap["result"] == "anything"
+
+    # (e) to_openai carries the truncated finish_reason, and sse_from_completion
+    # frames it as delta -> terminal (length) -> [DONE].
+    result = server.to_openai(cut, "m", finish_reason=fr)
+    assert result["choices"][0]["finish_reason"] == "length", result
+    assert result["choices"][0]["message"]["content"] == cut["result"]
+
+    async def collect():
+        out = []
+        async for frame in server.sse_from_completion(result, "m"):
+            out.append(frame)
+        return out
+
+    frames = asyncio.run(collect())
+    assert len(frames) == 3, frames
+    assert frames[-1] == "data: [DONE]\n\n", frames[-1]
+    first = json.loads(frames[0][6:])
+    assert first["choices"][0]["delta"]["content"] == cut["result"], first
+    terminal = json.loads(frames[-2][6:])
+    assert terminal["choices"][0]["finish_reason"] == "length", terminal
+    print(f"  over-budget -> 'length' at {len(cut['result'])} bytes; "
+          "estimate<=cap and no-cap stay 'stop'; sse ordering preserved")
+
+
+def test_unenforceable_max_tokens_returns_400():
+    """A codex-backed request with max_tokens must 400 with the contract
+    detail -- and the same request WITHOUT max_tokens must still 502 from
+    the CLI spawn guard (proving omission is unchanged).
+
+    The save/restore of server.PROVIDER/PROFILE/CLI follows the convention
+    set by test_text_path_no_tools_passthrough_with_metadata_still_parses
+    and the text_path_argv tests above.
+    """
+    import asyncio
+    from fastapi import HTTPException
+    saved_provider, saved_profile, saved_cli = \
+        server.PROVIDER, server.PROFILE, server.CLI
+    try:
+        server.PROVIDER = "codex"
+        server.PROFILE = server.PROFILES["codex"]
+        server.CLI = server.PROFILE["cli"]
+        # Sentinel CLI that does not exist on disk: any spawn attempt would
+        # 502 (FileNotFoundError -> spawn-failed 502). That's the second
+        # branch's expected outcome.
+        server.CLI = "/no/such/cli-binary-for-issue70"
+
+        async def go_with():
+            try:
+                await server._handle_chat({
+                    "model": "m", "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}]})
+            except HTTPException as exc:
+                return exc.status_code, exc.detail
+
+        status, detail = asyncio.run(go_with())
+        assert status == 400, (status, detail)
+        assert detail["error"]["message"] == "max_tokens is not enforceable on this lane", \
+            detail
+        assert detail["error"]["type"] == "max_tokens_unenforceable", detail
+
+        async def go_without():
+            try:
+                await server._handle_chat({
+                    "model": "m",
+                    "messages": [{"role": "user", "content": "hi"}]})
+            except HTTPException as exc:
+                return exc.status_code, exc.detail
+
+        status2, _detail2 = asyncio.run(go_without())
+        assert status2 == 502, status2
+        print("  codex + max_tokens -> 400 max_tokens_unenforceable; "
+              "codex without max_tokens -> 502 (omission unchanged)")
+
+        # Ordering: a codex request carrying both tools AND max_tokens must
+        # surface the more specific max_tokens_unenforceable, not the generic
+        # tools_unsupported. The refusal block sits BEFORE the tools check so
+        # the caller gets the reason it can act on. (Reviewer finding on #87.)
+        async def go_both():
+            try:
+                await server._handle_chat({
+                    "model": "m", "max_tokens": 100,
+                    "tools": [{"type": "function",
+                               "function": {"name": "x",
+                                            "parameters": {"type": "object",
+                                                           "properties": {}}}}],
+                    "messages": [{"role": "user", "content": "hi"}]})
+            except HTTPException as exc:
+                return exc.status_code, exc.detail
+
+        status3, detail3 = asyncio.run(go_both())
+        assert status3 == 400, (status3, detail3)
+        assert detail3["error"]["type"] == "max_tokens_unenforceable", \
+            "max_tokens refusal must precede the tools check " \
+            "(more specific reason wins): " + repr(detail3)
+        print("  codex + tools + max_tokens -> 400 max_tokens_unenforceable "
+              "(specific refusal beats generic tools_unsupported)")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = \
+            saved_provider, saved_profile, saved_cli
+
+
+def test_fold_max_tokens_is_gone():
+    """The fold-into-prompt shim is removed entirely: no shim, no deprecation,
+    no warn-and-ignore. /health reports the real mode now (see next test)."""
+    assert not hasattr(server, "fold_max_tokens"), \
+        "fold_max_tokens must be removed, not kept as a shim"
+    print("  fold_max_tokens is gone (no shim, no deprecation)")
+
+
+def test_health_reports_max_tokens_mode():
+    """opencode profile -> enforces_max_tokens=True with no reason key;
+    codex profile -> False, reason 'no-truncation-flag'.
+
+    Same shape both bridges report; /health's callers can branch on the
+    field and (when false) inspect the reason to tell a future streaming-
+    only refusal apart from the current one.
+    """
+    import asyncio
+    saved_provider, saved_profile = server.PROVIDER, server.PROFILE
+    try:
+        server.PROVIDER = "opencode"
+        server.PROFILE = server.PROFILES["opencode"]
+        h_open = asyncio.run(server.health())
+        assert h_open["enforces_max_tokens"] is True, h_open
+        assert "enforces_max_tokens_reason" not in h_open, h_open
+
+        server.PROVIDER = "codex"
+        server.PROFILE = server.PROFILES["codex"]
+        h_codex = asyncio.run(server.health())
+        assert h_codex["enforces_max_tokens"] is False, h_codex
+        assert h_codex["enforces_max_tokens_reason"] == "no-truncation-flag", \
+            h_codex
+    finally:
+        server.PROVIDER, server.PROFILE = saved_provider, saved_profile
+
+    print("  opencode health -> enforces_max_tokens=True (no reason); "
+          "codex health -> False, reason='no-truncation-flag'")
 
 
 if __name__ == "__main__":

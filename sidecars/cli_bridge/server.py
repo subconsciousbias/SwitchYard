@@ -337,6 +337,11 @@ PROFILES: dict[str, dict] = {
         "parser": "claude_json",
         # Reset-window hint the CLI prints when the 5h limit is hit.
         "default_retry_after": 5 * 3600,
+        # max_tokens enforcement. Claude Code has no token cap flag, so the
+        # sidecar truncates the answer to roughly max_tokens*4 bytes
+        # post-hoc (see enforce_max_tokens). finish_reason becomes "length"
+        # in that case; usage still reports the real billed tokens.
+        "enforce_max_tokens": True,
     },
     # OpenCode, logged in to the provider whose subscription this process
     # fronts. Headless is `opencode run`, models are named provider/model, and
@@ -376,6 +381,7 @@ PROFILES: dict[str, dict] = {
         "system_args": [],
         "parser": "events_json",
         "default_retry_after": 3600,
+        "enforce_max_tokens": True,
     },
     # NOTE: the Codex CLI's flags move between releases. Verify against the
     # installed version with `codex exec --help`; override with CLI_EXTRA_ARGS
@@ -405,6 +411,13 @@ PROFILES: dict[str, dict] = {
         "system_args": [],
         "parser": "codex_jsonl",
         "default_retry_after": 3600,
+        # codex exec runs its own multi-turn agent loop; truncating its
+        # narration mid-stream is not an honest token cap (the model is
+        # still mid-episode and will continue to charge tokens to refill
+        # the cut). The right behaviour for an unenforceable cap is to
+        # refuse with 400, not fake a "length" finish.
+        "enforce_max_tokens": False,
+        "enforce_max_tokens_reason": "no-truncation-flag",
     },
 }
 
@@ -970,21 +983,43 @@ def parse_output(stdout: str, kind: str | None = None) -> dict:
 STRUCTURED_PARSERS = {"claude_json", "events_json", "codex_jsonl"}
 
 
-def fold_max_tokens(system: str | None, max_tokens: int | None) -> str | None:
-    """Turn the caller's max_tokens into an instruction, since no CLI has a flag.
+def estimate_tokens(text: str) -> int:
+    """Rough token count from UTF-8 bytes, for post-hoc max_tokens enforcement.
 
-    `claude -p` and `opencode run` expose turn limits, not token caps, so a
-    caller asking for 50 tokens would otherwise get a full-length answer — and
-    pay the subscription quota for it. An instruction is a soft limit the model
-    can ignore, but it genuinely shortens output, which is the point. /health
-    reports enforces_max_tokens: false so this is not mistaken for a hard cap.
+    No tokenizer is available in this image, and the sidecar lives behind the
+    CLI anyway -- a precise count would still have to assume a tokeniser that
+    never sees the model's output. Four bytes per token is the commonly used
+    heuristic; rounding up via ceil() makes a too-short cap still cut
+    something rather than silently letting the original through.
+    """
+    if not text:
+        return 0
+    return -(-len(text.encode("utf-8")) // 4)   # ceil(bytes / 4)
+
+
+def enforce_max_tokens(payload: dict, max_tokens: int | None) -> tuple[dict, str]:
+    """Truncate the assistant text to honor `max_tokens`; report the finish_reason.
+
+    Returns `(payload, finish_reason)`: `"length"` when content was cut,
+    `"stop"` when it already fit. `payload["result"]` is rewritten only on
+    truncation -- the byte-identical case is left alone so the unchanged-
+    output behaviour (and any caching keyed on it) is preserved. `usage`
+    is intentionally NOT touched: the caller paid for whatever the CLI
+    actually produced, and `completion_tokens` must stay honest so the
+    ledger books the real charge (issue #70).
     """
     if not max_tokens or max_tokens <= 0:
-        return system
-    words = max(10, int(max_tokens * 0.7))
-    hint = (f"Answer in at most roughly {words} words. Be direct: no preamble, "
-            "no restating the question.")
-    return f"{system}\n\n{hint}" if system else hint
+        return payload, "stop"
+    text = payload.get("result", "") or ""
+    if estimate_tokens(text) <= max_tokens:
+        return payload, "stop"
+    payload = dict(payload)
+    # Cut on a byte boundary and decode `errors="ignore"` so a multi-byte
+    # sequence split across the cut does not raise UnicodeDecodeError;
+    # the model already paid for what we threw away.
+    cut_bytes = max_tokens * 4
+    payload["result"] = text.encode("utf-8")[:cut_bytes].decode("utf-8", errors="ignore")
+    return payload, "length"
 
 
 @contextlib.contextmanager
@@ -1350,7 +1385,7 @@ def _limit_error(blob: str, default_retry_after: int | None = None) -> HTTPExcep
     )
 
 
-def to_openai(payload: dict, model: str) -> dict:
+def to_openai(payload: dict, model: str, finish_reason: str = "stop") -> dict:
     usage = payload.get("usage") or {}
     input_tokens = int(usage.get("input_tokens", 0) or 0)
     output_tokens = int(usage.get("output_tokens", 0) or 0)
@@ -1394,7 +1429,7 @@ def to_openai(payload: dict, model: str) -> dict:
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": payload.get("result", "")},
-            "finish_reason": "stop",
+            "finish_reason": finish_reason,
         }],
         "usage": out_usage,
     }
@@ -1588,21 +1623,30 @@ async def usage() -> dict:
 @app.get("/health")
 async def health() -> dict:
     cfg = config()
-    return {"ok": cfg.source == "config", "provider": PROVIDER,
-            "config_source": cfg.source, "supports_tools": False,
-            # All three profiles carry images in some form (see stage_images /
-            # build_argv in this file). A "false" here would mean: callers may
-            # still send image blocks, but the sidecar will drop them. Better
-            # honest than optimistic.
-            "supports_images": PROVIDER in ("claude", "codex", "opencode"),
-            "home": os.environ.get("HOME", ""), "warm": _warm.is_set(),
-            # The CLIs have no token cap, so max_tokens becomes a prompt
-            # instruction: a real reduction, but not a guarantee.
-            "enforces_max_tokens": False,
-            "system_mode": SYSTEM_MODE, "bare": BARE,
-            "plan": PLAN or PROVIDER, "model": cfg.model,
-            "models": sorted(cfg.models), "concurrency": cfg.concurrency,
-            "in_flight": _gate.in_flight, "config": PLANS_PATH}
+    health_doc = {"ok": cfg.source == "config", "provider": PROVIDER,
+                  "config_source": cfg.source, "supports_tools": False,
+                  # All three profiles carry images in some form (see stage_images /
+                  # build_argv in this file). A "false" here would mean: callers may
+                  # still send image blocks, but the sidecar will drop them. Better
+                  # honest than optimistic.
+                  "supports_images": PROVIDER in ("claude", "codex", "opencode"),
+                  "home": os.environ.get("HOME", ""), "warm": _warm.is_set(),
+                  # Profile-driven: claude/opencode honor max_tokens post-hoc
+                  # (truncate, finish_reason "length"); codex refuses with 400
+                  # because its multi-turn agent loop makes truncation a lie.
+                  # The reason key surfaces only on the refusing lane, so a
+                  # caller can tell a future "streaming-only" refusal apart
+                  # from the current one.
+                  "enforces_max_tokens": bool(PROFILE.get("enforce_max_tokens")),
+                  "system_mode": SYSTEM_MODE, "bare": BARE,
+                  "plan": PLAN or PROVIDER, "model": cfg.model,
+                  "models": sorted(cfg.models), "concurrency": cfg.concurrency,
+                  "in_flight": _gate.in_flight, "config": PLANS_PATH}
+    if not health_doc["enforces_max_tokens"]:
+        reason = PROFILE.get("enforce_max_tokens_reason")
+        if reason:
+            health_doc["enforces_max_tokens_reason"] = reason
+    return health_doc
 
 
 @app.get("/v1/models")
@@ -1619,6 +1663,22 @@ async def _handle_chat(body: dict):
     That identity is what "no regression on the text path" means here: there
     is only one code path for it, whichever sidecar is asking.
     """
+    # Refuse max_tokens on lanes that cannot honor it honestly (issue #70).
+    # Placed BEFORE the tools_refusal block: a request carrying both max_tokens
+    # AND tools should report the more specific max_tokens reason rather than a
+    # generic tools-unsupported 400. Placement also guarantees the 400 is
+    # raised before any stage_or_fail / flatten / gate / spawn, so no SSE
+    # header is ever sent for a request we already know to refuse.
+    if body.get("max_tokens") and body["max_tokens"] > 0 \
+            and not PROFILE.get("enforce_max_tokens", True):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {
+                "message": "max_tokens is not enforceable on this lane",
+                "type": "max_tokens_unenforceable",
+                "plan": PLAN or PROVIDER,
+                "reason": PROFILE.get("enforce_max_tokens_reason")}})
+
     # Refuse tool calls loudly. SwitchYard already routes these away from
     # CLI-backed plans; if one arrives anyway, dropping the definitions silently
     # would look like the model simply choosing not to call anything.
@@ -1632,6 +1692,7 @@ async def _handle_chat(body: dict):
                 "type": "tools_unsupported"}})
 
     messages = body.get("messages") or []
+
     # Stage images BEFORE flatten, so the markers `[image N: <path>]` survive
     # into the prompt text and the per-CLI argv flags can carry the files.
     # A request with an unsupported image (a remote URL we cannot fetch) is
@@ -1642,9 +1703,6 @@ async def _handle_chat(body: dict):
         raise exc.http()
     try:
         prompt, system = flatten(messages)
-        # No CLI accepts a token cap, so express it as an instruction instead of
-        # dropping it on the floor.
-        system = fold_max_tokens(system, body.get("max_tokens"))
         if not prompt:
             raise HTTPException(status_code=400, detail="no usable message content")
         if image_paths:
@@ -1730,7 +1788,9 @@ async def _handle_chat(body: dict):
             payload = await invoke(prompt, system, model, image_paths or None)
         finally:
             await _gate.release()
-        result = to_openai(payload, model)
+        payload, finish_reason = enforce_max_tokens(
+            payload, body.get("max_tokens"))
+        result = to_openai(payload, model, finish_reason=finish_reason)
     finally:
         # Image dir is owned here; the workdir on the mcp_bridge path is owned
         # by the session and outlives the request, so this only cleans up

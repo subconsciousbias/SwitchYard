@@ -1850,19 +1850,30 @@ async def handle_tool_request(body: dict, tools: list[dict],
 @app.get("/health")
 async def health() -> dict:
     cfg = cli_bridge.config()
-    return {"ok": cfg.source == "config", "provider": PROVIDER, "supports_tools": True,
-            # All three MCP_PROFILES carry images via the same per-profile
-            # flags as cli_bridge (see build_argv / write_opencode_dir).
-            # Expressed as a set-membership check rather than a constant so
-            # adding a future provider here matches the cli_bridge side.
-            "supports_images": PROVIDER in ("claude", "opencode", "codex"),
-            "config_source": cfg.source, "model": cfg.model, "models": sorted(cfg.models),
-            "concurrency": cfg.concurrency, "in_flight": cli_bridge._gate.in_flight,
-            "sessions": len(SESSIONS),
-            "awaiting_followup": sum(1 for x in SESSIONS.values()
-                                     if x.awaiting_followup and not x.dead),
-            "parked_limit": cfg.parked_limit,
-            "session_ttl_seconds": SESSION_TTL}
+    health_doc = {"ok": cfg.source == "config", "provider": PROVIDER, "supports_tools": True,
+                 # All three MCP_PROFILES carry images via the same per-profile
+                 # flags as cli_bridge (see build_argv / write_opencode_dir).
+                 # Expressed as a set-membership check rather than a constant so
+                 # adding a future provider here matches the cli_bridge side.
+                 "supports_images": PROVIDER in ("claude", "opencode", "codex"),
+                 "config_source": cfg.source, "model": cfg.model, "models": sorted(cfg.models),
+                 "concurrency": cfg.concurrency, "in_flight": cli_bridge._gate.in_flight,
+                 "sessions": len(SESSIONS),
+                 "awaiting_followup": sum(1 for x in SESSIONS.values()
+                                          if x.awaiting_followup and not x.dead),
+                 "parked_limit": cfg.parked_limit,
+                 "session_ttl_seconds": SESSION_TTL,
+                 # Profile-driven (mirrors cli_bridge /health). The MCP path's
+                 # tool loop ignores max_tokens regardless (see handle_fresh /
+                 # render_turn), so this field is reported but only the
+                 # no-tools fall-through actually applies it -- a CLI tool
+                 # request is not the contract the cap was designed for.
+                 "enforces_max_tokens": bool(cli_bridge.PROFILE.get("enforce_max_tokens"))}
+    if not health_doc["enforces_max_tokens"]:
+        reason = cli_bridge.PROFILE.get("enforce_max_tokens_reason")
+        if reason:
+            health_doc["enforces_max_tokens_reason"] = reason
+    return health_doc
 
 
 @app.get("/usage")

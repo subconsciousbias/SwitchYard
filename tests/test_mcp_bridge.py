@@ -3182,6 +3182,54 @@ if caller_env_module is None:
     _spec.loader.exec_module(caller_env_module)
 
 
+# ------------------------------------------ issue #70: enforce max_tokens post-hoc ---
+def test_no_tools_fallthrough_inherits_max_tokens_enforcement_and_health_reports_it():
+    """The mcp_bridge no-tools path delegates to cli_bridge._handle_chat, so it
+    inherits the per-profile max_tokens mode (issue #70). On a codex profile
+    the bare request must 400 with max_tokens_unenforceable; on a claude
+    profile /health reports enforces_max_tokens=true with no reason. The
+    tool loop (handle_fresh / run_session / render_turn) is NOT exercised
+    here -- it is out of scope and unchanged: max_tokens stays ignored on
+    that path exactly as today.
+    """
+    from fastapi import HTTPException
+    saved_provider, saved_profile = server.cli_bridge.PROVIDER, server.cli_bridge.PROFILE
+    try:
+        # codex -> 400 max_tokens_unenforceable on the no-tools fall-through.
+        server.cli_bridge.PROVIDER = "codex"
+        server.cli_bridge.PROFILE = server.cli_bridge.PROFILES["codex"]
+        server.PROVIDER = "codex"
+
+        async def go_codex():
+            try:
+                await server.cli_bridge._handle_chat({
+                    "model": "m", "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}]})
+            except HTTPException as exc:
+                return exc.status_code, exc.detail
+
+        status, detail = asyncio.run(go_codex())
+        assert status == 400, (status, detail)
+        assert detail["error"]["type"] == "max_tokens_unenforceable", detail
+        assert detail["error"]["message"] == \
+            "max_tokens is not enforceable on this lane", detail
+
+        # claude -> /health reports enforces_max_tokens=true, no reason key.
+        server.cli_bridge.PROVIDER = "claude"
+        server.cli_bridge.PROFILE = server.cli_bridge.PROFILES["claude"]
+        server.PROVIDER = "claude"
+        h = asyncio.run(server.health())
+        assert h["enforces_max_tokens"] is True, h
+        assert "enforces_max_tokens_reason" not in h, h
+    finally:
+        server.cli_bridge.PROVIDER, server.cli_bridge.PROFILE = \
+            saved_provider, saved_profile
+        server.PROVIDER = saved_provider
+
+    print("  mcp no-tools fall-through: codex profile -> 400 max_tokens_unenforceable; "
+          "claude /health -> enforces_max_tokens=True")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):
