@@ -804,3 +804,14 @@ if __name__ == "__main__":
                 print(f" FAIL {name}: {exc}")
                 failed += 1
     print(f"\n{passed} passed, {failed} failed")
+
+
+def test_billed_usage_from_the_mcp_bridge_is_what_the_ledger_books():
+    """The mcp_bridge reports the conversation's size in prompt_tokens and the
+    whole run's spend beside it; the ledger books the spend."""
+    from switchyard.hooks import _prompt_completion_tokens
+    usage = {"prompt_tokens": 120_000, "completion_tokens": 50,
+             "switchyard_billed_prompt_tokens": 2_400_000,
+             "switchyard_billed_completion_tokens": 1_000}
+    assert _prompt_completion_tokens(None, usage) == (2_400_000, 1_000)
+    assert _prompt_completion_tokens(None, {"prompt_tokens": 9, "completion_tokens": 1}) == (9, 1)

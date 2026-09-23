@@ -3190,3 +3190,60 @@ if __name__ == "__main__":
             fn()
             n += 1
     print(f"\n{n} mcp-bridge tests passed")
+
+
+# ------------------------------------------------------------- context usage ---
+def _write_inner_transcript(session: "server.Session", root: Path, calls: list[dict]) -> None:
+    """Lay down what the inner claude CLI writes: one assistant entry per model call."""
+    import re
+    folder = root / re.sub(r"[^A-Za-z0-9]", "-", str(session.workdir))
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / f"{uuid.uuid4()}.jsonl", "w", encoding="utf-8") as fh:
+        for usage in calls:
+            fh.write(json.dumps({"type": "user", "message": {"content": "x"}}) + "\n")
+            fh.write(json.dumps({"type": "assistant",
+                                 "message": {"content": [], "usage": usage}}) + "\n")
+
+
+def test_final_turn_reports_the_last_calls_size_not_the_runs_sum():
+    """A tool loop is ONE inner CLI run, so its final usage is the sum of every
+    model call in it. Claude Code reads a reply's usage as its context size and
+    auto-compacts past the window, so reporting the sum compacted the caller's
+    session after every tool-using answer. The caller must see the last call's
+    size; the ledger must still book what the run spent."""
+    session = _new_session()
+    root = Path(tempfile.mkdtemp(prefix="projects-"))
+    calls = [{"input_tokens": 2, "cache_read_input_tokens": 100_000 + i * 1000,
+              "cache_creation_input_tokens": 500, "output_tokens": 50}
+             for i in range(20)]
+    _write_inner_transcript(session, root, calls)
+    summed = {k: sum(c[k] for c in calls) for k in calls[0]}
+    old_root = server.cli_bridge.CLAUDE_PROJECTS
+    server.cli_bridge.CLAUDE_PROJECTS = root
+    try:
+        response = server.render_turn(
+            session, {"type": "final", "payload": {"result": "done", "usage": summed}}, None)
+    finally:
+        server.cli_bridge.CLAUDE_PROJECTS = old_root
+        _drop(session)
+    usage = response["usage"]
+    assert usage["prompt_tokens"] == 2 + 119_000 + 500, usage
+    assert usage["switchyard_billed_prompt_tokens"] == (
+        summed["input_tokens"] + summed["cache_read_input_tokens"]
+        + summed["cache_creation_input_tokens"]), usage
+    assert usage["switchyard_billed_completion_tokens"] == summed["output_tokens"]
+
+
+def test_no_inner_transcript_keeps_the_old_usage():
+    session = _new_session()
+    old_root = server.cli_bridge.CLAUDE_PROJECTS
+    server.cli_bridge.CLAUDE_PROJECTS = Path(tempfile.mkdtemp(prefix="projects-empty-"))
+    try:
+        response = server.render_turn(
+            session, {"type": "final", "payload": {"result": "done", "usage": {
+                "input_tokens": 7, "output_tokens": 3}}}, None)
+    finally:
+        server.cli_bridge.CLAUDE_PROJECTS = old_root
+        _drop(session)
+    assert response["usage"]["prompt_tokens"] == 7
+    assert response["usage"]["switchyard_billed_prompt_tokens"] == 7
