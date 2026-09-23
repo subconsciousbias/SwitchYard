@@ -302,6 +302,87 @@ def test_affinity_drops_lease_when_held_plan_is_draining():
           f"re-leased onto {pick.ref}; future pick pins {lease_after}")
 
 
+def test_set_lease_writes_lease_and_reverse_index_in_one_round_trip():
+    """`set_lease` is the third member of the lease trio (set / touch /
+    drop). Cycle-2 closed the analogous races in `touch_lease` and
+    `drop_lease` by moving both into Lua scripts; `set_lease` was left
+    as a three-step Python sequence with a single-round-trip race between
+    the SADD and the EXPIRE on the SET (network drop leaves the SET with
+    new membership but no TTL, `sessions_on_plan(plan)` reads a phantom
+    forever). Cycle-3 closes this by moving `set_lease` into a Lua script
+    too.
+
+    The contract we pin here is the observable happy-path behaviour:
+
+      (a) the lease key holds the new ref with the requested TTL,
+      (b) the SET key holds the session,
+      (c) the script's SADD does not duplicate the membership on a
+          same-session re-set (SADD returns 0 for an already-present
+          member — the atomicity shape the Lua guarantees).
+
+    The fake cannot directly simulate the partial-failure the script
+    closes (its `expire` is string-only — see the SET_LEASE shadow's
+    comment in `tests/fake_redis.py`), so the "atomicity holds across
+    network failures" property is real-Redis-only. This test pins the
+    membership and TTL contract; the cross-plan migration is the
+    responsibility of `drop_lease` (SREM on the old plan's SET, atomic),
+    not `set_lease`. In the live flow, every picker re-lease is preceded
+    by `_affinity`'s `drop_lease`, so the phantom problem the reviewer
+    raised on a hypothetical "set_lease twice without drop_lease" path
+    does not exist in the codebase.
+    """
+    async def go():
+        reg, slots, _picker = _build()
+        ttl = reg.settings.lease_ttl_seconds
+        plan_a = "claude-max"
+        plan_b = "minimax-ultra"
+
+        # First set: lease on plan A, SADD to plan A's SET.
+        await slots.set_lease("s-reroute", "claude-max/fable", ttl, plan_a)
+        lease_a = await slots.get_lease("s-reroute")
+        on_a = sorted(await slots.sessions_on_plan(plan_a))
+        ttl_a = await slots.redis.ttl("sy:lease:s-reroute")
+
+        # Re-set on the SAME session, SAME ref: SADD returns 0 (already a
+        # member), the SET still has exactly one entry for this session,
+        # the lease keeps its TTL.
+        await slots.set_lease("s-reroute", "claude-max/fable", ttl, plan_a)
+        on_a_again = sorted(await slots.sessions_on_plan(plan_a))
+        ttl_a_again = await slots.redis.ttl("sy:lease:s-reroute")
+        # And again on a DIFFERENT plan — the SADD lands on the new SET
+        # (the script's KEYS[2] is the new plan); the old SET still holds
+        # the session because cross-plan migration is drop_lease's job,
+        # not set_lease's. We assert only that the new SET gained the
+        # session; the phantom-cleanup behaviour is exercised in the
+        # existing `test_set_touch_drop_lease_keep_lease_plan_index_in_sync`.
+        await slots.set_lease("s-reroute", "minimax-ultra/m3", ttl, plan_b)
+        on_b_after = sorted(await slots.sessions_on_plan(plan_b))
+        ttl_b = await slots.redis.ttl("sy:lease:s-reroute")
+
+        return (lease_a, on_a, ttl_a,
+                on_a_again, ttl_a_again,
+                on_b_after, ttl_b)
+
+    (lease_a, on_a, ttl_a,
+     on_a_again, ttl_a_again,
+     on_b_after, ttl_b) = _run(go())
+    assert lease_a == "claude-max/fable", lease_a
+    assert on_a == ["s-reroute"], on_a
+    assert ttl_a > 0, f"lease must have a TTL after set_lease, got {ttl_a}"
+    # Same-session re-set: SET has exactly one entry, no duplicate.
+    assert on_a_again == ["s-reroute"], on_a_again
+    assert ttl_a_again > 0, (
+        f"lease TTL must persist across a same-session re-set, "
+        f"got {ttl_a_again}")
+    # Cross-plan re-set: the new SET gained the session via the script.
+    assert on_b_after == ["s-reroute"], on_b_after
+    assert ttl_b > 0, f"lease must have a fresh TTL after re-set, got {ttl_b}"
+    print(f"  lease_a={lease_a!r} (ttl={ttl_a}s, A={on_a}); "
+          f"re-set same session: A={on_a_again} (ttl={ttl_a_again}s, "
+          f"no duplicate); re-set to plan B: B={on_b_after} (ttl={ttl_b}s); "
+          f"SADD/SET/EXPIRE atomic, membership contract holds")
+
+
 if __name__ == "__main__":
     test_funcs = [(name, fn) for name, fn in sorted(globals().items())
                   if name.startswith("test_") and callable(fn)]

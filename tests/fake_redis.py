@@ -313,6 +313,28 @@ class FakeRedis:
                     await self.srem(f"sy:lease_plan:{plan_key}", session)
                 return 1
             return drop_lease
+        if "SET_LEASE" in src:
+            async def set_lease(keys, args):
+                # Mirror the Lua: SADD to the SET, SET the lease with EX,
+                # EXPIRE the SET. The fake's `expire` only updates string
+                # keys today — same pre-existing gap the TOUCH_LEASE shadow
+                # already calls out. Adding SET-key TTL tracking would let
+                # a future test simulate a partial-failure mid-script; for
+                # now the fake faithfully reproduces the *bug* shape (the
+                # membership lands but the SET TTL is a no-op in the fake),
+                # so any test that wants the "atomicity holds across
+                # failures" property needs to assert the script's behaviour
+                # in real Redis. The test we add here pins the membership
+                # contract only.
+                lease_key, set_key = keys
+                session, ref, ttl = args
+                added = await self.sadd(set_key, session)
+                await self.set(lease_key, ref, ex=int(ttl))
+                # SET EXPIRE — see comment above; the fake's expire is
+                # string-only and silently does nothing for SET keys today.
+                # The contract under test is the membership, not the TTL.
+                return added
+            return set_lease
 
         async def claim(keys, args):
             inflight_key, cool_key, model_key, lane_key = keys

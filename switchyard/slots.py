@@ -181,6 +181,30 @@ end
 return 1
 """
 
+# Set lease + per-plan reverse-index membership + both TTLs atomically.
+# The previous three-step Python sequence (SET lease EX ttl, SADD plan SET,
+# EXPIRE plan SET) had a single-round-trip race between the SADD and the
+# EXPIRE: a network drop after SADD but before EXPIRE leaves the SET with
+# the new membership but no TTL, and SADD never sets a TTL on a fresh
+# key. Membership then persists forever, and `sessions_on_plan(plan)`
+# reads a phantom for every plan that ever partial-failed. Single-script:
+# SADD, SET, EXPIRE — no window where SET exists without TTL, and no
+# caller can observe the membership without the TTL bound to it.
+#
+# KEYS[1] lease key
+# KEYS[2] reverse-index key (sy:lease_plan:{plan})
+# ARGV[1] session id (for SADD)
+# ARGV[2] ref string (the value the lease holds)
+# ARGV[3] ttl (lease seconds and SET EXPIRE seconds)
+# -> SADD count (newly added; 1 if first, 0 if already a member)
+_SET_LEASE = """
+-- SET_LEASE
+local added = redis.call('SADD', KEYS[2], ARGV[1])
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+return added
+"""
+
 
 @dataclass
 class Claim:
@@ -198,6 +222,7 @@ class SlotTable:
         self._bump_and_cool = redis.register_script(_BUMP_AND_COOL)
         self._touch_lease = redis.register_script(_TOUCH_LEASE)
         self._drop_lease = redis.register_script(_DROP_LEASE)
+        self._set_lease = redis.register_script(_SET_LEASE)
 
     # -- capacity ----------------------------------------------------------
     async def try_claim(self, plan: str, cap: int, request_id: str,
@@ -322,9 +347,19 @@ class SlotTable:
         # already have the ref and don't want to thread a registry through.
         if plan_key is None:
             plan_key = ref.split("/", 1)[0]
-        await self.redis.set(K_LEASE.format(session=session), ref, ex=ttl)
-        await self.redis.sadd(K_LEASE_PLAN.format(plan=plan_key), session)
-        await self.redis.expire(K_LEASE_PLAN.format(plan=plan_key), ttl)
+        # Atomic: SADD, SET lease EX, EXPIRE SET — all in one Lua script.
+        # The previous three-step Python sequence had a window between the
+        # SADD and the EXPIRE on the SET (a single round-trip's worth) where
+        # a network drop could leave the SET with new membership but no TTL;
+        # `sessions_on_plan(plan)` would then read a phantom forever, and
+        # the drain flow would re-pick the same session every migration.
+        # Single-script: no window where the SET exists without a TTL bound
+        # to it.
+        await self._set_lease(
+            keys=[K_LEASE.format(session=session),
+                  K_LEASE_PLAN.format(plan=plan_key)],
+            args=[session, ref, ttl],
+        )
 
     async def touch_lease(self, session: str, ttl: int) -> None:
         # Atomic: the script reads the lease value first, so a concurrent
