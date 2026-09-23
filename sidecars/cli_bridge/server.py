@@ -137,6 +137,45 @@ def over_argv_limit(text: str) -> bool:
     return len(text.encode("utf-8")) > STDIN_PROMPT_LIMIT
 
 
+# --------------------------------------------------- subprocess env (issue #116) ---
+# Subprocess env contract. Every `asyncio.create_subprocess_exec` that spawns a
+# vendor CLI passes `env=subprocess_env()` -- never `env=os.environ` and never
+# `env=None`. The container runs as root with the operator's `.env` mounted
+# via compose's env_file, so an inner CLI inheriting the parent environment
+# could exfiltrate every provider key, the gateway master key and the OAuth
+# grant on a single prompt injection. The allowlist below is what the inner
+# CLIs actually need: enough to look up their own binaries (PATH), pick up
+# HOME and the XDG_* vars Dockerfile.sidecar pins, and find Claude/Codex's
+# credential stores (CLAUDE_CONFIG_DIR, CODEX_HOME).
+#
+# Values come from os.environ ONLY when set by name -- widening to
+# `os.environ.copy()` is the regression we are guarding against. A future CLI
+# auth/config failure caused by a missing var is fixed by adding that var to
+# SUBPROCESS_ENV_KEYS deliberately (and only that var), so the allowlist
+# stays the canonical list.
+#
+# Bridge-siblings rule: mcp_bridge imports `subprocess_env` from this module
+# rather than duplicating it (see sidecars/CLAUDE.md).
+SUBPROCESS_ENV_KEYS = (
+    "PATH", "HOME", "LANG", "LC_ALL", "TERM",
+    "USER", "LOGNAME", "SHELL", "TMPDIR",
+    "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+    "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+)
+
+
+def subprocess_env() -> dict:
+    """A minimal env dict for spawning a vendor CLI subprocess.
+
+    Only the keys in SUBPROCESS_ENV_KEYS are carried forward, and only when
+    they are set in the sidecar's own environment. A missing var the CLI
+    actually needs (a credential-store fallback, a locale the chat tool
+    depends on) is fixed by adding it to SUBPROCESS_ENV_KEYS above -- not by
+    widening this function to copy `os.environ`.
+    """
+    return {k: os.environ[k] for k in SUBPROCESS_ENV_KEYS if k in os.environ}
+
+
 # ------------------------------------------------------------------ images ---
 # flatten() used to drop every non-text content block, so a request with a
 # screenshot was accepted, answered confidently, and wrong -- `#EDF6EC` for a
@@ -1203,6 +1242,12 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=spawn_cwd,
+            # env=allowlist, NOT os.environ.copy(): the operator's .env is
+            # mounted into this container, so inheriting it wholesale would
+            # hand every provider key, the gateway master key and the OAuth
+            # grant to the inner CLI -- a single prompt injection exfiltrates
+            # all of it (issue #116).
+            env=subprocess_env(),
         )
     except OSError as exc:
         shutil.rmtree(spawn_cwd, ignore_errors=True)
@@ -1594,7 +1639,8 @@ async def usage_report() -> dict:
     proc = await asyncio.create_subprocess_exec(
         PROFILE["cli"], "-p", "/usage",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        cwd=tempfile.gettempdir())
+        cwd=tempfile.gettempdir(),
+        env=subprocess_env())
     try:
         _, err = await asyncio.wait_for(proc.communicate(), USAGE_TIMEOUT)
     except asyncio.TimeoutError:

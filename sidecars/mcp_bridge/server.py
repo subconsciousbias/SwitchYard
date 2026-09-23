@@ -258,11 +258,31 @@ MCP_PROFILES: dict[str, dict] = {
         # --approve-for-me, routes every call through an extra model review,
         # which is latency and quota per tool call on a high-volume path.
         #
-        # The tool surface here is one MCP server that executes nothing locally:
-        # it parks an HTTP call back to this process. Codex's own shell tools are
-        # what the container boundary contains, the same as on the text path.
+        # The flag alone is not enough any more (issue #116): codex 0.155.1
+        # has a built-in shell tool that, even inside this container, can run
+        # `id`, `env`, and read ~/.codex/auth.json -- any one of which would
+        # exfiltrate the OAuth grant mounted for the ChatGPT seat. So the
+        # flag is paired with explicit -c overrides:
+        #   tools.web_search=false           strips the web-search tool
+        #   -c sandbox_mode="read-only"      neutralises the built-in shell
+        # -c fragments are applied in argv order, so they sit AFTER the
+        # bypass flag and WIN over its implicit `danger-full-access`. The
+        # four `mcp_servers.switchyard.*` lines below follow.
+        #
+        # FALLBACK (issue #116 No-Go path): if a live MCP-path request still
+        # parks an MCP tool call but built-in `id` / `env` / cat
+        # ~/.codex/auth.json attempts are NOT refused (i.e. the sandbox_mode
+        # override loses to the bypass flag on this codex version), the
+        # codex MCP path is unsafe to keep. The operator action is to flip
+        # codex-sidecar's `BRIDGE: mcp` -> `BRIDGE: cli` in docker-compose.yml
+        # (owned by the workstream-2 docker-compose change); the text path's
+        # built-in shell is the same codex, the same container, but it is
+        # already blocked from running tools by the cli_bridge gate, so it is
+        # safe.
         "argv": ["exec", "--json", "--skip-git-repo-check",
                  "--dangerously-bypass-approvals-and-sandbox",
+                 "-c", "sandbox_mode=\"read-only\"",
+                 "-c", "tools.web_search=false",
                  "--model", "{model}",
                  "-c", "mcp_servers.switchyard.command=python3",
                  "-c", 'mcp_servers.switchyard.args=["{tool_server}"]',
@@ -934,6 +954,13 @@ async def _run_session_attempt(session: Session, argv: list[str],
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=session.workdir,
+            # env=allowlist, NOT os.environ.copy(): same rationale as
+            # cli_bridge._run_cli_attempt -- the operator's .env is mounted
+            # into this container, and we cannot hand every provider key and
+            # the OAuth grant to a child CLI whose built-in tools we cannot
+            # fully neutralise. The helper lives on cli_bridge because the
+            # allowlist is the one being shared (bridge-siblings rule).
+            env=cli_bridge.subprocess_env(),
         )
     except OSError as exc:
         # Same mapping cli_bridge._run_cli applies to a failed spawn (issue

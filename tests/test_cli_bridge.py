@@ -1657,6 +1657,126 @@ def test_health_reports_max_tokens_mode():
           "codex health -> False, reason='no-truncation-flag'")
 
 
+def test_spawn_sites_pass_only_the_allowlisted_env_to_the_cli():
+    """Every `create_subprocess_exec` here hands the CLI an `env=` whose keys
+    are a subset of SUBPROCESS_ENV_KEYS. A planted secret (LITELLM_MASTER_KEY,
+    the kind compose's env_file would have injected into the container) must
+    not appear. Otherwise a single prompt injection exfiltrates every
+    provider key, the gateway master key and the OAuth grant (issue #116).
+
+    Covers BOTH cli_bridge spawn sites: _run_cli_attempt (text path) and
+    usage_report (the /usage slash-command path, which is otherwise an
+    attractive injection target because its argv is fixed and predictable).
+    mcp_bridge's spawn site is covered in test_mcp_bridge.py.
+    """
+    import asyncio
+    from fastapi import HTTPException
+
+    real_exec = asyncio.create_subprocess_exec
+    captured_envs: list = []
+
+    async def fake_exec(*args, **kwargs):
+        # Capture the env keyword arg verbatim. A real spawn would also need
+        # stdin/stdout/stderr PIPE objects, communicate(), etc.; we substitute
+        # a sentinel Process-like object so the post-spawn code under test
+        # doesn't choke. For usage_report the spawn returns early, so this
+        # only needs to look real enough for the first await past exec.
+        env = kwargs.get("env")
+        captured_envs.append(env)
+        class _Stub:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                # Text path: an empty but non-zero stdout trips the
+                # "exit 0 but nothing" branch and lets _run_cli_attempt
+                # raise its expected HTTPException (502). The test catches
+                # that exception -- only the captured env matters.
+                # usage_report path: never reads stdout.
+                return (b"", b"")
+
+            async def wait(self):
+                return 0
+
+            def kill(self):
+                return None
+        return _Stub()
+
+    # Plant the secret AFTER importing server so the constant SUBPROCESS_ENV_KEYS
+    # is already captured; this mirrors the real failure shape where the
+    # operator's .env is mounted into a running sidecar mid-life.
+    planted = "LITELLM_MASTER_KEY"
+    previous = os.environ.get(planted)
+    os.environ[planted] = "sk-test-planted-secret"
+    # The default PROVIDER for these tests is opencode; usage_report only
+    # spawns for PROVIDER=claude (the others raise 501). Snapshot the
+    # current PROVIDER and toggle to claude for the second half so the
+    # /usage spawn site actually fires.
+    saved_provider = server.PROVIDER
+    try:
+        asyncio.create_subprocess_exec = fake_exec
+
+        # 1) The text path. _run_cli_attempt is what /v1/chat/completions
+        #    reaches; its spawn is the one that runs the user's prompt.
+        #    The fake spawn returns exit 0 / empty stdout, which is the
+        #    "exit 0 but nothing" branch -- _run_cli raises 502. We do
+        #    not care about the raised exception; we only need the spawn
+        #    to have happened so the env= capture is meaningful.
+        try:
+            asyncio.run(server._run_cli("hi", None, "m", []))
+        except HTTPException:
+            pass
+
+        # 2) The /usage path. Different call site in the file; same env=
+        #    contract must hold. PROVIDER=claude so the spawn actually
+        #    fires (opencode/codex raise 501/503 without spawning). The
+        #    fake spawn returns exit 0 -- _find_usage_report finds no
+        #    transcripts in this fake workdir and raises 502. Irrelevant;
+        #    only the spawn's env= matters here.
+        server.PROVIDER = "claude"
+        try:
+            asyncio.run(server.usage_report())
+        except HTTPException:
+            pass
+    finally:
+        asyncio.create_subprocess_exec = real_exec
+        server.PROVIDER = saved_provider
+        if previous is None:
+            os.environ.pop(planted, None)
+        else:
+            os.environ[planted] = previous
+
+    # Exactly one capture per documented spawn site: the text-path
+    # _run_cli_attempt and the /usage command. `_run_cli` would also spawn
+    # a second time on its single no-text-with-usage retry -- that retry
+    # does NOT fire here today because the empty-stdout stub trips
+    # _run_cli_attempt's HTTPException(502) terminal branch, not the
+    # retriable CliNoTextError branch -- but pin the count so a future
+    # change that flips the empty-stdout shape into a retry (or adds
+    # another spawn) is caught here instead of silently extending the
+    # captured list past two.
+    assert len(captured_envs) == 2, captured_envs
+    for env in captured_envs:
+        # Plain dict, not None (which would have meant "inherit parent") and
+        # not os.environ (which would have meant copy-the-whole-bag).
+        assert isinstance(env, dict), type(env)
+        # Every key must be on the allowlist. No drift, no stragglers.
+        bad = set(env) - set(server.SUBPROCESS_ENV_KEYS)
+        assert not bad, f"unexpected env keys passed to CLI: {sorted(bad)}"
+        # The planted secret must be absent: the allowlist is the only
+        # source of truth, and LITELLM_MASTER_KEY is not on it.
+        assert planted not in env, \
+            f"{planted!r} was passed to the inner CLI: {sorted(env)[:5]}..."
+        # And we did not accidentally widen to os.environ: at least one of
+        # the well-known SECRET_KEYS is NOT here even if it is in os.environ.
+        # (LITELLM_MASTER_KEY above already proves that; this is belt and braces.)
+        assert env.keys() <= set(server.SUBPROCESS_ENV_KEYS)
+
+    print(f"  spawn env allowlist honoured at both sites: "
+          f"{len(captured_envs)} captures, all keys subset of "
+          f"{len(server.SUBPROCESS_ENV_KEYS)}-key allowlist; "
+          f"{planted} absent")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

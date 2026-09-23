@@ -28,7 +28,6 @@ name: ${SWITCHYARD_PROJECT:?run compose from the main checkout — see CLAUDE.md
 
 x-common: &common
   restart: unless-stopped
-  env_file: [.env]
 
 services:
 
@@ -71,10 +70,19 @@ services:
       REDIS_PORT: "6379"
       DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:-litellm}@postgres:5432/litellm
       LOCAL_API_BASE: ${LOCAL_API_BASE:-http://host.docker.internal:11434/v1}
-      # Reaches the container via env_file too, but named here so the
-      # dependency is visible when the local lane 401s.
       LOCAL_API_KEY: ${LOCAL_API_KEY:-}
       GATEWAY_WORKERS: ${GATEWAY_WORKERS:-2}
+      # The only service that legitimately holds secrets: every key listed in
+      # config/plans.yaml's `os.environ/NAME` references. Named explicitly so a
+      # lane 401 names the missing variable instead of failing silently.
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?missing}
+      MINIMAX_ULTRA_API_BASE: ${MINIMAX_ULTRA_API_BASE:-}
+      MINIMAX_ULTRA_API_KEY: ${MINIMAX_ULTRA_API_KEY:-}
+      MINIMAX_MAX_API_BASE: ${MINIMAX_MAX_API_BASE:-}
+      MINIMAX_MAX_API_KEY: ${MINIMAX_MAX_API_KEY:-}
+      GLM_API_BASE: ${GLM_API_BASE:-}
+      GLM_API_KEY: ${GLM_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
       redis: {condition: service_healthy}
@@ -94,6 +102,10 @@ services:
       - ./config:/app/config:ro
     environment:
       SWITCHYARD_REDIS_URL: redis://redis:6379/1
+      # Probe code in switchyard/portal/app.py reads os.environ/OPENCODE_ORG_ID
+      # and os.environ/OPENCODE_ORG_ID2 from plans.yaml; one per Go subscription.
+      OPENCODE_ORG_ID: ${OPENCODE_ORG_ID:-}
+      OPENCODE_ORG_ID2: ${OPENCODE_ORG_ID2:-}
     depends_on:
       redis: {condition: service_healthy}
 
@@ -117,6 +129,8 @@ services:
     build: {context: ., dockerfile: Dockerfile.sidecar}
     image: switchyard-sidecar:latest
     <<: *common
+    user: node
+    cap_drop: [ALL]
     expose: ["8081"]
     # Concurrency and model aliases come from config/plans.yaml — the plans
     # sharing `subscription: claude-max`. Nothing about limits is set here, so
@@ -150,6 +164,8 @@ services:
   codex-sidecar:
     image: switchyard-sidecar:latest     # built by claude-max-sidecar
     <<: *common
+    user: node
+    cap_drop: [ALL]
     expose: ["8082"]
     # Serves both the `openai` seat (gpt-5) and `astra` (GPT 6) — one seat, one
     # set of connections. Limits come from plans.yaml.
@@ -211,6 +227,8 @@ services:
   opencode-go-sidecar:
     image: switchyard-sidecar:latest     # built by claude-max-sidecar
     <<: *common
+    user: node
+    cap_drop: [ALL]
     expose: ["8084"]
     environment:
       PROVIDER: opencode
@@ -242,6 +260,8 @@ services:
   opencode-go2-sidecar:
     image: switchyard-sidecar:latest     # built by claude-max-sidecar
     <<: *common
+    user: node
+    cap_drop: [ALL]
     expose: ["8085"]
     environment:
       PROVIDER: opencode

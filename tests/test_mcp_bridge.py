@@ -3534,6 +3534,190 @@ def test_no_inner_transcript_keeps_old_usage_and_bills_mirror_it():
     print("  no transcript: today's usage kept; billed keys mirror it")
 
 
+def test_run_session_attempt_passes_only_the_allowlisted_env_to_the_cli():
+    """mcp_bridge's only `create_subprocess_exec` (the one inside
+    _run_session_attempt) must hand the inner CLI a plain-dict `env=`
+    whose keys are a subset of cli_bridge's SUBPROCESS_ENV_KEYS. A
+    planted secret (LITELLM_MASTER_KEY, the kind compose's env_file would
+    have injected into the container) must be absent -- otherwise a
+    single prompt injection on the MCP path exfiltrates every provider
+    key, the gateway master key and the OAuth grant (issue #116).
+    """
+    async def scenario():
+        session = _new_session()
+        session.new_turn()
+
+        real_exec = asyncio.create_subprocess_exec
+        captured: list = []
+
+        async def fake_exec(*args, **kwargs):
+            captured.append(kwargs.get("env"))
+            class _Stub:
+                returncode = 0
+
+                async def communicate(self, input=None):
+                    return (b"", b"")
+
+                async def wait(self):
+                    return 0
+
+                def kill(self):
+                    return None
+            return _Stub()
+
+        # Plant the secret AFTER importing server so SUBPROCESS_ENV_KEYS is
+        # already captured; this is the real failure shape -- an .env line
+        # arrives in a running sidecar via env_file.
+        planted = "LITELLM_MASTER_KEY"
+        previous = os.environ.get(planted)
+        os.environ[planted] = "sk-test-planted-secret"
+        try:
+            asyncio.create_subprocess_exec = fake_exec
+            await server.run_session(session, ["fake-argv"])
+        finally:
+            asyncio.create_subprocess_exec = real_exec
+            if previous is None:
+                os.environ.pop(planted, None)
+            else:
+                os.environ[planted] = previous
+        return session.turn_future.result(), captured
+
+    result, captured = asyncio.run(scenario())
+    # run_session resolved without raising -- if _run_session_attempt
+    # raised because the fake spawn returned nothing usable, the resolved
+    # turn_future still has to be the success path here.
+    assert isinstance(result, dict), result
+
+    assert captured, "create_subprocess_exec was never called"
+    # Every captured env, not just the last: a future regression that
+    # leaked the env on attempt N but switched to the allowlist on
+    # attempt N+1 would pass a `captured[-1]` peek while still having
+    # shipped a real spawn with the leaked bag. The contract is "every
+    # CLI spawn on this path gets the allowlist", so assert it on every
+    # capture. (run_session's no-text-with-usage retry only adds a
+    # second spawn if the first raises CliNoTextError -- the empty-
+    # stdout stub here trips the terminal HTTPException branch, not the
+    # retry branch -- so today there is exactly one capture and the
+    # single-env check below is no weaker than the per-attempt check.)
+    for attempt, env in enumerate(captured, start=1):
+        # Plain dict, NOT None (inherit parent) and NOT os.environ (copy whole bag).
+        assert isinstance(env, dict), (attempt, type(env))
+        # Every key on the allowlist -- exactly, no more, no less.
+        bad = set(env) - set(server.cli_bridge.SUBPROCESS_ENV_KEYS)
+        assert not bad, \
+            f"attempt {attempt}: unexpected env keys passed to CLI: {sorted(bad)}"
+        # The planted secret must not be present on any attempt.
+        assert "LITELLM_MASTER_KEY" not in env, \
+            f"attempt {attempt}: LITELLM_MASTER_KEY was passed to the inner CLI: " \
+            f"{sorted(env)[:5]}..."
+    print(f"  _run_session_attempt env allowlist honoured on every attempt: "
+          f"{len(captured)} capture(s), all keys subset of "
+          f"{len(server.cli_bridge.SUBPROCESS_ENV_KEYS)}-key allowlist; "
+          f"LITELLM_MASTER_KEY absent")
+
+
+def test_codex_mcp_profile_argv_carries_disable_overrides_after_bypass():
+    """The codex profile in MCP_PROFILES is the only surface on the MCP path
+    that runs a CLI with its OWN shell-and-search tools still enabled. The
+    fix (issue #116) has to land three pieces at once:
+
+      1. --dangerously-bypass-approvals-and-sandbox KEPT. Without it codex
+         refuses an MCP tool call ("MCP tool call requires approval").
+      2. `-c` overrides added: `sandbox_mode="read-only"` neutralises the
+         built-in shell, `tools.web_search=false` strips web search. Both
+         MUST sit in argv AFTER the bypass flag so the overrides win.
+      3. Every `mcp_servers.switchyard.*` line KEPT -- parking an MCP tool
+         call is the whole point of this bridge.
+
+    SCOPE OF THIS TEST: argv shape only -- it asserts that argv contains
+    the three pieces above, in the right order, with the expected config
+    key spellings. It deliberately does NOT assert:
+
+      * That `sandbox_mode=` and `tools.web_search=` are still recognised
+        config keys on the pinned codex line. A rename upstream (e.g.
+        `sandbox.policy=` or `tools.search=`) would no-op the override
+        while keeping this test green on a literal startswith match -- the
+        issue #116 attack surface would silently reopen. That gap is owned
+        by the runtime probe described in
+        `sidecars/mcp_bridge/server.py:271-280` (operator-visible fallback
+        + a `scripts/smoke.py` no-network probe should be the next step;
+        it cannot live here because the offline suite must not depend on
+        the codex binary).
+      * That the `-c` overrides win over `--dangerously-bypass-approvals-and-sandbox`.
+        That depends on codex argv-order config merge, which is
+        implementation-defined. The PR hedges this in the same comment;
+        the test name + this paragraph make the limit explicit.
+
+    In short: this test is the trip-wire against argv drift, not against
+    a future codex version changing its config-key namespace. Both are
+    real risks, but only the former belongs in an offline test.
+    """
+    profile = server.MCP_PROFILES["codex"]
+    argv = profile["argv"]
+
+    # The bypass flag has to stay: codex refuses an MCP tool call otherwise.
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv, \
+        f"--dangerously-bypass-approvals-and-sandbox missing from argv: {argv}"
+
+    # Both tool-disable overrides have to be in argv, AFTER the bypass flag
+    # (so they win). Find their indices and check ordering.
+    bypass_idx = argv.index("--dangerously-bypass-approvals-and-sandbox")
+    sandbox_c_idx = None
+    web_search_c_idx = None
+    for i, element in enumerate(argv):
+        if element.startswith("-c") and i + 1 < len(argv) \
+                and argv[i + 1].startswith("sandbox_mode="):
+            sandbox_c_idx = i
+        if element.startswith("-c") and i + 1 < len(argv) \
+                and argv[i + 1].startswith("tools.web_search="):
+            web_search_c_idx = i
+
+    assert sandbox_c_idx is not None, \
+        f"sandbox_mode -c override missing from codex argv: {argv}"
+    assert web_search_c_idx is not None, \
+        f"tools.web_search -c override missing from codex argv: {argv}"
+    assert bypass_idx < sandbox_c_idx, \
+        f"bypass flag must precede -c override (bypass at {bypass_idx}, " \
+        f"sandbox at {sandbox_c_idx}): {argv}"
+    assert bypass_idx < web_search_c_idx, \
+        f"bypass flag must precede -c override (bypass at {bypass_idx}, " \
+        f"web_search at {web_search_c_idx}): {argv}"
+
+    # sandbox_mode must be restrictive (read-only or workspace-write), not
+    # back to danger-full-access which is what the bypass flag wanted.
+    # We only need the value, not the position, so plain iteration (the
+    # earlier ordering loop above does need the index and uses it).
+    sandbox_value = None
+    for element in argv:
+        if element.startswith("sandbox_mode="):
+            sandbox_value = element.split("=", 1)[1].strip('"').strip("'")
+            break
+    assert sandbox_value in ("read-only", "workspace-write"), \
+        f"sandbox_mode override must restrict shell, got {sandbox_value!r}: {argv}"
+    assert sandbox_value != "danger-full-access", \
+        f"sandbox_mode override is the default the bypass wanted, not a restriction: {argv}"
+
+    # All four mcp_servers.switchyard.* lines still there. Parking an MCP
+    # tool call is the bridge's whole purpose -- a regression that drops
+    # them turns the bridge into a CLI with no tools.
+    mcp_fragments = [el for el in argv
+                     if isinstance(el, str) and el.startswith("mcp_servers.switchyard.")]
+    assert len(mcp_fragments) == 4, \
+        f"expected 4 mcp_servers.switchyard.* fragments, got {len(mcp_fragments)}: {argv}"
+    # Spot-check: command, args, startup_timeout_sec and env.
+    keys = {el.split("=", 1)[0] for el in mcp_fragments}
+    assert keys == {
+        "mcp_servers.switchyard.command",
+        "mcp_servers.switchyard.args",
+        "mcp_servers.switchyard.startup_timeout_sec",
+        "mcp_servers.switchyard.env",
+    }, f"missing/wrong mcp_servers.switchyard.* keys: {keys}"
+
+    print(f"  codex argv: bypass flag kept; sandbox_mode={sandbox_value!r} "
+          f"and tools.web_search override sit AFTER it; "
+          f"{len(mcp_fragments)} mcp_servers.switchyard.* keys intact")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
