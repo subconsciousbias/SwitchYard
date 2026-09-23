@@ -49,6 +49,46 @@ SIDECARS = {"claude-max-sidecar": 8081, "codex-sidecar": 8082,
 TOKEN_PROXIES = {"xai-token-proxy": 8090}
 
 results: list[tuple[str, bool, str]] = []
+skipped: list[tuple[str, str]] = []
+
+# The checks used to assume the example install (lanes local/bulk/forge, a
+# minimax-ultra plan, an xai-token-proxy, an opencode-go-sidecar). On any other
+# plans.yaml they failed for things that were never configured, which buried
+# the real failures. Everything below now asks the config what exists, and
+# says "skip" instead of "FAIL" for what does not.
+FREE_LANES = ("local", "bulk")
+
+
+def skip(name: str, why: str) -> None:
+    skipped.append((name, why))
+    print(f"  skip  {name}\n          {why}")
+
+
+_SERVICES = None
+
+
+def services() -> set[str]:
+    global _SERVICES
+    if _SERVICES is None:
+        _SERVICES = set(compose("config", "--services").split())
+    return _SERVICES
+
+
+def lanes() -> list[str]:
+    return list(registry().lanes)
+
+
+def free_lanes() -> list[str]:
+    return [l for l in FREE_LANES if l in registry().lanes]
+
+
+def probe_lane(paid: bool) -> str | None:
+    """A lane that is safe to send a real request to: a free one, or with
+    --paid the first configured lane."""
+    free = free_lanes()
+    if free:
+        return free[0]
+    return lanes()[0] if paid and lanes() else None
 
 
 def check(name: str, ok: bool, detail: str = "") -> bool:
@@ -117,7 +157,7 @@ def check_services() -> None:
     out = compose("ps", "--format", "{{.Service}} {{.Status}}")
     running = [l for l in out.splitlines() if " Up " in l or l.endswith("Up")]
     expected = ({"gateway", "portal", "redis", "postgres"}
-                | set(SIDECARS) | set(TOKEN_PROXIES))
+                | set(SIDECARS) | set(TOKEN_PROXIES)) & services()
     names = {l.split()[0] for l in running}
     check("all services up", expected <= names,
           f"missing: {sorted(expected - names)}" if expected - names else
@@ -133,6 +173,9 @@ def check_plugin_loaded() -> None:
 
 def check_sidecar_health() -> None:
     for svc, port in SIDECARS.items():
+        if svc not in services():
+            skip(f"{svc} health", "not in this compose file")
+            continue
         raw = compose("exec", "-T", svc, "python3", "-c",
                       f"import json,urllib.request;"
                       f"print(json.dumps(json.load(urllib.request.urlopen("
@@ -160,6 +203,9 @@ def check_token_proxy_health() -> None:
     otherwise fail every request in its lane.
     """
     for svc, port in TOKEN_PROXIES.items():
+        if svc not in services():
+            skip(f"{svc} health", "not in this compose file")
+            continue
         raw = compose("exec", "-T", svc, "python3", "-c",
                       f"import json,urllib.request;"
                       f"print(json.dumps(json.load(urllib.request.urlopen("
@@ -193,8 +239,11 @@ def check_lane(lane: str, api_key: str, expect_text: str | None = None) -> None:
           f"-> {member}  {content[:60]!r}")
 
 
-def check_anthropic_protocol(api_key: str) -> None:
-    d = post("/v1/messages", {"model": "bulk", "max_tokens": 200,
+def check_anthropic_protocol(api_key: str, lane: str | None) -> None:
+    if lane is None:
+        skip("anthropic /v1/messages", "no free lane configured (use --paid)")
+        return
+    d = post("/v1/messages", {"model": lane, "max_tokens": 200,
              "messages": [{"role": "user", "content": "Reply with exactly: MESSAGES OK"}]},
              api_key, anthropic=True)
     if "__http__" in d:
@@ -254,14 +303,17 @@ def check_tool_routing(lane: str, api_key: str) -> None:
           f"plan.can_use_tools={capable}")
 
 
-def check_affinity(api_key: str) -> None:
+def check_affinity(api_key: str, lane: str | None) -> None:
+    if lane is None:
+        skip("session affinity", "no free lane configured (use --paid)")
+        return
     session = f"smoke-{int(time.time())}"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}",
                "X-Session-Id": session}
     for _ in range(3):
         req = urllib.request.Request(
             GW + "/v1/chat/completions",
-            json.dumps({"model": "local", "max_tokens": 40,
+            json.dumps({"model": lane, "max_tokens": 40,
                         "messages": [{"role": "user", "content": "say hi"}]}).encode(),
             headers)
         try:
@@ -270,13 +322,16 @@ def check_affinity(api_key: str) -> None:
             check("session affinity", False, f"HTTP {exc.code}")
             return
     logs = compose("logs", "--tail=20", "gateway")
-    sticky = [l for l in logs.splitlines() if "lane=local ->" in l and "(sticky)" in l]
+    sticky = [l for l in logs.splitlines() if f"lane={lane} ->" in l and "(sticky)" in l]
     check("session affinity keeps a session on one model", len(sticky) >= 2,
           f"{len(sticky)} of the last 3 requests were sticky")
 
 
 def check_cooldown_shrinks_capacity() -> None:
-    lane, plan = "forge", "minimax-ultra"
+    # Any configured lane and the plan of its first member. The cool key has
+    # a 60 s TTL, so even an interrupted run cannot leave the plan cooled.
+    lane = "forge" if "forge" in lanes() else lanes()[0]
+    plan = registry().routing_order(lane)[0].split("/")[0]
     before = next(l for l in state()["capacity"]["lanes"] if l["lane"] == lane)
     compose("exec", "-T", "redis", "redis-cli", "-n", "1", "SET",
             f"sy:cool:{plan}", "quota_exhausted|0", "EX", "60")
@@ -295,7 +350,8 @@ def check_pacing_switch() -> None:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.load(resp)
     on = toggle("on")
-    lane = next(l for l in state()["capacity"]["lanes"] if l["lane"] == "forge")
+    name = "forge" if "forge" in lanes() else lanes()[0]
+    lane = next(l for l in state()["capacity"]["lanes"] if l["lane"] == name)
     tail_open = [p["ref"] for p in lane["plans"] if p["tail"] and p["cap"] > 0]
     toggle("default")
     off = state()["capacity"]["pacing"]
@@ -320,6 +376,9 @@ def check_harness_overhead() -> None:
     write. Slow: one real call per sidecar."""
     for svc, port, model in (("claude-max-sidecar", 8081, "claude-opus-5"),
                              ("codex-sidecar", 8082, "gpt-5.6-sol")):
+        if svc not in services():
+            skip(f"{svc} harness overhead", "not in this compose file")
+            continue
         script = (
             "import json,urllib.request;"
             f"body=json.dumps({{'model':'{model}','max_tokens':60,"
@@ -360,22 +419,26 @@ def main() -> int:
         check("master key readable from the gateway", False, "empty")
         return 1
 
+    probe = probe_lane(args.paid)
     print("\nfree lanes")
-    for lane in ("local", "bulk"):
+    if not free_lanes():
+        skip("free lanes", f"none of {FREE_LANES} is configured")
+    for lane in free_lanes():
         check_lane(lane, api_key)
-    check_anthropic_protocol(api_key)
+    check_anthropic_protocol(api_key, probe)
 
     print("\nbehaviour")
-    check_affinity(api_key)
+    check_affinity(api_key, probe)
     check_cooldown_shrinks_capacity()
     check_pacing_switch()
     check_quota_windows_tracked()
-    for lane in ("local", "bulk"):
+    for lane in free_lanes():
         check_tool_routing(lane, api_key)
 
     if args.paid:
         print("\npaid lanes (spending subscription quota)")
-        for lane in ("forge", "judge", "apex"):
+        paid = [l for l in ("forge", "judge", "apex") if l in lanes()] or lanes()[:1]
+        for lane in paid:
             check_lane(lane, api_key)
             check_tool_routing(lane, api_key)
 
@@ -384,7 +447,8 @@ def main() -> int:
         check_harness_overhead()
 
     failed = [n for n, ok, _ in results if not ok]
-    print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
+    print(f"\n{len(results) - len(failed)}/{len(results)} checks passed"
+          + (f", {len(skipped)} skipped (not configured)" if skipped else ""))
     if failed:
         print("failed: " + ", ".join(failed))
     return 1 if failed else 0

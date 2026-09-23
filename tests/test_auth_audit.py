@@ -158,6 +158,16 @@ def test_env_bak_suffix_snapshots_are_ignored():
     # `git check-ignore -q` rejects multiple pathnames, so loop and assert
     # each path individually — exit 0 means that path is ignored.
     import subprocess
+    import shutil
+    if shutil.which("git") is None:
+        # The gateway image (where the suite is usually run) ships no git;
+        # a FileNotFoundError there says nothing about .gitignore.
+        try:
+            import pytest
+            pytest.skip("git not installed")
+        except ImportError:
+            print("  skipped: git not installed")
+            return
     snapshot_names = [
         ".env.bak-20260921", ".env.bak-", ".env.bak",
         ".env.backup.1", ".env",

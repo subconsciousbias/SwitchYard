@@ -119,6 +119,38 @@ print(
 )
 PY
 
+# Token counting for sidecar-backed deployments (issue #198). Every plan here
+# is `openai/...` pointed at a SwitchYard CLI sidecar, so LiteLLM's
+# OpenAITokenCounter forwards /v1/messages/count_tokens to
+# {api_base}/responses/input_tokens. No sidecar serves that (a CLI cannot
+# count), so every count 404'd, logged an ERROR, and THEN fell back to
+# LiteLLM's local tokenizer - which is the number the client got anyway.
+# Skip the doomed round trip: an api_base whose host ends in "-sidecar"
+# returns None, which is LiteLLM's own "use the local counter" signal.
+# Same answer the client already got, one less request and error line.
+RUN python3 - <<'PY'
+import os, sys
+import litellm
+target = os.path.join(os.path.dirname(litellm.__file__), "llms", "openai",
+                      "responses", "count_tokens", "token_counter.py")
+if not os.path.isfile(target):
+    sys.exit(f"switchyard: expected {target}")
+src = open(target, encoding="utf-8").read()
+anchor = '        api_base: Final = litellm_params.get("api_base")\n'
+if src.count(anchor) != 1:
+    sys.exit("switchyard: count_tokens api_base anchor appeared "
+             f"{src.count(anchor)} times, expected 1; re-derive the #198 patch")
+guard = anchor + (
+    "        try:\n"
+    "            from urllib.parse import urlparse as _sy_urlparse\n"
+    "            if (_sy_urlparse(api_base or '').hostname or '').endswith('-sidecar'):\n"
+    "                return None  # switchyard #198: sidecars cannot count; count locally\n"
+    "        except Exception:\n"
+    "            pass\n")
+open(target, "w", encoding="utf-8").write(src.replace(anchor, guard, 1))
+print("switchyard: count_tokens patched (sidecar api_base -> local count)")
+PY
+
 COPY switchyard /switchyard/switchyard
 COPY docker/gateway-entrypoint.sh /switchyard/entrypoint.sh
 RUN chmod +x /switchyard/entrypoint.sh

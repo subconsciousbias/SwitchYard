@@ -461,6 +461,11 @@ def test_cli_blocklist_drops_blocked_tools_and_passes_the_rest():
         handler.emit = captured.append
         log = _logging.getLogger("switchyard")
         prior_level = log.level
+        # test_hot_reload.py sets `hooks.log.disabled = True` at import, and
+        # pytest imports every file before running any test, so in a full
+        # run this logger was silently off and `captured` stayed empty.
+        prior_disabled = log.disabled
+        log.disabled = False
         log.setLevel(_logging.INFO)
         log.addHandler(handler)
         try:
@@ -485,6 +490,7 @@ def test_cli_blocklist_drops_blocked_tools_and_passes_the_rest():
         finally:
             log.removeHandler(handler)
             log.setLevel(prior_level)
+            log.disabled = prior_disabled
 
     tools, messages = run(go())
     kept_names = [_tool_name(t) for t in tools]

@@ -26,6 +26,38 @@ server = load("cli_bridge_server",
 
 FIXTURE = os.path.join(HERE, "fixtures", "opencode-events.jsonl")
 
+# Every suite sets its own env at IMPORT time, and pytest imports all test
+# files before running any test. test_mcp_bridge.py (collected after this
+# file) sets PROVIDER=claude plus SWITCHYARD_PLAN/SWITCHYARD_PLANS, so any
+# test here that restored "the env" and reloaded `server` got a claude-profile
+# module, and the opencode-shaped tests after it failed only in a full run.
+# Pin this file's own baseline around every test instead.
+_ENV_AT_IMPORT = {k: os.environ.get(k) for k in
+                  ("PROVIDER", "SWITCHYARD_PLAN", "SWITCHYARD_PLANS", "SYSTEM_MODE")}
+
+try:
+    import pytest as _pytest
+except ImportError:          # the __main__ runner below does not need it
+    _pytest = None
+
+if _pytest is not None:
+    @_pytest.fixture(autouse=True)
+    def _cli_bridge_env():
+        import _modules
+        saved = dict(os.environ)
+        for k, v in _ENV_AT_IMPORT.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        _modules.reload(server)
+        try:
+            yield
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+            _modules.reload(server)
+
 
 def test_opencode_stream_yields_text_and_usage():
     out = server.parse_output(open(FIXTURE).read())

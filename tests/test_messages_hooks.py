@@ -1360,6 +1360,10 @@ def test_pre_call_hook_derives_needs_images_from_anthropic_image_block():
     handler.emit = captured.append
     log = _logging.getLogger("switchyard")
     prior_level = log.level
+    # test_hot_reload.py sets `hooks.log.disabled = True` at import; in a
+    # full-suite run that would swallow the routing line asserted below.
+    prior_disabled = log.disabled
+    log.disabled = False
     log.setLevel(_logging.INFO)
     log.addHandler(handler)
     try:
@@ -1387,6 +1391,7 @@ def test_pre_call_hook_derives_needs_images_from_anthropic_image_block():
     finally:
         log.removeHandler(handler)
         log.setLevel(prior_level)
+        log.disabled = prior_disabled
 
     assert ctx["needs_images"] is True, ctx
     log_lines = [r.getMessage() for r in captured]
