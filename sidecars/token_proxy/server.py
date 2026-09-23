@@ -43,6 +43,7 @@ from typing import Callable
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 # Sibling package, not installed — same layering as the gateway image, which
 # sets PYTHONPATH=/switchyard rather than pip-installing switchyard into the
@@ -207,25 +208,64 @@ async def _forward(request: Request, path_attr: str, path_name: str) -> Streamin
 
     client = httpx.AsyncClient(timeout=TIMEOUT)
     if wants_stream:
-        async def relay():
-            async with client:
-                async with client.stream("POST", url, content=body, headers=headers) as upstream:
-                    if upstream.status_code >= 400:
-                        # Buffer the (small) error body rather than yielding a
-                        # 200 stream that then contains an error — an SSE
-                        # client has no way to recover from that.
-                        text = (await upstream.aread()).decode(errors="replace")
-                        log.warning("%s upstream %s error: %s", PROVIDER,
-                                   upstream.status_code, text[:300])
-                        yield f"data: {json.dumps({'error': text[:2000]})}\n\n".encode()
-                        return
-                    async for chunk in upstream.aiter_raw():
-                        yield chunk
-        # A streamed response cannot carry the upstream's headers, because they
-        # are not known until the request is made; the caller gets none, and the
-        # quota board falls back to whatever the last non-streamed call
-        # reported. Worth knowing rather than silently assuming coverage.
-        return StreamingResponse(relay(), media_type="text/event-stream")
+        # Contact upstream before committing to a streamed response: an SSE
+        # client has no way to recover from a 200 stream that hides an error
+        # chunk, and the quota headers must reach the caller on every response
+        # shape — they are the only headroom this plan exposes (see
+        # _quota_headers). build_request/send(..., stream=True) lets us see
+        # the upstream status and headers before the body is consumed.
+        try:
+            req = client.build_request("POST", url, content=body, headers=headers)
+            upstream = await client.send(req, stream=True)
+        except httpx.ConnectError as exc:
+            await client.aclose()
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"upstream connect failed: {exc}"})
+        except httpx.TimeoutException as exc:
+            await client.aclose()
+            return JSONResponse(
+                status_code=504,
+                content={"error": f"upstream timed out: {exc}"})
+
+        if upstream.status_code >= 400:
+            # Buffer the (small) error body. The aread() call sits in an
+            # inner try/except so a ReadTimeout while reading the body —
+            # the realistic shape of a flaky upstream on a quota 429
+            # (headers arrive, body stalls) — closes the connection and
+            # surfaces as 504 with quota headers, rather than leaking the
+            # socket and propagating as a 500. The outer try/finally
+            # guarantees cleanup on any other exception (RemoteProtocol
+            # Error, ReadError) that aren't subclasses of TimeoutException
+            # but still must not leak the httpx socket on the way out.
+            try:
+                try:
+                    text = (await upstream.aread()).decode(errors="replace")
+                except httpx.TimeoutException as exc:
+                    return JSONResponse(
+                        status_code=504,
+                        content={"error": f"upstream timed out reading error body: {exc}"},
+                        headers=_quota_headers(upstream))
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+            log.warning("%s upstream %s error: %s", PROVIDER,
+                        upstream.status_code, text[:300])
+            return JSONResponse(status_code=upstream.status_code,
+                                content=_safe_json_text(text),
+                                headers=_quota_headers(upstream))
+
+        # Success: relay the upstream body verbatim and forward quota headers
+        # in the response head — they now reach the caller on streamed
+        # responses too, not just the buffered path. _close runs after the
+        # body is sent so the httpx connection does not leak; BackgroundTask
+        # fires whether the client finishes the stream, disconnects early, or
+        # the ASGI server raises mid-response.
+        return StreamingResponse(
+            upstream.aiter_raw(),
+            media_type="text/event-stream",
+            headers=_quota_headers(upstream),
+            background=BackgroundTask(_close, upstream, client))
 
     try:
         resp = await client.post(url, content=body, headers=headers)
@@ -258,6 +298,21 @@ def _safe_json(resp: httpx.Response):
         # often) — surface it as text rather than raising here and losing the
         # real status code to a 500.
         return {"error": resp.text[:2000]}
+
+
+def _safe_json_text(text: str) -> object:
+    try:
+        return json.loads(text)
+    except ValueError:
+        # Same convention as _safe_json: upstream sent something that is not
+        # JSON (an HTML error page, most often); surface it as text rather
+        # than raising here and losing the real status code to a 500.
+        return {"error": text[:2000]}
+
+
+async def _close(upstream: httpx.Response, client: httpx.AsyncClient) -> None:
+    await upstream.aclose()
+    await client.aclose()
 
 
 # The subscription's real headroom, which nothing else exposes. api.x.ai's

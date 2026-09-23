@@ -3,15 +3,22 @@ the caller sent (that is the entire point — see server.py's module docstring),
 the health honesty convention, and the openai NotImplementedError path.
 
 No network: switchyard.oauth is stubbed at the function level (access_token /
-account_id / status), and httpx.AsyncClient inside the server module is
-replaced with a fake that records what it was asked to send instead of
-opening a socket.
+account_id / status), and most tests replace httpx.AsyncClient inside the
+server module with a fake that records what it was asked to send instead of
+opening a socket — except the `_StubUpstream` tests, which open a loopback
+HTTP server on 127.0.0.1 to exercise real `httpx.AsyncClient` semantics
+(`build_request`/`send(stream=True)`/`aiter_raw`) that the fake cannot mock.
 """
 from __future__ import annotations
 
+import dataclasses
+import http.server
 import json
 import os
+import socket
 import sys
+import threading
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -266,6 +273,263 @@ def test_quota_headers_are_forwarded_but_framing_headers_are_not():
     assert resp.headers.get("content-length") != "999999", "would truncate the body"
     assert "server" not in got or resp.headers["server"] != "cloudflare"
     print("  forwarded the x-ratelimit-* and retry-after headers, dropped the framing ones")
+
+
+class _StubUpstream:
+    """A loopback http.server that answers POSTs with a configured response.
+
+    Records the requests it receives so a test can assert the caller's body
+    and headers reached the proxy's upstream call unchanged. Pattern borrowed
+    from tests/test_probes.py:126-160.
+    """
+    def __init__(self, status_code, headers=None, body=b"", hold_seconds=0.0):
+        self.status_code = status_code
+        self.headers = dict(headers or {})
+        self.body = body
+        self.hold_seconds = hold_seconds
+        self.received: list[dict] = []
+        outer = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", "0"))
+                raw = self.rfile.read(length) if length else b""
+                outer.received.append({"path": self.path,
+                                        "headers": dict(self.headers),
+                                        "body": raw})
+                self.send_response(outer.status_code)
+                # Framing headers must match the bytes on the wire — set them
+                # explicitly from the body length rather than echoing the
+                # test's configured values, which would either produce a
+                # protocol error (conflicting Content-Length) or truncate the
+                # response. Tests that want to assert framing is filtered out
+                # of the proxy's response still see those headers in
+                # outer.headers above (the proxy's _quota_headers filters by
+                # prefix, not by what reached the upstream).
+                for k, v in outer.headers.items():
+                    if k.lower() in ("content-length", "transfer-encoding",
+                                     "content-encoding"):
+                        continue
+                    self.send_header(k, v)
+                if outer.hold_seconds:
+                    # Advertise a Content-Length that does not match the
+                    # bytes we will actually write, then sleep before
+                    # sending the (empty) body. httpx's aread() waits for
+                    # the advertised length and raises ReadTimeout past the
+                    # client's timeout — the realistic shape of an
+                    # upstream that returned the status+headers then
+                    # stalled, which is what the should-fix on the >= 400
+                    # branch of _forward has to handle cleanly.
+                    self.send_header("content-length", str(max(len(outer.body), 1) + 1024))
+                else:
+                    self.send_header("content-length", str(len(outer.body)))
+                self.end_headers()
+                if outer.hold_seconds:
+                    time.sleep(outer.hold_seconds)
+                if outer.body:
+                    self.wfile.write(outer.body)
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.port = self.srv.server_address[1]
+
+    @property
+    def base(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def test_stream_passes_through_upstream_429_and_retry_after():
+    """A streamed request that hits a quota-exhausted upstream must surface
+    the upstream's 429 and its Retry-After header — not wrap a 429 in a 200
+    SSE chunk. Regression for the bug where the proxy always answered 200
+    once it had committed to streaming.
+    """
+    stub = _StubUpstream(
+        status_code=429,
+        headers={"Retry-After": "60",
+                 "x-ratelimit-remaining-tokens": "0"},
+        body=b'{"error":{"message":"quota exceeded"}}',
+    )
+    server.PROVIDER = "xai"
+    originals = _install_fake_oauth(token="secret-xai-token")
+    saved = server.PROVIDERS["xai"]
+    server.PROVIDERS["xai"] = dataclasses.replace(saved, api_base=stub.base)
+    try:
+        resp = TestClient(server.app).post(
+            "/v1/chat/completions",
+            content=json.dumps({"model": "grok-4.6",
+                                "messages": [],
+                                "stream": True}))
+        assert resp.status_code == 429, resp.text
+        assert resp.headers.get("retry-after") == "60", dict(resp.headers)
+        assert resp.headers.get("x-ratelimit-remaining-tokens") == "0", dict(resp.headers)
+        assert resp.json() == {"error": {"message": "quota exceeded"}}, resp.text
+        # The body the proxy forwarded is exactly what the caller sent —
+        # the streamed path is no different from the buffered one in that
+        # regard (it is the only thing the sidecar's module docstring claims).
+        assert len(stub.received) == 1, stub.received
+        sent = stub.received[0]
+        assert json.loads(sent["body"]) == {
+            "model": "grok-4.6", "messages": [], "stream": True}, sent["body"]
+        # BaseHTTPRequestHandler.headers preserves the original casing, so
+        # look up the bearer case-insensitively rather than hard-coding it.
+        bearer = next((v for k, v in sent["headers"].items()
+                       if k.lower() == "authorization"), None)
+        assert bearer == "Bearer secret-xai-token", sent["headers"]
+    finally:
+        server.PROVIDERS["xai"] = saved
+        _restore_oauth(originals)
+        stub.close()
+
+
+def test_stream_passes_through_upstream_503_with_text_body():
+    """A non-JSON error body from upstream must surface the upstream's status
+    and quota headers too — the proxy never raises on a non-JSON error and
+    must not 500 here, otherwise a transient HTML maintenance page would
+    hide a real 503 from SwitchYard's classifier.
+    """
+    stub = _StubUpstream(
+        status_code=503,
+        headers={"Retry-After": "120"},
+        body=b"backend exploded",
+    )
+    server.PROVIDER = "xai"
+    originals = _install_fake_oauth(token="secret-xai-token")
+    saved = server.PROVIDERS["xai"]
+    server.PROVIDERS["xai"] = dataclasses.replace(saved, api_base=stub.base)
+    try:
+        resp = TestClient(server.app).post(
+            "/v1/chat/completions",
+            content=json.dumps({"model": "grok-4.6",
+                                "messages": [],
+                                "stream": True}))
+        assert resp.status_code == 503, resp.text
+        assert resp.headers.get("retry-after") == "120", dict(resp.headers)
+        assert resp.json() == {"error": "backend exploded"}, resp.text
+    finally:
+        server.PROVIDERS["xai"] = saved
+        _restore_oauth(originals)
+        stub.close()
+
+
+def test_stream_success_relays_upstream_body_and_quota_headers():
+    """The streamed happy path: bytes from upstream reach the caller verbatim,
+    and the quota headers ride on the response head — the same headroom that
+    the buffered path has always passed through, now present on streamed
+    responses too."""
+    stub = _StubUpstream(
+        status_code=200,
+        headers={"x-ratelimit-remaining-tokens": "42",
+                 "x-ratelimit-limit-tokens": "53000000"},
+        body=b"data: hello\n\ndata: [DONE]\n\n",
+    )
+    server.PROVIDER = "xai"
+    originals = _install_fake_oauth(token="secret-xai-token")
+    saved = server.PROVIDERS["xai"]
+    server.PROVIDERS["xai"] = dataclasses.replace(saved, api_base=stub.base)
+    try:
+        resp = TestClient(server.app).post(
+            "/v1/chat/completions",
+            content=json.dumps({"model": "grok-4.6",
+                                "messages": [],
+                                "stream": True}))
+        assert resp.status_code == 200, resp.text
+        assert resp.text == "data: hello\n\ndata: [DONE]\n\n", resp.text
+        assert resp.headers.get("x-ratelimit-remaining-tokens") == "42", dict(resp.headers)
+        assert resp.headers.get("x-ratelimit-limit-tokens") == "53000000", dict(resp.headers)
+    finally:
+        server.PROVIDERS["xai"] = saved
+        _restore_oauth(originals)
+        stub.close()
+
+
+def test_stream_connect_refused_returns_502_not_500():
+    """api_base pointed at a closed port must surface 502 — not crash, not
+    200, not 504. The proxy is async; httpx surfaces ECONNREFUSED as
+    ConnectError on `client.send`, which the new path catches.
+    """
+    # Bind a kernel-assigned socket to grab a port, then close it without
+    # listening so the next connect() raises ECONNREFUSED instead of
+    # succeeding against a stale listener.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    closed_port = sock.getsockname()[1]
+    sock.close()
+    server.PROVIDER = "xai"
+    originals = _install_fake_oauth(token="secret-xai-token")
+    saved = server.PROVIDERS["xai"]
+    server.PROVIDERS["xai"] = dataclasses.replace(
+        saved, api_base=f"http://127.0.0.1:{closed_port}/")
+    try:
+        resp = TestClient(server.app).post(
+            "/v1/chat/completions",
+            content=json.dumps({"model": "grok-4.6",
+                                "messages": [],
+                                "stream": True}))
+        assert resp.status_code == 502, resp.text
+        body = resp.json()
+        assert "error" in body and "connect" in body["error"].lower(), body
+    finally:
+        server.PROVIDERS["xai"] = saved
+        _restore_oauth(originals)
+
+
+def test_stream_read_timeout_during_error_body_returns_504_with_quota_headers():
+    """Upstream sent the response status+headers (so a 429 reached us) and
+    then stalled before sending the body. The aread() in the >= 400 branch
+    must surface as 504 — not 500 (the bug the should-fix eliminated) and
+    not 502 (we did connect, headers did arrive) — and must still forward
+    the quota headers that came in with the status, since those are the
+    only headroom SwitchYard's classifier has on this plan.
+    """
+    # The proxy's httpx client is constructed with server.TIMEOUT, so we
+    # monkey-patch that to a short value. The stub then writes the status
+    # + headers and sleeps past it: client.send returns immediately
+    # (headers are in), aread() times out waiting for body bytes. Hold
+    # for the patched timeout (not the pre-patch one) — otherwise with the
+    # default 600s proxy timeout the stub's daemon thread would sleep
+    # for ~601s and waste CPU until process exit, even though the proxy
+    # itself has already responded with 504.
+    saved_timeout = server.TIMEOUT
+    server.TIMEOUT = 0.5
+    hold_seconds = server.TIMEOUT + 1.0
+    stub = _StubUpstream(
+        status_code=429,
+        headers={"Retry-After": "60",
+                 "x-ratelimit-remaining-tokens": "0"},
+        body=b"",
+        hold_seconds=hold_seconds,
+    )
+    server.PROVIDER = "xai"
+    originals = _install_fake_oauth(token="secret-xai-token")
+    saved = server.PROVIDERS["xai"]
+    server.PROVIDERS["xai"] = dataclasses.replace(saved, api_base=stub.base)
+    try:
+        resp = TestClient(server.app).post(
+            "/v1/chat/completions",
+            content=json.dumps({"model": "grok-4.6",
+                                "messages": [],
+                                "stream": True}))
+        assert resp.status_code == 504, resp.text
+        body = resp.json()
+        assert "error" in body and "timed out" in body["error"].lower(), body
+        # Headers that arrived with the status are still readable after
+        # aclose — that is the whole point of forwarding them on a
+        # ReadTimeout, since the plan's quota board has no other source.
+        assert resp.headers.get("retry-after") == "60", dict(resp.headers)
+        assert resp.headers.get("x-ratelimit-remaining-tokens") == "0", dict(resp.headers)
+    finally:
+        server.PROVIDERS["xai"] = saved
+        _restore_oauth(originals)
+        server.TIMEOUT = saved_timeout
+        stub.close()
 
 
 if __name__ == "__main__":
