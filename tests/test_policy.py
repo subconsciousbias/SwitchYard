@@ -257,6 +257,47 @@ def test_pacing_mode_disables_the_tail():
     print(f"  tail present when pacing off ({off[-1]}), absent when on")
 
 
+def test_tail_stays_on_when_no_body_plan_is_actually_paced():
+    """#225: pacing on, but every paced plan reports 'no allowance known yet'.
+    Nothing is being narrowed, so dropping the tail would only lose the
+    fallback. The tail goes off once one plan's pacer is really active."""
+    from switchyard.models import Quota
+
+    async def go():
+        reg, _, _, policy, _ = build(pacing=True)
+        idle = reg.plans["claude-max"]           # percent-only: allowance null
+        assert not (await policy.pace_state(idle))["active"]
+        idle_only = await policy.tail_enabled([idle])
+        armed = replace(idle, quotas=(Quota(
+            name="weekly", role="target", kind="tokens", period="week",
+            allowance=40_000_000),))
+        assert (await policy.pace_state(armed))["active"]
+        with_armed = await policy.tail_enabled([idle, armed])
+        legacy = await policy.tail_enabled()     # no plans: the switch alone
+        return idle_only, with_armed, legacy
+    idle_only, with_armed, legacy = run(go())
+    assert idle_only is True
+    assert with_armed is False
+    assert legacy is False
+    print("  idle pacers keep the tail; an active pacer drops it")
+
+
+def test_tail_lease_is_dropped_when_pacing_turns_the_tail_off():
+    """#110: a session leased on a tail member must not stay sticky there
+    once pacing has switched that lane's tail off."""
+    async def go():
+        reg, _, _, _, picker = build(pacing=True)
+        assert not await picker._tail_on("forge")
+        await picker.slots.set_lease("s-110", "local-box/qwen", ttl=600)
+        pick = await picker.pick("forge", "s-110")
+        await picker.release(pick.plan.key, pick.request_id, pick.ref)
+        return pick.ref, pick.sticky
+    ref, sticky = run(go())
+    assert ref != "local-box/qwen", ref
+    assert not sticky
+    print(f"  tail lease dropped, session re-placed on {ref}")
+
+
 
 
 # ------------------------------------------------------- multiple windows ----

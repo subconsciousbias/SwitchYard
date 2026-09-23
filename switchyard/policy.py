@@ -38,6 +38,7 @@ because there is no allowance to land exactly on.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -427,9 +428,28 @@ class CapacityPolicy:
         """Pacing state for the portal, with the on/off resolution applied."""
         return await self.pacer.state(plan, await self.plan_is_paced(plan), now)
 
-    async def tail_enabled(self) -> bool:
+    async def tail_enabled(self, plans: Iterable[Plan] | None = None) -> bool:
         """In pacing mode the tail is off: narrowing is the point, and falling
-        back to a local model would hide the fact that we are ahead of budget."""
+        back to a local model would hide the fact that we are ahead of budget.
+
+        That reasoning only holds while something is actually being paced. With
+        `plans` (a lane's body plans) the tail is dropped only when at least one
+        of them has an active pacer. A lane whose paced plans all report "no
+        allowance known yet" is not being narrowed at all, so taking its tail
+        away would lose the fallback and buy nothing (#225).
+
+        Without `plans` the answer is the switch alone, as before.
+        """
         if not self.settings.pacing.disable_tail:
             return True
-        return not await self.pacing_enabled()
+        if not await self.pacing_enabled():
+            return True
+        if plans is None:
+            return False
+        for plan in plans:
+            if not await self.plan_is_paced(plan):
+                continue
+            # `state` only reads; `desired_slots` would advance the EWMA.
+            if (await self.pacer.state(plan, True))["active"]:
+                return False
+        return True

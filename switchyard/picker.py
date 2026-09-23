@@ -175,6 +175,16 @@ class Picker:
         remaining = facts.get("reported_remaining")
         return isinstance(remaining, float) and remaining <= 0
 
+    async def _tail_on(self, lane: str) -> bool:
+        """Is this lane's tail usable? Off only while pacing is actually
+        narrowing one of the lane's body plans (see `tail_enabled`)."""
+        if self.policy is None:
+            return True
+        body = {m.plan_key: self.registry.plan_of(m)
+                for m in self.registry.lane_members(lane)
+                if not self.registry.is_tail(lane, m.ref)}
+        return await self.policy.tail_enabled(body.values())
+
     async def _members(self, lane: str, needs_tools: bool = False,
                         needs_images: bool = False) -> list[Model]:
         """Lane order, minus the tail when pacing is on and minus members whose
@@ -192,7 +202,7 @@ class Picker:
         omits the key and a lane that sets it to `"off"` behave identically.
         """
         members = self.registry.lane_members(lane)
-        if self.policy is not None and not await self.policy.tail_enabled():
+        if not await self._tail_on(lane):
             members = [m for m in members if not self.registry.is_tail(lane, m.ref)]
         if needs_tools:
             members = [m for m in members
@@ -703,7 +713,7 @@ class Picker:
         #    that is paced-to-0 is excluded by `_members` upstream when
         #    pacing is on, but the picker re-checks at claim time too.
         tail_refs = self.registry.lanes[lane].tail
-        tail_on = self.policy is None or await self.policy.tail_enabled()
+        tail_on = await self._tail_on(lane)
         for ref in tail_refs:
             if not tail_on:
                 ctx.skipped.append(f"{ref}(tail disabled (pacing))")
@@ -772,6 +782,13 @@ class Picker:
         reachable = set(self.registry.routing_order(ctx.lane))
         reachable.update(self.registry.lanes[ctx.lane].tail)
         if held not in reachable:
+            return None
+        # A lease on a tail member must not outlive the tail being switched
+        # off, or the session stays on the overflow model while the body has
+        # room (#110). Drop it so the body walk re-places the session.
+        if self.registry.is_tail(ctx.lane, held) and not await self._tail_on(ctx.lane):
+            await self.slots.drop_lease(ctx.session)
+            ctx.skipped.append(f"{held}(tail disabled (pacing))")
             return None
         model = self.registry.model(held)
         if model is None:
@@ -875,7 +892,7 @@ class Picker:
         rows = []
         used = 0
         used_elsewhere = 0
-        tail_on = self.policy is None or await self.policy.tail_enabled()
+        tail_on = await self._tail_on(lane)
         counted_used: set[str] = set()
         live_members = 0
         # Per plan: how much of its limit this lane can actually reach. A plan of
