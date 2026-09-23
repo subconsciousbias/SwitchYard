@@ -55,6 +55,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -1266,13 +1267,106 @@ async def internal_tools_call(request: Request):
 # ---------------------------------------------------------------------------
 # The public OpenAI-compatible surface.
 # ---------------------------------------------------------------------------
+def last_call_usage(session: Session) -> dict | None:
+    """The most recent `assistant` usage record written by the inner CLI.
+
+    The CLI's own transcript (`~/.claude/projects/<sanitized-workdir>/*.jsonl`)
+    is the most reliable place to read the *current* context size: the CLI
+    itself counts it per turn, and the file is written synchronously before
+    exit. The OpenAI-shaped `usage.prompt_tokens` cli_bridge.to_openai emits is
+    the SUM of every turn the CLI ran -- which is what the ledger needs to
+    book -- but it is also wildly inflated for context-meter purposes: a
+    caller asking for context size mid-loop wants the size of the LAST turn,
+    not the running total. The summed figure is still kept on the response,
+    just under `switchyard_billed_*`, so the caller's view is honest.
+
+    Returns None when there is nothing meaningful to read: a non-claude
+    provider (no transcript shape to lean on), a missing project dir (the
+    CLI never wrote here), an OSError (transient), or a transcript with no
+    assistant usage line yet (mid-run, before the first call finished). All
+    four are caller-neutral -- the response keeps today's usage unchanged.
+    """
+    if PROVIDER != "claude":
+        return None
+    sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(session.workdir))
+    project_dir = cli_bridge.CLAUDE_PROJECTS / sanitized
+    try:
+        if not project_dir.is_dir():
+            return None
+        newest: tuple[float, Path] | None = None
+        for path in project_dir.glob("*.jsonl"):
+            try:
+                stamp = path.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or stamp > newest[0]:
+                newest = (stamp, path)
+        if newest is None:
+            return None
+        path = newest[1]
+        # Read the whole file rather than tailing: transcripts are small
+        # (kilobytes) and JSONL's "scan in reverse" is what callers expect
+        # -- the latest assistant usage is what matters, but a partial
+        # tail could swallow the newline that splits entries.
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            return None
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        return {
+            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+            "cache_read_input_tokens":
+                int(usage.get("cache_read_input_tokens", 0) or 0),
+            "cache_creation_input_tokens":
+                int(usage.get("cache_creation_input_tokens", 0) or 0),
+            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+        }
+    return None
+
+
+def _with_context_usage(response: dict, session: Session, billed: dict) -> dict:
+    """Replace `response["usage"]` with the last-call context, keep the sum as billed.
+
+    `billed` is whatever the caller wants surfaced as the run-total so far --
+    an empty dict on a mid-loop tool_calls (nothing booked yet, the caller
+    just wants a real context meter) or `dict(response["usage"])` on the
+    final turn (the OpenAI-shaped sum the CLI's payload carried). The
+    OpenAI-shaped last-call view comes from cli_bridge.to_openai, which folds
+    cache reads / cache writes into `prompt_tokens` the same way it does on
+    the text path; the billed figures sit alongside as separate keys so the
+    ledger has the running total it needs.
+    """
+    usage = response.get("usage") or {}
+    last = last_call_usage(session)
+    if last is not None:
+        usage = cli_bridge.to_openai({"usage": last}, "")["usage"]
+    usage["switchyard_billed_prompt_tokens"] = int(billed.get("prompt_tokens", 0) or 0)
+    usage["switchyard_billed_completion_tokens"] = int(billed.get("completion_tokens", 0) or 0)
+    response["usage"] = usage
+    return response
+
+
 def render_turn(session: Session, result: dict, requested_model: str | None) -> dict:
     if result["type"] == "tool_calls":
         message = {"role": "assistant", "content": None, "tool_calls": [
             {"id": c.id, "type": "function",
              "function": {"name": c.name, "arguments": json.dumps(c.arguments)}}
             for c in result["calls"]]}
-        return {
+        response = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}", "object": "chat.completion",
             "created": int(time.time()), "model": requested_model or session.model,
             "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
@@ -1280,8 +1374,16 @@ def render_turn(session: Session, result: dict, requested_model: str | None) -> 
             # (see cli_bridge); mid-loop it is not available at all.
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
+        # No usage has been booked yet on a mid-loop tool_calls turn, but
+        # the caller can still want a real context meter — the CLI wrote
+        # one to its transcript before exiting this turn.
+        return _with_context_usage(response, session, {})
     if result["type"] == "final":
-        return cli_bridge.to_openai(result["payload"], requested_model or session.model)
+        response = cli_bridge.to_openai(result["payload"], requested_model or session.model)
+        # On the final turn, the OpenAI-shaped sum the CLI's payload carries
+        # is what should be billed; the last-call context replaces
+        # `prompt_tokens` so the caller sees a context meter, not the run total.
+        return _with_context_usage(response, session, dict(response["usage"]))
     if result["type"] == "error":
         raise HTTPException(status_code=result["status"], detail=result["detail"],
                              headers=result.get("headers"))

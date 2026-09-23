@@ -1387,6 +1387,17 @@ def _prompt_completion_tokens(
         else:
             src = getattr(response_obj, "usage", None) or {}
     if isinstance(src, dict):
+        billed_prompt = src.get("switchyard_billed_prompt_tokens")
+        if billed_prompt is not None:
+            billed_completion = src.get("switchyard_billed_completion_tokens")
+            return int(billed_prompt or 0), int(billed_completion or 0)
+    elif getattr(src, "switchyard_billed_prompt_tokens", None) is not None:
+        billed_completion = getattr(src, "switchyard_billed_completion_tokens", None)
+        return (
+            int(getattr(src, "switchyard_billed_prompt_tokens") or 0),
+            int(billed_completion or 0),
+        )
+    if isinstance(src, dict):
         if src.get("prompt_tokens"):
             prompt = int(src.get("prompt_tokens") or 0)
             cache_read = 0

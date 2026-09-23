@@ -24,10 +24,13 @@ import errno
 import http.server
 import json
 import os
+import re
+import shutil
 import socketserver
 import subprocess
 import sys
 import tempfile
+import types
 import threading
 import time
 import uuid
@@ -3228,6 +3231,288 @@ def test_no_tools_fallthrough_inherits_max_tokens_enforcement_and_health_reports
 
     print("  mcp no-tools fall-through: codex profile -> 400 max_tokens_unenforceable; "
           "claude /health -> enforces_max_tokens=True")
+
+
+# ----------------------------------------- last-call context vs billed sum -----
+def _write_inner_transcript(session: "server.Session", root: Path,
+                            calls: list[dict]) -> None:
+    """Lay down `calls` user/assistant JSONL pairs under the sanitized workdir.
+
+    Mirrors the shape Claude Code writes: alternating `user` / `assistant`
+    entries, with the assistant's `message.usage` carrying the per-turn
+    token breakdown that `last_call_usage` reads back. Pairs are appended in
+    order; `last_call_usage` scans the file in reverse so the LAST assistant
+    in the list is what callers see.
+    """
+    sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(session.workdir))
+    target = root / sanitized
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / "transcript.jsonl"
+    with path.open("w") as fh:
+        for i, usage in enumerate(calls):
+            fh.write(json.dumps({"type": "user", "message": {"role": "user",
+                                                               "content": f"q{i}"}}) + "\n")
+            fh.write(json.dumps({"type": "assistant",
+                                 "message": {"role": "assistant",
+                                             "content": f"a{i}",
+                                             "usage": usage}}) + "\n")
+
+
+def test_final_turn_reports_last_call_context_size_and_bills_the_sum():
+    """A final turn with a 20-call summed payload keeps the SUM under
+    `switchyard_billed_*` (for the ledger) but reports the LAST call's size
+    under `usage.prompt_tokens` (for the caller looking at context).
+
+    The summed payload is what cli_bridge.to_openai emits today -- the
+    CLI's own transcript writes per-turn usage, but the bridge's existing
+    parser folds them all into one running total before the response is
+    built. That sum is still the right number to bill, since each turn
+    consumed real tokens; it is just not the right number to display as a
+    context meter. The last call's size replaces `prompt_tokens`; the
+    cache breakdown still rides alongside it (folded into `prompt_tokens`
+    by to_openai), the way it would on a text path.
+    """
+    # Twenty per-turn usage records; the LAST one carries a distinctive
+    # input+cache shape the assertions can pin to without ambiguity.
+    calls = []
+    for i in range(19):
+        calls.append({
+            "input_tokens": 100 + i,
+            "cache_read_input_tokens": 10,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 5,
+        })
+    last_usage = {
+        "input_tokens": 1234,
+        "cache_read_input_tokens": 56,
+        "cache_creation_input_tokens": 7,
+        "output_tokens": 42,
+    }
+    calls.append(last_usage)
+    summed = {
+        "input_tokens": sum(c["input_tokens"] for c in calls),
+        "cache_read_input_tokens": sum(c["cache_read_input_tokens"] for c in calls),
+        "cache_creation_input_tokens": sum(c["cache_creation_input_tokens"] for c in calls),
+        "output_tokens": sum(c["output_tokens"] for c in calls),
+    }
+    assert len(calls) == 20, calls
+
+    saved = server.cli_bridge.CLAUDE_PROJECTS
+    tmp = Path(tempfile.mkdtemp(prefix="mcpb-projects-"))
+    try:
+        session = _new_session()
+        _write_inner_transcript(session, tmp, calls)
+        server.cli_bridge.CLAUDE_PROJECTS = tmp
+
+        # cli_bridge.to_openai's Anthropic-shaped branch folds cache reads
+        # AND cache writes into prompt_tokens, mirroring what the text
+        # bridge reports.
+        expected_prompt = (last_usage["input_tokens"]
+                           + last_usage["cache_read_input_tokens"]
+                           + last_usage["cache_creation_input_tokens"])
+        expected_billed_prompt = (summed["input_tokens"]
+                                  + summed["cache_read_input_tokens"]
+                                  + summed["cache_creation_input_tokens"])
+
+        result = {"type": "final", "payload": {"result": "answer", "usage": summed}}
+        response = server.render_turn(session, result, session.model)
+        usage = response["usage"]
+
+        assert usage["prompt_tokens"] == expected_prompt, usage
+        assert usage["completion_tokens"] == last_usage["output_tokens"], usage
+        assert usage["total_tokens"] == (
+            expected_prompt + last_usage["output_tokens"]), usage
+        # Cache reads surface in prompt_tokens_details (OpenAI convention).
+        assert usage["prompt_tokens_details"]["cached_tokens"] == \
+            last_usage["cache_read_input_tokens"], usage
+        # Cache writes ride top-level using the verbatim Anthropic spelling,
+        # exactly as cli_bridge.to_openai emits on the text path.
+        assert usage["cache_creation_input_tokens"] == \
+            last_usage["cache_creation_input_tokens"], usage
+
+        # And the SUM -- what the ledger needs to book -- is preserved
+        # under the *billed* keys, not lost when the context view replaced
+        # prompt_tokens.
+        assert usage["switchyard_billed_prompt_tokens"] == \
+            expected_billed_prompt, usage
+        assert usage["switchyard_billed_completion_tokens"] == \
+            summed["output_tokens"], usage
+
+        _drop(session)
+    finally:
+        server.cli_bridge.CLAUDE_PROJECTS = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"  final turn: prompt_tokens={usage['prompt_tokens']} "
+          f"(last call), billed_prompt={usage['switchyard_billed_prompt_tokens']} "
+          f"(20-call sum)")
+
+
+def test_tool_calls_turn_reports_last_call_context_and_zero_billed():
+    """A mid-loop `tool_calls` turn goes through `_with_context_usage`
+    with an empty `billed` dict (nothing has been booked yet on this turn),
+    so the response's `prompt_tokens` is the LAST inner CLI call's context
+    size, the cache breakdown rides alongside it, and the billed keys are
+    stamped as 0/0 — the caller can read size, the ledger has nothing to
+    book yet.
+
+    The final-turn test pins the same code path with a non-empty billed
+    dict; this one pins the empty-billed branch (`render_turn`'s
+    `tool_calls` branch) and the empty-transcript fallback that the final
+    turn already covers separately.
+    """
+    # Three per-turn usage records; the LAST one carries a distinctive
+    # input+cache shape the assertions can pin to without ambiguity.
+    calls = []
+    for i in range(2):
+        calls.append({
+            "input_tokens": 100 + i,
+            "cache_read_input_tokens": 10,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 5,
+        })
+    last_usage = {
+        "input_tokens": 987,
+        "cache_read_input_tokens": 65,
+        "cache_creation_input_tokens": 4,
+        "output_tokens": 17,
+    }
+    calls.append(last_usage)
+
+    saved = server.cli_bridge.CLAUDE_PROJECTS
+    tmp = Path(tempfile.mkdtemp(prefix="mcpb-projects-tools-"))
+    try:
+        session = _new_session()
+        _write_inner_transcript(session, tmp, calls)
+        server.cli_bridge.CLAUDE_PROJECTS = tmp
+
+        # cli_bridge.to_openai's Anthropic-shaped branch folds cache reads
+        # AND cache writes into prompt_tokens, mirroring what the text
+        # bridge reports — same expectation as the final-turn test.
+        expected_prompt = (last_usage["input_tokens"]
+                           + last_usage["cache_read_input_tokens"]
+                           + last_usage["cache_creation_input_tokens"])
+
+        # A single fake call so render_turn's tool_calls branch builds
+        # the response without raising; render_turn only reads .id /
+        # .name / .arguments, so a SimpleNamespace stands in for the full
+        # ParkedCall (its future would need an event loop this thread
+        # doesn't have).
+        parked = types.SimpleNamespace(id="call_abc", name="lookup",
+                                       arguments={"q": "x"})
+        result = {"type": "tool_calls", "calls": [parked]}
+        response = server.render_turn(session, result, session.model)
+        usage = response["usage"]
+
+        # Context view: the LAST CLI call's size, not the mid-loop zero
+        # the bridge used to ship.
+        assert usage["prompt_tokens"] == expected_prompt, usage
+        assert usage["completion_tokens"] == last_usage["output_tokens"], usage
+        assert usage["total_tokens"] == (
+            expected_prompt + last_usage["output_tokens"]), usage
+        # Cache breakdown rides alongside, exactly the way the text path
+        # reports it.
+        assert usage["prompt_tokens_details"]["cached_tokens"] == \
+            last_usage["cache_read_input_tokens"], usage
+        assert usage["cache_creation_input_tokens"] == \
+            last_usage["cache_creation_input_tokens"], usage
+
+        # Billed keys are stamped as 0 — nothing has been booked on this
+        # turn. They MUST be present and zero, not absent and not missing.
+        assert usage["switchyard_billed_prompt_tokens"] == 0, usage
+        assert usage["switchyard_billed_completion_tokens"] == 0, usage
+
+        # The tool_calls branch's other duties are intact: finish_reason
+        # and the tool_calls list ride through the wrap untouched.
+        assert response["choices"][0]["finish_reason"] == "tool_calls", response
+        out_calls = response["choices"][0]["message"]["tool_calls"]
+        assert len(out_calls) == 1, out_calls
+        assert out_calls[0]["id"] == "call_abc", out_calls[0]
+        assert out_calls[0]["function"]["name"] == "lookup", out_calls[0]
+        _drop(session)
+
+        # Empty-transcript flavour: no JSONL to read, last_call_usage
+        # returns None, the response keeps the mid-loop {0, 0, 0} it built,
+        # and billed keys are still stamped as 0/0 (consistent with the
+        # no-billed path on a fresh turn).
+        session = _new_session()
+        tmp2 = Path(tempfile.mkdtemp(prefix="mcpb-projects-empty-tools-"))
+        server.cli_bridge.CLAUDE_PROJECTS = tmp2
+        try:
+            parked2 = types.SimpleNamespace(id="call_def", name="noop",
+                                            arguments={})
+            result2 = {"type": "tool_calls", "calls": [parked2]}
+            response2 = server.render_turn(session, result2, session.model)
+            usage2 = response2["usage"]
+            assert usage2["prompt_tokens"] == 0, usage2
+            assert usage2["completion_tokens"] == 0, usage2
+            assert usage2["total_tokens"] == 0, usage2
+            assert usage2["switchyard_billed_prompt_tokens"] == 0, usage2
+            assert usage2["switchyard_billed_completion_tokens"] == 0, usage2
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
+        _drop(session)
+    finally:
+        server.cli_bridge.CLAUDE_PROJECTS = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"  tool_calls turn: prompt_tokens={usage['prompt_tokens']} "
+          f"(last call), billed_prompt={usage['switchyard_billed_prompt_tokens']} "
+          f"(mid-loop)")
+
+
+def test_no_inner_transcript_keeps_old_usage_and_bills_mirror_it():
+    """An empty/nonexistent transcript root is the common state for callers
+    that have not yet finished their first CLI turn, or run a provider with
+    no transcript layout to read. The bridge must keep today's usage shape
+    unchanged AND still surface the billed figures alongside, so the caller's
+    view does not silently degrade just because we could not read the
+    transcript.
+
+    Two flavours are pinned: the dir does not exist (fresh sidecar on a new
+    machine) and the dir exists but has no JSONL in it (workdir folder just
+    got created, the CLI has not run yet).
+    """
+    saved = server.cli_bridge.CLAUDE_PROJECTS
+    tmp = Path(tempfile.mkdtemp(prefix="mcpb-projects-empty-"))
+    try:
+        # First flavour: no project dir at all for this session's workdir.
+        session = _new_session()
+        server.cli_bridge.CLAUDE_PROJECTS = tmp
+        summed = {
+            "input_tokens": 500,
+            "output_tokens": 200,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
+        result = {"type": "final", "payload": {"result": "answer", "usage": summed}}
+        response = server.render_turn(session, result, session.model)
+        usage = response["usage"]
+        # Today would be: prompt_tokens=500, completion_tokens=200,
+        # total_tokens=700 -- the to_openai shape with no Anthropic cache
+        # keys, so prompt_tokens is just input_tokens. That stays put.
+        assert usage["prompt_tokens"] == 500, usage
+        assert usage["completion_tokens"] == 200, usage
+        assert usage["total_tokens"] == 700, usage
+        # Billed keys mirror the kept usage -- not zero, not absent.
+        assert usage["switchyard_billed_prompt_tokens"] == 500, usage
+        assert usage["switchyard_billed_completion_tokens"] == 200, usage
+        _drop(session)
+
+        # Second flavour: the project dir exists but has no JSONL yet.
+        session = _new_session()
+        sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(session.workdir))
+        (tmp / sanitized).mkdir(parents=True, exist_ok=True)
+        result = {"type": "final", "payload": {"result": "answer", "usage": summed}}
+        response = server.render_turn(session, result, session.model)
+        usage = response["usage"]
+        assert usage["prompt_tokens"] == 500, usage
+        assert usage["completion_tokens"] == 200, usage
+        assert usage["switchyard_billed_prompt_tokens"] == 500, usage
+        assert usage["switchyard_billed_completion_tokens"] == 200, usage
+        _drop(session)
+    finally:
+        server.cli_bridge.CLAUDE_PROJECTS = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  no transcript: today's usage kept; billed keys mirror it")
 
 
 if __name__ == "__main__":

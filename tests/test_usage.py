@@ -10,6 +10,16 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ``switchyard.models`` captures SWITCHYARD_PLANS at import time, and
+# ``switchyard.hooks`` instantiates ``SwitchyardHandler`` (which calls
+# ``models.load``) at import time. The existing tests don't need a plans
+# file, but the four ``_prompt_completion_tokens`` tests below do, so point
+# the loader at the tracked example BEFORE anything imports either module.
+os.environ["SWITCHYARD_PLANS"] = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config", "plans.example.yaml",
+)
+
 from switchyard import usage as usage_module
 from switchyard.models import Plan, Quota
 from switchyard.usage import (
@@ -785,6 +795,84 @@ def test_model_overview_plan_n_sessions_is_union_not_sum():
     # Plan-level union: the shared session counted once, plus the unique one = 2.
     assert result["m1"]["plan_n_sessions"] == 2
     assert result["m2"]["plan_n_sessions"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: _prompt_completion_tokens honors switchyard_billed_* (issue #89)
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_completion_tokens_books_billed_over_reported():
+    """When the bridge stamps ``switchyard_billed_*``, the gateway ledger
+    books those numbers (the run's true spend) instead of the provider's
+    reported context-size prompt. The reported ``prompt_tokens`` /
+    ``completion_tokens`` would double the burn if taken at face value on the
+    mcp_bridge path; the billed keys are the authoritative count.
+    """
+    from switchyard.hooks import _prompt_completion_tokens
+    usage = {
+        # Reported shape: conversation-context size, not cumulative spend.
+        "prompt_tokens": 12_345,
+        "completion_tokens": 678,
+        # Billed shape: the run's true spend, what the ledger must book.
+        "switchyard_billed_prompt_tokens": 2_400_000,
+        "switchyard_billed_completion_tokens": 1_000,
+    }
+    prompt, completion = _prompt_completion_tokens(None, usage)
+    assert prompt == 2_400_000, prompt
+    assert completion == 1_000, completion
+
+
+def test_prompt_completion_tokens_plain_dict_unchanged():
+    """A usage dict without the billed keys still goes through the existing
+    extraction -- the new branch must be a pure override, byte-for-byte
+    unchanged on the path every other provider / route takes today.
+    """
+    from switchyard.hooks import _prompt_completion_tokens
+    usage = {
+        "prompt_tokens": 12_345,
+        "completion_tokens": 678,
+    }
+    prompt, completion = _prompt_completion_tokens(None, usage)
+    assert prompt == 12_345, prompt
+    assert completion == 678, completion
+
+
+def test_prompt_completion_tokens_billed_attribute_shape():
+    """Same override fires on the pydantic / attribute-shaped usage object
+    path too, matching the function's dual-shape handling. A bare object
+    carrying the billed attributes returns them; one without keeps the
+    existing attribute-based extraction.
+    """
+    from switchyard.hooks import _prompt_completion_tokens
+
+    class _Usage:
+        # Reported fields present (so the regular path would not be empty).
+        prompt_tokens = 100
+        completion_tokens = 10
+        # Billed attributes stamped by the bridge override the above.
+        switchyard_billed_prompt_tokens = 2_400_000
+        switchyard_billed_completion_tokens = 1_000
+
+    prompt, completion = _prompt_completion_tokens(None, _Usage())
+    assert prompt == 2_400_000, prompt
+    assert completion == 1_000, completion
+
+
+def test_prompt_completion_tokens_billed_completion_optional():
+    """The billed-completion key is allowed to be absent / None -- the
+    override still fires with the completion figure defaulting to 0. This
+    matches the case where the bridge only has the prompt figure to stamp.
+    """
+    from switchyard.hooks import _prompt_completion_tokens
+    usage = {
+        "prompt_tokens": 12_345,
+        "completion_tokens": 678,
+        "switchyard_billed_prompt_tokens": 2_400_000,
+    }
+    prompt, completion = _prompt_completion_tokens(None, usage)
+    assert prompt == 2_400_000, prompt
+    assert completion == 0, completion
 
 
 # ---------------------------------------------------------------------------
