@@ -2956,6 +2956,128 @@ def test_duplicate_delivery_returns_cached_response_without_rebuilding():
         restore()
 
 
+def test_duplicate_delivery_under_saturated_gate_returns_cached_without_touching_gate():
+    """Cover the explicit hoisting claim from issue #130's fix.
+
+    `_continue_followup` runs the duplicate-delivery short-circuit BEFORE
+    `await unpark_session(session)` so a duplicate arriving on a saturated
+    plan returns the cached tool_calls response without ever trying to
+    acquire a gate slot. The companion
+    `test_duplicate_delivery_returns_cached_response_without_rebuilding`
+    exercises the short-circuit with a free-capacity gate (so the order
+    is irrelevant), and the new `test_followup_503_on_saturated_gate_...`
+    exercises the saturated gate with a FRESH delivery (so the
+    short-circuit never fires). Neither catches a regression that moves
+    `if` below `await unpark_session`; this test does.
+
+    Drives one delivery to completion to populate `last_response`,
+    `resolved_recently`, and `awaiting_followup=True` (same setup as the
+    existing duplicate test), then saturates `cli_bridge._gate` against
+    `limit` with a fresh `cli_bridge.Gate` swap (same pattern as
+    `test_unpark_returns_503_quickly_when_gate_is_full`), pins
+    `server.RESUME_WAIT` so a regression that called `unpark_session`
+    first would 503 within `SHORT`, then re-delivers the same
+    `tool_msgs`. A duplicate on a saturated gate must:
+      - return `session.last_response` verbatim (cached, not a fresh turn),
+      - leave `gate.in_flight == limit` (the gate was never touched),
+      - leave `session.awaiting_followup` True (no unpark ran),
+      - record zero `await_turn` calls (no fresh CLI turn was awaited).
+    """
+    SHORT = 0.3
+    await_turn_calls: list = []
+
+    # Fresh-gate swap: the shared `_gate`'s lock/Condition are lazily
+    # bound to whichever event loop first called acquire_waiting, so
+    # without a swap the gate's locks would be tied to an earlier
+    # test's event loop. Same reason as
+    # test_unpark_returns_503_quickly_when_gate_is_full.
+    saved_gate = server.cli_bridge._gate
+    gate = server.cli_bridge.Gate()
+    server.cli_bridge._gate = gate
+    saved_sessions = dict(server.SESSIONS)
+    server.SESSIONS.clear()
+    saved_wait = server.RESUME_WAIT
+    server.RESUME_WAIT = SHORT
+    real_await_turn = server.await_turn
+
+    async def record_turn(sess, request):
+        await_turn_calls.append({"session_id": sess.id})
+        return {"type": "tool_calls", "calls": []}
+    server.await_turn = record_turn
+
+    try:
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            parked = asyncio.create_task(
+                server.register_tool_call(session.id, "get_weather",
+                                          {"city": "Oslo"}))
+            await asyncio.sleep(0)
+            turn = await session.turn_future
+            assert turn["type"] == "tool_calls", turn
+            call = turn["calls"][0]
+
+            # Simulate the prior delivery that consumed the tool result:
+            # exactly the same hand-built parked-with-cached-response
+            # state as
+            # test_duplicate_delivery_returns_cached_response_without_rebuilding.
+            session.pending.pop(call.id, None)
+            session.mark_resolved(call.id)
+            cached = server.render_turn(session, turn, None)
+            session.last_response = cached
+            session.awaiting_followup = True
+            call.future.set_result(
+                {"content": [{"type": "text", "text": '{"temp_c":-3}'}],
+                 "isError": False})
+            with contextlib.suppress(Exception):
+                await parked
+
+            # Saturate the gate from a known clean state. RESUME_WAIT is
+            # pinned so a regression that called unpark_session BEFORE the
+            # short-circuit would 503 within SHORT rather than blocking
+            # the test for the production 300 s wait (and would never
+            # reach the `return session.last_response` line at all).
+            limit = server.cli_bridge.config().concurrency
+            for _ in range(limit):
+                assert await gate.acquire(limit)
+            assert gate.in_flight == limit, gate.in_flight
+
+            body = {"model": "m", "messages": [
+                {"role": "tool", "tool_call_id": call.id,
+                 "content": '{"temp_c":-3}'},
+            ]}
+            second = await server._continue_followup(
+                body, session.id, body["messages"], None)
+            return cached, second, session, call.id
+
+        cached, second, session, call_id = asyncio.run(scenario())
+        limit = server.cli_bridge.config().concurrency
+        # 1. Returned the cached tool_calls response verbatim.
+        assert cached is second, "duplicate must echo the cached response"
+        assert cached["choices"][0]["finish_reason"] == "tool_calls", cached
+        # 2. The gate was never touched: still at `limit`, the saturation
+        # holds -- if the short-circuit had been below `await unpark_session`,
+        # unpark would have acquired one slot on success or 503'd here.
+        assert gate.in_flight == limit, (gate.in_flight, limit)
+        # 3. The session still looks parked -- no unpark ran.
+        assert session.awaiting_followup, session
+        assert not session.holds_slot, session
+        assert session.id in server.SESSIONS
+        assert not session.dead
+        assert call_id in session.resolved_recently
+        # 4. No fresh CLI turn was awaited -- no new inference happened.
+        assert await_turn_calls == [], await_turn_calls
+        print("  duplicate delivery on a saturated gate returned the cached "
+              "response; gate untouched, awaiting_followup still True, "
+              "0 await_turn calls")
+    finally:
+        server.RESUME_WAIT = saved_wait
+        server.await_turn = real_await_turn
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        server.cli_bridge._gate = saved_gate
+
+
 def test_rebuild_supersedes_the_old_session_so_two_live_sessions_never_coexist():
     """Regression for issue #13, defect 2.
 
@@ -5929,6 +6051,181 @@ def test_mcp_bridge_render_turn_passes_session_thinking_to_to_openai():
         shutil.rmtree(workdir, ignore_errors=True)
     print("  render_turn (production path): session.thinking.display -> "
           "to_openai(reasoning_display=...) honours omitted contract")
+
+
+# ------------------------------------------ issue #130: acquire-before-deliver --
+def test_followup_503_on_saturated_gate_leaves_session_parked():
+    """A 503 on a saturated plan must leave the follow-up path's state untouched.
+
+    Before issue #130, `_continue_followup` resolved the parked tool_call
+    futures BEFORE calling `unpark_session`, and `unpark_session` cleared
+    `awaiting_followup` up front. On a 503 the parked calls had already been
+    popped and the CLI had already been kicked back into inference with no
+    slot held -- the inner CLI ran over the cap with the session looking
+    delivered, the gateway's retry hit the supersede-and-rebuild path, and
+    the original CLI subprocess leaked until the 1800 s idle reaper came
+    round. The fix is acquire-before-deliver: hoist the duplicate-delivery
+    short-circuit (issue #13 defect 1), then `await unpark_session` so the
+    slot is held and `awaiting_followup` cleared only AFTER a successful
+    acquire, THEN the resolve loop. A 503 above mutates nothing; the
+    gateway's retry walks the same follow-up path against the same live
+    session.
+
+    Drives `_continue_followup` twice through the same hand-built parked
+    session, mirroring `test_followup_error_result_does_not_leak` (parked
+    session built with `_new_session` + `register_tool_call`, stubbed
+    `new_turn`/`await_turn`) and `test_unpark_returns_503_quickly_when_gate_is_full`
+    (fresh `cli_bridge.Gate` swap, saturate to `limit`, `server.RESUME_WAIT`
+    pinned to `SHORT`):
+
+      1. First call: the gate is saturated, `_continue_followup` raises
+         HTTPException 503 with the parked future NOT done, the call still in
+         `session.pending`, `session.awaiting_followup` still True, the id
+         NOT in `resolved_recently`, and `gate.in_flight == limit`.
+      2. `gate.release()` a slot and retry `_continue_followup`: the turn
+         proceeds from the SAME session (no supersede/rebuild -- exactly one
+         `await_turn` call, exactly one live session in `SESSIONS`), pending
+         is popped, and the parked `register_tool_call` task resolves to the
+         delivered content.
+    """
+    SHORT = 0.3
+    # tool_calls turn keeps the session in SESSIONS (park_session rather than
+    # end_session) -- the assertion "one live session in SESSIONS" below needs
+    # the post-turn state to be parked, not ended.
+    SECOND_TURN = {"type": "tool_calls", "calls": []}
+    await_turn_calls: list = []
+
+    async def scenario():
+        # Same fresh-gate reason as the unpark/resume tests: bind the lock
+        # and condition to this scenario's event loop, not one an earlier test
+        # used.
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+
+        # Hand-build a parked session: tool_calls turn already resolved by
+        # the CLI, the parked future waiting on the caller. `holds_slot` is
+        # False (parked sessions hold no slot by design; see park_session).
+        session = _new_session()
+        session.new_turn()
+        parked = asyncio.create_task(
+            server.register_tool_call(session.id, "get_weather",
+                                      {"city": "Oslo"}))
+        await asyncio.sleep(0)
+        turn = await session.turn_future
+        assert turn["type"] == "tool_calls", turn
+        call = turn["calls"][0]
+        session.awaiting_followup = True
+        session.holds_slot = False
+
+        # Saturate the gate from a known clean state so unpark_session's
+        # acquire_waiting 503s deterministically within SHORT.
+        limit = server.cli_bridge.config().concurrency
+        for _ in range(limit):
+            assert await gate.acquire(limit)
+        assert gate.in_flight == limit, gate.in_flight
+
+        # Stub await_turn so we can assert it is called exactly once on the
+        # retry path (no rebuild fired). Stub new_turn on the session so its
+        # awaitable resolves without run_session being started -- the second
+        # pass otherwise would block forever on a never-running CLI.
+        real_new_turn = type(session).new_turn
+
+        def resolved_new_turn(self):
+            f = asyncio.get_event_loop().create_future()
+            f.set_result(SECOND_TURN)
+            self.turn_future = f
+            return f
+        type(session).new_turn = resolved_new_turn
+
+        real_await_turn = server.await_turn
+
+        async def record_turn(sess, request):
+            await_turn_calls.append({"session_id": sess.id})
+            return SECOND_TURN
+        server.await_turn = record_turn
+
+        saved_wait = server.RESUME_WAIT
+        server.RESUME_WAIT = SHORT
+        try:
+            body = {"model": "m",
+                    "messages": [
+                        {"role": "tool", "tool_call_id": call.id,
+                         "content": '{"temp_c":-3}'},
+                    ]}
+            # ---- 1) Saturated-gate path: 503, nothing mutated. ----
+            try:
+                await server._continue_followup(body, session.id,
+                                                body["messages"], None)
+            except server.HTTPException as exc:
+                assert exc.status_code == 503, exc.status_code
+                assert "no slot freed" in exc.detail, exc.detail
+                assert exc.headers and exc.headers.get("Retry-After") == "15", \
+                    exc.headers
+            else:
+                raise AssertionError(
+                    "_continue_followup must 503 when the gate stays full")
+
+            # Invariants: the parked future is still waiting, the call is
+            # still in pending, the session still looks parked, the id was
+            # NOT marked resolved (so a retry cannot be misread as a
+            # duplicate), and the gate was not silently mutated.
+            assert not call.future.done(), \
+                "parked future must not be resolved on 503"
+            assert call.id in session.pending, \
+                f"parked call must remain in pending on 503: {session.pending}"
+            assert session.awaiting_followup, \
+                "awaiting_followup must remain True on 503"
+            assert not session.holds_slot, \
+                "holds_slot must remain False on 503"
+            assert call.id not in session.resolved_recently, \
+                "resolved_recently must not record the id on 503"
+            assert gate.in_flight == limit, gate.in_flight
+            assert session.id in server.SESSIONS, dict(server.SESSIONS)
+            assert not session.dead, session
+
+            # ---- 2) Retry: free a slot and run again, same session. ----
+            await gate.release()
+            assert gate.in_flight == limit - 1, gate.in_flight
+
+            response = await server._continue_followup(
+                body, session.id, body["messages"], None)
+
+            # No rebuild: the same live session answered, exactly one turn
+            # awaited, exactly one live session in SESSIONS, and the parked
+            # register_tool_call task received the delivered content.
+            assert response is not None, response
+            assert len(await_turn_calls) == 1, await_turn_calls
+            assert await_turn_calls[0]["session_id"] == session.id, \
+                await_turn_calls
+            assert session.id in server.SESSIONS, dict(server.SESSIONS)
+            # The parked call was popped during the resolve loop on the
+            # retry and resolved to the delivered content.
+            assert call.id not in session.pending, \
+                f"parked call must be popped after retry resolves it: " \
+                f"{session.pending}"
+            assert call.future.done(), \
+                "parked future must be resolved after the retry"
+            tool_result = await parked
+            assert tool_result["content"] == [
+                {"type": "text", "text": '{"temp_c":-3}'}], tool_result
+            assert tool_result["isError"] is False, tool_result
+        finally:
+            server.RESUME_WAIT = saved_wait
+            server.await_turn = real_await_turn
+            type(session).new_turn = real_new_turn
+            server.SESSIONS.clear()
+            server.SESSIONS.update(saved_sessions)
+            server.cli_bridge._gate = saved_gate
+
+    asyncio.run(scenario())
+    assert server.cli_bridge._gate.in_flight == 0, \
+        server.cli_bridge._gate.in_flight
+    print("  follow-up 503 left the session parked (awaiting_followup=True, "
+          "parked future not done); retry after gate.release() resolved the "
+          "same session's parked call (one await_turn call, one live session)")
 
 
 def test_followup_superseded_mid_turn_rebuilds_instead_of_500():

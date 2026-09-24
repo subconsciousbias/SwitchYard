@@ -1540,9 +1540,16 @@ async def unpark_session(session: Session) -> None:
     This is the only place that queues. A follow-up has nowhere else to go --
     its tool_call_ids exist in this process alone -- so it waits rather than
     being refused, which is the opposite of a NEW request's contract.
+
+    `awaiting_followup` is NOT cleared up front: it is left True until the slot
+    is actually in hand, so a 503 on a saturated gate leaves the session
+    looking parked and the gateway's retry hits the same follow-up path
+    instead of the supersede-and-rebuild branch. The early-return path (the
+    session already holds a slot) clears it because nothing about the gate
+    can fail there.
     """
-    session.awaiting_followup = False
     if session.holds_slot:
+        session.awaiting_followup = False
         return
     limit = cli_bridge.config().concurrency
     waited = time.time()
@@ -1553,6 +1560,11 @@ async def unpark_session(session: Session) -> None:
                    f"tool call; the plan is busy with other turns",
             headers={"Retry-After": "15"})
     session.holds_slot = True
+    # The flag is cleared only AFTER acquire_waiting succeeded and the slot
+    # is held -- a 503 above leaves the session looking parked, the gate
+    # untouched, and the parked futures unresolved, so the gateway's retry
+    # walks the same follow-up path instead of rebuilding a new session.
+    session.awaiting_followup = False
     held = time.time() - waited
     if held > 1:
         log.info("session %s waited %.1fs for a slot to resume", session.id, held)
@@ -2590,8 +2602,48 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
     The set of `tool_msgs` here is already filtered to those whose embedded
     session id matches `wanted` -- any tool results for other live sessions or
     for foreign sessions were dropped by the caller, by design.
+
+    Order matters: the duplicate-delivery short-circuit is checked BEFORE any
+    resolve work or gate acquire (issue #13, defect 1); the unpark happens
+    BEFORE the resolve loop so a 503 on a saturated gate leaves the parked
+    calls parked and `awaiting_followup` true; the resolve loop only runs once
+    the slot is in hand.
     """
     session = SESSIONS[wanted]
+    delivered_ids = [m["tool_call_id"] for m in tool_msgs]
+    # Defect 1 (issue #13): every delivered id is already resolved and the
+    # session is still parked, so this is a duplicate delivery of a batch we
+    # already turned into a tool_calls response. Return the cached response
+    # rather than rebuilding -- the caller is retrying because the original
+    # response never arrived, not asking for a new turn. The check is run
+    # BEFORE the resolve loop because mark_resolved inside the loop is what
+    # populates `resolved_recently` for THIS delivery; a first-time delivery
+    # fails the check, a duplicate (already-marked ids) returns the cached
+    # tool_calls response without ever touching the gate. (We only return
+    # the cached response while the session is parked: once the CLI has
+    # continued, last_response is from a stale turn and the right answer
+    # is whatever the new turn produces.)
+    if (session.last_response is not None
+            and session.awaiting_followup
+            and all(cid in session.resolved_recently for cid in delivered_ids)):
+        log.info(
+            "live mcp_bridge session %s received a duplicate delivery of "
+            "%d already-resolved tool_call_id(s); returning the cached "
+            "tool_calls response rather than rebuilding",
+            session.id, len(delivered_ids))
+        return session.last_response
+
+    # Acquire a gate slot BEFORE resolving any parked tool_call future. The
+    # contract is acquire-before-deliver: the inner CLI is unblocked by
+    # future.set_result, and once unblocked it runs inference and consumes a
+    # slot. If we resolved first and the gate acquire failed, the CLI would
+    # be running with no slot (issue #130: 503 on a saturated gate used to
+    # leak the slot the CLI was about to need, with the session looking
+    # delivered, so the gateway's retry hit the supersede-and-rebuild path
+    # instead of resuming). On 503 the parked calls stay parked, the flag
+    # stays True, `resolved_recently` is untouched, and the gateway's retry
+    # walks the same follow-up path against the same live session.
+    await unpark_session(session)
     resolved = 0
     for m in tool_msgs:
         call = session.pending.pop(m["tool_call_id"], None)
@@ -2621,24 +2673,6 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
         })
         resolved += 1
     if resolved == 0:
-        delivered_ids = [m["tool_call_id"] for m in tool_msgs]
-        # Defect 1: every delivered id is already resolved and the session is
-        # still parked, so this is a duplicate delivery of a batch we already
-        # turned into a tool_calls response. Return the cached response rather
-        # than rebuilding -- the caller is retrying because the original
-        # response never arrived, not asking for a new turn. (We only return
-        # the cached response while the session is parked: once the CLI has
-        # continued, last_response is from a stale turn and the right answer
-        # is whatever the new turn produces.)
-        if (session.last_response is not None
-                and session.awaiting_followup
-                and all(cid in session.resolved_recently for cid in delivered_ids)):
-            log.info(
-                "live mcp_bridge session %s received a duplicate delivery of "
-                "%d already-resolved tool_call_id(s); returning the cached "
-                "tool_calls response rather than rebuilding",
-                session.id, len(delivered_ids))
-            return session.last_response
         # Duplicate-delivery-in-flight (issue #96 owner comment): the session
         # is mid-turn (not parked), the delivered ids do not match anything
         # parked here, and a turn_future that is still running means the CLI
@@ -2700,7 +2734,10 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
         # request keeps the caller moving instead of throwing a 400 they
         # cannot recover from -- but the superseded session must be torn down
         # first, otherwise the rebuild leaves two live sessions on one tool
-        # loop (issue #13, defect 2).
+        # loop (issue #13, defect 2). Reached only after the gate acquire
+        # above succeeded, so the rebuild path inherits a slot just like the
+        # normal fresh turn (acquire_resume_slot in resume_gone_session does
+        # the same thing explicitly; here the unpark already did it).
         log.warning(
             "live mcp_bridge session %s had no parked tool call matching the "
             "delivered ids; superseding it and rebuilding from the request "
@@ -2710,12 +2747,6 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
         return await resume_gone_session(
             body, body.get("tools") or [], session.id, request,
             why="no parked call matched delivered ids")
-
-    # The results are in; the model is about to run again, so take a slot back.
-    # unpark_session is deliberately OUTSIDE the try below: its 503-on-saturated-
-    # gate failure intentionally leaves the session in place for the gateway to
-    # retry (issue #13, follow-up path must queue rather than fail fast).
-    await unpark_session(session)
     try:
         session.touch()
         await session.new_turn()
