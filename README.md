@@ -125,6 +125,16 @@ the 20 its plans' limits sum to, because several members cap themselves lower.
 A **tail** member is last-resort capacity: it keeps a lane from hard-failing but
 never carries normal traffic, and is excluded from the lane's advertised slots.
 
+A session that spills onto the tail does **not** stay pinned there: on its next
+turn, the picker drops the tail lease and the lane's normal members get the
+request back as soon as a body slot is free. The tail lease would otherwise
+silently pin the session across provider boundaries (the body is paid, the
+tail is local), and prompt-cache / tool-quota stickiness is a provider-bound
+concept that does not transfer. Mid-tool-loop pins are exempt — that pin
+rides on the lease, and tool-call mid-turn stickiness is preserved — so the
+body walk or the tail walk re-leases the next ref and placement converges
+without any caller code touching the lease.
+
 **A tail must be local.** Its entire job is to still be there once the paid
 capacity is exhausted, so a subscription in the tail is self-defeating — it is
 precisely what will have run out at the moment the tail is needed. A metered

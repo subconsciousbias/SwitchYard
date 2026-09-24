@@ -293,6 +293,53 @@ async def scenario_drop_lease(slots, r):
             sorted(await slots.sessions_on_plan(PLAN)))
 
 
+async def scenario_drop_lease_if_match(slots, r):
+    """drop_lease_if with a matching ref clears lease + marker + SET,
+    and returns True. Mirrors drop_lease when the caller's read is current."""
+    await slots.set_lease("sess-A", MODEL, LEASE_TTL, PLAN)
+    await slots.mark_injected("sess-A", LEASE_TTL)
+    before = await slots.injected("sess-A")
+    matched = await slots.drop_lease_if("sess-A", MODEL)
+    return (before,
+            matched,
+            await slots.get_lease("sess-A"),
+            await slots.injected("sess-A"),
+            sorted(await slots.sessions_on_plan(PLAN)))
+
+
+async def scenario_drop_lease_if_mismatch(slots, r):
+    """drop_lease_if with a stale ref is a no-op: returns False and
+    leaves the lease, the injection marker, and the SET entry alone.
+    This covers the lease-REPLACED shape (drain migration / a parallel
+    _visit_ref set_lease writes a different ref). It does NOT cover
+    the touch_lease same-value interleaving — touch only EXPIREs, so
+    the CAS still matches and drops; see the picker overflow-gate
+    comment for that documented limitation."""
+    await slots.set_lease("sess-A", MODEL, LEASE_TTL, PLAN)
+    await slots.mark_injected("sess-A", LEASE_TTL)
+    before_lease = await slots.get_lease("sess-A")
+    before_inj = await slots.injected("sess-A")
+    before_set = sorted(await slots.sessions_on_plan(PLAN))
+    matched = await slots.drop_lease_if("sess-A", "stale-ref/m")
+    return (before_lease,
+            before_inj,
+            before_set,
+            matched,
+            await slots.get_lease("sess-A"),
+            await slots.injected("sess-A"),
+            sorted(await slots.sessions_on_plan(PLAN)))
+
+
+async def scenario_drop_lease_if_missing(slots, r):
+    """drop_lease_if on a session with no lease at all returns False and
+    touches nothing — same contract as on a stale-ref mismatch."""
+    matched = await slots.drop_lease_if("sess-A", MODEL)
+    return (matched,
+            await slots.get_lease("sess-A"),
+            await slots.injected("sess-A"),
+            sorted(await slots.sessions_on_plan(PLAN)))
+
+
 async def scenario_sessions_on_plan(slots, r):
     """sessions_on_plan returns the SET membership per plan, in insert order."""
     await slots.set_lease("sess-A", MODEL, LEASE_TTL, PLAN)
@@ -318,6 +365,9 @@ SCENARIOS = [
     ("set_lease",                    scenario_set_lease),
     ("touch_lease",                  scenario_touch_lease),
     ("drop_lease",                   scenario_drop_lease),
+    ("drop_lease_if_match",          scenario_drop_lease_if_match),
+    ("drop_lease_if_mismatch",       scenario_drop_lease_if_mismatch),
+    ("drop_lease_if_missing",        scenario_drop_lease_if_missing),
     ("sessions_on_plan",             scenario_sessions_on_plan),
 ]
 

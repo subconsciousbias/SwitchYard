@@ -181,6 +181,56 @@ end
 return 1
 """
 
+# Compare-and-drop the lease: read the lease, and only DEL + SREM + clear the
+# injection marker if the current value still matches ARGV[2] (the ref the
+# caller read at decision time). Same KEYS / ARGV layout as _DROP_LEASE plus
+# the expected-ref check.
+#
+# The CAS-on-value guards two interleavings and explicitly does NOT guard a
+# third:
+#
+#   * Lease-replaced — covered. The value differs from ARGV[2] because
+#     a parallel turn (drain migration, `_visit_ref` body walk's
+#     set_lease) wrote a different ref. The parallel turn's new state
+#     is left alone; the caller bails out of the DEL.
+#   * Lease-gone — covered. TTL fired, a prior `drop_lease` landed
+#     (e.g. hooks.py:1369 on a post-call QUOTA_EXHAUSTED / PLAN_DEAD /
+#     AUTH / explicit-drop verdict), or the key never existed (failover
+#     to a primary without it). The CAS sees a missing key and is a
+#     no-op.
+#
+# The CAS does NOT close the touch_lease-same-value race: _TOUCH_LEASE
+# only EXPIREs the lease key, it does not re-SET the value, so a parallel
+# pinned turn that touch_leases the same lease between the caller's read
+# and now leaves the value unchanged. The CAS still matches and the
+# drop fires — i.e. the caller does NOT get the protection a future
+# reader of "compare-and-drop" might assume. Closing that race needs a
+# TTL/touch-aware variant (a counter _TOUCH_LEASE bumps and _DROP_LEASE_IF
+# checks); until one exists, callers that care about the touch_lease
+# interleaving must be aware that this primitive is value-CAS, not
+# touch-aware CAS. The picker overflow gate is the only caller today, and
+# its wrapping comment in switchyard/picker.py names the limitation.
+#
+# KEYS[1] lease key
+# KEYS[2] injection marker key
+# ARGV[1] session id (for SREM)
+# ARGV[2] expected ref (the ref the caller wants to drop)
+# -> 1 dropped | 0 skipped (value did not match — caller no longer owns this lease)
+_DROP_LEASE_IF = """
+-- DROP_LEASE_IF
+local v = redis.call('GET', KEYS[1])
+if not v or v ~= ARGV[2] then
+  return 0
+end
+redis.call('DEL', KEYS[1])
+redis.call('DEL', KEYS[2])
+local plan = string.match(v, '^([^/]+)/')
+if plan then
+  redis.call('SREM', 'sy:lease_plan:' .. plan, ARGV[1])
+end
+return 1
+"""
+
 # Set lease + per-plan reverse-index membership + both TTLs atomically.
 # The previous three-step Python sequence (SET lease EX ttl, SADD plan SET,
 # EXPIRE plan SET) had a single-round-trip race between the SADD and the
@@ -222,6 +272,7 @@ class SlotTable:
         self._bump_and_cool = redis.register_script(_BUMP_AND_COOL)
         self._touch_lease = redis.register_script(_TOUCH_LEASE)
         self._drop_lease = redis.register_script(_DROP_LEASE)
+        self._drop_lease_if = redis.register_script(_DROP_LEASE_IF)
         self._set_lease = redis.register_script(_SET_LEASE)
 
     # -- capacity ----------------------------------------------------------
@@ -391,6 +442,36 @@ class SlotTable:
                   K_INJECTED.format(session=session)],
             args=[session],
         )
+
+    async def drop_lease_if(self, session: str, expected_ref: str) -> bool:
+        # Compare-and-drop on the lease value: only DEL the lease (and the
+        # matching injection marker + per-plan reverse-index entry) if the
+        # lease's current value is *still* the one the caller read at
+        # decision time. Returns True when the drop fired, False when the
+        # lease no longer matches — it has been replaced (drain migration
+        # wrote a different ref, a `_visit_ref` body walk `set_lease`d a
+        # different ref), or it has gone away (TTL fired, a prior
+        # `drop_lease` landed — e.g. hooks.py:1369 on a post-call
+        # QUOTA_EXHAUSTED / PLAN_DEAD / AUTH / explicit-drop verdict —
+        # or failover to a primary without the key), between the caller's
+        # read and now. In either sub-case the caller no longer owns the
+        # lease and a blind DEL would have clobbered state a concurrent
+        # turn just established.
+        #
+        # This is a value-CAS, not a touch-aware CAS. A parallel pinned
+        # follow-up that touch_leases the same lease in the window does
+        # not change the lease value (_TOUCH_LEASE only EXPIREs — it does
+        # not re-SET), so the CAS still matches and the drop fires. The
+        # picker overflow gate (the only caller today, see
+        # switchyard/picker.py) names this limitation in its wrapping
+        # comment; closing the touch_lease race needs a TTL/touch-aware
+        # primitive slots.py does not yet expose.
+        result = await self._drop_lease_if(
+            keys=[K_LEASE.format(session=session),
+                  K_INJECTED.format(session=session)],
+            args=[session, expected_ref],
+        )
+        return int(result) == 1
 
     # -- plan drain gate ----------------------------------------------------
     # A drained plan refuses new work without unmounting anything — apply.sh

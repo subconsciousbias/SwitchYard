@@ -25,9 +25,28 @@ from switchyard.slots import (
     _BUMP_STREAK,
     _CLAIM,
     _DROP_LEASE,
+    _DROP_LEASE_IF,
     _SET_LEASE,
     _TOUCH_LEASE,
 )
+
+# Real Redis compiles each Lua script once and matches `register_script`
+# callers by exact source. The fake matches the same way: this dict pairs
+# each `switchyard.slots` script constant with the `_shadow_*` method name
+# the fake uses to mimic it. `register_script` looks up the constant, finds
+# the method on `self`, and returns the bound method — a simple flat dispatch
+# that keeps the per-script bodies in their own methods instead of as
+# closures inside one giant function (which is what tripped C901 once the
+# new _DROP_LEASE_IF script landed).
+_SCRIPT_SOURCE_TO_SHADOW = {
+    _CLAIM:           "_shadow_claim",
+    _BUMP_AND_COOL:   "_shadow_bump_and_cool",
+    _BUMP_STREAK:     "_shadow_bump_streak",
+    _TOUCH_LEASE:     "_shadow_touch_lease",
+    _DROP_LEASE:      "_shadow_drop_lease",
+    _DROP_LEASE_IF:   "_shadow_drop_lease_if",
+    _SET_LEASE:       "_shadow_set_lease",
+}
 
 
 class FakePipeline:
@@ -381,6 +400,138 @@ class FakeRedis:
     async def ping(self):
         return True
 
+    # -- the Lua shadow methods ---------------------------------------------
+    # `register_script` looks each script's exact source up in
+    # `_SCRIPT_SOURCE_TO_SHADOW` and returns the bound shadow method. The
+    # bodies are kept as standalone methods (not closures inside
+    # `register_script`) so C901 stays well below the 25 ceiling even as
+    # new scripts land — adding a new script is +1 entry in the dict,
+    # not +N control-flow nodes on a single function.
+
+    async def _shadow_claim(self, keys, args):
+        inflight_key, cool_key, model_key, lane_key = keys
+        rid, now, plan_cap, stale_before, ttl, model_cap, lane = args
+        if await self.get(cool_key) is not None:
+            return -1
+        await self.zremrangebyscore(inflight_key, "-inf", stale_before)
+        await self.zremrangebyscore(model_key, "-inf", stale_before)
+        plan_z = self.zsets.setdefault(inflight_key, {})
+        if len(plan_z) >= int(plan_cap):
+            return 0
+        mcap = int(model_cap)
+        model_z = self.zsets.setdefault(model_key, {})
+        if mcap >= 0 and len(model_z) >= mcap:
+            return -2
+        plan_z[rid] = float(now)
+        model_z[rid] = float(now)
+        if lane:
+            self.hashes.setdefault(lane_key, {})[rid] = str(lane)
+        # Mirror the Lua's ZADD-then-EXPIRE ordering: TTL the plan zset,
+        # the model zset, and the lane hash (when a lane is set) only after
+        # the writes succeed. A failed claim must not leave a TTL behind,
+        # and a successful one must, the same way the real Redis EVAL does
+        # it.
+        ttl = int(ttl)
+        await self.expire(inflight_key, ttl)
+        await self.expire(model_key, ttl)
+        if lane:
+            await self.expire(lane_key, ttl)
+        return 1
+
+    async def _shadow_bump_and_cool(self, keys, args):
+        streak_key, cool_key = keys
+        streak_ttl, base, cap, reason, now = args
+        v = await self.incr(streak_key)
+        await self.expire(streak_key, int(streak_ttl))
+        # Mirror the Lua ladder: base * 2**(streak-1), capped.
+        cooldown = int(base)
+        if v > 1:
+            doubled = int(base) * (2 ** (v - 1))
+            cooldown = cap if doubled > cap else doubled
+        # Match cool_down's "{reason}|{until}" shape and TTL.
+        until = int(now) + cooldown
+        await self.set(cool_key, f"{reason}|{until}",
+                       ex=max(1, int(cooldown)))
+        return v
+
+    async def _shadow_bump_streak(self, keys, args):
+        streak_key = keys[0]
+        v = await self.incr(streak_key)
+        await self.expire(streak_key, int(args[0]))
+        return v
+
+    async def _shadow_touch_lease(self, keys, args):
+        # Mirror the Lua: GET lease, return 0 if absent (and skip the EXPIRE
+        # refresh on either key — the exact contract a "lease was just
+        # dropped under us" caller wants); otherwise EXPIRE the lease AND
+        # the per-plan reverse-index SET.
+        lease_key = keys[0]
+        ttl = int(args[0])
+        v = await self.get(lease_key)
+        if v is None:
+            return 0
+        await self.expire(lease_key, ttl)
+        # Mirror Lua's `string.match(v, '^([^/]+)/')` exactly: only refresh
+        # the per-plan reverse-index SET when the lease value carries a
+        # `plan/` prefix. A bare lease value with no slash yields no match
+        # in real Redis (no EXPIRE on the SET); `split` would have
+        # refreshed a wrong SET key instead.
+        m = re.match(r"^([^/]+)/", v)
+        if m:
+            await self.expire(f"sy:lease_plan:{m.group(1)}", ttl)
+        return 1
+
+    async def _shadow_drop_lease(self, keys, args):
+        # Mirror the Lua: GET lease (to learn the plan), then DEL lease +
+        # DEL injection marker + SREM from the SET.
+        lease_key, inject_key = keys
+        session = args[0]
+        v = await self.get(lease_key)
+        await self.delete(lease_key)
+        await self.delete(inject_key)
+        if v is not None:
+            # Same Lua-vs-split drift as the touch_lease shadow: only SREM
+            # the per-plan SET when the lease value carries a `plan/`
+            # prefix.
+            m = re.match(r"^([^/]+)/", v)
+            if m:
+                await self.srem(f"sy:lease_plan:{m.group(1)}", session)
+        return 1
+
+    async def _shadow_drop_lease_if(self, keys, args):
+        # Mirror the Lua: GET lease, compare against ARGV[2] (the expected
+        # ref the caller read at decision time), and only DEL + SREM +
+        # clear the injection marker when the values match. On a mismatch
+        # (or a missing lease) return 0 unchanged — same return value the
+        # real script returns so `drop_lease_if`'s True/False mapping
+        # stays in step. This is a value-CAS, not a touch-aware CAS — see
+        # slots.py:184-213 and the picker overflow gate comment for which
+        # interleavings the primitive guards and which it does not.
+        lease_key, inject_key = keys
+        session, expected = args
+        v = await self.get(lease_key)
+        if v is None or v != expected:
+            return 0
+        await self.delete(lease_key)
+        await self.delete(inject_key)
+        m = re.match(r"^([^/]+)/", v)
+        if m:
+            await self.srem(f"sy:lease_plan:{m.group(1)}", session)
+        return 1
+
+    async def _shadow_set_lease(self, keys, args):
+        # Mirror the Lua: SADD to the SET, SET the lease with EX, EXPIRE
+        # the SET. Now that `expire` works for every key type (not just
+        # strings) the SET TTL is honored end-to-end, so the membership
+        # and its bound TTL land together — the property the real Lua
+        # script exists to guarantee.
+        lease_key, set_key = keys
+        session, ref, ttl = args
+        added = await self.sadd(set_key, session)
+        await self.set(lease_key, ref, ex=int(ttl))
+        await self.expire(set_key, int(ttl))
+        return added
+
     # -- the Lua shadows ---------------------------------------------------
     # Real Redis compiles each script once; the fake matches by exact-source
     # identity against the constants in `switchyard.slots`. The fast suite
@@ -389,123 +540,16 @@ class FakeRedis:
     # to the CLAIM fallback — a typo in a script constant or a renamed copy
     # should never look like a working claim.
     def register_script(self, src):
-        if src is _CLAIM:
-            async def claim(keys, args):
-                inflight_key, cool_key, model_key, lane_key = keys
-                rid, now, plan_cap, stale_before, ttl, model_cap, lane = args
-                if await self.get(cool_key) is not None:
-                    return -1
-                await self.zremrangebyscore(inflight_key, "-inf", stale_before)
-                await self.zremrangebyscore(model_key, "-inf", stale_before)
-                plan_z = self.zsets.setdefault(inflight_key, {})
-                if len(plan_z) >= int(plan_cap):
-                    return 0
-                mcap = int(model_cap)
-                model_z = self.zsets.setdefault(model_key, {})
-                if mcap >= 0 and len(model_z) >= mcap:
-                    return -2
-                plan_z[rid] = float(now)
-                model_z[rid] = float(now)
-                if lane:
-                    self.hashes.setdefault(lane_key, {})[rid] = str(lane)
-                # Mirror the Lua's ZADD-then-EXPIRE ordering: TTL the plan
-                # zset, the model zset, and the lane hash (when a lane is
-                # set) only after the writes succeed. A failed claim must
-                # not leave a TTL behind, and a successful one must, the
-                # same way the real Redis EVAL does it.
-                ttl = int(ttl)
-                await self.expire(inflight_key, ttl)
-                await self.expire(model_key, ttl)
-                if lane:
-                    await self.expire(lane_key, ttl)
-                return 1
-            return claim
-
-        if src is _BUMP_AND_COOL:
-            async def bump_and_cool(keys, args):
-                streak_key, cool_key = keys
-                streak_ttl, base, cap, reason, now = args
-                v = await self.incr(streak_key)
-                await self.expire(streak_key, int(streak_ttl))
-                # Mirror the Lua ladder: base * 2**(streak-1), capped.
-                cooldown = int(base)
-                if v > 1:
-                    doubled = int(base) * (2 ** (v - 1))
-                    cooldown = cap if doubled > cap else doubled
-                # Match cool_down's "{reason}|{until}" shape and TTL.
-                until = int(now) + cooldown
-                await self.set(cool_key, f"{reason}|{until}",
-                               ex=max(1, int(cooldown)))
-                return v
-            return bump_and_cool
-
-        if src is _BUMP_STREAK:
-            async def bump_streak(keys, args):
-                streak_key = keys[0]
-                v = await self.incr(streak_key)
-                await self.expire(streak_key, int(args[0]))
-                return v
-            return bump_streak
-
-        if src is _TOUCH_LEASE:
-            async def touch_lease(keys, args):
-                # Mirror the Lua: GET lease, return 0 if absent (and skip the
-                # EXPIRE refresh on either key — the exact contract a "lease
-                # was just dropped under us" caller wants); otherwise EXPIRE
-                # the lease AND the per-plan reverse-index SET.
-                lease_key = keys[0]
-                ttl = int(args[0])
-                v = await self.get(lease_key)
-                if v is None:
-                    return 0
-                await self.expire(lease_key, ttl)
-                # Mirror Lua's `string.match(v, '^([^/]+)/')` exactly: only
-                # refresh the per-plan reverse-index SET when the lease value
-                # carries a `plan/` prefix. A bare lease value with no slash
-                # yields no match in real Redis (no EXPIRE on the SET); `split`
-                # would have refreshed a wrong SET key instead.
-                m = re.match(r"^([^/]+)/", v)
-                if m:
-                    await self.expire(f"sy:lease_plan:{m.group(1)}", ttl)
-                return 1
-            return touch_lease
-
-        if src is _DROP_LEASE:
-            async def drop_lease(keys, args):
-                # Mirror the Lua: GET lease (to learn the plan), then
-                # DEL lease + DEL injection marker + SREM from the SET.
-                lease_key, inject_key = keys
-                session = args[0]
-                v = await self.get(lease_key)
-                await self.delete(lease_key)
-                await self.delete(inject_key)
-                if v is not None:
-                    # Same Lua-vs-split drift as the touch_lease shadow: only
-                    # SREM the per-plan SET when the lease value carries a
-                    # `plan/` prefix.
-                    m = re.match(r"^([^/]+)/", v)
-                    if m:
-                        await self.srem(f"sy:lease_plan:{m.group(1)}", session)
-                return 1
-            return drop_lease
-
-        if src is _SET_LEASE:
-            async def set_lease(keys, args):
-                # Mirror the Lua: SADD to the SET, SET the lease with EX,
-                # EXPIRE the SET. Now that `expire` works for every key type
-                # (not just strings) the SET TTL is honored end-to-end, so
-                # the membership and its bound TTL land together — the
-                # property the real Lua script exists to guarantee.
-                lease_key, set_key = keys
-                session, ref, ttl = args
-                added = await self.sadd(set_key, session)
-                await self.set(lease_key, ref, ex=int(ttl))
-                await self.expire(set_key, int(ttl))
-                return added
-            return set_lease
-
-        raise ValueError(
-            f"FakeRedis.register_script: unknown Lua source ({len(src)} chars). "
-            "Add an exact-source shadow in tests/fake_redis.py before importing "
-            "the new script into slots.py."
-        )
+        # Dispatch via the module-level `_SCRIPT_SOURCE_TO_SHADOW` map.
+        # Each shadow is a `_shadow_*` method on this class; looking up the
+        # bound method on self keeps `register_script` at one branch and the
+        # per-script bodies under the C901 ceiling even as new scripts land.
+        method_name = _SCRIPT_SOURCE_TO_SHADOW.get(src)
+        if method_name is None:
+            raise ValueError(
+                f"FakeRedis.register_script: unknown Lua source "
+                f"({len(src)} chars). Add an exact-source shadow in "
+                "tests/fake_redis.py before importing the new script "
+                "into slots.py."
+            )
+        return getattr(self, method_name)

@@ -805,6 +805,63 @@ class Picker:
         reachable.update(self.registry.lanes[ctx.lane].tail)
         if held not in reachable:
             return None
+        # Overflow gate: a lease on a lane's tail / last-resort member is NOT
+        # sticky. The tail exists because the lane's body was full when the
+        # session spilled onto it; now the lane is no longer full and the
+        # next turn should land on the body again. Touching the lease here
+        # would silently pin the session to the tail until it expires, and
+        # prompt-cache / tool-quota stickiness is a provider-bound concept
+        # that does not transfer across providers — the tail is local. Drop
+        # the lease and let the body walk re-place the session on a normal
+        # member. Mid-tool-loop pins are exempt: that pin rides on the
+        # lease, and preserving tool-call mid-turn stickiness is the
+        # precedent the gen_litellm regression set. When the body then
+        # claims a member, `_visit_ref` re-leases via `set_lease`; when the
+        # body is fully skipped, step 3's tail `_visit_ref` re-leases the
+        # tail. So placement converges and nothing has to re-add the lease
+        # by hand.
+        if self.registry.is_tail(ctx.lane, held) and not ctx.pinned:
+            # Compare-and-drop the tail lease: between `held = ...`
+            # (line 763) and now we have awaited at least once (the
+            # `is_draining` check on the held plan, plus the `drop_lease`
+            # calls in the expired / disabled / draining / held-in-exclude
+            # sibling paths above). A blind DEL on a healthy lease in
+            # that window is unsafe, so we use drop_lease_if (a CAS on
+            # the lease value) instead of drop_lease:
+            #
+            # * Lease-replaced race — covered. A parallel turn wrote a
+            #   different value to the lease key while T1 was awaiting:
+            #   `drain.py` migrating the session, or a `_visit_ref`
+            #   body walk on the same session that `set_lease`s a body
+            #   ref. The CAS sees a value mismatch and is a no-op, so
+            #   the parallel turn's new state is left alone.
+            # * Lease-gone race — covered. The TTL fired, or a prior
+            #   `drop_lease` landed (e.g. hooks.py:1369 on a
+            #   post-call QUOTA_EXHAUSTED / PLAN_DEAD / AUTH / explicit
+            #   drop verdict), or T1 read from a primary that didn't
+            #   have the key (failover). The CAS sees a missing key
+            #   and is a no-op.
+            #
+            # The CAS does NOT cover one interleaving: a parallel
+            # pinned follow-up that `touch_lease`s the same lease in
+            # the window leaves the value unchanged (TOUCH only
+            # EXPIREs, it does not re-SET), so the CAS still matches
+            # and the drop fires. The drop will DEL T2's just-renewed
+            # tail lease and the injection marker T2 relies on, and
+            # T1's body walk will `set_lease` a body member, so T2's
+            # *next* pinned turn will read body — exactly the
+            # tool-loop stickiness break the gate is supposed to
+            # prevent. Closing that race needs a TTL/touch-aware
+            # CAS primitive on top of the lease value, which slots.py
+            # does not yet expose; see the comment on drop_lease_if
+            # in slots.py for why this gate stays with the value-CAS
+            # for now. The `ctx.skipped` entry only fires when the
+            # CAS actually dropped, so we do not advertise a skip
+            # that did not happen.
+            dropped = await self.slots.drop_lease_if(ctx.session, held)
+            if dropped:
+                ctx.skipped.append(f"{held}(tail overflow, body walk)")
+            return None
         model = self.registry.model(held)
         if model is None:
             return None

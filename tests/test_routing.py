@@ -5638,6 +5638,149 @@ def test_pick_direct_refuses_expired_and_disabled():
     print(f"  pick_direct refused: {a_refused} | {b_refused} | {c_refused}")
 
 
+def test_overflow_lease_is_not_sticky_on_a_paid_local_tail_lane():
+    """A session leased to a lane's tail does NOT stay pinned there.
+
+    The tail exists because the lane's body was full when the session
+    spilled onto it; once the body is no longer full, the next turn must
+    leave the tail and re-claim a normal member. Touching the tail lease
+    would silently pin the session across provider boundaries (the body
+    is Claude/OpenAI, the tail is local), defeating the lane's normal
+    routing. Pinned mid-tool-loop follow-ups are exempt — that pin rides
+    on the lease, and tool-call mid-turn stickiness is the gen_litellm
+    precedent.
+    """
+    async def go():
+        reg, slots, picker = build()
+        # `apex` has Claude / OpenAI body and a `local-box/qwen` tail, so
+        # the test fixture matches the "tail is local, body is paid" shape
+        # the overflow gate exists to police.
+        lane = "apex"
+        session = "sess-overflow"
+        tail_ref = "local-box/qwen"
+        # Sanity: confirm the lane actually has a non-tail body member
+        # before any of the three scenarios depend on it. A regression
+        # that empties the lane or demotes every member to the tail
+        # would make the test silently vacuous without this guard.
+        body_refs = [
+            m.ref for m in reg.lane_members(lane)
+            if not reg.is_tail(lane, m.ref)
+        ]
+        assert body_refs, (
+            "test needs at least one non-tail body member on "
+            f"{lane!r}; got {body_refs!r}"
+        )
+        assert reg.is_tail(lane, tail_ref), (
+            "test fixture drifted: expected tail_ref "
+            f"{tail_ref!r} on lane {lane!r}"
+        )
+
+        # (a) Prime the lease to the tail — the spill-over shape — and
+        # then call pick. The overflow gate must drop the tail lease and
+        # let the body walk re-place the session on a normal member;
+        # `set_lease` in `_visit_ref` then MOVES the lease to that body
+        # member, not just ignores it.
+        await slots.set_lease(
+            session, tail_ref, reg.settings.lease_ttl_seconds)
+        held_before = await slots.get_lease(session)
+        assert held_before == tail_ref, held_before
+
+        picked = await picker.pick(lane, session)
+        assert picked.ref in body_refs, (
+            "overflow pick must land on a body member, "
+            f"not {picked.ref!r} (body={body_refs!r})"
+        )
+        assert not picked.sticky, (
+            "a tail lease that was acquired by spill-over is not sticky")
+        held_after = await slots.get_lease(session)
+        assert held_after == picked.ref, (
+            "lease must MOVE to the new body member, not be dropped "
+            f"or left pointing at the tail: {held_after!r} vs "
+            f"picked={picked.ref!r}"
+        )
+        assert held_after != tail_ref, held_after
+        await picker.release(
+            picked.plan.key, picked.request_id, picked.ref)
+
+        # (b) With every body member's plan now full, the next pick
+        # cannot place on a body member and must fall back to the tail.
+        # The same `_visit_ref` claim path then re-leases the tail via
+        # `set_lease`, so placement converges and nothing has to
+        # re-add the lease by hand.
+        filler_rids: list[str] = []
+        for ref in body_refs:
+            model = reg.model(ref)
+            plan = reg.plan_of(model)
+            for n in range(plan.max_parallel * 2):
+                rid = f"overflow-filler-{ref.replace('/', '-')}-{n}"
+                if await slots.try_claim(
+                        plan.key, plan.max_parallel, rid,
+                        model.ref, model.max_parallel,
+                        lane=lane) != 1:
+                    break
+                filler_rids.append(rid)
+        assert filler_rids, "could not fill any body plan slot"
+
+        # Re-prime the lease to the tail, so the picker enters
+        # `_affinity` with a tail lease and the overflow gate fires
+        # before the body walk.
+        await slots.set_lease(
+            session, tail_ref, reg.settings.lease_ttl_seconds)
+        picked = await picker.pick(lane, session)
+        assert picked.ref == tail_ref, (
+            "with body plans full, the tail must take the request "
+            f"(got {picked.ref!r})"
+        )
+        held_after_b = await slots.get_lease(session)
+        assert held_after_b == tail_ref, (
+            "tail walk must re-lease the tail via _visit_ref: "
+            f"{held_after_b!r}"
+        )
+        await picker.release(
+            picked.plan.key, picked.request_id, picked.ref)
+
+        # Drain the fillers so the third scenario starts clean. ZREM is
+        # idempotent, so calling release for every (plan, rid) pair is a
+        # no-op on plans where that rid was never claimed.
+        for ref in body_refs:
+            model = reg.model(ref)
+            plan = reg.plan_of(model)
+            for rid in filler_rids:
+                await picker.release(plan.key, rid, model.ref)
+
+        # (c) A pinned (mid-tool-loop) follow-up must STILL honour the
+        # tail lease — the tool-loop pin rides on the lease and is the
+        # gen_litellm precedent. The overflow gate only fires for
+        # non-pinned picks.
+        await slots.set_lease(
+            session, tail_ref, reg.settings.lease_ttl_seconds)
+        picked_pinned = await picker.pick(lane, session, pinned=True)
+        assert picked_pinned.ref == tail_ref, (
+            "pinned follow-up must keep the tail lease: "
+            f"got {picked_pinned.ref!r}"
+        )
+        assert picked_pinned.sticky, (
+            "pinned follow-up on the tail must read as sticky")
+        held_after_c = await slots.get_lease(session)
+        assert held_after_c == tail_ref, held_after_c
+        await picker.release(
+            picked_pinned.plan.key, picked_pinned.request_id,
+            picked_pinned.ref)
+
+        return (
+            tail_ref, body_refs, picked.ref, picked_pinned.ref,
+            held_after, held_after_b, held_after_c,
+        )
+
+    (tail_ref, body_refs, body_pick, pinned_pick,
+     moved_to, fell_to, kept_to) = run(go())
+    print(f"  tail {tail_ref} -> overflow pick moved lease to "
+          f"{moved_to} (body {sorted(body_refs)}); "
+          f"with body full, pick fell back to tail {fell_to} "
+          f"and re-leased it; pinned follow-up kept tail {kept_to} "
+          f"({pinned_pick}, sticky=True)")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
