@@ -3489,6 +3489,149 @@ def test_thinking_display_omitted_means_text_path_result_is_empty():
           "content=\"\", reasoning_content populated")
 
 
+def test_codex_usage_report_401_when_not_logged_in():
+    """Issue #203: /usage on a codex seat that was never logged in returns
+    401 (auth missing), not 503 (no rate-limits data yet). The two cases
+    have different fixes: 401 means run `codex login --device-auth`; 503
+    means send a real request through first."""
+    import asyncio
+    import shutil
+    from fastapi import HTTPException
+    tmp = Path(tempfile.mkdtemp(prefix="clib-codex-usage-nologin-"))
+    saved_provider = server.PROVIDER
+    saved_home = os.environ.get("CODEX_HOME")
+    os.environ["CODEX_HOME"] = str(tmp)
+    server.PROVIDER = "codex"
+    try:
+        try:
+            asyncio.run(server.usage_report())
+        except HTTPException as exc:
+            assert exc.status_code == 401, exc.detail
+            assert "codex login --device-auth" in exc.detail, exc.detail
+        else:
+            raise AssertionError("expected HTTPException with status 401")
+    finally:
+        server.PROVIDER = saved_provider
+        if saved_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = saved_home
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  codex /usage -> 401 when CODEX_HOME/auth.json is missing")
+
+
+def test_codex_usage_report_503_when_logged_in_but_no_data():
+    """The 503 case survives: auth.json present, no sessions yet means
+    send a real request through this plan first. Issue #203 is explicit
+    that only the never-logged-in case changes; logged-in-but-no-data
+    must keep returning 503."""
+    import asyncio
+    import shutil
+    from fastapi import HTTPException
+    tmp = Path(tempfile.mkdtemp(prefix="clib-codex-usage-nodata-"))
+    (tmp / "auth.json").write_text("{}")
+    sessions_tmp = Path(tempfile.mkdtemp(prefix="clib-codex-usage-sessions-"))
+    saved_provider = server.PROVIDER
+    saved_sessions = server.CODEX_SESSIONS
+    saved_home = os.environ.get("CODEX_HOME")
+    os.environ["CODEX_HOME"] = str(tmp)
+    server.PROVIDER = "codex"
+    server.CODEX_SESSIONS = sessions_tmp
+    try:
+        try:
+            asyncio.run(server.usage_report())
+        except HTTPException as exc:
+            assert exc.status_code == 503, exc.detail
+            assert "no rate_limits recorded yet" in exc.detail, exc.detail
+        else:
+            raise AssertionError("expected HTTPException with status 503")
+    finally:
+        server.PROVIDER = saved_provider
+        server.CODEX_SESSIONS = saved_sessions
+        if saved_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = saved_home
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(sessions_tmp, ignore_errors=True)
+    print("  codex /usage -> 503 when auth.json present but no sessions yet")
+
+
+def test_codex_usage_report_reads_codex_home_not_decoy():
+    """CODEX_HOME is what compose pins for the codex seat (secrets/codex);
+    the lookup must honour that, not fall back to a hardcoded path. We
+    avoid touching the operator's real ~/.codex by using two tmpdirs:
+    CODEX_HOME points at the empty one; a decoy auth.json sits in the
+    other so a code path that read from the wrong dir would find it and
+    return 503. The 401 proves the lookup used CODEX_HOME."""
+    import asyncio
+    import shutil
+    from fastapi import HTTPException
+    codex_home_tmp = Path(tempfile.mkdtemp(prefix="clib-codex-usage-home-"))
+    decoy_tmp = Path(tempfile.mkdtemp(prefix="clib-codex-usage-decoy-"))
+    (decoy_tmp / "auth.json").write_text("{}")
+    saved_provider = server.PROVIDER
+    saved_home = os.environ.get("CODEX_HOME")
+    os.environ["CODEX_HOME"] = str(codex_home_tmp)
+    server.PROVIDER = "codex"
+    try:
+        try:
+            asyncio.run(server.usage_report())
+        except HTTPException as exc:
+            assert exc.status_code == 401, exc.detail
+        else:
+            raise AssertionError("expected HTTPException with status 401")
+    finally:
+        server.PROVIDER = saved_provider
+        if saved_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = saved_home
+        shutil.rmtree(codex_home_tmp, ignore_errors=True)
+        shutil.rmtree(decoy_tmp, ignore_errors=True)
+    print("  codex /usage reads CODEX_HOME (decoy auth.json under another dir ignored)")
+
+
+def test_codex_usage_report_401_when_auth_json_is_empty():
+    """Issue #203 follow-up: an empty `auth.json` is not a real login. It
+    is the shape left behind by an interrupted `codex login --device-auth`
+    — the file got created but the OAuth tokens never landed. A
+    presence-only check would let it through to the 503 path and
+    mis-claim the seat is logged in. Lifted from PR #208 (the only
+    piece of that competing approach worth keeping; the inline call-time
+    read of CODEX_HOME is the one this branch keeps)."""
+    import asyncio
+    import shutil
+    from fastapi import HTTPException
+    tmp = Path(tempfile.mkdtemp(prefix="clib-codex-usage-empty-auth-"))
+    (tmp / "auth.json").write_text("")
+    sessions_tmp = Path(tempfile.mkdtemp(prefix="clib-codex-usage-empty-sessions-"))
+    saved_provider = server.PROVIDER
+    saved_sessions = server.CODEX_SESSIONS
+    saved_home = os.environ.get("CODEX_HOME")
+    os.environ["CODEX_HOME"] = str(tmp)
+    server.PROVIDER = "codex"
+    server.CODEX_SESSIONS = sessions_tmp
+    try:
+        try:
+            asyncio.run(server.usage_report())
+        except HTTPException as exc:
+            assert exc.status_code == 401, exc.detail
+            assert "codex login --device-auth" in exc.detail, exc.detail
+        else:
+            raise AssertionError("expected HTTPException with status 401")
+    finally:
+        server.PROVIDER = saved_provider
+        server.CODEX_SESSIONS = saved_sessions
+        if saved_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = saved_home
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(sessions_tmp, ignore_errors=True)
+    print("  codex /usage -> 401 when auth.json is present but empty")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

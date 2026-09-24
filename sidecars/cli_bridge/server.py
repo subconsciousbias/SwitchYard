@@ -3007,6 +3007,27 @@ async def usage_report() -> dict:
     are read.
     """
     if PROVIDER == "codex":
+        # Read CODEX_HOME at call time, not import time: `codex login --device-auth`
+        # is run inside a running sidecar (TESTING.md:256), and the auth check
+        # should not need a restart to notice. Compose pins CODEX_HOME for the
+        # codex seat (secrets/codex), so this looks inside the mounted auth store.
+        codex_auth = Path(os.environ.get(
+            "CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"
+        # An empty auth.json is not a real login — its presence alone is a
+        # stale file left behind by an interrupted `codex login`, and the
+        # 503 path would otherwise mis-claim the seat is logged in. Lifted
+        # from PR #208's `codex_logged_in()` body (PR #208 was closed as
+        # superseded by #320 in the cycle-2 review). The PR body was kept
+        # in step with the four-test supersession in cycle 3.
+        try:
+            logged_in = codex_auth.is_file() and codex_auth.stat().st_size > 0
+        except OSError:
+            logged_in = False
+        if not logged_in:
+            raise HTTPException(
+                status_code=401,
+                detail="codex cli is not logged in for this plan; "
+                       "run `codex login --device-auth` in this sidecar")
         report = _codex_rate_limits()
         if report is None:
             raise HTTPException(
