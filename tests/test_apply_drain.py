@@ -100,15 +100,7 @@ def _run_health_idle(port):
 
 
 def test_health_idle_mcp_bridge_idle_shape():
-    """mcp_bridge idle: every counter zero, no parked sessions.
-
-    The mcp_bridge /health doc carries `in_flight`, `sessions`, and
-    `awaiting_followup`. All three summing to zero is the only way the
-    bridge is genuinely idle (a parked session still lives in SESSIONS
-    with `awaiting_followup=True` — see mcp_bridge/server.py
-    `park_session` — so `sessions > 0` alone is enough to keep the
-    sidecar out of the `idle` bucket).
-    """
+    """mcp_bridge idle: every counter zero."""
     srv, port = _start_stub(
         {"in_flight": 0, "sessions": 0, "awaiting_followup": 0})
     try:
@@ -119,16 +111,31 @@ def test_health_idle_mcp_bridge_idle_shape():
     assert out == "idle", (out, err)
 
 
-def test_health_idle_mcp_bridge_parked_shape_is_busy():
-    """mcp_bridge parked: in_flight=0 but a parked call is alive.
+def test_health_idle_mcp_bridge_parked_shape_is_idle():
+    """mcp_bridge parked: in_flight=0 while sessions wait on tool results.
 
-    `park_session` releases the slot (parked sessions don't hold a gate
-    slot — see the comment block at `park_session`), so `in_flight`
-    alone would miss this case. The `in_flight + sessions +
-    awaiting_followup` sum is what catches it.
+    `park_session` releases the gate slot, so `in_flight` counts running
+    model turns only. A parked session is NOT busy: in an agentic loop one
+    is almost always parked, and counting them kept a sidecar "busy" for
+    the whole session TTL. Recreating during that tool-call gap loses no
+    work — the follow-up names a session the new process lacks, and
+    `handle_followup` rebuilds it from the request (`resume_gone_session`).
     """
     srv, port = _start_stub(
         {"in_flight": 0, "sessions": 2, "awaiting_followup": 1})
+    try:
+        rc, out, err = _run_health_idle(port)
+    finally:
+        srv.shutdown()
+    assert rc == 0, (rc, err)
+    assert out == "idle", (out, err)
+
+
+def test_health_idle_mcp_bridge_running_turn_is_busy():
+    """mcp_bridge with a turn running: in_flight>0 is busy whatever the
+    session counters say."""
+    srv, port = _start_stub(
+        {"in_flight": 1, "sessions": 2, "awaiting_followup": 1})
     try:
         rc, out, err = _run_health_idle(port)
     finally:
@@ -168,16 +175,14 @@ def test_health_idle_cli_bridge_busy_shape():
     assert out == "busy", (out, err)
 
 
-def test_health_idle_token_proxy_shape_is_unknown():
+def test_health_idle_token_proxy_shape_is_untracked():
     """Token-proxy shape: no `in_flight` field on the doc.
 
-    The token-proxy /health doc exposes OAuth status only — no session
-    bookkeeping. A classifier that fabricated a busy signal out of an
-    absent field would force every token-proxy drain to sleep the full
-    grace and re-burn the wait this whole change is meant to avoid. So
-    absent `in_flight` is structurally `unknown`, and the bash caller
-    treats `unknown` like `busy` — sleep the remaining grace and err on
-    the side of patience.
+    The token-proxy /health doc exposes OAuth status only — it is a
+    pass-through with no turn or session state. It answers `untracked`
+    (distinct from `unknown`, which means the probe could not read a doc at
+    all): apply.sh then relies on the gateway's `sy:inflight:{plan}` alone
+    instead of waiting out a grace window for state that does not exist.
     """
     srv, port = _start_stub(
         {"ok": True, "provider": "xai", "authorised": True,
@@ -187,7 +192,7 @@ def test_health_idle_token_proxy_shape_is_unknown():
     finally:
         srv.shutdown()
     assert rc == 0, (rc, err)
-    assert out == "unknown", (out, err)
+    assert out == "untracked", (out, err)
 
 
 def test_health_idle_connection_refused_is_unknown():
@@ -214,7 +219,7 @@ def test_health_idle_connection_refused_is_unknown():
 
 
 def test_health_idle_printable_token_exits_zero():
-    """The three output tokens are the only things `print` ever emits.
+    """The four output tokens are the only things `print` ever emits.
 
     Bash only needs to read one line per drain; a stray warning on
     stdout (e.g. an unhandled KeyError) would be parsed as the state
@@ -224,9 +229,10 @@ def test_health_idle_printable_token_exits_zero():
         ({"in_flight": 0}, "idle"),
         ({"in_flight": 1}, "busy"),
         ({"in_flight": 0, "sessions": 0, "awaiting_followup": 0}, "idle"),
-        ({"in_flight": 0, "sessions": 1}, "busy"),
-        # No in_flight at all → unknown (token-proxy shape).
-        ({"ok": True}, "unknown"),
+        # a parked session (no running turn) is idle
+        ({"in_flight": 0, "sessions": 1}, "idle"),
+        # No in_flight at all → untracked (token-proxy shape).
+        ({"ok": True}, "untracked"),
     ]
     for payload, expected in cases:
         srv, port = _start_stub(payload)
@@ -352,13 +358,11 @@ def test_apply_sh_grace_block_consumes_health_probe():
          CLAUDE.md:179-180 — never a hard-coded `timeout` invocation
          that would fail on a fresh macOS install.
 
-      3. The `idle` case prints the documented message AND skips the
-         sleep.
+      3. The drain wait polls ZCARD + the probe every $poll_secs and
+         proceeds the moment the sidecar is idle (or untracked).
 
-      4. The `busy` and `unknown` cases log a grace-sleeps-Ns message
-         AND keep the sleep — these are the cases the original 120s
-         unconditional sleep was approximating, and they must not
-         silently regress to a no-op.
+      4. `busy`/`unknown` keep waiting — up to the grace window, which
+         stays the upper bound — instead of sleeping it blindly.
     """
     text = _apply_sh_text()
     # (1) the in-container exec, with timeout + fallback. The prefix
@@ -388,26 +392,22 @@ def test_apply_sh_grace_block_consumes_health_probe():
         "grace block must initialize `timeout_cmd` empty so the "
         "unbounded fallback (CLAUDE.md's documented last resort) "
         "fires when neither `timeout` nor `gtimeout` is on PATH")
-    # (3) the idle short-circuit.
-    assert "grace: skipped ($svc /health reports nothing in flight or parked)" in text, (
-        "grace block must log `grace: skipped ($svc /health reports "
-        "nothing in flight or parked)` on idle")
-    # (4a) the busy branch keeps the sleep. Locate the `case` arm by
-    # anchoring on the case statement (the only place `busy)` is the
-    # left-hand label of a `case` pattern — anywhere else it's prose).
-    case_idx = text.index('case "$health_state" in')
-    busy_block_idx = text.index("busy)", case_idx)
-    busy_end = text.index(";;", busy_block_idx)
-    busy = text[busy_block_idx:busy_end]
-    assert "sleep \"$remaining\"" in busy, (
-        f"`busy)` branch must keep `sleep \"$remaining\"` — got: {busy!r}")
-    # (4b) the wildcard (unknown) branch keeps the sleep. Same `case`
-    # anchoring so a stray `*)` in a comment can't satisfy this.
-    wild_block_idx = text.index("*)", case_idx)
-    wild_end = text.index(";;", wild_block_idx)
-    wild = text[wild_block_idx:wild_end]
-    assert "sleep \"$remaining\"" in wild, (
-        f"`*)` branch (unknown) must keep `sleep \"$remaining\"` — got: {wild!r}")
+    # (3) the drain wait POLLS instead of sleeping the grace blindly: the
+    # loop re-reads ZCARD and the /health probe every $poll_secs, breaks on
+    # idle/untracked, and only on the grace deadline proceeds with a WARN.
+    loop_start = text.index("    # (3) wait for the first moment no model turn is running")
+    loop_end = text.index("    # (4) stop + recreate.", loop_start)
+    loop = text[loop_start:loop_end]
+    assert 'health_state="$(health_probe "$svc")"' in loop, loop
+    assert 'cur="$(inflight "$plan")"' in loop, loop
+    assert "idle|untracked)" in loop and "break" in loop, loop
+    assert 'sleep "$poll_secs"' in loop, loop
+    assert '"$waited" -ge "$drain_grace_secs"' in loop, (
+        "the grace window must remain the drain's upper bound")
+    assert "proceeding" in loop, "a drain timeout proceeds, as it always has"
+    # (4) no blind sleep of the remaining grace survives anywhere.
+    assert 'sleep "$remaining"' not in text, (
+        "the drain must poll, not sleep the remaining grace blindly")
 
 
 def test_apply_sh_predict_total_secs_does_not_exec_into_containers():

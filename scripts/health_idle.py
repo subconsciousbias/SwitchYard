@@ -1,23 +1,19 @@
-"""Classify a sidecar's /health doc as `idle`, `busy`, or `unknown`.
+"""Classify a sidecar's /health doc as `idle`, `busy`, `untracked` or `unknown`.
 
-Read by `scripts/apply.sh`'s drain loop to gate the post-drain grace window.
-The drain flag is set and the in-flight zset is drained before this probe
-runs, so a `busy` reading is evidence that something is still parked (an
-mcp_bridge parked call, or any session sitting in `awaiting_followup`); an
-`idle` reading is the same evidence the 120-second `sleep` was
-approximating. `unknown` covers the two cases this script cannot classify:
-
-  * the endpoint is unreachable (the container is in the middle of a
-    recreate, the network is mid-flap) — apply.sh treats this exactly like
-    `busy` and sleeps the remaining grace, on the principle that we would
-    rather wait than race a recreate.
-  * the doc has no `in_flight` field (the token-proxy `/health` exposes
-    OAuth state only, not session bookkeeping) — again treated as
-    `unknown`.
+Read by `scripts/apply.sh` to decide whether a sidecar can be recreated right
+now (the idle batch) and, for one that cannot, to poll until it can (the
+drain). `idle` means no model turn is running -- parked mcp_bridge sessions
+waiting on a caller-side tool result do NOT count, see `classify` for why
+that is safe. `busy` means a turn is running. `untracked` is a live /health
+without turn bookkeeping (the token-proxy); apply.sh relies on the gateway's
+`sy:inflight:{plan}` for it. `unknown` covers everything this script cannot
+read: the endpoint is unreachable (mid-recreate, network flap), the exec
+timed out, or a counter is malformed -- apply.sh treats it as `busy`, on the
+principle that we would rather wait than race a recreate.
 
 Always exits 0: the bash caller consumes the printed token and never has
 to catch a non-zero exit. The print is exactly one of `idle`, `busy`,
-`unknown`, followed by a single newline.
+`untracked`, `unknown`, followed by a single newline.
 
 Bash wires it up like this (the same `docker compose exec -T` + `python3 -`
 shape the compose healthchecks already use, since both sidecar and
@@ -68,41 +64,49 @@ def _fetch(port: str) -> dict | None:
 
 
 def classify(doc: dict | None) -> str:
-    """Map a /health doc to `idle`, `busy`, or `unknown`.
+    """Map a /health doc to `idle`, `busy`, `untracked`, or `unknown`.
 
-    `unknown` covers a missing doc AND a doc without `in_flight` — the
-    token-proxy never exposes that field, so its shape is structurally
-    distinct from a sidecar that has gone idle. We don't fabricate a busy
-    signal out of an absent field, because that would force every token-
-    proxy drain to sleep the full grace and re-burn the wait this script
-    exists to avoid.
+    The question is "is a model turn running right now?", not "does this
+    sidecar hold any session at all". It is answered by `in_flight`, the
+    bridge's gate-slot count:
 
-    `idle` / `busy` are decided on
-        in_flight + (sessions or 0) + (awaiting_followup or 0)
-    so mcp_bridge's parked-but-released-slot session (a session sitting in
-    `SESSIONS` with `awaiting_followup=True` — see mcp_bridge/server.py
-    `park_session`) counts as busy. mcp_bridge releases the slot on park,
-    so `in_flight` alone would miss it.
+      * cli_bridge holds a slot for exactly the length of one CLI call.
+      * mcp_bridge holds a slot while a turn runs and gives it back when the
+        session PARKS for a caller-side tool result (`park_session` in
+        mcp_bridge/server.py), so `in_flight` counts running turns only.
+
+    A parked session is deliberately NOT busy. In an agentic loop some session
+    is almost always parked, so counting parked sessions (the old
+    `in_flight + sessions + awaiting_followup` sum) kept a sidecar "busy" for
+    as long as the session TTL and made every drain wait out its whole grace.
+    Recreating the sidecar during a tool-call gap loses no work: the caller's
+    follow-up names a session the new process does not have, and
+    `handle_followup` routes it to `resume_gone_session`, which rebuilds the
+    session from the request -- the request carries the whole history, tool
+    results included (MCP_REBUILD_LOST, on by default; foreign ids rebuild
+    even with it off). The cost is re-processing the prompt once. A follow-up
+    already on its way (queued in `unpark_session`) is a gateway request in
+    flight, so apply.sh's `ZCARD sy:inflight:{plan}` check catches it before
+    this probe is consulted.
+
+    `untracked`: the doc is a real /health answer but carries no `in_flight`
+    -- the token-proxy, which is a pass-through with no turn or session
+    state of its own. Its in-flight requests are counted by the gateway's
+    `sy:inflight:{plan}`, which the caller checks separately, so there is
+    nothing more to wait for here.
+
+    `unknown`: no doc at all (unreachable, timed out, non-2xx, not JSON) or a
+    malformed counter. The caller treats it as busy.
     """
     if not isinstance(doc, dict):
         return "unknown"
     if "in_flight" not in doc:
-        return "unknown"
+        return "untracked"
     try:
         in_flight = int(doc.get("in_flight") or 0)
     except (TypeError, ValueError):
         return "unknown"
-    try:
-        sessions = int(doc.get("sessions") or 0)
-    except (TypeError, ValueError):
-        sessions = 0
-    try:
-        awaiting_followup = int(doc.get("awaiting_followup") or 0)
-    except (TypeError, ValueError):
-        awaiting_followup = 0
-    if in_flight + sessions + awaiting_followup == 0:
-        return "idle"
-    return "busy"
+    return "idle" if in_flight == 0 else "busy"
 
 
 def main() -> int:

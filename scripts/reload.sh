@@ -34,6 +34,12 @@ fi
 
 cd "$(dirname "$0")/.."
 
+# Poll interval for every wait below (overridable for the offline tests).
+poll_secs="${SWITCHYARD_APPLY_POLL_SECS:-2}"
+case "$poll_secs" in
+  ''|*[!0-9.]*|*.*.*) echo "SWITCHYARD_APPLY_POLL_SECS must be a number" >&2; exit 2 ;;
+esac
+
 plans="config/plans.yaml"
 [ -f "$plans" ] || { echo "no $plans — run scripts/sync-env.sh first" >&2; exit 1; }
 
@@ -77,23 +83,34 @@ live_sig="$(docker compose exec -T redis redis-cli -n 1 get switchyard:router_si
 
 if [ -n "$live_sig" ] && [ "$new_sig" = "$live_sig" ]; then
   echo "==> policy-only change — gateway hot-swaps within ~5s, no restart"
-  # Give the watcher a cycle plus margin, then confirm the gateway actually
-  # applied it; a gateway stuck on the OLD file (bad perms, broken yaml) would
-  # otherwise look done. The signature alone cannot prove the swap — the
-  # watcher re-publishes the running signature even when it refuses a
-  # router-shaped edit — so the gateway log is the tiebreaker.
-  sleep 8
+  # Confirm the gateway actually applied it; a gateway stuck on the OLD file
+  # (bad perms, broken yaml) would otherwise look done. The signature alone
+  # cannot prove the swap — the watcher re-publishes the running signature
+  # even when it refuses a router-shaped edit — so the gateway log is the
+  # tiebreaker. POLLED every $poll_secs until the watcher logs a verdict,
+  # with the old fixed 8s wait kept only as the upper bound.
   # Captured, not piped: grep -q exits at the first match, docker compose logs
   # then dies on SIGPIPE, and pipefail turns "found it" into "not found" —
   # which would restart on every successful hot-swap.
-  gwlog="$(docker compose logs --since 30s gateway 2>/dev/null || true)"
-  if printf '%s' "$gwlog" | grep -q "reloaded in place"; then
-    echo "    gateway: hot-swapped"
-  elif printf '%s' "$gwlog" | grep -q "KEEPING the current"; then
+  verdict=""
+  started=$SECONDS
+  while : ; do
+    gwlog="$(docker compose logs --since 30s gateway 2>/dev/null || true)"
+    if printf '%s' "$gwlog" | grep -q "reloaded in place"; then
+      verdict=swapped; break
+    elif printf '%s' "$gwlog" | grep -q "KEEPING the current"; then
+      verdict=refused; break
+    fi
+    [ $((SECONDS - started)) -ge 8 ] && break
+    sleep "$poll_secs"
+  done
+  if [ "$verdict" = swapped ]; then
+    echo "    gateway: hot-swapped after $((SECONDS - started))s"
+  elif [ "$verdict" = refused ]; then
     echo "    gateway refused the swap (router-shaped) — restarting"
     restart=1
   else
-    echo "    gateway did not report a swap — restarting to be safe"
+    echo "    gateway did not report a swap within 8s — restarting to be safe"
     restart=1
   fi
 else

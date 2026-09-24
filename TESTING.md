@@ -1437,31 +1437,32 @@ through the picker — exactly what `tests/conftest.py` blocks.
    line) is a real outage at that timestamp and worth investigating
    before the change merges.
 
-3. Trigger the change. The drain flow runs whenever `apply.sh` needs to
-   recreate a sidecar, the token proxy, the gateway, or the portal —
-   i.e. when `env_added > 0`, when an image is stale (see step 3 of
-   `scripts/apply.sh`), or when `--build` is passed. The smallest
-   trigger that exercises the sidecar loop is to add a harmless key to
-   `.env.example` (so `sync-env.sh` adds it and `env_added` becomes
-   non-zero), then run from the main checkout:
+3. Trigger the change. `apply.sh` recreates a service when
+   `scripts/image_plan.py` says so: its image was rebuilt (inputs changed,
+   or `--build`), its container runs an older image, it has no container,
+   or its environment drifted from compose's resolved config. The smallest
+   trigger that exercises the sidecar path is a harmless edit under
+   `sidecars/` (e.g. a comment in `sidecars/mcp_bridge/server.py`), then
+   from the main checkout:
 
    ```bash
    # from the main checkout, NOT this worktree:
+   scripts/apply.sh --plan    # expect claude-max-sidecar REBUILD + its consumers
    scripts/apply.sh
    ```
 
-   Or, to exercise the build path without touching config:
-   `scripts/apply.sh --build`. A config-only edit (no `env_added`, no
-   stale image) makes the drain loop a no-op; that is the intended
-   outcome, not a regression.
+   A config-only edit (nothing to rebuild, no env drift) recreates
+   nothing; that is the intended outcome, not a regression.
 
-4. Read the apply output. Each drained sidecar should appear in the
-   order it was ranked by `ZCARD sy:inflight:{plan}` ascending (lowest
-   first), with one `==> draining <svc>` line per sidecar, a `grace:
-   sleeping ...` line, then a `waiting for <svc> — healthy` line.
-   `==> recreating portal` and `==> recreating gateway` come AFTER the
-   sidecar loop, never interleaved. `reload.sh` runs at the end as
-   usual.
+4. Read the apply output. Idle services (no model turn running) appear
+   together on one `==> recreating (idle, one call): a b c` line; each
+   busy sidecar appears under `==> draining in parallel (busy): ...` and
+   its job log is printed when it finishes (`draining <svc>`, `waiting
+   for <svc> to drain (N in flight, ...)` at most every 10s, `drained
+   after Ns`, `<svc> healthy`). A busy gateway is recreated last.
+   `docker compose up -d --no-recreate` and then `reload.sh` run at the
+   end as usual. A service that never turns healthy fails the apply
+   (non-zero exit) with its `sy:drain` gate left set.
 
 ### 11b. What success looks like
 
@@ -1483,8 +1484,9 @@ through the picker — exactly what `tests/conftest.py` blocks.
 ### 11c. The dry-run check
 
 Before any of the above, `scripts/apply.sh --dry-run` should print the
-planned drain order with each sidecar's `in_flight` count and lease
-count, plus a predicted total drain time:
+idle/busy partition, each busy sidecar's `in_flight` count and lease
+count, plus a predicted drain time (the slowest drain — they run in
+parallel):
 
 ```bash
 scripts/apply.sh --dry-run
@@ -1493,33 +1495,33 @@ scripts/apply.sh --dry-run
 **Expect** a block like:
 
 ```
-==> (dry-run) planned drain order
-    claude-max-sidecar       plan=claude-max     in_flight=0   leases=1
-    opencode-go-sidecar      plan=opencode-go   in_flight=2   leases=0
-    xai-token-proxy          plan=grok           in_flight=0   leases=0
-    predicted total drain time: 460s (incl. 120s grace per sidecar)
-    portal: skip (up to date)
-    gateway: skip (up to date or policy-only hot-swap)
+==> (dry-run) recreate plan
+    claude-max-sidecar     idle -> one batched recreate   (image claude-max-sidecar rebuilt)
+    xai-token-proxy        idle -> one batched recreate   (environment changed: SWITCHYARD_PLAN)
+    opencode-go-sidecar    busy -> drain  plan=opencode-go    in_flight=2    leases=0
+    predicted drain time: 200s (parallel; incl. 120s grace)
+    then: docker compose up -d --no-build --no-recreate (start anything missing)
     (dry-run: not writing Redis state, not touching containers)
 ```
 
-The order (lowest in-flight first) and the absence of any Redis writes
-are the contract. A predicted time that's wildly different from real
-wall-clock during 11a is feedback for the heuristic — adjust the
+The idle/busy split and the absence of any Redis writes are the
+contract. The predicted time is an upper bound (the drain polls and
+usually finishes at the next tool-call gap); if it is wildly different
+from real wall-clock during 11a, adjust the
 `30s per in-flight` constant in `predict_total_secs`, not the rest of
 the loop.
 
 ### 11d. Adjusting the grace window
 
-`--drain-grace-secs N` overrides the default 120s. The default covers
-`mcp_bridge`'s 90s parked-call timeout; lower it only when you know the
-sidecar's longest realistic call (e.g. an `api.x.ai` request without
-tool calls will fit in tens of seconds). A value that's too low lets
-the recreate happen mid-call, which is the bug the grace window exists
-to prevent. The script logs a `WARN: <plan> still has N in-flight
-after Xs — proceeding` when the grace is exhausted; one or two of
-those during a busy apply is fine, a stream of them means the value
-should go up.
+`--drain-grace-secs N` overrides the default 120s. It is an upper bound,
+not a sleep: a busy sidecar is polled every 2s and recreated the moment
+the gateway has nothing in flight for its plan and its `/health` reports
+no model turn running (parked tool-loop sessions do not count — their
+follow-ups are rebuilt from the request). Lower it only when you know the
+sidecar's longest realistic turn. A value that's too low lets the
+recreate happen mid-turn. The script logs `WARN: <svc> still busy after
+Xs (...) — proceeding` when the bound is hit; one or two of those during
+a busy apply is fine, a stream of them means the value should go up.
 
 
 

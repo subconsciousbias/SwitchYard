@@ -5,7 +5,8 @@ the sidecar image (shared by four subscription services) and the token-proxy
 image (one service). Only `./config` is mounted into them at runtime;
 everything in `sidecars/` and the small slivers of `switchyard/` that get
 baked in are part of the image itself, so a code edit there is followed by
-`scripts/apply.sh --build` (see the root `CLAUDE.md`).
+`scripts/apply.sh` from the main checkout, which detects the changed inputs
+and rebuilds the sidecar image (see the root `CLAUDE.md`).
 
 ## Image contents
 

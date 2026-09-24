@@ -931,15 +931,26 @@ scripts/apply.sh
 
 It does what `reload.sh` does, plus everything a brand-new plan needs:
 
-1. propagates new `.env.example` keys into `.env` (append-only, always),
-   recreating the app containers on the way up if anything was added, because
-   `.env` is read when a container is created, not on restart;
+1. propagates new `.env.example` keys into `.env` (append-only, always);
 2. validates the config before Docker touches anything;
-3. rebuilds the baked images **only where they are stale** — it compares the
-   mtimes of `switchyard/`, `sidecars/` and the Dockerfiles against each
-   image's creation time. A pure `plans.yaml` edit rebuilds nothing, because
-   `./config` is mounted, not baked;
-4. `docker compose up -d` — brings up any service a new plan added;
+3. rebuilds the baked images **only where their inputs changed** —
+   `scripts/image_plan.py` hashes each image's Dockerfile plus every path its
+   `COPY` lines name, and compares that with the `switchyard.inputs` label
+   stamped on the image when it was built. It prints which files changed. A
+   pure `plans.yaml` edit rebuilds nothing, because `./config` is mounted, not
+   baked. An image with no label (built before this existed, or by a bare
+   `docker compose build`) is rebuilt once;
+4. recreates what needs it — containers whose image was rebuilt, that run an
+   older image, or whose environment differs from what compose would create
+   now (that is how a `.env` edit is caught; values are never printed).
+   Services with no model turn running are recreated **together, in one
+   compose call**; a sidecar mid-turn is drained in a background job, in
+   parallel with the others, and recreated at its next tool-call gap (a
+   parked tool-loop session is not a turn: its follow-up is rebuilt from the
+   request). Every wait polls its real condition every 2s and moves on the
+   moment it holds; a service that never turns healthy fails the apply. Then
+   `docker compose up -d --no-recreate` starts anything missing or stopped —
+   a new plan's sidecar, a crashed one;
 5. runs `reload.sh` (restarts the gateway only if the router cannot follow the
    edit — policy-only changes hot-swap in place — portal board refresh, health
    wait);
@@ -952,8 +963,11 @@ It does what `reload.sh` does, plus everything a brand-new plan needs:
 Useful variants:
 
 ```bash
+scripts/apply.sh --fast         # build what changed, up -d, exit: no drain, no waits
+scripts/apply.sh --plan         # what would be rebuilt/recreated and why; no changes
 scripts/apply.sh --dry-run      # validate + audit + report, change nothing
-scripts/apply.sh --build        # force a rebuild even if nothing looks stale
+scripts/apply.sh --build        # force a rebuild of every image
+scripts/apply.sh --no-build     # never rebuild, even when stale
 scripts/apply.sh --skip-reload  # run the reload steps separately
 ```
 

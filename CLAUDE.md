@@ -88,7 +88,8 @@ What "done on the worktree" looks like:
   * `git status` clean, `git log` shows the new commit on the worktree branch.
   * Offline test suite (`scripts/test.sh`) green.
   * The user has the new commit hash and the branch name; the rebuild/redeploy
-    (`scripts/apply.sh --build` from the main checkout) is theirs to run.
+    (`scripts/apply.sh` from the main checkout — it detects which images need
+    a rebuild by content; `--build` forces all) is theirs to run.
 
 Read-only diagnosis from a worktree is fine: `docker compose ps`, `docker logs`,
 the portal board. None of those mutate the live stack.
@@ -126,12 +127,21 @@ The sidecar image is shared: one `switchyard-sidecar:latest` image serves
 so compose does not build the same image four times.
 
 After editing code that is baked into an image, rebuild and redeploy **from
-the main checkout** (see the worktree section above — never from a worktree):
+the main checkout** (see the worktree section above — never from a worktree).
+`scripts/apply.sh` does this for you: `scripts/image_plan.py` hashes each
+image's Dockerfile + COPY inputs, compares the result with the
+`switchyard.inputs` label stamped on the image at build time, and rebuilds
+only the images whose inputs changed (`scripts/apply.sh --plan` shows the
+decision and the changed files; `--fast` skips every drain and wait). By hand
+the equivalent is:
 
 ```bash
 docker compose build gateway portal claude-max-sidecar xai-token-proxy
 docker compose up -d
 ```
+
+— but a bare `docker compose build` leaves the images without the
+`switchyard.inputs` label, so the next `apply.sh` rebuilds them once more.
 
 Only `claude-max-sidecar` declares `build:` for the sidecar image; rebuilding
 the sidecar image rebuilds all four sidecar services. Rebuilding

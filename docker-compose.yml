@@ -89,7 +89,12 @@ services:
       retries: 10
 
   gateway:
-    build: {context: ., dockerfile: Dockerfile.gateway}
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+      # scripts/image_plan.py: manifest of this image's build inputs,
+      # compared by scripts/apply.sh to decide whether to rebuild.
+      labels: {switchyard.inputs: "${SWITCHYARD_INPUTS_GATEWAY:-}"}
     <<: *common
     # Loopback by default: the gateway speaks OpenAI/Anthropic over plain HTTP,
     # and `LITELLM_MASTER_KEY` is the only authentication. A bare
@@ -135,7 +140,10 @@ services:
       start_period: 40s
 
   portal:
-    build: {context: ., dockerfile: Dockerfile.portal}
+    build:
+      context: .
+      dockerfile: Dockerfile.portal
+      labels: {switchyard.inputs: "${SWITCHYARD_INPUTS_PORTAL:-}"}   # see gateway
     <<: *common
     # Same loopback-by-default rationale as the gateway above. The portal has
     # no authentication at all — anyone reaching :4001 can read your quota
@@ -172,7 +180,10 @@ services:
   # which wastes build time and (with concurrent exports) can fail with
   # "image already exists".
   claude-max-sidecar:
-    build: {context: ., dockerfile: Dockerfile.sidecar}
+    build:
+      context: .
+      dockerfile: Dockerfile.sidecar
+      labels: {switchyard.inputs: "${SWITCHYARD_INPUTS_CLAUDE_MAX_SIDECAR:-}"}   # see gateway
     image: switchyard-sidecar:latest
     <<: *common
     user: node
@@ -244,7 +255,10 @@ services:
   # there is no agent harness in the way — see sidecars/token_proxy/server.py.
   # Needs a grant first, from the host: python3 -m switchyard.oauth login xai
   xai-token-proxy:
-    build: {context: ., dockerfile: Dockerfile.token_proxy}
+    build:
+      context: .
+      dockerfile: Dockerfile.token_proxy
+      labels: {switchyard.inputs: "${SWITCHYARD_INPUTS_XAI_TOKEN_PROXY:-}"}   # see gateway
     image: switchyard-token-proxy:latest
     <<: *common
     expose: ["8090"]

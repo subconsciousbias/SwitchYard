@@ -19,16 +19,19 @@ The fix is two-fold, in `scripts/apply.sh` step 4a (drain loop):
     failing DEL clobber the script's exit status.
 
 These tests stage a temp tree — a regular `git init` repo (passes the
-worktree guard at `apply.sh:62`), the real `apply.sh`, stubs for
-`scripts/sync-env.sh` and `scripts/auth_audit.py`, the example
+worktree guard), the real `apply.sh` + `image_plan.py` + `health_idle.py`,
+stubs for `scripts/sync-env.sh` and `scripts/auth_audit.py`, the example
 `config/plans.yaml`, a symlinked `switchyard/`, and `Dockerfile.sidecar`
-+ `sidecars/` so `newest_mtime` is non-zero and the sidecar goes stale.
-A fake `docker` shim first on PATH logs every argv to `$SHIM_LOG` and
-returns canned output; no real redis, compose project, or container is
-touched.
++ `sidecars/` (the sidecar image's build inputs). `tests/fake_docker.py`
+first on PATH logs every argv and answers from a JSON state in which the
+sidecar image carries no `switchyard.inputs` label (so it is rebuilt and
+recreated) and its /health probe says `unknown` (so it is drained rather
+than batched); no real redis, compose project, or container is touched.
+The drain runs in a background job now (#262), with its own EXIT trap.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -49,109 +52,35 @@ sys.path.insert(0, HERE)
 # Fake docker shim
 # ---------------------------------------------------------------------------
 
-DOCKER_SHIM = r"""#!/usr/bin/env python3
-# Fake `docker` for tests/test_apply_drain_guard.py.
-# Logs every argv to $SHIM_LOG and returns canned output. No real docker,
-# no real redis, no real containers.
-import os, sys
-
-LOG = os.environ.get("SHIM_LOG")
-if LOG:
-    with open(LOG, "a") as fh:
-        fh.write(" ".join(sys.argv[1:]) + "\n")
-
-args = sys.argv[1:]
+# The shared stateful fake (tests/fake_docker.py). One sidecar, `test-sidecar`,
+# on plan `testplan`, whose image exists WITHOUT a `switchyard.inputs` label —
+# so image_plan.py rebuilds it and plans a recreate — and whose /health probe
+# answers `unknown`, so apply.sh classifies it busy and runs the drain (the
+# path whose SET / trap / DEL contract these tests pin).
+import fake_docker  # noqa: E402
 
 
-def _find_after(args, flag):
-    for i, a in enumerate(args):
-        if a == flag and i + 1 < len(args):
-            return args[i + 1]
-        if a.startswith(flag + "="):
-            return a[len(flag) + 1:]
-    return None
-
-
-# docker compose config --services
-if args[:3] == ["compose", "config", "--services"]:
-    for s in ("test-sidecar", "redis", "gateway", "portal", "xai-token-proxy"):
-        print(s)
-    sys.exit(0)
-
-# docker compose exec -T <svc> ...
-if args[:2] == ["compose", "exec"]:
-    rest = args[2:]
-    if rest and rest[0] == "-T":
-        rest = rest[1:]
-    svc = rest[0] if rest else ""
-    rest = rest[1:]
-
-    if svc == "redis":
-        if rest and rest[0] == "redis-cli":
-            rest = rest[1:]
-            if rest and rest[0] == "-n":
-                rest = rest[2:]
-        sys.exit(0)
-
-    if svc == "gateway":
-        # python -m switchyard.drain "$plan" — return a well-formed summary
-        # so apply.sh's awk parser picks up `migrated 0 session(s) off …`.
-        print("migrated 0 session(s) off testplan")
-        sys.exit(0)
-
-    if svc == "test-sidecar":
-        # printenv SWITCHYARD_PLAN
-        if rest and rest[0] == "printenv":
-            print("testplan")
-        sys.exit(0)
-
-    sys.exit(0)
-
-# docker compose images -q <svc>
-if args[:3] == ["compose", "images", "-q"]:
-    svc = args[3] if len(args) > 3 else ""
-    images = {
-        "test-sidecar": "sha-sidecar",
-        "redis": "sha-redis",
-        "gateway": "sha-gateway",
-        "portal": "sha-portal",
-        "xai-token-proxy": "sha-xai",
+def _initial_state():
+    return {
+        "project": "sy",
+        "services": {
+            "test-sidecar": {"build": {"dockerfile": "Dockerfile.sidecar"},
+                             "image": "switchyard-sidecar:latest",
+                             "environment": {"SWITCHYARD_PLAN": "testplan"}},
+            "redis": {"image": "redis:7-alpine", "environment": {}},
+        },
+        "images": {"switchyard-sidecar:latest": {"Id": "sha256:old", "Labels": {}},
+                   "redis:7-alpine": {"Id": "sha256:redis", "Labels": {}}},
+        "containers": {
+            "test-sidecar": {"ID": "c-test-sidecar", "Image": "sha256:old",
+                             "Env": ["SWITCHYARD_PLAN=testplan"],
+                             "Status": "running", "Health": "healthy"},
+            "redis": {"ID": "c-redis", "Image": "sha256:redis", "Env": [],
+                      "Status": "running", "Health": "healthy"},
+        },
+        "zcard": {"testplan": [0]},
+        "health": {"test-sidecar": "unknown"},
     }
-    img = images.get(svc, "")
-    if img:
-        print(img)
-    sys.exit(0)
-
-# docker compose ps -q <svc>
-if args[:3] == ["compose", "ps", "-q"]:
-    print("test-cid-12345")
-    sys.exit(0)
-
-# docker compose {stop,up,build}
-if len(args) >= 2 and args[0] == "compose" and args[1] in ("stop", "up", "build"):
-    sys.exit(0)
-
-# docker image inspect <id> --format '{{.Created}}'
-if args[:2] == ["image", "inspect"]:
-    img = args[2] if len(args) > 2 else ""
-    fmt = _find_after(args, "--format")
-    if fmt and "Created" in fmt:
-        # sidecar image is dated 2000 (stale → triggers the rebuild decision),
-        # everything else is dated 2099 (fresh → kept out of the rebuild and
-        # the fold-on recreate paths).
-        print("2000-01-01T00:00:00.000000000Z" if img == "sha-sidecar"
-              else "2099-01-01T00:00:00.000000000Z")
-    sys.exit(0)
-
-# docker inspect --format='{{.State.Health.Status}}' <cid>
-if args and args[0] == "inspect":
-    fmt = _find_after(args, "--format")
-    if fmt and "Health" in fmt:
-        print("healthy")
-    sys.exit(0)
-
-sys.exit(0)
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +114,9 @@ def _stage_apply_sandbox():
     # not the previous version.
     scripts_dir = os.path.join(tmp, "scripts")
     os.makedirs(scripts_dir, exist_ok=True)
-    shutil.copy2(os.path.join(ROOT, "scripts", "apply.sh"),
-                 os.path.join(scripts_dir, "apply.sh"))
+    for name in ("apply.sh", "image_plan.py", "health_idle.py"):
+        shutil.copy2(os.path.join(ROOT, "scripts", name),
+                     os.path.join(scripts_dir, name))
 
     # Stubs.
     with open(os.path.join(scripts_dir, "sync-env.sh"), "w") as fh:
@@ -207,25 +137,17 @@ def _stage_apply_sandbox():
     # resolve `from switchyard import models` via `sys.path.insert(0, ".")`.
     os.symlink(os.path.join(ROOT, "switchyard"), os.path.join(tmp, "switchyard"))
 
-    # Dockerfile.sidecar + sidecars/ — without these, `newest_mtime`
-    # returns 0.0 and the sidecar never goes stale, so apply.sh would
-    # skip the drain loop entirely and the tests would have nothing to
-    # observe. Copy rather than symlink so the mtime is concrete (any
-    # value > 2000-01-01 triggers staleness against the fake image's
-    # 2000-01-01 Created timestamp).
+    # Dockerfile.sidecar + sidecars/ — the sidecar image's build inputs, so
+    # image_plan.py has a real manifest to compare with the (missing) label.
     shutil.copy2(os.path.join(ROOT, "Dockerfile.sidecar"),
                  os.path.join(tmp, "Dockerfile.sidecar"))
     shutil.copytree(os.path.join(ROOT, "sidecars"),
                     os.path.join(tmp, "sidecars"))
 
-    # Fake docker shim. Put its dir first on PATH for the apply.sh
-    # subprocess — that picks up the shim before any real `docker`.
-    bin_dir = os.path.join(tmp, "bin")
-    os.makedirs(bin_dir, exist_ok=True)
-    shim_path = os.path.join(bin_dir, "docker")
-    with open(shim_path, "w") as fh:
-        fh.write(DOCKER_SHIM)
-    os.chmod(shim_path, 0o755)
+    # Fake docker first on PATH for the apply.sh subprocess.
+    shim_path = fake_docker.install(os.path.join(tmp, "bin"))
+    with open(os.path.join(tmp, "docker-state.json"), "w") as fh:
+        json.dump(_initial_state(), fh)
     shim_log = os.path.join(tmp, "shim.log")
     open(shim_log, "w").close()
 
@@ -308,7 +230,8 @@ def _run_apply(tmp, shim_path, shim_log, *args, start_new_session=False):
     first on PATH and SHIM_LOG wired up. Returns the Popen object."""
     env = os.environ.copy()
     env["PATH"] = os.path.dirname(shim_path) + os.pathsep + env.get("PATH", "")
-    env["SHIM_LOG"] = shim_log
+    env["FAKE_DOCKER_LOG"] = shim_log
+    env["FAKE_DOCKER_STATE"] = os.path.join(tmp, "docker-state.json")
     return subprocess.Popen(
         ["bash", "scripts/apply.sh", *args],
         cwd=tmp, env=env,
