@@ -63,17 +63,39 @@ PROBE_PREFIX = "switchyard_env_"
 # session holds (AWS keys, GitHub PATs, etc.). The shell name comes from
 # the allowlisted `$SHELL` echo, not from any other variable.
 #
-# Pwd and uname are chosen because they are universally available on every
-# shell environment SwitchYard serves (POSIX sh, zsh, fish, bash on Linux
-# and macOS; cmd / powershell on Windows -- see the find_command_tool
-# adapters for how the Windows shell tool also reads this). The labelled
-# `cwd=...` / `platform=...` / `shell=...` form is what parse_probe_result
-# looks for: a regex anchored to those labels tolerates shell quoting,
-# whitespace and the trailing newline without parsing a structured output
-# the various shells don't have a common syntax for.
+# PROBE_COMMAND is POSIX only: printf, uname and $(...) exist in sh / bash /
+# zsh (Linux, macOS, Git Bash on Windows), NOT in a native PowerShell or
+# cmd.exe. It only looks like it works in PowerShell on machines where Git
+# for Windows put its coreutils on PATH; elsewhere it errors and the probe
+# is marked unparseable. So each shell kind gets its own command, chosen by
+# find_probe_tool from the caller's tool. All three print the same labelled
+# `cwd=...` / `platform=...` / `shell=...` lines, which is what
+# parse_probe_result looks for: a regex anchored to those labels tolerates
+# shell quoting, whitespace and the trailing newline.
 PROBE_COMMAND = (
     "printf 'cwd=%s\\nplatform=%s\\nshell=%s\\n' \"$(pwd)\" \"$(uname -s)\" \"$SHELL\""
 )
+
+# Windows PowerShell 5.1 and PowerShell 7+. Only $PSVersionTable and the
+# current location are read -- never Get-ChildItem env: or similar. No
+# double quotes: Windows PowerShell 5.1 strips them when a tool hands the
+# string to a child `pwsh -Command`, which turns each line into an unknown
+# command.
+POWERSHELL_PROBE_COMMAND = (
+    "'cwd=' + (Get-Location).Path; "
+    "'platform=' + $(if ($PSVersionTable.OS) { $PSVersionTable.OS } "
+    "else { [Environment]::OSVersion.VersionString }); "
+    "'shell=powershell ' + $PSVersionTable.PSEdition + ' ' + $PSVersionTable.PSVersion"
+)
+
+# cmd.exe. %CD% and %OS% only; never `set`, which dumps every variable.
+CMD_PROBE_COMMAND = "echo cwd=%CD%& echo platform=%OS%& echo shell=cmd"
+
+PROBE_COMMANDS = {
+    "posix": PROBE_COMMAND,
+    "powershell": POWERSHELL_PROBE_COMMAND,
+    "cmd": CMD_PROBE_COMMAND,
+}
 
 # A path under the relay container is the bug we are explicitly avoiding.
 # If a parsed cwd looks like the relay itself, the value is the relay's
@@ -514,6 +536,79 @@ def find_command_tool(tools: list[dict[str, Any]] | None) -> tuple[str, str] | N
     return None
 
 
+_POSIX_NAME_WORDS = {"bash", "sh", "zsh", "fish", "shell", "terminal"}
+
+
+def _name_words(name: str) -> set[str]:
+    # "mcp__switchyard__PowerShell" -> {"mcp", "switchyard", "powershell"}
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+    return {w for w in re.split(r"[^a-z0-9]+", spaced.lower()) if w}
+
+
+def command_tool_shell(tool: dict[str, Any]) -> str:
+    """Which shell a command tool runs: "posix", "powershell" or "cmd".
+
+    The NAME decides first: a tool called PowerShell / pwsh is PowerShell,
+    one called Bash / sh / shell is POSIX. The description is only read
+    when the name says nothing, and only counts when it names exactly one
+    shell -- Claude Code's Bash tool description says "not cmd.exe or
+    PowerShell", which must not make it PowerShell. Unknown -> "posix",
+    the behaviour before shell kinds existed.
+    """
+    fn = tool.get("function") if tool.get("type") == "function" else tool
+    if not isinstance(fn, dict):
+        return "posix"
+    name = str(fn.get("name") or "")
+    lowered = name.lower()
+    words = _name_words(name)
+    if "powershell" in lowered or "pwsh" in words:
+        return "powershell"
+    if "cmd.exe" in lowered or {"cmd", "exe"} <= words:
+        return "cmd"
+    if words & _POSIX_NAME_WORDS or "bash" in lowered:
+        return "posix"
+    desc = str(fn.get("description") or "").lower()
+    says_ps = "powershell" in desc or "pwsh" in desc
+    says_cmd = "cmd.exe" in desc
+    says_posix = bool(re.search(r"\b(bash|zsh|posix|/bin/sh)\b", desc))
+    if says_ps and not (says_cmd or says_posix):
+        return "powershell"
+    if says_cmd and not (says_ps or says_posix):
+        return "cmd"
+    return "posix"
+
+
+_SHELL_PREFERENCE = {"posix": 0, "powershell": 1, "cmd": 2}
+
+
+def find_probe_tool(tools: list[dict[str, Any]] | None) -> tuple[str, str, str] | None:
+    """(tool_name, arg_key, probe_command) for the best command tool, or None.
+
+    Same recognition as find_command_tool, but when a caller offers several
+    shells (Claude Code on Windows has both Bash and PowerShell) a POSIX
+    one is preferred, then PowerShell, then cmd, and the probe command is
+    the one that shell can actually run.
+    """
+    if not tools:
+        return None
+    best: tuple[int, int, str, str, str] | None = None
+    for index, tool in enumerate(tools):
+        name, params = _tool_schema(tool)
+        if not name:
+            continue
+        arg_key = _schema_has_command(params)
+        if arg_key is None:
+            continue
+        kind = command_tool_shell(tool)
+        rank = (_SHELL_PREFERENCE[kind], index)
+        if best is None or rank < best[:2]:
+            best = (*rank, name, arg_key, kind)
+    if best is None:
+        return None
+    _, _, name, arg_key, kind = best
+    return name, arg_key, PROBE_COMMANDS[kind]
+
+
 # ---------------------------------------------------------------------------
 # Probe primitives
 # ---------------------------------------------------------------------------
@@ -591,7 +686,22 @@ def parse_probe_result(content: Any) -> CallerEnvironment | None:
         return None
     if _is_relay_path(cwd):
         cwd = None
-    return CallerEnvironment(cwd=cwd, platform=platform, shell=shell, source="probe")
+    return CallerEnvironment(cwd=cwd, platform=_readable_platform(platform),
+                             shell=shell, source="probe")
+
+
+def _readable_platform(platform: str | None) -> str | None:
+    """`uname -s` under Git Bash / MSYS2 / Cygwin says MINGW64_NT-10.0-26200
+    or MSYS_NT-..., which does not read as "Windows" to a model choosing
+    path syntax. Say Windows and keep the raw value; `Windows_NT` (cmd's
+    %OS%) becomes plain Windows. Everything else passes through."""
+    if not platform:
+        return platform
+    if re.match(r"(?i)(mingw|msys|cygwin)", platform):
+        return f"Windows ({platform})"
+    if platform.lower() == "windows_nt":
+        return "Windows"
+    return platform
 
 
 # ---------------------------------------------------------------------------

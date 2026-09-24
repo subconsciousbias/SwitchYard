@@ -816,6 +816,82 @@ def test_parse_git_flag_from_claude_code_and_opencode():
     assert (cc.git, oc.git, no.git, bare.git) == (True, True, False, None)
     print("  git flag: true / yes / no / absent")
 
+
+def _cmd_tool(name, description="", key="command"):
+    return {"type": "function", "function": {
+        "name": name, "description": description,
+        "parameters": {"type": "object",
+                       "properties": {key: {"type": "string"}},
+                       "required": [key]}}}
+
+
+def test_probe_tool_powershell_gets_a_powershell_probe():
+    """A native PowerShell has no printf / uname, so the POSIX probe errors
+    there unless Git for Windows happens to be on PATH. A PowerShell tool
+    must be sent the PowerShell probe."""
+    for name in ("PowerShell", "pwsh", "mcp__switchyard__PowerShell", "run_powershell"):
+        hit = caller_env.find_probe_tool([_cmd_tool(name)])
+        assert hit == (name, "command", caller_env.POWERSHELL_PROBE_COMMAND), (name, hit)
+    assert "printf" not in caller_env.POWERSHELL_PROBE_COMMAND
+    assert "uname" not in caller_env.POWERSHELL_PROBE_COMMAND
+
+
+def test_probe_tool_cmd_gets_a_cmd_probe():
+    hit = caller_env.find_probe_tool([_cmd_tool("cmd_exe")])
+    assert hit[2] == caller_env.CMD_PROBE_COMMAND, hit
+    hit = caller_env.find_probe_tool([_cmd_tool("run", "Runs a line in cmd.exe")])
+    assert hit[2] == caller_env.CMD_PROBE_COMMAND, hit
+    assert " set" not in caller_env.CMD_PROBE_COMMAND
+
+
+def test_probe_tool_prefers_bash_over_powershell_whatever_the_order():
+    """Claude Code on Windows offers both; Bash (Git Bash) is the one the
+    POSIX probe was written for."""
+    tools = [_cmd_tool("PowerShell"), _cmd_tool("Bash")]
+    assert caller_env.find_probe_tool(tools) == ("Bash", "command", caller_env.PROBE_COMMAND)
+
+
+def test_bash_description_naming_powershell_stays_posix():
+    """Claude Code's Bash description says it is 'not cmd.exe or
+    PowerShell'; the name wins over the description."""
+    bash = _cmd_tool("Bash", "This tool runs Git Bash, not cmd.exe or PowerShell.")
+    assert caller_env.command_tool_shell(bash) == "posix"
+    generic = _cmd_tool("run_command", "Runs a command in PowerShell.")
+    assert caller_env.command_tool_shell(generic) == "powershell"
+    unknown = _cmd_tool("run_command")
+    assert caller_env.command_tool_shell(unknown) == "posix"
+    assert caller_env.command_tool_shell(_cmd_tool("run_cmd")) == "posix"
+
+
+def test_probe_tool_none_without_a_command_tool():
+    assert caller_env.find_probe_tool(None) is None
+    assert caller_env.find_probe_tool([]) is None
+
+
+def test_parse_probe_result_reads_powershell_and_cmd_output():
+    """Real output captured from pwsh 7, Windows PowerShell 5.1 and cmd."""
+    ps7 = ("cwd=C:\\Users\\u\nplatform=Microsoft Windows 10.0.26200\n"
+           "shell=powershell Core 7.5.5\n")
+    ps5 = ("cwd=C:\\Users\\u\nplatform=Microsoft Windows NT 10.0.26200.0\n"
+           "shell=powershell Desktop 5.1.26100.8655\n")
+    cmd = "cwd=C:\\Users\\u\r\nplatform=Windows_NT\r\nshell=cmd\r\n"
+    e7, e5, ec = (caller_env.parse_probe_result(t) for t in (ps7, ps5, cmd))
+    assert (e7.cwd, e7.platform, e7.shell) == (
+        "C:\\Users\\u", "Microsoft Windows 10.0.26200", "powershell Core 7.5.5"), e7
+    assert e5.platform == "Microsoft Windows NT 10.0.26200.0", e5
+    assert (ec.cwd, ec.platform, ec.shell) == ("C:\\Users\\u", "Windows", "cmd"), ec
+
+
+def test_parse_probe_result_names_git_bash_as_windows():
+    """uname -s under Git Bash / MSYS2 / Cygwin does not say Windows."""
+    for raw in ("MINGW64_NT-10.0-26200", "MSYS_NT-10.0-26200", "CYGWIN_NT-10.0"):
+        env = caller_env.parse_probe_result(
+            f"cwd=/c/Users/u\nplatform={raw}\nshell=/usr/bin/bash\n")
+        assert env.platform == f"Windows ({raw})", env
+    env = caller_env.parse_probe_result("cwd=/x\nplatform=Darwin\nshell=/bin/zsh\n")
+    assert env.platform == "Darwin"
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

@@ -706,10 +706,12 @@ def _maybe_probe(body: dict, tools: list[dict]) -> "asyncio.Future | None":
                 # answered env rides the metadata, and a pending one is
                 # the other request's to finish.
                 return None
-            tool = _caller_env.find_command_tool(tools)
+            # find_probe_tool also picks the command that tool's shell can
+            # run: the POSIX probe errors in a native PowerShell / cmd.
+            tool = _caller_env.find_probe_tool(tools)
             if tool is None:
                 return None
-            name, arg_key = tool
+            name, arg_key, probe_command = tool
             call_id = _caller_env.mint_probe_call_id(fp)
             # Publish PENDING so a concurrent caller arriving after
             # we release the lock sees fp as already-taken. The real
@@ -723,7 +725,7 @@ def _maybe_probe(body: dict, tools: list[dict]) -> "asyncio.Future | None":
         message = {"role": "assistant", "content": None, "tool_calls": [
             {"id": call_id, "type": "function",
              "function": {"name": name,
-                          "arguments": json.dumps({arg_key: _caller_env.PROBE_COMMAND})}}
+                          "arguments": json.dumps({arg_key: probe_command})}}
         ]}
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
