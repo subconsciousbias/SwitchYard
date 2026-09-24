@@ -706,10 +706,15 @@ def _maybe_probe(body: dict, tools: list[dict]) -> "asyncio.Future | None":
                 # answered env rides the metadata, and a pending one is
                 # the other request's to finish.
                 return None
-            tool = _caller_env.find_command_tool(tools)
+            # The probe is written for the tool's shell: the POSIX one runs
+            # nowhere on a PowerShell or cmd tool (a Windows caller). What is
+            # already known of the platform decides for an unnamed shell.
+            platform = (getattr(env, "platform", None)
+                        or getattr(ce_settings, "fallback_platform", None))
+            tool = _caller_env.find_probe_tool(tools, platform)
             if tool is None:
                 return None
-            name, arg_key = tool
+            name, arg_key, probe_command = tool
             call_id = _caller_env.mint_probe_call_id(fp)
             # Publish PENDING so a concurrent caller arriving after
             # we release the lock sees fp as already-taken. The real
@@ -723,7 +728,7 @@ def _maybe_probe(body: dict, tools: list[dict]) -> "asyncio.Future | None":
         message = {"role": "assistant", "content": None, "tool_calls": [
             {"id": call_id, "type": "function",
              "function": {"name": name,
-                          "arguments": json.dumps({arg_key: _caller_env.PROBE_COMMAND})}}
+                          "arguments": json.dumps({arg_key: probe_command})}}
         ]}
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -2105,8 +2110,25 @@ def session_env(env: Any, workdir: Path, spawn_dir: Path, web: bool = False) -> 
         extra["OPENCODE_ENABLE_EXA"] = "true"     # its websearch tool (Exa)
     shell = getattr(env, "shell", None)
     if PROVIDER == "claude" and shell:
-        extra["SHELL"] = shell if shell.startswith("/") else f"/bin/{shell}"
+        extra["SHELL"] = relay_shell(shell)
     return extra
+
+
+def relay_shell(shell: str) -> str:
+    """The SHELL value that makes Claude's `Shell:` line name the caller's
+    shell. Claude prints `zsh` / `bash` for any SHELL containing those
+    names and the raw value otherwise, and never executes it here (its
+    own shell tool is off). A POSIX path or bare POSIX name keeps the old
+    `/bin/<name>` spelling; a Windows shell -- `PowerShell`, `pwsh`,
+    `cmd`, a `C:\\...\\bash.exe` path, Claude Code's own `PowerShell
+    (primary); ...` description -- is passed as the caller wrote it, since
+    `/bin/` before it made a path that is neither the caller's nor real."""
+    if shell.startswith("/"):
+        return shell
+    if re.fullmatch(r"[A-Za-z0-9_.+-]+", shell) and not re.search(
+            r"powershell|pwsh|^cmd$|\.exe$", shell, re.I):
+        return f"/bin/{shell}"
+    return shell
 
 
 async def start_session(body: dict, mcp_tools: list[dict], prompt: str,

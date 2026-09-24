@@ -3844,6 +3844,72 @@ def test_fresh_with_unknown_env_emits_synthetic_probe_tool_call():
         server.RESOLVED_PROBES.update(saved_resolved)
 
 
+
+def test_windows_caller_gets_a_probe_its_shell_can_run():
+    """A caller known only to be on Windows (its prompt names the platform,
+    not the cwd) whose command tool does not say which shell it runs gets
+    the PowerShell probe; a PowerShell-named tool gets it anywhere; a Bash
+    tool keeps the POSIX probe. The POSIX probe errors in PowerShell and
+    cmd, which used to leave a Windows caller with no cwd at all."""
+    saved_failed = dict(server.FAILED_PROBES)
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    captured = []
+    restore = _stub_start_session(captured)
+    cases = [
+        ("execute_command", "<env>\nPlatform: win32\n</env>",
+         caller_env_module.PROBE_COMMAND_POWERSHELL),
+        ("PowerShell", "no env here", caller_env_module.PROBE_COMMAND_POWERSHELL),
+        ("Bash", "<env>\nPlatform: win32\n</env>", caller_env_module.PROBE_COMMAND),
+        ("execute_command", "no env here", caller_env_module.PROBE_COMMAND),
+    ]
+    try:
+        for n, (tool, system, want) in enumerate(cases):
+            server.FAILED_PROBES.clear()
+            server.RESOLVED_PROBES.clear()
+            body = {"model": "m",
+                    "tools": [{"type": "function", "function": {
+                        "name": tool, "description": "Run a command",
+                        "parameters": {"type": "object",
+                                       "properties": {"command": {"type": "string"}},
+                                       "required": ["command"]}}}],
+                    "messages": [{"role": "system", "content": system},
+                                 {"role": "user", "content": f"windows probe case {n}"}]}
+            response = asyncio.run(server.handle_tool_request(body, body["tools"], None))
+            tc = response["choices"][0]["message"]["tool_calls"][0]
+            assert tc["id"].startswith(caller_env_module.PROBE_PREFIX), tc
+            assert tc["function"]["name"] == tool, tc
+            assert json.loads(tc["function"]["arguments"]) == {"command": want}, (tool, tc)
+        assert captured == [], captured
+        print("  win32 + unnamed shell / PowerShell tool -> PowerShell probe; Bash -> POSIX")
+    finally:
+        restore()
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved_failed)
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
+
+def test_windows_probe_answer_resolves_the_callers_environment():
+    """The PowerShell probe's CRLF answer is consumed like the POSIX one:
+    the env it names is what the session is built with."""
+    body = {"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": caller_env_module.mint_probe_call_id("a" * 16), "type": "function",
+            "function": {"name": "PowerShell", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": caller_env_module.mint_probe_call_id("a" * 16),
+         "content": "cwd=C:\\Users\\Me\\proj\r\nplatform=Windows\r\nshell=powershell\r\n"}]}
+    saved_resolved = dict(server.RESOLVED_PROBES)
+    try:
+        env, stripped = server._consume_probe_results(body)
+        assert (env.cwd, env.platform, env.shell) == (
+            "C:\\Users\\Me\\proj", "Windows", "powershell"), env
+        assert all(m.get("role") != "tool" for m in stripped["messages"]), stripped
+        print("  PowerShell probe answer -> C:\\Users\\Me\\proj / Windows / powershell")
+    finally:
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved_resolved)
+
 def test_probe_follow_up_strips_synthetic_exchange_and_starts_session():
     """The follow-up request carrying the probe result must: parse the env,
     strip the synthetic assistant+tool exchange, then proceed into the
@@ -4731,6 +4797,18 @@ def test_mirror_is_created_only_for_safe_caller_paths():
         print("  mirror: caller path recreated (git init on request); unsafe paths refused")
 
 
+
+def test_windows_caller_cwd_is_never_mirrored():
+    """A Windows cwd in any spelling has no Linux path equal to it, so the
+    session keeps its workdir (the env block and reminder carry the
+    caller's path instead). Git Bash's /c/... is not under a mirror root."""
+    CE = server._caller_env.CallerEnvironment
+    for cwd in ("C:\\Users\\me\\proj", "C:/Users/me/proj", "c:/Users/me/proj",
+                "\\\\server\\share\\proj", "//server/share/proj", "/c/Users/me/proj",
+                "/C:/Users/me/proj"):
+        assert server.mirror_target(CE(cwd=cwd, platform="win32", source="request")) is None, cwd
+    print("  C:\\..., C:/..., UNC and /c/... cwds keep the session workdir")
+
 def test_mirror_is_removed_with_its_last_session_and_only_what_was_created():
     """Review of #273: a caller-supplied path must not leave directories and
     repos behind. Each mirror is reference-counted; the last session to end
@@ -4831,6 +4909,32 @@ def test_session_env_and_argv_follow_the_mirror():
     finally:
         server.PROVIDER, server.PROFILE = saved
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_claude_shell_names_a_windows_shell_as_the_caller_does():
+    """Claude echoes $SHELL in its Shell: line (bash/zsh for anything
+    containing those names, the raw value otherwise). POSIX names keep the
+    /bin/<name> spelling; a Windows shell is passed as written, never as a
+    made-up /bin/PowerShell or /bin/C:\\... path."""
+    long = ("PowerShell (primary); Bash tool also available for POSIX scripts"
+            " \u2014 each takes its own syntax.")
+    cases = {"zsh": "/bin/zsh", "bash": "/bin/bash", "fish": "/bin/fish",
+             "/usr/local/bin/fish": "/usr/local/bin/fish", "/bin/zsh": "/bin/zsh",
+             "PowerShell": "PowerShell", "powershell": "powershell", "pwsh": "pwsh",
+             "cmd": "cmd", "powershell.exe": "powershell.exe",
+             "C:\\Program Files\\Git\\bin\\bash.exe": "C:\\Program Files\\Git\\bin\\bash.exe",
+             long: long}
+    for shell, want in cases.items():
+        assert server.relay_shell(shell) == want, (shell, server.relay_shell(shell))
+    saved = (server.PROVIDER, server.PROFILE)
+    try:
+        server.PROVIDER, server.PROFILE = "claude", server.MCP_PROFILES["claude"]
+        env = server._caller_env.CallerEnvironment(cwd="C:\\x", shell="PowerShell",
+                                                   platform="win32", source="request")
+        assert server.session_env(env, Path("/tmp/w"), Path("/tmp/w")) == {"SHELL": "PowerShell"}
+    finally:
+        server.PROVIDER, server.PROFILE = saved
+    print("  SHELL: POSIX names -> /bin/<name>; Windows shells verbatim")
 
 
 def test_final_turn_reports_last_call_context_size_and_bills_the_sum():

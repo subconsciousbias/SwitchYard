@@ -816,6 +816,227 @@ def test_parse_git_flag_from_claude_code_and_opencode():
     assert (cc.git, oc.git, no.git, bare.git) == (True, True, False, None)
     print("  git flag: true / yes / no / absent")
 
+
+# ------------------------------------------------------ Windows callers ---
+# Claude Code 2.1.278's environment section as it renders on Windows
+# (process.platform win32, cwd in Windows form, the shell description it
+# gives when its PowerShell tool is on), with CRLF line ends.
+CLAUDE_CODE_WINDOWS_SECTION = (
+    "# Environment\r\nYou have been invoked in the following environment: \r\n"
+    " - Primary working directory: C:\\Users\\Me\\proj\r\n"
+    " - Is a git repository: true\r\n"
+    " - Platform: win32\r\n"
+    " - Shell: PowerShell (primary); Bash tool also available for POSIX scripts"
+    " \u2014 each takes its own syntax.\r\n"
+    " - OS Version: Windows 11 Pro 10.0.22631\r\n")
+
+
+def _env_of(text: str):
+    return caller_env.parse_request({"messages": [{"role": "system", "content": text},
+                                                  {"role": "user", "content": "hi"}]})
+
+
+def test_parse_request_windows_claude_code_section():
+    env = _env_of(CLAUDE_CODE_WINDOWS_SECTION)
+    assert env.cwd == "C:\\Users\\Me\\proj", env
+    assert env.platform == "win32" and env.git is True, env
+    assert env.shell.startswith("PowerShell (primary)"), env
+    print(f"  Claude Code on Windows (CRLF): {env.cwd} / {env.platform} / git")
+
+
+def test_parse_request_windows_opencode_codex_and_path_forms():
+    """OpenCode's <env> (forward-slash drive path), codex's
+    environment_context (powershell), a UNC share and a Git Bash path all
+    parse with the path exactly as the caller wrote it."""
+    oc = _env_of("<env>\n  Working directory: C:/Users/Me/proj\n"
+                 "  Workspace root folder: C:/Users/Me/proj\n"
+                 "  Is directory a git repo: yes\n  Platform: win32\n</env>")
+    assert (oc.cwd, oc.platform, oc.git) == ("C:/Users/Me/proj", "win32", True), oc
+    cx = _env_of("<environment_context>\n  <cwd>C:\\Users\\Me\\proj</cwd>\n"
+                 "  <shell>powershell</shell>\n</environment_context>")
+    assert (cx.cwd, cx.shell) == ("C:\\Users\\Me\\proj", "powershell"), cx
+    unc = _env_of("<env>\nWorking directory: \\\\server\\share\\proj\nPlatform: win32\n</env>")
+    assert unc.cwd == "\\\\server\\share\\proj", unc
+    gb = _env_of("# Environment\n - Primary working directory: /c/Users/Me/proj\n"
+                 " - Platform: win32\n - Shell: bash\n")
+    assert (gb.cwd, gb.shell) == ("/c/Users/Me/proj", "bash"), gb
+    print("  OpenCode C:/..., codex powershell, UNC and /c/... all parse verbatim")
+
+
+def test_parse_request_cline_system_information():
+    """Cline-family agents (OpenAI-compatible, PowerShell on Windows) state
+    their environment in a SYSTEM INFORMATION section; it is read passively
+    instead of costing a probe."""
+    text = ("You are an agent.\n\n====\n\nSYSTEM INFORMATION\n\n"
+            "Operating System: Windows 11\n"
+            "Default Shell: C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\n"
+            "Home Directory: C:/Users/me\n"
+            "Current Working Directory: c:/Users/me/proj\n\n====\n")
+    env = _env_of(text)
+    assert env.cwd == "c:/Users/me/proj", env
+    assert env.platform == "Windows 11", env
+    assert env.shell.endswith("powershell.exe"), env
+    roo = _env_of("SYSTEM INFORMATION\n\nOperating System: macOS Sonoma\n"
+                  "Default Shell: /bin/zsh\nCurrent Workspace Directory: /Users/me/proj\n")
+    assert (roo.cwd, roo.shell) == ("/Users/me/proj", "/bin/zsh"), roo
+    print("  Cline/Roo SYSTEM INFORMATION: cwd, OS and default shell read")
+
+
+def test_is_windows_platform():
+    for yes in ("win32", "windows", "Windows", "Windows_NT", "Windows 11 Pro 10.0"):
+        assert caller_env.is_windows_platform(yes), yes
+    for no in (None, "", "darwin", "linux", "Darwin", "MINGW64_NT-10.0-22631",
+               "MSYS_NT-10.0", "CYGWIN_NT-10.0"):
+        assert not caller_env.is_windows_platform(no), no
+    print("  win32/windows/Windows_NT are Windows; MINGW/MSYS/Cygwin are not")
+
+
+def _cmd_tool(name, description="", key="command"):
+    return {"type": "function", "function": {
+        "name": name, "description": description,
+        "parameters": {"type": "object", "properties": {key: {"type": "string"}},
+                       "required": [key]}}}
+
+
+def test_find_probe_tool_writes_the_probe_for_the_tools_shell():
+    """The probe must be one the caller's shell can run: PowerShell and cmd
+    have no printf/uname and cmd has no $(...)."""
+    posix, ps, cmd = (caller_env.PROBE_COMMAND, caller_env.PROBE_COMMAND_POWERSHELL,
+                      caller_env.PROBE_COMMAND_CMD)
+    cases = [
+        # (tool, platform hint, expected probe)
+        (_cmd_tool("Bash"), None, posix),
+        (_cmd_tool("Bash", "Runs in Git Bash. Prefer the PowerShell tool."), "win32", posix),
+        (_cmd_tool("run_bash"), "windows", posix),
+        (_cmd_tool("PowerShell"), None, ps),
+        (_cmd_tool("pwsh", key="script"), None, ps),
+        (_cmd_tool("execute_command", "Runs the command in PowerShell."), None, ps),
+        (_cmd_tool("execute_command", "Runs the command with cmd.exe."), None, cmd),
+        (_cmd_tool("cmd"), "win32", cmd),
+        (_cmd_tool("cmd"), None, cmd),
+        (_cmd_tool("CMD", "Run a command"), "win32", cmd),
+        (_cmd_tool("cmd_exe"), None, cmd),
+        (_cmd_tool("command_prompt"), None, cmd),
+        # `cmd` as shorthand for "command" names no shell.
+        (_cmd_tool("run_cmd"), "win32", ps),
+        (_cmd_tool("exec_cmd"), None, posix),
+        (_cmd_tool("execute_command", "Runs the command in bash."), "win32", posix),
+        (_cmd_tool("execute_command"), "win32", ps),
+        (_cmd_tool("execute_command"), "Windows 11", ps),
+        (_cmd_tool("execute_command"), None, posix),
+        (_cmd_tool("execute_command"), "darwin", posix),
+        (_cmd_tool("execute_command"), "MINGW64_NT-10.0", posix),
+        # Names more than one shell: the platform decides.
+        (_cmd_tool("shell", "bash on Linux, PowerShell on Windows"), "win32", ps),
+        (_cmd_tool("shell", "bash on Linux, PowerShell on Windows"), "linux", posix),
+    ]
+    for tool, platform, want in cases:
+        name, key, command = caller_env.find_probe_tool([tool], platform)
+        assert name == tool["function"]["name"], (name, tool)
+        assert key in ("command", "script"), key
+        assert command == want, (tool["function"], platform, command)
+    assert caller_env.find_probe_tool([], "win32") is None
+    assert caller_env.find_probe_tool([{"type": "function", "function": {
+        "name": "get_weather", "parameters": {"type": "object", "properties": {
+            "city": {"type": "string"}}}}}], "win32") is None
+    print(f"  {len(cases)} tool/platform combinations -> posix/powershell/cmd probe")
+
+
+def test_posix_probe_is_byte_identical():
+    """The POSIX probe every non-Windows caller gets is unchanged."""
+    assert caller_env.PROBE_COMMAND == (
+        "printf 'cwd=%s\\nplatform=%s\\nshell=%s\\n' \"$(pwd)\" \"$(uname -s)\" \"$SHELL\"")
+    assert caller_env.find_probe_tool([_cmd_tool("Bash")])[2] == caller_env.PROBE_COMMAND
+    for command in caller_env.PROBE_COMMANDS.values():
+        for word in ("env", "printenv", "set", "Get-ChildItem", "gci", "dir"):
+            assert f" {word} " not in f" {command} ", (word, command)
+    print("  POSIX probe unchanged; no probe enumerates the environment")
+
+
+def test_parse_probe_result_windows_outputs():
+    """PowerShell and cmd answers (CRLF) parse; cmd's UNC fallback to
+    C:\\Windows is not taken for the caller's cwd."""
+    ps = caller_env.parse_probe_result(
+        "cwd=C:\\Users\\Me\\proj\r\nplatform=Windows\r\nshell=powershell\r\n")
+    assert (ps.cwd, ps.platform, ps.shell) == ("C:\\Users\\Me\\proj", "Windows",
+                                               "powershell"), ps
+    cmd = caller_env.parse_probe_result("shell=cmd\r\nplatform=Windows\r\ncwd=C:\\work\r\n")
+    assert (cmd.cwd, cmd.platform, cmd.shell) == ("C:\\work", "Windows", "cmd"), cmd
+    unc = caller_env.parse_probe_result(
+        "'\\\\server\\share\\proj'\r\nCMD.EXE was started with the above path as the "
+        "current directory.\r\nUNC paths are not supported.  Defaulting to Windows "
+        "directory.\r\nshell=cmd\r\nplatform=Windows\r\ncwd=C:\\Windows\r\n")
+    assert unc.cwd is None and unc.platform == "Windows", unc
+    gb = caller_env.parse_probe_result(
+        "cwd=/c/Users/Me/proj\nplatform=MINGW64_NT-10.0-22631\nshell=/usr/bin/bash\n")
+    assert gb.cwd == "/c/Users/Me/proj", gb
+    print("  PowerShell / cmd (CRLF) / Git Bash answers parse; UNC fallback cwd dropped")
+
+
+def test_parse_probe_result_rejects_an_echoed_probe():
+    """A probe that another shell ECHOED instead of running (the cmd probe
+    under bash prints `cwd=%CD%` and a made-up `shell=cmd`) is no answer."""
+    for text in ("shell=cmd\nplatform=Windows\ncwd=%CD%\n",
+                 "cwd=%CD%\n",
+                 "cwd=$(pwd)\nplatform=$(uname -s)\nshell=\n",
+                 "cwd=$PWD\n"):
+        assert caller_env.parse_probe_result(text) is None, text
+    assert caller_env.parse_probe_result("cwd=C:\\$Recycle.Bin\\x\n").cwd == \
+        "C:\\$Recycle.Bin\\x"
+    print("  literal %CD% / $(pwd) / $PWD answers rejected; a real $ in a path kept")
+
+
+def test_probes_run_in_their_own_shell_and_stay_silent_in_others():
+    """Each probe, executed for real: it answers in its own shell and yields
+    NO answer in a shell it was not written for (a wrong guess must never
+    produce a made-up environment). pwsh is used when installed."""
+    import shutil
+    import subprocess
+
+    def run(argv):
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=60,
+                             stdin=subprocess.DEVNULL)
+        return caller_env.parse_probe_result(out.stdout + out.stderr)
+
+    here = os.path.realpath(os.getcwd())
+    posix_shells = [sh for sh in ("sh", "bash", "zsh", "dash") if shutil.which(sh)]
+    assert posix_shells, "no POSIX shell to run the probes in"
+    for sh in posix_shells:
+        env = run([sh, "-c", caller_env.PROBE_COMMAND])
+        assert env is not None and os.path.realpath(env.cwd) == here, (sh, env)
+        for other in (caller_env.PROBE_COMMAND_POWERSHELL, caller_env.PROBE_COMMAND_CMD):
+            assert run([sh, "-c", other]) is None, (sh, other)
+    ran = f"posix probe in {', '.join(posix_shells)}"
+    pwsh = shutil.which("pwsh")
+    if pwsh:
+        env = run([pwsh, "-NoProfile", "-NonInteractive", "-Command",
+                   caller_env.PROBE_COMMAND_POWERSHELL])
+        assert env is not None and os.path.realpath(env.cwd) == here, env
+        assert env.shell == "pwsh" and env.platform in ("Darwin", "Linux", "Windows"), env
+        assert run([pwsh, "-NoProfile", "-NonInteractive", "-Command",
+                    caller_env.PROBE_COMMAND_CMD]) is None
+        ran += "; powershell probe in pwsh"
+    print(f"  {ran}; the other probes stay silent there")
+
+
+def test_render_system_block_tells_a_windows_model_about_paths_and_shell():
+    """On a Windows caller the block adds one note (paths as the caller
+    writes them, commands in the caller's shell); every other block is
+    exactly what it was."""
+    win = caller_env.render_system_block(caller_env.CallerEnvironment(
+        cwd="C:\\Users\\Me\\proj", platform="win32", shell="PowerShell", source="request"))
+    assert "Caller working directory: C:\\Users\\Me\\proj" in win, win
+    assert "The caller is on Windows." in win and "PowerShell and\ncmd are not POSIX" in win
+    for platform in ("windows", "Windows_NT"):
+        assert "The caller is on Windows." in caller_env.render_system_block(
+            caller_env.CallerEnvironment(platform=platform, source="request"))
+    for platform in (None, "darwin", "linux", "MINGW64_NT-10.0"):
+        block = caller_env.render_system_block(caller_env.CallerEnvironment(
+            cwd="/x", platform=platform, shell="zsh", source="request"))
+        assert "Windows" not in block, block
+        assert block.endswith("the caller\nenvironment above is authoritative."), block
+    print("  Windows note on win32/windows/Windows_NT only; POSIX block unchanged")
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

@@ -28,6 +28,9 @@ positive -- the caller's world is what the model sees and uses:
                naming a relay path, and report the host's files
   read file    read README.md from the caller (host-only marker content)
   environment  without tools, name the OS (macOS), the host cwd, git = yes
+  environment (Windows caller)
+               the same for a Claude Code-style Windows caller (win32, a
+               C:\\ cwd, a PowerShell tool): Windows, that exact cwd, git = yes
   web search   a request carrying web_search_options (Claude Code's WebSearch
                arrives this way) gets a live, sourced answer from the CLI's own
                provider-side search -- text path and tool path
@@ -98,9 +101,9 @@ def host_answer(name, args):
         return f"cwd={HOST_CWD}\nplatform=Darwin\nshell=/bin/zsh\n"
     return "\n"
 
-def run(user, tools=None, turns=6):
+def run(user, tools=None, turns=6, system=SYSTEM):
     # Drive one conversation, answering every bridged call as the host would.
-    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     calls = []
     for _ in range(turns):
         body = {"model": MODEL, "messages": messages}
@@ -175,14 +178,33 @@ def read():
     ok = bool(paths) and not relay and "Caller Project Marker" in text
     return ok, f"calls {calls}" + (f"; RELAY PATHS {relay}" if relay else "") + f"; answer {short(text)}"
 
+ENV_Q = ("Without calling any tool, answer on exactly three lines: 1) the operating "
+         "system of the machine your tools run on, 2) the absolute path of the current "
+         "working directory, 3) whether that directory is a git repository (yes/no).")
+
 def environment():
-    text, calls = run("Without calling any tool, answer on exactly three lines: 1) the operating "
-                      "system of the machine your tools run on, 2) the absolute path of the current "
-                      "working directory, 3) whether that directory is a git repository (yes/no).",
-                      CALLER_TOOLS)
+    text, calls = run(ENV_Q, CALLER_TOOLS)
     low = text.lower()
     os_ok = ("mac" in low or "darwin" in low) and not re.search(r"\blinux\b", low.split("\n")[0])
     ok = os_ok and HOST_CWD in text and "yes" in low and not RELAY_PATH.search(text)
+    return ok, f"answer {short(text)}; tool calls {calls}"
+
+# A Windows caller, as Claude Code on Windows describes itself: its tools run
+# in PowerShell on C:\..., which no relay directory can mirror, so only the
+# env block and reminder stand between the model and the relay's Linux cwd.
+WIN_CWD = r"C:\Users\switchyard-live-check\project"
+WIN_SYSTEM = ("You are a coding agent working on the caller's machine.\n# Environment\n"
+              f" - Primary working directory: {WIN_CWD}\n - Is a git repository: true\n"
+              " - Platform: win32\n - Shell: PowerShell\n - OS Version: Windows 11 Pro\n")
+POWERSHELL = tool("PowerShell", "Run a PowerShell command on the caller's machine.",
+                  {"command": {"type": "string"}}, ["command"])
+
+def environment_windows():
+    text, calls = run(ENV_Q, [POWERSHELL, READ], system=WIN_SYSTEM)
+    low = text.lower()
+    first = low.split("\n")[0]
+    os_ok = "windows" in first and not re.search(r"\blinux\b", first)
+    ok = os_ok and WIN_CWD.lower() in low and "yes" in low and not RELAY_PATH.search(text)
     return ok, f"answer {short(text)}; tool calls {calls}"
 
 # ---- negative: nothing of the relay's own is reachable ----------------------
@@ -208,6 +230,7 @@ check("client MCP tool", mcp_tool)
 check("list cwd", listing)
 check("read file", read)
 check("environment (os/cwd/git)", environment)
+check("environment, Windows caller (os/cwd/git)", environment_windows)
 def web_requested(tools):
     # A caller that ASKS for server-side web search (web_search_options, what
     # LiteLLM makes of Claude Code's WebSearch sub-request) gets the CLI's own

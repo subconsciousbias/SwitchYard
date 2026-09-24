@@ -64,8 +64,8 @@ def _login_dir(root: Path) -> Path:
 
 
 def _run(argv: list[str], fake: _fake_model.FakeModel, root: Path, cwd: Path,
-         stdin_data: str | None = None):
-    env = {**server.cli_bridge.subprocess_env(),
+         stdin_data: str | None = None, extra_env: dict | None = None):
+    env = {**server.cli_bridge.subprocess_env(), **(extra_env or {}),
            "HOME": str(root), "CLAUDE_CONFIG_DIR": str(root / "claude"),
            "ANTHROPIC_BASE_URL": fake.url,
            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
@@ -168,6 +168,53 @@ def test_claude_tool_path_offers_a_typed_bash_tool_with_its_schema():
     finally:
         server.PROVIDER, server.PROFILE = saved
         import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+
+
+def test_claude_reports_a_windows_callers_shell_as_written():
+    """A Windows caller's shell reaches the pinned claude through
+    session_env and comes back in its Shell: line exactly as the caller's
+    own Claude Code writes it -- and a SHELL that is no executable path does
+    not stop claude from running (its own shell tool is off)."""
+    try:
+        claude = _pinned_clis.require("claude")
+    except _pinned_clis.Skip as why:
+        print(f"  skipped: {why}")
+        return
+    import re
+    import shutil
+    root = Path(tempfile.mkdtemp(prefix="lockdown-claude-winshell-"))
+    _login_dir(root)
+    saved = (server.PROVIDER, server.PROFILE)
+    long = ("PowerShell (primary); Bash tool also available for POSIX scripts"
+            " \u2014 each takes its own syntax.")
+    try:
+        server.PROVIDER = "claude"
+        server.PROFILE = dict(server.MCP_PROFILES["claude"], cli=claude)
+        workdir = root / "session"
+        workdir.mkdir()
+        tools_path = workdir / "tools.json"
+        tools_path.write_text(json.dumps([PROBE]))
+        for caller_shell in ("PowerShell", long, "cmd"):
+            env = server._caller_env.CallerEnvironment(
+                cwd="C:\\Users\\me\\proj", platform="win32", shell=caller_shell,
+                source="request")
+            extra = server.session_env(env, workdir, workdir)
+            argv, _ = server.build_argv("hello", None, "claude-sonnet-5", workdir,
+                                        uuid.uuid4().hex, tools_path,
+                                        "mcp__switchyard__probe")
+            with _fake_model.FakeModel([{"text": "ok"}]) as fake:
+                done = _run(argv, fake, root, workdir, extra_env=extra)
+            assert done.returncode == 0, (caller_shell, done.stderr[-500:])
+            # request_text is the JSON of the request: match the JSON spelling.
+            text = _fake_model.request_text(fake.requests[-1]["body"])
+            want = "Shell: " + json.dumps(caller_shell)[1:-1] + "\\n"
+            assert want in text, (caller_shell, re.findall(r"Shell: [^\\]*", text))
+        print(f"  claude {_pinned_clis.installed_version('claude')}: Shell: line names "
+              "PowerShell / Claude Code's PowerShell description / cmd as written")
+    finally:
+        server.PROVIDER, server.PROFILE = saved
         shutil.rmtree(root, ignore_errors=True)
 
 

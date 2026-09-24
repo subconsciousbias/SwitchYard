@@ -63,17 +63,42 @@ PROBE_PREFIX = "switchyard_env_"
 # session holds (AWS keys, GitHub PATs, etc.). The shell name comes from
 # the allowlisted `$SHELL` echo, not from any other variable.
 #
-# Pwd and uname are chosen because they are universally available on every
-# shell environment SwitchYard serves (POSIX sh, zsh, fish, bash on Linux
-# and macOS; cmd / powershell on Windows -- see the find_command_tool
-# adapters for how the Windows shell tool also reads this). The labelled
+# This is the POSIX probe: sh, bash, zsh, fish on Linux and macOS, and Git
+# Bash / MSYS on Windows (where `uname -s` says MINGW64_NT-...). It does NOT
+# run in PowerShell or cmd -- neither has printf/uname, and cmd has no
+# `$(...)` -- so a caller whose command tool is one of those gets its own
+# probe below (probe_command_for / find_probe_tool). The labelled
 # `cwd=...` / `platform=...` / `shell=...` form is what parse_probe_result
 # looks for: a regex anchored to those labels tolerates shell quoting,
-# whitespace and the trailing newline without parsing a structured output
-# the various shells don't have a common syntax for.
+# whitespace, CRLF line ends and the trailing newline without parsing a
+# structured output the various shells don't have a common syntax for.
 PROBE_COMMAND = (
     "printf 'cwd=%s\\nplatform=%s\\nshell=%s\\n' \"$(pwd)\" \"$(uname -s)\" \"$SHELL\""
 )
+
+# The same three lines from Windows PowerShell 5.1 and PowerShell 7 (pwsh).
+# ProviderPath, not Path: on a UNC location Path is prefixed with
+# `Microsoft.PowerShell.Core\FileSystem::`. `$IsWindows` does not exist on
+# 5.1 (which only runs on Windows), hence `-eq $false` rather than `-not`.
+# No variables are assigned, so a persistent caller session is left as it
+# was. In a POSIX shell this is a syntax error that prints no labelled line.
+PROBE_COMMAND_POWERSHELL = (
+    "\"cwd=$((Get-Location).ProviderPath)\"; "
+    "\"platform=$(if ($IsWindows -eq $false) { if ($IsMacOS) { 'Darwin' } "
+    "else { 'Linux' } } else { 'Windows' })\"; "
+    "\"shell=$(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh' } "
+    "else { 'powershell' })\""
+)
+
+# The same from cmd.exe. `cwd` comes LAST on purpose: in a shell that is not
+# cmd, `&` backgrounds (bash) or starts a job (pwsh) and the echo prints the
+# literal `%CD%` -- parse_probe_result drops a result whose cwd is still an
+# unexpanded placeholder, so a mis-aimed cmd probe yields nothing rather
+# than a made-up `shell=cmd`.
+PROBE_COMMAND_CMD = "echo shell=cmd& echo platform=Windows& echo cwd=%CD%"
+
+PROBE_COMMANDS = {"posix": PROBE_COMMAND, "powershell": PROBE_COMMAND_POWERSHELL,
+                  "cmd": PROBE_COMMAND_CMD}
 
 # A path under the relay container is the bug we are explicitly avoiding.
 # If a parsed cwd looks like the relay itself, the value is the relay's
@@ -349,15 +374,20 @@ def _parse_generic_env_section(text: str) -> CallerEnvironment | None:
     happens to mention `platform:` is not a passive environment signal.
 
     Recognised: `cwd:`, `working directory:`, `platform:`, `os:`,
-    `shell:`. The scan stops at the first match to avoid picking up a
-    body paragraph that mentions one of those words.
+    `shell:`, and the `SYSTEM INFORMATION` section of Cline-family agents
+    (`Operating System:`, `Default Shell:`, `Current Working Directory:` /
+    `Current Workspace Directory:`) -- the usual prompt of an
+    OpenAI-compatible agent on Windows, whose shell tool runs PowerShell.
+    The scan stops at the first match to avoid picking up a body paragraph
+    that mentions one of those words.
     """
     if not text:
         return None
     cwd = _label_value(text, "cwd", "working_directory", "primary working directory",
-                       "working directory")
-    platform = _label_value(text, "platform", "os")
-    shell = _label_value(text, "shell")
+                       "working directory", "current working directory",
+                       "current workspace directory")
+    platform = _label_value(text, "platform", "os", "operating system")
+    shell = _label_value(text, "shell", "default shell")
     if cwd is None and platform is None and shell is None:
         return None
     return CallerEnvironment(cwd=cwd, platform=platform, shell=shell, source="request")
@@ -514,6 +544,64 @@ def find_command_tool(tools: list[dict[str, Any]] | None) -> tuple[str, str] | N
     return None
 
 
+# Which shell a caller's command tool runs, so the probe is written in a
+# syntax that shell can execute. The tool's NAME is the strongest hint (a
+# `Bash` tool is bash even on Windows, where Claude Code runs it in Git
+# Bash; a `PowerShell` tool is PowerShell), then its description when it
+# names exactly one shell family, then the caller's platform: a Windows
+# caller with an unnamed shell gets the PowerShell probe (the Windows
+# default for interactive agents, and harmless -- a syntax error with no
+# labelled output -- in cmd and in POSIX shells). Everything else keeps the
+# POSIX probe, byte for byte what it always was.
+_POWERSHELL_HINT = re.compile(r"powershell|pwsh", re.I)
+_POSIX_HINT = re.compile(r"\b(?:bash|zsh|fish|dash|ksh|sh|posix|wsl)\b", re.I)
+_CMD_HINT = re.compile(r"\bcmd\.exe\b|command prompt", re.I)
+
+
+def is_windows_platform(platform: str | None) -> bool:
+    """`win32` (Claude Code, OpenCode), `windows` (codex), `Windows_NT`,
+    `Windows 11 Pro ...`. Not MINGW/MSYS/Cygwin: those are POSIX shells."""
+    return bool(platform) and str(platform).strip().lower().startswith("win")
+
+
+def tool_shell_kind(tool: dict[str, Any], platform: str | None = None) -> str:
+    """`posix`, `powershell` or `cmd` for a command tool (see above)."""
+    name, _ = _tool_schema(tool)
+    fn = tool.get("function") if isinstance(tool, dict) and tool.get("type") == "function" \
+        else tool
+    description = str((fn or {}).get("description") or "") if isinstance(fn, dict) else ""
+    name = str(name or "").replace("_", " ").replace("-", " ")
+    if _POWERSHELL_HINT.search(name):
+        return "powershell"
+    if _POSIX_HINT.search(name):
+        return "posix"
+    # A tool NAMED cmd is cmd.exe; `run_cmd` / `exec_cmd` use "cmd" for
+    # "command" and say nothing about the shell, so only the whole name counts.
+    if _CMD_HINT.search(name) or name.strip().lower() in ("cmd", "cmd exe"):
+        return "cmd"
+    hints = {kind for kind, rx in (("powershell", _POWERSHELL_HINT),
+                                   ("posix", _POSIX_HINT), ("cmd", _CMD_HINT))
+             if rx.search(description)}
+    if len(hints) == 1:
+        return hints.pop()
+    return "powershell" if is_windows_platform(platform) else "posix"
+
+
+def find_probe_tool(tools: list[dict[str, Any]] | None,
+                    platform: str | None = None) -> tuple[str, str, str] | None:
+    """(tool_name, arg_key, probe command) for the command tool
+    find_command_tool picks, with the probe written for that tool's shell.
+    `platform` is whatever is already known of the caller's platform (a
+    platform-only prompt, fallback_platform); it only matters when the tool
+    itself does not say which shell it runs."""
+    hit = find_command_tool(tools)
+    if hit is None:
+        return None
+    name, arg_key = hit
+    tool = next(t for t in tools or [] if _tool_schema(t)[0] == name)
+    return name, arg_key, PROBE_COMMANDS[tool_shell_kind(tool, platform)]
+
+
 # ---------------------------------------------------------------------------
 # Probe primitives
 # ---------------------------------------------------------------------------
@@ -572,8 +660,13 @@ def parse_probe_call_id(call_id: str | None) -> str | None:
     return rest
 
 
+# A probe variable that no shell expanded: cmd's %CD%, POSIX $(pwd) / $PWD,
+# PowerShell's $((Get-Location)...).
+_UNEXPANDED = re.compile(r"%CD%|\$\(|\$PWD\b", re.I)
+
+
 def parse_probe_result(content: Any) -> CallerEnvironment | None:
-    """The three labelled lines from PROBE_COMMAND -> CallerEnvironment.
+    """The three labelled lines from a probe (PROBE_COMMANDS) -> CallerEnvironment.
 
     Tolerates shell quoting, surrounding text and any whitespace. Each
     line is matched on its own, so a stray `echo` or warning line that
@@ -589,9 +682,18 @@ def parse_probe_result(content: Any) -> CallerEnvironment | None:
     shell = _label_value(text, "shell")
     if cwd is None and platform is None and shell is None:
         return None
-    if _is_relay_path(cwd):
+    if cwd is not None and _UNEXPANDED.search(cwd):
+        # The probe's text came back echoed, not executed: a shell other
+        # than the one the probe was written for printed it literally
+        # (e.g. the cmd probe under bash). Its other lines are just as
+        # literal, so none of it describes the caller.
+        return None
+    if _is_relay_path(cwd) or "UNC paths are not supported" in text:
+        # cmd.exe refuses a UNC current directory and silently runs in
+        # C:\Windows instead, so a cwd it reports then is not the caller's.
         cwd = None
     return CallerEnvironment(cwd=cwd, platform=platform, shell=shell, source="probe")
+
 
 
 # ---------------------------------------------------------------------------
@@ -630,11 +732,24 @@ def render_system_block(env: CallerEnvironment) -> str:
     not missing. The relay's environment is NEVER substituted as a
     fallback: the relay is the relay, and saying otherwise is the bug.
     """
-    return _SYSTEM_BLOCK_TEMPLATE.format(
+    block = _SYSTEM_BLOCK_TEMPLATE.format(
         platform=_render_field(env.platform),
         cwd=_render_field(env.cwd),
         shell=_render_field(env.shell),
     )
+    if is_windows_platform(env.platform):
+        # The relay CLI's own environment says Linux and names a Linux
+        # directory; on a Windows caller nothing of that shape is usable.
+        block += _WINDOWS_NOTE
+    return block
+
+
+_WINDOWS_NOTE = """
+
+The caller is on Windows. Give its tools paths in the form the caller
+uses (like the working directory above), never a Linux path of the relay,
+and write commands in the syntax of the caller shell above: PowerShell and
+cmd are not POSIX shells."""
 
 
 def render_first_turn_reminder(env: CallerEnvironment) -> str:
