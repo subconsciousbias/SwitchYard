@@ -1076,6 +1076,148 @@ def test_parallel_tool_calls_land_in_one_batch():
     print(f"  {n} parallel tool calls surfaced as one finish_reason=tool_calls turn")
 
 
+# ------------------------------------------------- issue #128: leftover flush ---
+def test_late_parallel_tool_call_surfaces_on_new_turn():
+    """Regression for issue #128.
+
+    A parallel `tool_use` that arrives after mcp_bridge's quiet-period batch
+    has already flushed used to land in `Session.batch_ids` but its `_flush`
+    no-oped against the now-done turn future. The caller's follow-up
+    (`_continue_followup`) then created a new turn whose `turn_future` nothing
+    ever resolved -- the inner CLI blocked on the parked call while the bridge
+    blocked on the turn, holding a gate slot until the 1800 s reaper.
+
+    The fix surfaces any leftover batch the moment `Session.new_turn()` installs
+    a fresh turn_future. This test pins the exact repro from the issue:
+    enqueue A, await turn `[a]`, enqueue B after the future is done, sleep so
+    the no-op flush actually fires (assert `batch_ids` still holds B), then
+    drive `_continue_followup` with the caller's result for A. After the fix
+    the response is `finish_reason=tool_calls` naming only B, `batch_ids` is
+    empty, and A's parked future resolved. On `TimeoutError` (a regression)
+    the held gate slot is released and an `AssertionError` naming #128 lets a
+    regression fail fast instead of hanging the test.
+    """
+    async def scenario():
+        # Fresh gate so unpark_session's acquire_waiting binds its Condition
+        # to THIS event loop, the same pattern as
+        # test_unpark_returns_503_quickly_when_gate_is_full /
+        # test_followup_error_result_does_not_leak (the shared `_gate`
+        # singleton is bound to whichever loop first touched it earlier).
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        try:
+            session = _new_session()
+            session.new_turn()
+
+            # Enqueue A and await turn [a].
+            parked_a = asyncio.create_task(
+                server.register_tool_call(session.id, "a", {"x": 1}))
+            await asyncio.sleep(0)
+            turn_a = await session.turn_future
+            assert turn_a["type"] == "tool_calls", turn_a
+            assert [c.name for c in turn_a["calls"]] == ["a"], turn_a
+            call_a = turn_a["calls"][0]
+            assert session.batch_ids == [], session.batch_ids
+            # Parked state, exactly as the happy path leaves it: awaiting
+            # the caller's tool result, no concurrency slot held.
+            session.awaiting_followup = True
+            session.holds_slot = False
+
+            # Enqueue B *after* the turn future is done. Its BATCH_WINDOW
+            # timer fires against the now-done turn future and no-ops,
+            # leaving B stranded in batch_ids. That stranded state is what
+            # the fix in `Session.new_turn()` rescues when
+            # `_continue_followup` next installs a fresh turn_future.
+            parked_b = asyncio.create_task(
+                server.register_tool_call(session.id, "b", {"y": 2}))
+            await asyncio.sleep(0)
+            call_b_id = session.batch_ids[-1]
+            assert session.batch_ids == [call_b_id], session.batch_ids
+
+            # Sleep so the no-op flush actually fires -- without this the
+            # BATCH_WINDOW timer is still queued in the loop and the next
+            # step would race it. After the sleep, batch_ids still holds B
+            # because `_flush` short-circuited on the done turn_future.
+            await asyncio.sleep(server.BATCH_WINDOW + 0.05)
+            assert session.batch_ids == [call_b_id], session.batch_ids
+            assert session.turn_future.done(), \
+                "turn_future from turn [a] must remain done"
+
+            # Drive `_continue_followup` with the caller's result for A.
+            # The fix should: pop A from pending, resolve A's parked
+            # future, take a fresh turn (which flushes B into the fresh
+            # turn_future), and render a tool_calls response naming only
+            # B. Without the fix this hangs on the fresh turn_future; the
+            # wait_for lets a regression fail fast instead of running out
+            # the test timeout.
+            body = {"model": "m", "messages": [
+                {"role": "tool", "tool_call_id": call_a.id,
+                 "content": '{"x":1}'},
+            ]}
+            try:
+                response = await asyncio.wait_for(
+                    server._continue_followup(body, session.id,
+                                              body["messages"], None),
+                    timeout=server.BATCH_WINDOW + 1)
+            except asyncio.TimeoutError:
+                # Without the fix `_continue_followup` blocks on the new
+                # turn_future, holds the unpark-acquired slot, and never
+                # resolves. Release the slot so the rest of the suite can
+                # proceed and raise an AssertionError naming #128.
+                # `from None` silences the chained TimeoutError so ruff B904
+                # (raise inside except must use `from err`/`from None`) is
+                # satisfied without changing the test's semantics.
+                await server.cli_bridge._gate.release()
+                raise AssertionError(
+                    "issue #128: _continue_followup hung on a leftover "
+                    "batch after `Session.new_turn()` -- the fix that "
+                    "flushes batch_ids into the fresh turn_future is "
+                    "missing") from None
+
+            # The parked-A future was resolved inside the resolve loop;
+            # parked_a task should have completed normally.
+            assert not parked_a.done() or parked_a.exception() is None
+            result_a = await parked_a
+            assert result_a["isError"] is False, result_a
+
+            # park_session does not touch parked calls. Resolve B's parked
+            # future and drain parked_b -- B is the response's surfaced
+            # call, awaiting the caller's tool result that would come next.
+            call_b = session.pending[call_b_id]
+            call_b.future.set_result(
+                {"content": [{"type": "text", "text": '{"y":2}'}],
+                 "isError": False})
+            result_b = await parked_b
+            assert result_b["isError"] is False, result_b
+
+            # The response names only B -- the only call left in the batch
+            # when the new turn installed its fresh turn_future.
+            assert response["choices"][0]["finish_reason"] == "tool_calls", response
+            names = sorted(c["function"]["name"]
+                           for c in response["choices"][0]["message"]["tool_calls"])
+            assert names == ["b"], names
+            # Leftover batch was consumed by the fix; nothing left.
+            assert session.batch_ids == [], session.batch_ids
+            # The session is parked, alive, not holding a slot, the gate is clean.
+            assert session.id in server.SESSIONS, session.id
+            assert session.awaiting_followup, session.awaiting_followup
+            assert not session.holds_slot, session.holds_slot
+            assert server.cli_bridge._gate.in_flight == 0, \
+                server.cli_bridge._gate.in_flight
+            return names
+        finally:
+            server.cli_bridge._gate = saved_gate
+            try:
+                _drop(session)
+            except (NameError, UnboundLocalError):
+                pass
+
+    names = asyncio.run(scenario())
+    print(f"  leftover batch surfaced as the new turn: {names}; "
+          f"batch_ids empty; gate in_flight=0")
+
+
 # ------------------------------------------------------------------- reaping ---
 def test_reap_abandoned_session():
     async def scenario():

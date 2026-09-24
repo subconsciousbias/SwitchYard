@@ -391,6 +391,17 @@ class Session:
 
     def new_turn(self) -> "asyncio.Future":
         self.turn_future = asyncio.get_event_loop().create_future()
+        # Issue #128: a parallel tool_use that arrives after this session's
+        # quiet-period batch has already flushed lands in `batch_ids` but its
+        # `_flush` no-ops against the now-done turn_future -- so the leftover
+        # sits there until something installs a fresh turn to resolve against.
+        # `new_turn()` is the single site that does that for the follow-up
+        # path (`_continue_followup`), and it is also where any future caller
+        # of `new_turn()` will land. Surface the leftover here instead of
+        # re-arming the timer (which while parked would become a perpetual
+        # 250 ms poll against a never-changing queue).
+        if self.batch_ids:
+            self._flush()
         return self.turn_future
 
     def enqueue(self, call: ParkedCall) -> None:
