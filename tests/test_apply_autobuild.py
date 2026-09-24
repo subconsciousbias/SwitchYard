@@ -342,6 +342,55 @@ def test_service_without_a_container_is_planned_for_start():
     _with(check)
 
 
+def test_env_key_removed_from_compose_recreates_that_service():
+    """A variable dropped from compose/.env that the old container still
+    carries is drift too (#291 review) -- named, never valued."""
+    def check(sb):
+        sb.update(lambda st: st["services"]["gateway"]["environment"].pop("GLM_API_KEY"))
+        build, recreate, out = sb.plan()
+        assert build == [], build
+        assert list(recreate) == ["gateway"], recreate
+        assert "no longer set: GLM_API_KEY" in recreate["gateway"], recreate
+        assert "secret" not in out and "secret" not in recreate["gateway"], out
+    _with(check)
+
+
+def test_image_own_env_is_not_mistaken_for_a_removed_key():
+    """The container inherits the image's ENV (PATH, PYTHON_VERSION, ...);
+    those keys are not in compose and must not trigger a recreate."""
+    def check(sb):
+        def seed(st):
+            img = st["images"]["switchyard-sidecar:latest"]
+            img["Env"] = ["PATH=/usr/local/bin:/usr/bin", "PYTHON_VERSION=3.12.4"]
+            st["containers"]["codex-sidecar"]["Env"] += img["Env"]
+        sb.update(seed)
+        _, recreate, _ = sb.plan()
+        assert recreate == {}, recreate
+        # ...but an image ENV key the container holds with ANOTHER value
+        # (compose used to override it and no longer does) is drift.
+        sb.update(lambda st: st["containers"]["codex-sidecar"]["Env"].append(
+            "PYTHON_VERSION=3.11.0"))
+        _, recreate, _ = sb.plan()
+        assert "no longer set: PYTHON_VERSION" in recreate.get("codex-sidecar", ""), recreate
+    _with(check)
+
+
+def test_every_container_of_a_service_is_checked_not_just_the_first():
+    """Two containers for one service (scaled, or a stale leftover of a
+    half-finished recreate): a stale one must not hide behind a current one,
+    whichever order `compose ps` lists them in."""
+    def check(sb):
+        def add_stale(st):
+            cur = st["containers"]["codex-sidecar"]
+            st["containers"]["codex-sidecar-stale"] = dict(
+                cur, ID="c-codex-sidecar-2", Image="sha256:old", Service="codex-sidecar")
+        sb.update(add_stale)
+        _, recreate, _ = sb.plan()
+        assert list(recreate) == ["codex-sidecar"], recreate
+        assert "older image" in recreate["codex-sidecar"], recreate
+    _with(check)
+
+
 # ------------------------------------------------------------------ apply.sh
 
 
@@ -591,3 +640,33 @@ def test_apply_fails_when_an_idle_batch_member_never_gets_healthy():
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
+
+
+def test_apply_fast_dry_run_still_prints_the_image_plan():
+    """--fast --dry-run previews the same image plan as --dry-run (what would
+    be rebuilt and why) before the fast recreate line, and mutates nothing."""
+    def check(sb):
+        sb.edit("sidecars/mcp_bridge/server.py")
+        res = sb.apply("--fast", "--dry-run")
+        assert res.returncode == 0, (res.stdout, res.stderr)
+        out = res.stdout
+        assert "images (content hash of Dockerfile" in out, out
+        assert re.search(r"claude-max-sidecar\s+REBUILD", out), out
+        assert out.index("REBUILD") < out.index("(dry-run) would recreate:"), out
+        assert _mutating(sb.log_lines()) == [], sb.log_lines()
+    _with(check)
+
+
+def test_apply_health_probe_follows_the_published_gateway_port():
+    """svc_ready asks compose where the gateway is published (GATEWAY_PORT /
+    BIND_ADDR) instead of assuming localhost:4000."""
+    def check(sb):
+        sb.update(lambda st: st.update(ports={"gateway": "127.0.0.1:4555"}))
+        sb.update(lambda st: st["services"]["gateway"]["environment"].update(
+            GLM_API_KEY="secret-2"))
+        res = sb.apply()
+        assert res.returncode == 0, (res.stdout, res.stderr)
+        curls = [ln for ln in sb.log_lines() if ln.startswith("curl ")]
+        assert any("http://127.0.0.1:4555/health/liveliness" in ln for ln in curls), curls
+        assert not any(":4000/" in ln for ln in curls), curls
+    _with(check)

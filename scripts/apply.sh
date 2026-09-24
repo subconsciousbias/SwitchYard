@@ -215,13 +215,6 @@ tsv_list() {   # tsv_list KIND -> space-separated service names
 svc_field() {  # svc_field SERVICE N -> field N of that service's row
   awk -F'\t' -v s="$1" -v n="$2" '$1=="service" && $2==s {print $n; exit}' "$plan_file"
 }
-recreate_reason() {
-  awk -F'\t' -v s="$1" '$1=="recreate" && $2==s {print $3; exit}' "$plan_file"
-}
-in_list() {    # in_list WORD "LIST"
-  case " $2 " in *" $1 "*) return 0 ;; esac
-  return 1
-}
 
 # ---------------------------------------------------------------- 1. sync-env
 echo "==> propagating .env.example keys (appends only, never overwrites)"
@@ -360,8 +353,11 @@ is_idle() {  # is_idle SERVICE -> 0 when no model turn is running
   [ "$state" = "running" ] || return 0       # nothing running = nothing to drain
   case "$svc" in
     portal) return 0 ;;                        # the board holds no requests
-    gateway) [ "$(total_inflight)" -eq 0 ]; return ;;
   esac
+  if [ "$svc" = "gateway" ]; then
+    [ "$(total_inflight)" -eq 0 ] && return 0
+    return 1
+  fi
   plan="$(svc_field "$svc" 4)"
   [ -n "$plan" ] && [ "$plan" != "-" ] || return 0
   [ "$(inflight "$plan")" -eq 0 ] || return 1
@@ -370,11 +366,29 @@ is_idle() {  # is_idle SERVICE -> 0 when no model turn is running
 }
 
 # ---- readiness: what "came back" means per service ----
+# The gateway/portal probes go to wherever compose actually published the
+# container port (GATEWAY_PORT / PORTAL_PORT / BIND_ADDR in .env), asked of
+# `docker compose port` on every poll -- a recreated container may not be
+# published yet, and then the compose default is the fallback (the probe just
+# fails that round and the next poll asks again).
+published_url() {  # published_url SERVICE CONTAINER_PORT -> http://host:port
+  local out host port
+  out="$(docker compose port "$1" "$2" 2>/dev/null | head -1 || true)"
+  port="${out##*:}"
+  host="${out%:*}"
+  case "$port" in ''|*[!0-9]*) port="$2"; host="" ;; esac
+  case "$host" in ''|0.0.0.0|'[::]'|::) host="localhost" ;; esac
+  echo "http://${host}:${port}"
+}
 svc_ready() {
   local svc="$1" cid status
   case "$svc" in
-    portal)  curl -fsS -m 2 http://localhost:4001/healthz >/dev/null 2>&1; return ;;
-    gateway) curl -fsS -m 2 http://localhost:4000/health/liveliness >/dev/null 2>&1; return ;;
+    portal)
+      curl -fsS -m 2 "$(published_url portal 4001)/healthz" >/dev/null 2>&1 && return 0
+      return 1 ;;
+    gateway)
+      curl -fsS -m 2 "$(published_url gateway 4000)/health/liveliness" >/dev/null 2>&1 && return 0
+      return 1 ;;
   esac
   cid="$(docker compose ps -q "$svc" 2>/dev/null | head -1 || true)"
   [ -n "$cid" ] || return 1
@@ -468,8 +482,12 @@ drain_one() {
     }
     draining_plan=""
     trap clear_drain_flag EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    # Ignore further signals FIRST: under a process-group kill the job gets
+    # the signal directly AND again from the parent's on_exit forward; a
+    # second TERM landing in the EXIT trap before clear_drain_flag's own
+    # `trap ''` would re-run `exit` and skip the DEL.
+    trap 'trap "" INT TERM; exit 130' INT
+    trap 'trap "" INT TERM; exit 143' TERM
     echo "==> draining $svc (plan=$plan, in_flight=$(inflight "$plan"))"
 
     # (1) flip the picker gate. SET (not SETNX) — a previous apply that
@@ -620,7 +638,8 @@ if [ "$dry_run" -eq 1 ]; then
     echo "    (nothing to recreate — every container runs its current image and environment)"
   fi
   for svc in $idle_svcs; do
-    printf "    %-22s idle -> one batched recreate   (%s)\n" "$svc" "$(recreate_reason "$svc")"
+    reason="$(awk -F'\t' -v s="$svc" '$1=="recreate" && $2==s {print $3; exit}' "$plan_file")"
+    printf "    %-22s idle -> one batched recreate   (%s)\n" "$svc" "$reason"
   done
   for svc in $busy_svcs; do
     plan="$(svc_field "$svc" 4)"

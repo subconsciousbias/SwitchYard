@@ -32,9 +32,15 @@ Which containers need a recreate -- exact, from Docker's own state:
     never recreated);
   * a consumer whose container environment differs from what compose would
     create now (`docker compose config` resolves .env interpolation) -- that is
-    how a .env edit is detected. Values are compared in memory and never
-    printed; only KEY names are reported;
+    how a .env edit is detected. Both directions count: a key compose sets
+    that the container lacks or holds differently, and a key the container
+    still carries that compose no longer sets (the image's own ENV excepted).
+    Values are compared in memory and never printed; only KEY names are
+    reported;
   * a consumer with no container at all (new service, or removed).
+
+A service with several containers (scaled, or a stale one left by a
+half-finished recreate) has every container checked, not just the first.
 
 Only `docker compose config`, `docker image inspect`, `docker compose ps` and
 `docker inspect` are called by `plan`; it never mutates anything.
@@ -252,45 +258,66 @@ def image_info(tag: str, root: str) -> dict | None:
     return data[0] if data else None
 
 
-def containers(root: str) -> dict[str, dict]:
-    """{service: docker-inspect doc of its (first) container}."""
+def containers(root: str) -> dict[str, list[dict]]:
+    """{service: docker-inspect docs of EVERY container it has}, running ones
+    first. A service can have more than one (a scaled service, or a stale
+    container left by a half-finished recreate); the plan checks them all, so
+    a stale one cannot hide behind a current one."""
     p = _docker(["compose", "ps", "-a", "--format", "json"], root)
     if p.returncode != 0 or not p.stdout.strip():
         return {}
     text = p.stdout.strip()
     rows = json.loads(text) if text.startswith("[") else [
         json.loads(ln) for ln in text.splitlines() if ln.strip()]
-    ids: dict[str, str] = {}
+    ids: dict[str, list[str]] = {}
     for r in rows:
-        svc = r.get("Service")
-        if svc and svc not in ids:
-            ids[svc] = r.get("ID")
+        svc, cid = r.get("Service"), r.get("ID")
+        if svc and cid:
+            ids.setdefault(svc, []).append(cid)
     if not ids:
         return {}
-    q = _docker(["inspect", *ids.values()], root)
+    q = _docker(["inspect", *(c for cs in ids.values() for c in cs)], root)
     docs = json.loads(q.stdout) if q.stdout.strip() else []
-    by_id = {d.get("Id", ""): d for d in docs}
-    out = {}
-    for svc, cid in ids.items():
-        for full, doc in by_id.items():
-            if cid and full.startswith(cid):
-                out[svc] = doc
+    out: dict[str, list[dict]] = {}
+    for svc, cids in ids.items():
+        found = [d for d in docs for cid in cids if d.get("Id", "").startswith(cid)]
+        if found:
+            found.sort(key=lambda d: ((d.get("State") or {}).get("Status") != "running"))
+            out[svc] = found
     return out
 
 
-def env_drift(expected: dict, container_env: list[str]) -> list[str]:
-    """KEY names whose value the container does not have. Never values."""
-    have = {}
-    for item in container_env or []:
+def _env_map(items: list[str] | None) -> dict[str, str]:
+    out = {}
+    for item in items or []:
         k, _, v = item.partition("=")
-        have[k] = v
-    drift = []
-    for k, v in sorted((expected or {}).items()):
-        if v is None:
+        out[k] = v
+    return out
+
+
+def env_drift(expected: dict, container_env: list[str],
+              image_env: list[str] | None = None) -> tuple[list[str], list[str]]:
+    """(changed, removed) KEY names -- never values.
+
+    changed: compose sets KEY and the container lacks it or has another value.
+    removed: the container has KEY, compose no longer sets it, and it is not
+    simply the image's own ENV (PATH, PYTHON_VERSION, ...) -- a variable
+    dropped from compose/.env that the old container still carries."""
+    have = _env_map(container_env)
+    base = _env_map(image_env)
+    expected = expected or {}
+    changed = [k for k, v in sorted(expected.items())
+               if v is not None and have.get(k) != str(v)]
+    removed = []
+    for k, v in sorted(have.items()):
+        if k in expected:
             continue
-        if have.get(k) != str(v):
-            drift.append(k)
-    return drift
+        if k in base and base[k] == v:
+            continue
+        if k == "PATH" and "PATH" not in base:   # the daemon's default PATH
+            continue
+        removed.append(k)
+    return changed, removed
 
 
 # ------------------------------------------------------------------ plan
@@ -304,6 +331,7 @@ def make_plan(root: str, force: bool = False, no_build: bool = False) -> dict:
 
     images = []      # [(svc, action, reason)]
     tag_ids = {}     # tag -> image id AFTER this run (None when being rebuilt)
+    tag_env = {}     # tag -> the image's own ENV (a container inherits it)
     rebuilt_tags = set()
     for svc, b in builds.items():
         ctx = b["context"] if os.path.isabs(b["context"]) else os.path.join(root, b["context"])
@@ -322,6 +350,7 @@ def make_plan(root: str, force: bool = False, no_build: bool = False) -> dict:
         if force:
             reason = "forced (--build)" + (f"; {reason}" if reason else "")
         tag_ids[tag] = (info or {}).get("Id")
+        tag_env[tag] = ((info or {}).get("Config") or {}).get("Env") or []
         if reason and not no_build:
             images.append((svc, "build", reason))
             rebuilt_tags.add(tag)
@@ -343,20 +372,24 @@ def make_plan(root: str, force: bool = False, no_build: bool = False) -> dict:
             continue
         env = spec.get("environment") or {}
         plan = env.get("SWITCHYARD_PLAN") or "-"
-        doc = ctrs.get(svc)
-        state = ((doc or {}).get("State") or {}).get("Status") or "absent"
+        docs = ctrs.get(svc) or []
+        state = ((docs[0] if docs else {}).get("State") or {}).get("Status") or "absent"
         svc_rows.append((svc, owner, plan, state))
         reasons = []
         if tag in rebuilt_tags:
             reasons.append(f"image {owner} rebuilt")
-        if doc is None:
+        if not docs:
             reasons.append("no container")
-        else:
+        for doc in docs:
             if tag not in rebuilt_tags and tag_ids.get(tag) and doc.get("Image") != tag_ids[tag]:
                 reasons.append("container runs an older image than the tag")
-            drift = env_drift(env, (doc.get("Config") or {}).get("Env") or [])
-            if drift:
-                reasons.append("environment changed: " + summarise(drift))
+            changed, removed = env_drift(env, (doc.get("Config") or {}).get("Env") or [],
+                                         tag_env.get(tag))
+            if changed:
+                reasons.append("environment changed: " + summarise(changed))
+            if removed:
+                reasons.append("environment no longer set: " + summarise(removed))
+        reasons = list(dict.fromkeys(reasons))
         if reasons:
             recreate.append((svc, "; ".join(reasons)))
     return {"images": images, "services": svc_rows, "recreate": recreate}

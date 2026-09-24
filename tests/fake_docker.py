@@ -26,8 +26,13 @@ State shape (all keys optional except `services`):
       "health_after": {"codex-sidecar": "unhealthy"},  # Health after a recreate
       "preflight_fail": ["codex-sidecar"],
       "redis_get": {"switchyard:router_sig": "abc"},   # redis-cli GET answers
-      "logs": ["", "gateway reloaded in place"]        # successive `compose logs`
+      "logs": ["", "gateway reloaded in place"],       # successive `compose logs`
+      "ports": {"gateway": "127.0.0.1:4555"}           # `compose port` answers
     }
+
+A container row may carry "Service" when its key is not the service name
+(two containers of one service). Image rows may carry "Env", the image's own
+ENV, which a recreated container inherits under the compose environment.
 
 Concurrent invocations (apply.sh runs drains in background jobs) are
 serialised with an fcntl lock on the state file.
@@ -45,7 +50,8 @@ import sys
 FAKE_CURL = """#!/bin/sh
 # Fake curl: the gateway's liveliness probe succeeds, everything else (the
 # portal's /healthz and /admin/reload) is unreachable -- so no test can ever
-# reach a live stack on localhost.
+# reach a live stack on localhost. Each call is logged as "curl ARGS".
+[ -n "$FAKE_DOCKER_LOG" ] && echo "curl $*" >> "$FAKE_DOCKER_LOG"
 for a in "$@"; do
   case "$a" in *health/liveliness*) exit 0 ;; esac
 done
@@ -85,8 +91,11 @@ def _pop(seq_map: dict, key: str, default):
     return seq[0] if seq else default
 
 
-def _env_list(spec: dict) -> list[str]:
-    return [f"{k}={v}" for k, v in (spec.get("environment") or {}).items() if v is not None]
+def _env_list(spec: dict, image_env: list[str] | None = None) -> list[str]:
+    env = dict(e.partition("=")[::2] for e in image_env or [])
+    env.update({k: str(v) for k, v in (spec.get("environment") or {}).items()
+                if v is not None})
+    return [f"{k}={v}" for k, v in env.items()]
 
 
 def _recreate(state: dict, svc: str) -> None:
@@ -98,7 +107,7 @@ def _recreate(state: dict, svc: str) -> None:
         img = {"Id": f"sha256:pulled-{svc}", "Labels": {}}
         state["images"][tag] = img
     state.setdefault("containers", {})[svc] = {
-        "ID": f"c-{svc}", "Image": img["Id"], "Env": _env_list(spec),
+        "ID": f"c-{svc}", "Image": img["Id"], "Env": _env_list(spec, img.get("Env")),
         "Status": "running",
         "Health": state.get("health_after", {}).get(svc, "healthy"),
     }
@@ -141,7 +150,16 @@ def _c_ps(state, rest):
             print(c["ID"])
         return 0
     for svc, c in containers.items():
-        print(json.dumps({"Service": svc, "ID": c["ID"], "State": c["Status"]}))
+        print(json.dumps({"Service": c.get("Service", svc), "ID": c["ID"],
+                          "State": c["Status"]}))
+    return 0
+
+
+def _c_port(state, rest):
+    ans = state.get("ports", {}).get(rest[0]) if rest else None
+    if not ans:
+        return 1
+    print(ans)
     return 0
 
 
@@ -232,7 +250,7 @@ def _c_exec(state, rest):
 
 
 COMPOSE = {"config": _c_config, "ps": _c_ps, "build": _c_build, "up": _c_up,
-           "stop": _c_stop, "logs": _c_logs, "exec": _c_exec}
+           "stop": _c_stop, "logs": _c_logs, "exec": _c_exec, "port": _c_port}
 
 
 def _image_inspect(state, tag):
@@ -241,7 +259,8 @@ def _image_inspect(state, tag):
         print(f"Error: No such image: {tag}", file=sys.stderr)
         print("[]")
         return 1
-    print(json.dumps([{"Id": img["Id"], "Config": {"Labels": img.get("Labels") or {}}}]))
+    print(json.dumps([{"Id": img["Id"], "Config": {"Labels": img.get("Labels") or {},
+                                                   "Env": img.get("Env") or []}}]))
     return 0
 
 

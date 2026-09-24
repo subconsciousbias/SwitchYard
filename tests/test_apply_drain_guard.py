@@ -339,6 +339,21 @@ def test_apply_sets_ttl_and_clears_on_happy_path():
     print("  happy path: SET argv carries EX 601, final DEL ran, exit 0")
 
 
+def test_drain_job_signal_handlers_ignore_a_second_signal_first():
+    """Under a process-group kill the drain job gets TERM directly and again
+    from the parent's on_exit forward. If its handler were a bare `exit 143`,
+    the second TERM could land in the EXIT trap before clear_drain_flag's own
+    `trap ''` and skip the DEL (seen as a CI flake of the test above). The
+    handlers must ignore INT/TERM before exiting."""
+    with open(os.path.join(ROOT, "scripts", "apply.sh")) as fh:
+        text = fh.read()
+    body = text[text.index("drain_one() {"):]
+    body = body[:body.index("\n}\n")]
+    assert """trap 'trap "" INT TERM; exit 143' TERM""" in body, body[:1500]
+    assert """trap 'trap "" INT TERM; exit 130' INT""" in body, body[:1500]
+    assert "trap 'exit 143' TERM" not in body
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
