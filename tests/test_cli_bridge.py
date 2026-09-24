@@ -1302,7 +1302,7 @@ def _pdf_msg(data: bytes = b"%PDF-1.4") -> list[dict]:
             "url": "data:image/png;base64," + base64.b64encode(PNG_MAGENTA).decode()}}]}]
 
 
-def _run_pdf_chat(provider: str) -> dict:
+def _run_pdf_chat(provider: str, **extra) -> dict:
     """Drive _handle_chat with a PDF + an image on `provider`; the fake
     invoke records the prompt and the argv the CLI would get (built while
     the staged files still exist)."""
@@ -1313,9 +1313,9 @@ def _run_pdf_chat(provider: str) -> dict:
                           web=False, effort=None):
         paths = list(image_paths or [])
         argv, stdin_data = server.build_argv(prompt, system, model, image_paths=paths)
-        seen.update(prompt=prompt, paths=paths, argv=argv, stdin=stdin_data,
+        seen.update(prompt=prompt, paths=paths, argv=argv, stdin=stdin_data, fmt=fmt,
                     bytes=[p.read_bytes() for p in paths])
-        return {"result": "ok", "usage": {}}
+        return {"result": '{"a": "x"}', "usage": {}}     # valid for every format
 
     real = (server.invoke, server.PROVIDER, server.PROFILE, server.CLI)
     try:
@@ -1323,10 +1323,49 @@ def _run_pdf_chat(provider: str) -> dict:
         server.PROVIDER = provider
         server.PROFILE = server.PROFILES[provider]
         server.CLI = server.PROFILE["cli"]
-        asyncio.run(server._handle_chat({"model": "m", "messages": _pdf_msg()}))
+        asyncio.run(server._handle_chat({"model": "m", "messages": _pdf_msg(), **extra}))
     finally:
         server.invoke, server.PROVIDER, server.PROFILE, server.CLI = real
     return seen
+
+
+def test_pdf_prompt_keeps_the_response_format_on_codex_and_opencode():
+    """#283 (response_format) and #286 (PDF -> text + pages) meet in
+    _complete: the expanded PDF's text, the image note AND the schema
+    instruction all reach the prompt; a codex strict schema still goes to
+    the CLI natively (fmt passed to invoke, no prompt instruction), an
+    opencode strict schema as the full instruction after the image note."""
+    from _modules import FakePoppler
+    for provider in ("codex", "opencode"):
+        with FakePoppler():
+            seen = _run_pdf_chat(provider, response_format={"type": "json_object"})
+        prompt = seen["prompt"]
+        assert "EXTRACTED TEXT" in prompt, prompt
+        assert prompt.index("[3 image(s) attached to this prompt:") \
+            < prompt.index("Respond with only a single JSON object"), prompt
+        assert seen["fmt"] is None, seen["fmt"]
+        assert len(seen["paths"]) == 3, seen["paths"]
+    strict = {"type": "json_schema", "json_schema": {
+        "name": "s", "strict": True, "schema": {
+            "type": "object", "properties": {"a": {"type": "string"}},
+            "required": ["a"], "additionalProperties": False}}}
+    with FakePoppler():
+        seen = _run_pdf_chat("codex", response_format=strict)
+    assert seen["fmt"] and seen["fmt"]["strict"], seen["fmt"]
+    assert "EXTRACTED TEXT" in seen["prompt"] and "JSON Schema" not in seen["prompt"], seen
+    # opencode never enforces a schema itself: the strict schema rides the
+    # prompt as an instruction (with the schema dump), after the image note.
+    with FakePoppler():
+        seen = _run_pdf_chat("opencode", response_format=strict)
+    prompt = seen["prompt"]
+    assert seen["fmt"] is None, seen["fmt"]
+    assert "EXTRACTED TEXT" in prompt, prompt
+    instruction = ("Respond with only a JSON value that validates against this JSON "
+                   "Schema: no prose before or after it, no code fences.\n"
+                   + json.dumps(strict["json_schema"]["schema"]))
+    assert prompt.index("[3 image(s) attached to this prompt:") \
+        < prompt.index(instruction), prompt
+    print("  PDF prompt + response_format: text, page note and schema all survive")
 
 
 def test_pdf_prompt_on_codex_and_opencode_is_text_plus_page_images():
