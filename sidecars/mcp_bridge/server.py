@@ -324,6 +324,28 @@ class _SupersedeSignal(RuntimeError):
         self.reason = reason
 
 
+class _ReapedSignal(RuntimeError):
+    """Mid-turn idle-reaper signal (issue #197).
+
+    Raised on the in-flight `turn_future` by `reap_session` when the
+    1800 s idle reaper (or an explicit `reap_session` call) wins the race
+    against a follow-up that is already inside `_continue_followup`'s
+    `await_turn`. The signal carries its reason on the exception object
+    itself -- by *type*, not by message text -- which is what makes the
+    race-free design work: a parallel `reap_session`'s `end_session`
+    call cannot lose the marker to a reset because there is no shared
+    marker to reset. `str()` stays fixed at "session reaped" so the
+    existing 499 mapping in `await_turn`, which matches the bare
+    RuntimeError the disconnect path raises on the substring
+    `"reaped" in str(exc)`, keeps working unchanged: `_ReapedSignal` is
+    still a RuntimeError and its message text is unchanged, so the
+    substring match still fires on the disconnect path while the new
+    `_continue_followup` catch picks the typed reaper race up off the
+    type itself and rebuilds the loop instead of letting it escape as a
+    500.
+    """
+
+
 @dataclass
 class ParkedCall:
     id: str
@@ -1649,7 +1671,7 @@ async def reap_session(session: Session) -> None:
                 len(session.pending))
     session.fail_pending(f"session {session.id} reaped after {SESSION_TTL:.0f}s idle")
     if session.turn_future is not None and not session.turn_future.done():
-        session.turn_future.set_exception(RuntimeError("session reaped"))
+        session.turn_future.set_exception(_ReapedSignal("session reaped"))
     if session.proc is not None and session.proc.returncode is None:
         with contextlib.suppress(ProcessLookupError):
             session.proc.kill()
@@ -2727,6 +2749,19 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
                     return await resume_gone_session(
                         body, body.get("tools") or [], session.id, request,
                         why="superseded mid-turn")
+                # Issue #197: the 1800 s idle reaper (or an explicit
+                # reap_session call) won the race against this
+                # follow-up and failed the in-flight `turn_future` with
+                # a `_ReapedSignal`. The reaped session is gone from
+                # SESSIONS (reap_session already called end_session);
+                # rebuild from the request's full history so the
+                # caller is not trapped by a 500. Order relative to
+                # `_SupersedeSignal` does not matter -- distinct
+                # types. Every other exception still re-raises below.
+                if isinstance(exc, _ReapedSignal):
+                    return await resume_gone_session(
+                        body, body.get("tools") or [], session.id, request,
+                        why="reaped as the follow-up arrived")
                 raise
             return response
         # Could be a lost session, ids from a parallel batch we already
@@ -2788,6 +2823,18 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
             return await resume_gone_session(
                 body, body.get("tools") or [], session.id, request,
                 why="superseded mid-turn")
+        # Issue #197: the 1800 s idle reaper (or an explicit
+        # reap_session call) won the race against this follow-up and
+        # failed the in-flight `turn_future` with a `_ReapedSignal`.
+        # The reaped session is gone from SESSIONS (reap_session
+        # already called end_session); rebuild from the request's full
+        # history so the caller is not trapped by a 500. Order
+        # relative to `_SupersedeSignal` does not matter -- distinct
+        # types. Every other exception still re-raises below.
+        if isinstance(exc, _ReapedSignal):
+            return await resume_gone_session(
+                body, body.get("tools") or [], session.id, request,
+                why="reaped as the follow-up arrived")
         raise
     return response
 

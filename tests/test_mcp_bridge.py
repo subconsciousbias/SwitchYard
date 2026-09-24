@@ -6430,6 +6430,211 @@ def test_followup_duplicate_delivery_in_flight_attaches_to_running_turn():
         restore()
 
 
+def test_followup_reaped_mid_turn_rebuilds_instead_of_500():
+    """Regression for issue #197.
+
+    A follow-up races the 1800 s idle reaper (or an explicit
+    `reap_session` call) on the same mcp_bridge session: follow-up #1
+    resolves its parked tool_call_ids, calls unpark_session, then awaits
+    the new turn_future while the CLI is still working. While that turn
+    is pending, the reaper fires `reap_session` on the same session
+    (the idle TTL has been reached, or the operator asked for it
+    directly). `reap_session` fails the in-flight `turn_future` with a
+    `_ReapedSignal`.
+
+    Before this fix, that bare `RuntimeError("session reaped")` escaped
+    the `except BaseException` teardown in `_continue_followup` and the
+    gateway saw a 500 (in tests, where `await_turn` does not map the
+    bare RuntimeError to a 499 because the request is in-process). The
+    pre-existing 499 mapping in `await_turn` was already a substring
+    match on `"reaped" in str(exc)` -- a brittle pattern that mirrors
+    nothing in the typed-signal design PR #306 introduced for the
+    supersede race. After this fix, the catch recognises the typed
+    `_ReapedSignal`, rebuilds via `resume_gone_session`, and returns the
+    rebuilt response instead of letting the signal escape. Reverting
+    the server.py change reproduces the production error verbatim.
+    """
+    captured: list = []
+    restore = _stub_start_session(captured)
+    try:
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            # Parked with a real parked call whose id the follow-up WILL name
+            # so the resolve loop resolves ONE call (the normal continue
+            # path) -- not the resolved == 0 branch the parallel-batch test
+            # exercises. `register_tool_call` is what tool_server.py invokes
+            # from its inner CLI; it blocks until `set_result` is called
+            # from `_continue_followup`'s resolve loop. `new_turn()` is
+            # called first because Session.enqueue's _flush only resolves a
+            # turn_future that exists.
+            parked = asyncio.create_task(
+                server.register_tool_call(session.id, "get_weather",
+                                          {"city": "Oslo"}))
+            await asyncio.sleep(0)
+            turn = await session.turn_future
+            assert turn["type"] == "tool_calls", turn
+            session.awaiting_followup = True
+            parked_id = next(iter(session.pending))
+
+            # Concurrent reap -- 50 ms after _continue_followup starts
+            # awaiting the new turn_future. The gap mirrors the production
+            # race window (a follow-up that arrives after the operator (or
+            # a hot path) reaped an already-idle session). On a reaped
+            # session `reap_session` is idempotent: end_session's dead-guard
+            # makes a second call a no-op, so the only side effect we are
+            # racing is the `set_exception(_ReapedSignal)` on the
+            # in-flight turn_future.
+            async def race():
+                await asyncio.sleep(0.05)
+                await server.reap_session(session)
+
+            reap_task = asyncio.create_task(race())
+
+            body = {"model": "m",
+                    "tools": [{"type": "function", "function": {
+                        "name": "get_weather", "description": "",
+                        "parameters": {"type": "object",
+                                       "properties": {}}}}],
+                    "messages": [
+                        {"role": "user", "content": "weather in Oslo?"},
+                        {"role": "assistant", "content": None, "tool_calls": [
+                            {"id": parked_id, "type": "function",
+                             "function": {"name": "get_weather",
+                                          "arguments": '{"city":"Oslo"}'}}]},
+                        {"role": "tool", "tool_call_id": parked_id,
+                         "content": '{"temp_c":-3}'},
+                    ]}
+            tool_msgs = body["messages"][2:]
+            # Drive _continue_followup directly with request=None (the test
+            # path through await_turn skips its RuntimeError-to-HTTPException
+            # mapping and propagates the underlying error -- which is exactly
+            # the surface _continue_followup's catch handles).
+            try:
+                result = await server._continue_followup(body, session.id,
+                                                         tool_msgs, None)
+                await reap_task
+                return result, session
+            finally:
+                # The parked call's future was resolved by _continue_followup
+                # BEFORE reap fired, so the register_tool_call task returns
+                # cleanly. Consume it here so asyncio does not log a "future
+                # exception was never retrieved" warning if the race
+                # ordering ever shifts.
+                with contextlib.suppress(Exception):
+                    await parked
+
+        result, session = asyncio.run(scenario())
+        # The rebuild fired -- start_session was called exactly once.
+        assert len(captured) == 1, captured
+        # And the caller got the rebuilt response back, NOT the
+        # `_ReapedSignal` (or pre-fix bare RuntimeError) that used to
+        # escape and surface as a 500.
+        assert result == {"stubbed": True}, result
+        # The reaped session is gone from SESSIONS and marked dead.
+        # The exception that would have escaped pre-fix had the same
+        # "session reaped" message text, so a future regression that
+        # drops the catch reproduces the exact production error.
+        assert session.id not in server.SESSIONS, dict(server.SESSIONS)
+        assert session.dead, session
+        print(f"  follow-up caught its own reap and rebuilt: "
+              f"start_session called once; session {session.id[:8]}... "
+              f"ended")
+    finally:
+        restore()
+
+
+def test_followup_duplicate_delivery_reaped_mid_turn_rebuilds_instead_of_500():
+    """Regression for issue #197, second catch site.
+
+    Same race as `test_followup_reaped_mid_turn_rebuilds_instead_of_500`,
+    but on the duplicate-delivery-in-flight branch in `_continue_followup`
+    (the one whose `except BaseException` was added in PR #306 alongside
+    the main path). The duplicate-delivery path fires when the follow-up's
+    tool_call_ids match nothing parked AND the session's `turn_future` is
+    still in flight -- the natural supersede+rebuild path would race the
+    CLI, so this branch attaches to the running turn instead. The new
+    `_ReapedSignal` catch has to fire here too, otherwise a follow-up that
+    loses the in-flight race to the idle reaper still escapes as a 500.
+    """
+    captured: list = []
+    restore = _stub_start_session(captured)
+    try:
+        async def scenario():
+            session = _new_session()
+            # Start the original turn (the one the follow-up is
+            # duplicating). We do NOT call register_tool_call: this
+            # branch fires when the follow-up's ids match nothing
+            # parked (resolved == 0) but the session is mid-turn.
+            session.new_turn()
+            session.awaiting_followup = False   # mid-turn state
+            # Mark the old id as already-resolved so the follow-up is
+            # unambiguously a duplicate (not in pending, but already
+            # consumed). The resolve loop iterates pending; an empty
+            # pending means resolved stays at 0, which is what the new
+            # branch's condition requires.
+            old_id = "call_old_1"
+            session.mark_resolved(old_id)
+
+            # Concurrent reap -- 50 ms after _continue_followup starts
+            # awaiting the in-flight turn_future. The turn_future has
+            # to still be pending when reap fires, otherwise
+            # `set_exception` is a no-op and the catch never sees the
+            # signal. Mirrors the main test's 50 ms gap.
+            async def race():
+                await asyncio.sleep(0.05)
+                await server.reap_session(session)
+
+            reap_task = asyncio.create_task(race())
+
+            body = {"model": "m",
+                    "tools": [{"type": "function", "function": {
+                        "name": "get_weather", "description": "",
+                        "parameters": {"type": "object",
+                                       "properties": {}}}}],
+                    "messages": [
+                        {"role": "user", "content": "weather in Oslo?"},
+                        {"role": "assistant", "content": None, "tool_calls": [
+                            {"id": old_id, "type": "function",
+                             "function": {"name": "get_weather",
+                                          "arguments": '{}'}}]},
+                        {"role": "tool", "tool_call_id": old_id,
+                         "content": "{}"},
+                    ]}
+            tool_msgs = body["messages"][2:]
+            try:
+                result = await server._continue_followup(body, session.id,
+                                                         tool_msgs, None)
+                await reap_task
+                return result, session
+            finally:
+                # The branch attaches to the running turn; if it parked
+                # instead, drain the parked-future warning.
+                if (session.id in server.SESSIONS
+                        and session.turn_future is not None
+                        and not session.turn_future.done()):
+                    with contextlib.suppress(Exception):
+                        await session.turn_future
+
+        result, session = asyncio.run(scenario())
+        # The rebuild fired -- start_session was called exactly once
+        # (the duplicate-delivery-in-flight branch's natural attachment
+        # would have called start_session ZERO times; the typed catch
+        # converts the in-flight reap race into a rebuild instead).
+        assert len(captured) == 1, captured
+        # And the caller got the rebuilt response back, NOT the
+        # `_ReapedSignal` that used to escape and surface as a 500.
+        assert result == {"stubbed": True}, result
+        # The reaped session is gone from SESSIONS and marked dead.
+        assert session.id not in server.SESSIONS, dict(server.SESSIONS)
+        assert session.dead, session
+        print(f"  duplicate-delivery follow-up caught its own reap and "
+              f"rebuilt: start_session called once; session "
+              f"{session.id[:8]}... ended")
+    finally:
+        restore()
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
