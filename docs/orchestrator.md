@@ -80,6 +80,33 @@ With the explicit `--merge` flag, the pipeline continues:
 - **cleaned** — the task container is destroyed and the
   `/tmp/orca-auto-<task-id>.json` journal is left in place for audit.
 
+### Conflict-fix round: plumbing fallback (issue #236)
+
+The CONFLICT-FIXER worker's spec lives in
+`~/.config/opencode/scripts/orchestrate-auto.py:1476`
+(`build_conflict_spec`). On a `CONFLICTING` PR the worker is told to
+run `git fetch origin <base>` then `git merge origin/<base>`. When the
+worktree guard refuses the merge verb (a conservative defense-in-depth
+case even after PR #243 removed `git merge` from the project-level
+`WORKTREE_ONLY` deny set), the spec directs the worker to fall back
+to plumbing — `git read-tree -m -u HEAD origin/<base>` (two-way merge
+into the index + working tree), resolve any conflict markers, run the
+repo's verification, then `git commit` — and to **proceed without
+asking the runner**. A worker question would time out before the
+operator could reply (the dispatch settles first; the late reply
+arrives as `dispatch_inactive` per the regression test
+`test_refused_reply_continues_pipeline`), so the only self-sufficient
+shape is plumbing-on-the-worker. The SwitchYard repo pins this
+contract via
+`tests/fixtures/conflict_fixer_spec.py` and
+`tests/test_orchestrate_conflict_spec.py`: the fixture is the
+canonical spec text and the tests assert it carries the
+`read-tree` plumbing instruction, the `do not ask` directive, and
+the stall-rationale anchor. The fixture MUST be kept in sync with
+`build_conflict_spec` on the operator Mac; an in-repo cross-check
+runs when `~/.config/opencode/scripts/orchestrate-auto.py` is
+present on the test host and skips otherwise.
+
 ## Mailbox verbs (worker side)
 
 Each dispatched worker has a terminal handle (`--from`). The worker
