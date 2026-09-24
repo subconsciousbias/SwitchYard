@@ -67,6 +67,16 @@ RUN pip install --no-cache-dir --break-system-packages \
 # same import work at container run time.
 RUN cd /app && python3 -c "import switchyard.models; assert switchyard.models.CallerEnvironmentSettings(probe='required').probe == 'required'"
 
+# Pre-create the node-owned XDG tree so the daemon never has to root-create the
+# mount parents. When the host's /home/node exists but a child like .local/share
+# or .config/opencode does not, Docker materialises the missing dir as
+# root:root at container creation; that's harmless when the daemon runs as root
+# (pre-#223), but compose runs as `user: node` (uid 1000), so the first opencode
+# call hits EACCES on `.local/share`/`.config/opencode` bind-mount parents. Bake
+# the four dirs in node-owned and the mounts land on a writable path.
+RUN mkdir -p /home/node/.local/state /home/node/.local/share /home/node/.config /home/node/.cache \
+    && chown -R node:node /home/node/.local /home/node/.config /home/node/.cache
+
 # The container runs as root, so $HOME is /root — but the host credential
 # directories are mounted under /home/node. Claude and Codex are pinned by
 # CLAUDE_CONFIG_DIR / CODEX_HOME and were unaffected, but OpenCode resolves
@@ -76,7 +86,8 @@ RUN cd /app && python3 -c "import switchyard.models; assert switchyard.models.Ca
 ENV HOME=/home/node \
     XDG_DATA_HOME=/home/node/.local/share \
     XDG_CONFIG_HOME=/home/node/.config \
-    XDG_CACHE_HOME=/home/node/.cache
+    XDG_CACHE_HOME=/home/node/.cache \
+    XDG_STATE_HOME=/home/node/.local/state
 
 ENV PROVIDER=claude SWITCHYARD_PLANS=/app/config/plans.yaml PYTHONPATH=/app
 EXPOSE 8081 8082 8083 8084

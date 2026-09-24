@@ -45,13 +45,21 @@ each image actually copies before relying on a change taking effect there.
 
 The sidecar image sets up the runtime environment in `Dockerfile.sidecar`:
 
-  - `HOME=/home/node` plus `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`
-    all pointing at `/home/node/...`. The container runs as root, so `$HOME`
-    would otherwise default to `/root`; Claude and Codex are pinned by
-    `CLAUDE_CONFIG_DIR`/`CODEX_HOME` and were unaffected, but OpenCode resolves
-    XDG paths from `$HOME` and so looked in `/root`, finding zero credentials
-    while a perfectly good login sat mounted a directory away. Pointing HOME
-    and the XDG variables at the mounts is what fixed that.
+  - `HOME=/home/node` plus `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
+    `XDG_STATE_HOME` all pointing at `/home/node/...`. (Pre-#223 the
+    container ran as root and `$HOME` would otherwise default to `/root`;
+    Claude and Codex are pinned by `CLAUDE_CONFIG_DIR`/`CODEX_HOME` and were
+    unaffected, but OpenCode resolves XDG paths from `$HOME` and so looked
+    in `/root`, finding zero credentials while a perfectly good login sat
+    mounted a directory away. Pointing HOME and the XDG variables at the
+    mounts is what fixed that. Post-#223 the sidecars run as `user: node`,
+    so the four XDG dirs (`/home/node/.local/{state,share}`,
+    `/home/node/.config`, `/home/node/.cache`) are pre-created in the
+    image and their three parents (`/home/node/.local`,
+    `/home/node/.config`, `/home/node/.cache`) are chowned to `node:node`
+    — see `Dockerfile.sidecar`, and `SUBPROCESS_ENV_KEYS` in
+    `cli_bridge/server.py` for the inner-CLI
+    env allowlist that carries these pins to the spawned subprocess.)
   - `PROVIDER=claude`, `SWITCHYARD_PLANS=/app/config/plans.yaml`,
     `PYTHONPATH=/app`, `BRIDGE` (defaults to `cli`, set per service in compose),
     `SIDECAR_PORT` (the port this process listens on).

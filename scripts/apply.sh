@@ -522,6 +522,41 @@ else
       sleep 2
     done
 
+    # (5b) XDG preflight — exercise the real failure mode (`opencode
+    # --version` mkdirs `$XDG_STATE_HOME`; on a recreated image that
+    # forgot to bake the node-owned XDG tree it EACCESes and the bridge
+    # then 502s every request for the lifetime of this container).
+    # compose exec runs as the service's `user: node`, so a failure here
+    # is exactly the failure the CLI would hit. On failure: print the
+    # root cause + the `apply.sh --build` remediation, exit 1 WITHOUT
+    # clearing the drain gate below — a sidecar that would 502 every
+    # call must never be re-admitted, and "fail loudly mid-way" (header
+    # above) is the deliberate outcome here. --dry-run exits before the
+    # drain loop, so this path is never reached by the dry-run branch.
+    preflight_cmd='mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}"'
+    if ! preflight_out="$(docker compose exec -T "$svc" \
+                            sh -c "$preflight_cmd" 2>&1)"; then
+      cat >&2 <<EOF
+    preflight failed for $svc (plan=$plan):
+      $preflight_out
+
+    root cause: the recreated sidecar image is missing the node-owned
+    XDG state directory. the vendor CLI's first call mkdirs
+    \$XDG_STATE_HOME; on a bind-mounted parent that is root-owned
+    (Docker materialises the missing path at container creation),
+    user=node EACCESes and every subsequent call would 502.
+
+    remediation: rerun from the main checkout so the sidecar image is
+    rebuilt from the fixed Dockerfile.sidecar (which bakes in the
+    mkdir + chown of the four XDG parents):
+        scripts/apply.sh --build
+
+    sy:drain:${plan} is still set, so this plan is NOT re-admitted
+    until the next apply run lands successfully.
+EOF
+      exit 1
+    fi
+
     # (6) clear the picker gate — new requests flow to this sidecar again.
     docker compose exec -T redis redis-cli -n 1 DEL "sy:drain:${plan}" \
       >/dev/null

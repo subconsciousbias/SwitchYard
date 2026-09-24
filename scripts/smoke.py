@@ -42,7 +42,7 @@ GW = "http://localhost:4000"
 SATURATED_RETRY_SECONDS = 8
 PORTAL = "http://localhost:4001"
 SIDECARS = {"claude-max-sidecar": 8081, "codex-sidecar": 8082,
-            "opencode-go-sidecar": 8084}
+            "opencode-go-sidecar": 8084, "opencode-go2-sidecar": 8085}
 # Not a CLI sidecar: it forwards the caller's body to api.x.ai under our own
 # OAuth grant, so it has no harness prompt to measure and no vendor CLI to log
 # in. Checked for a live grant instead.
@@ -149,6 +149,45 @@ def check_sidecar_health() -> None:
         check(f"{svc} reads its plan from config", ok,
               f"plan={d.get('plan') or d.get('provider')} "
               f"models={d.get('models')} conc={d.get('concurrency')}")
+
+
+def check_cli_starts_as_node() -> None:
+    """The vendored CLI must start, as `user: node`, inside its sidecar.
+
+    `--version` exits fast (seconds, no quota, no LLM call), and the CLI's
+    very first action is to mkdir its `$XDG_STATE_HOME` — the EACCES that
+    took out issue #247 was on that exact path. So a `--version` probe is
+    the cheapest possible "can this sidecar answer any real call" check,
+    and it catches the failure mode the health endpoint cannot: the
+    FastAPI daemon comes up (it never touches XDG) while the bridge's
+    first CLI invocation 502s forever.
+
+    opencode-go2-sidecar is checked here on purpose — its service was
+    added to the stack with no health coverage of its own, the same
+    blind spot that hid #247 until it shipped to production.
+    """
+    # Each vendored CLI ships under a different binary name; opencode-go2
+    # uses the same `opencode` binary as opencode-go (different login,
+    # same CLI per docker-compose.yml's `PROVIDER: opencode` for both).
+    cli_for_svc = {
+        "claude-max-sidecar":   "claude",
+        "codex-sidecar":        "codex",
+        "opencode-go-sidecar":  "opencode",
+        "opencode-go2-sidecar": "opencode",
+    }
+    for svc, cli in cli_for_svc.items():
+        # subprocess.run with no capture/output just to propagate rc.
+        # A nonzero exit here is the failure mode we are guarding; a
+        # non-empty stderr is the diagnostic we want on failure.
+        proc = subprocess.run(
+            ["docker", "compose", "exec", "-T", svc, cli, "--version"],
+            capture_output=True, text=True, timeout=60,
+        )
+        ok = proc.returncode == 0
+        detail = (proc.stdout or proc.stderr).strip().splitlines()[-1] \
+                 if (proc.stdout or proc.stderr) else "(no output)"
+        check(f"{svc}: {cli} --version starts as user=node", ok,
+              detail[:120])
 
 
 def check_token_proxy_health() -> None:
@@ -353,6 +392,7 @@ def main() -> int:
     check_services()
     check_plugin_loaded()
     check_sidecar_health()
+    check_cli_starts_as_node()
     check_token_proxy_health()
 
     api_key = key()

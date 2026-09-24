@@ -181,7 +181,7 @@ def over_argv_limit(text: str) -> bool:
 SUBPROCESS_ENV_KEYS = (
     "PATH", "HOME", "LANG", "LC_ALL", "TERM",
     "USER", "LOGNAME", "SHELL", "TMPDIR",
-    "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+    "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
     "CLAUDE_CONFIG_DIR", "CODEX_HOME",
 )
 
