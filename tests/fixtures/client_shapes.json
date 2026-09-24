@@ -1,0 +1,300 @@
+{
+  "claude": {
+    "requests": [
+      {
+        "headers": [
+          "anthropic-beta",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "x-app",
+          "x-claude-code-session-id",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ],
+        "message_block_types": [
+          "string",
+          "text",
+          "tool_result",
+          "tool_use"
+        ],
+        "nested_params": [
+          "context_management.edits",
+          "output_config.effort",
+          "thinking.display",
+          "thinking.type"
+        ],
+        "params": [
+          "context_management",
+          "max_tokens",
+          "metadata",
+          "model",
+          "output_config",
+          "stream",
+          "thinking"
+        ],
+        "path": "/v1/messages",
+        "tool_fields": [
+          "description",
+          "input_schema",
+          "name"
+        ],
+        "tool_types": [
+          "(plain)"
+        ]
+      },
+      {
+        "headers": [
+          "anthropic-beta",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "x-app",
+          "x-claude-code-session-id",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ],
+        "message_block_types": [
+          "text"
+        ],
+        "nested_params": [
+          "context_management.edits",
+          "output_config.effort",
+          "thinking.display",
+          "thinking.type"
+        ],
+        "params": [
+          "context_management",
+          "max_tokens",
+          "metadata",
+          "model",
+          "output_config",
+          "stream",
+          "thinking"
+        ],
+        "path": "/v1/messages",
+        "tool_fields": [
+          "description",
+          "input_schema",
+          "name"
+        ],
+        "tool_types": [
+          "(plain)"
+        ]
+      },
+      {
+        "headers": [
+          "anthropic-beta",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "x-app",
+          "x-claude-code-session-id",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ],
+        "message_block_types": [
+          "text"
+        ],
+        "nested_params": [
+          "output_config.effort"
+        ],
+        "params": [
+          "max_tokens",
+          "metadata",
+          "model",
+          "output_config",
+          "stream",
+          "tool_choice"
+        ],
+        "path": "/v1/messages",
+        "tool_fields": [
+          "max_uses",
+          "name",
+          "type"
+        ],
+        "tool_types": [
+          "web_search_20250305"
+        ]
+      }
+    ],
+    "version": "2.1.281 (Claude Code)"
+  },
+  "codex": {
+    "requests": [
+      {
+        "headers": [
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id",
+          "x-openai-internal-codex-responses-lite"
+        ],
+        "message_block_types": [
+          "additional_tools",
+          "input_text",
+          "message"
+        ],
+        "nested_params": [
+          "reasoning.context",
+          "reasoning.effort"
+        ],
+        "params": [
+          "client_metadata",
+          "include",
+          "model",
+          "parallel_tool_calls",
+          "prompt_cache_key",
+          "reasoning",
+          "store",
+          "stream",
+          "text",
+          "tool_choice"
+        ],
+        "path": "/v1/responses",
+        "tool_fields": [
+          "description",
+          "format",
+          "name",
+          "parameters",
+          "strict",
+          "type"
+        ],
+        "tool_types": [
+          "custom",
+          "function"
+        ]
+      }
+    ],
+    "version": "codex-cli 0.153.4"
+  },
+  "opencode": {
+    "requests": [
+      {
+        "headers": [
+          "anthropic-beta",
+          "anthropic-version",
+          "x-session-affinity",
+          "x-session-id"
+        ],
+        "message_block_types": [
+          "text"
+        ],
+        "nested_params": [
+          "output_config.effort",
+          "thinking.block_binding",
+          "thinking.display",
+          "thinking.type"
+        ],
+        "params": [
+          "max_tokens",
+          "model",
+          "output_config",
+          "stream",
+          "thinking"
+        ],
+        "path": "/v1/messages",
+        "tool_fields": [],
+        "tool_types": []
+      },
+      {
+        "headers": [
+          "anthropic-beta",
+          "anthropic-version",
+          "x-session-affinity",
+          "x-session-id"
+        ],
+        "message_block_types": [
+          "text"
+        ],
+        "nested_params": [
+          "thinking.block_binding",
+          "thinking.type"
+        ],
+        "params": [
+          "max_tokens",
+          "model",
+          "stream",
+          "thinking",
+          "tool_choice"
+        ],
+        "path": "/v1/messages",
+        "tool_fields": [
+          "description",
+          "eager_input_streaming",
+          "input_schema",
+          "name"
+        ],
+        "tool_types": [
+          "(plain)"
+        ]
+      },
+      {
+        "headers": [
+          "x-session-affinity",
+          "x-session-id"
+        ],
+        "message_block_types": [
+          "string"
+        ],
+        "nested_params": [
+          "stream_options.include_usage"
+        ],
+        "params": [
+          "max_tokens",
+          "model",
+          "reasoning_effort",
+          "stream",
+          "stream_options"
+        ],
+        "path": "/v1/chat/completions",
+        "tool_fields": [],
+        "tool_types": []
+      },
+      {
+        "headers": [
+          "x-session-affinity",
+          "x-session-id"
+        ],
+        "message_block_types": [
+          "string"
+        ],
+        "nested_params": [
+          "stream_options.include_usage"
+        ],
+        "params": [
+          "max_tokens",
+          "model",
+          "stream",
+          "stream_options",
+          "tool_choice"
+        ],
+        "path": "/v1/chat/completions",
+        "tool_fields": [
+          "description",
+          "name",
+          "parameters"
+        ],
+        "tool_types": [
+          "function"
+        ]
+      }
+    ],
+    "version": "1.18.32"
+  }
+}

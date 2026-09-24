@@ -697,6 +697,36 @@ built-ins) arrived with a CLI version. After raising a pin in
    (tool and text path), no native shell (`uid=1000(node)` in an answer is a
    fail). Exits non-zero on any failure.
 
+### 4j. Request-surface conformance — is every request executed or refused?
+
+The goal: any OpenAI- or Anthropic-compatible request is **executed** by
+every plan (CLI-backed or API), or **refused explicitly** so the router or
+client can go elsewhere — never answered with a 200 that quietly ignored part
+of it (web search answered from memory, a PDF the model never saw, a schema
+that came back as prose). Two tools, run when anything in the chain changes:
+
+```bash
+# Client side: what do the installed clients send? (free: a loopback fake model)
+python3 scripts/capture_client_shapes.py          # diff vs tests/fixtures/client_shapes.json
+python3 scripts/capture_client_shapes.py --update # accept after checking the diff
+
+# Serving side: every case x every plan, through the real gateway (spends a little quota)
+python3 scripts/request_conformance.py
+python3 scripts/request_conformance.py --plans openai,claude-max --cases tool_loop_chat
+```
+
+`capture_client_shapes.py` records only request *shapes* (parameters, tool
+types, content-block types, header names) from Claude Code, OpenCode and
+Codex; a new one after a client upgrade is a line to check. Each
+`request_conformance.py` cell is `PASS executed`, `PASS refused` (an explicit
+4xx/5xx), `SKIP capacity` (a 429 proves nothing), `FAIL degraded` (a 200 that
+ignored the feature) or `FAIL error` (e.g. a 404 from a route the plan should
+serve). Cases: text on both protocols, tool loops in Claude Code's and
+OpenCode's shapes (with their effort parameters), the output cap, image input,
+image and PDF in a tool result, requested web search, structured output,
+`n`, `stop`, a streamed tool call, an unsupported server-side tool, and the
+Responses API in both the SDK's and Codex's shape.
+
 ## 5. Behaviour tests
 
 ### 5a. Ordered fill and total capacity
