@@ -1498,16 +1498,27 @@ def _collect_anthropic_event_usage(event: dict, collected: dict) -> None:
 
     ``message_start`` carries the initial input-token count on ``message.usage``;
     a subsequent ``message_delta`` carries the running output and cache totals
-    directly on the top-level ``usage``. Both are *totals*, not deltas -- a
-    later ``message_delta`` is the latest authoritative reading, not an
-    addition. We overwrite the running figure so a fragmented stream (or a
-    provider that emits a ``message_delta`` before any tokens are counted)
-    cannot inflate the total.
+    directly on the top-level ``usage``, and some adapters (notably
+    LiteLLM's Anthropic -> chat-completions bridge) also synthesise the
+    input total on the final ``message_delta``. Both are *totals*, not
+    deltas -- a later ``message_delta`` is the latest authoritative reading,
+    not an addition. We overwrite the running figure so a fragmented stream
+    (or a provider that emits a ``message_delta`` before any tokens are
+    counted) cannot inflate the total.
+
+    The ``input_tokens`` field on a ``message_delta`` is the one exception:
+    it is overwritten only when strictly positive. An adapter that streams
+    a placeholder ``0`` for the input count (LiteLLM's path before it has
+    the real value) MUST NOT clobber a genuine ``message_start`` count, or
+    every streamed /v1/messages request would book zero prompt tokens.
+    The same coercion/tolerance rules apply -- non-numeric frames are
+    skipped silently so a malformed delta never crashes the parser.
 
     The function is intentionally narrow: ``message_start`` only writes the
-    input/cache fields it actually carries, ``message_delta`` only the output/
-    cache fields it carries, and any other event type is ignored. Other call
-    shapes (text completions, embeddings, etc.) reach a different hook path.
+    input/cache fields it actually carries, ``message_delta`` only the input/
+    output/cache fields it carries, and any other event type is ignored.
+    Other call shapes (text completions, embeddings, etc.) reach a different
+    hook path.
     """
     typ = event.get("type")
     if typ == "message_start":
@@ -1535,6 +1546,25 @@ def _collect_anthropic_event_usage(event: dict, collected: dict) -> None:
     if typ == "message_delta":
         usage = event.get("usage")
         if isinstance(usage, dict):
+            # message_delta can carry the real input total on the final
+            # frame (LiteLLM's Anthropic adapter does this so the
+            # chat-completion-shaped response has the full prompt count).
+            # An adapter that sends ``0`` here -- a placeholder while it
+            # waits for the real number -- MUST NOT clobber a positive
+            # ``message_start`` count, otherwise every streamed
+            # /v1/messages request would book zero prompt tokens. Treat
+            # only strictly-positive values as authoritative overwrites;
+            # non-numeric payloads are tolerated (skipped) the same way
+            # the other fields are.
+            inp = usage.get("input_tokens")
+            if inp is not None:
+                try:
+                    coerced = int(inp)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if coerced > 0:
+                        collected["input_tokens"] = coerced
             for key in ("output_tokens", "cache_creation_input_tokens",
                         "cache_read_input_tokens"):
                 value = usage.get(key)

@@ -593,6 +593,80 @@ def test_streamed_messages_tolerates_dict_and_pydantic_chunk_shapes():
           f"{int(bucket['completion_tokens'])}")
 
 
+def test_streamed_messages_adapter_input_in_delta_overwrites_start_zero():
+    """LiteLLM's Anthropic -> chat-completions adapter streams the input
+    total on the final ``message_delta`` rather than on ``message_start``
+    (the adapter has not yet had the chance to read the real count when
+    the start frame is emitted). The native Anthropic API does the
+    opposite -- input on the start, output on subsequent deltas. The
+    hook must accept either shape and book the same totals.
+
+    The exact sequence replayed here is the adapter's:
+        1. message_start carries ``input_tokens=0`` (placeholder, the
+           adapter hasn't computed the real count yet).
+        2. A few content_block_deltas stream the assistant text, no
+           usage payload on any of them.
+        3. The final message_delta carries the real input/output/cache
+           totals on its top-level ``usage`` block.
+
+    The ledger MUST record the delta's input (12000), not the start
+    frame's placeholder zero. If it recorded zero, every streamed
+    /v1/messages request routed through the adapter would book
+    prompt_tokens=0 and the plan ledger would undercount usage.
+    """
+    h, _reg, slots, _ledger, _policy, redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="anthropic_messages")
+    request_data = {"metadata": _meta_for(ctx)}
+
+    chunks = [
+        # 1. message_start: input=0 placeholder, output=1 placeholder,
+        #    cache tokens real. The ``0`` is the failure mode -- the
+        #    genuine count arrives later.
+        b'event: message_start\ndata: {"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"claude-...","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":1,"cache_creation_input_tokens":8,"cache_read_input_tokens":12}}}\n\n',
+        # 2. Two content deltas (no usage payloads).
+        b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n',
+        b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}\n\n',
+        # 3. Final message_delta: real input=12000, output=77, cache
+        #    totals carry through.
+        b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":12000,"output_tokens":77,"cache_creation_input_tokens":8,"cache_read_input_tokens":12}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+
+    async def produce():
+        for c in chunks:
+            yield c
+
+    async def consume():
+        async for _ in h.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=None, response=produce(), request_data=request_data,
+        ):
+            pass
+        # Give the detached finalize task time to land on the event loop.
+        await asyncio.sleep(0.05)
+
+    asyncio.run(consume())
+
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 0
+    plan_keys = [k for k in redis.hashes.keys()
+                 if k.startswith(f"sy:usage:{pick.plan.key}:p:")]
+    bucket = _bucket_sync(redis, plan_keys[0])
+    # 12000 (input, from message_delta) + 12 (cache_read) + 8
+    # (cache_creation) = 12020 prompt. The key assertion is that the
+    # input came from the delta (12000), not the start frame's 0.
+    assert bucket["prompt_tokens"] == 12020, (
+        f"expected prompt_tokens=12020 (12000 from message_delta input "
+        f"+ cache totals), got {bucket}")
+    assert bucket["completion_tokens"] == 77, (
+        f"expected completion_tokens=77 (from the final message_delta), "
+        f"got {bucket}")
+    assert bucket["requests"] == 1, bucket
+    print(f"  LiteLLM adapter sequence: input arrived on message_delta "
+          f"({int(bucket['prompt_tokens'])} prompt incl. cache, "
+          f"{int(bucket['completion_tokens'])} completion) -- not the "
+          "start frame's placeholder zero")
+
+
 # ============================================================================
 # Section 4: cancellation safety
 # ============================================================================
@@ -1312,6 +1386,87 @@ def test_collect_anthropic_event_usage_tolerates_partial_frames():
     assert collected["input_tokens"] == 17, collected
     assert collected["cache_read_input_tokens"] == 4, collected
     print("  parser tolerates empty / partial / non-dict Anthropic frames")
+
+
+def test_collect_anthropic_event_usage_delta_input_zero_does_not_clobber_start():
+    """A ``message_delta`` whose ``input_tokens`` is ``0`` is the
+    LiteLLM-adapter placeholder, NOT an authoritative recount -- the
+    parser must leave a positive ``message_start`` value in place.
+
+    The sibling test at line 448 already covers the opposite shape:
+    genuine ``input_tokens`` on the start frame, no ``input_tokens``
+    field on the deltas (native Anthropic). This one closes the loop
+    by covering the shape where a delta DOES carry ``input_tokens``
+    but the value is the placeholder zero, and proves the parser
+    refuses to overwrite the start frame's count. Without this guard,
+    every streamed /v1/messages request routed through the adapter
+    would book prompt_tokens=0 regardless of what the real count was.
+    """
+    collected: dict = {}
+    # 1. message_start carries the genuine input + cache totals.
+    _collect_anthropic_event_usage({
+        "type": "message_start",
+        "message": {
+            "usage": {
+                "input_tokens": 500, "output_tokens": 1,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 5,
+            },
+        },
+    }, collected)
+    assert collected["input_tokens"] == 500, collected
+    # 2. A delta whose input is the ``0`` placeholder -- the parser
+    #    MUST leave the 500 from step 1 intact, otherwise the ledger
+    #    will book prompt_tokens=0 for an Anthropic adapter request.
+    _collect_anthropic_event_usage({
+        "type": "message_delta",
+        "delta": {"stop_reason": None},
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 17,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 5,
+        },
+    }, collected)
+    assert collected["input_tokens"] == 500, (
+        f"message_delta with input_tokens=0 clobbered the "
+        f"message_start value; collected={collected}")
+    assert collected["output_tokens"] == 17, collected
+    # 3. A later delta with a REAL positive input_tokens DOES overwrite
+    #    (running totals, not deltas) -- the guard only vetoes the
+    #    zero placeholder, not genuine counts.
+    _collect_anthropic_event_usage({
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn"},
+        "usage": {
+            "input_tokens": 12000,
+            "output_tokens": 77,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 5,
+        },
+    }, collected)
+    assert collected["input_tokens"] == 12000, (
+        f"positive message_delta input_tokens did not overwrite the "
+        f"running total; collected={collected}")
+    assert collected["output_tokens"] == 77, collected
+    # 4. A non-numeric payload on a delta is tolerated (skipped) the
+    #    same way other fields are; the running total stays put.
+    _collect_anthropic_event_usage({
+        "type": "message_delta",
+        "delta": {},
+        "usage": {"input_tokens": "not-a-number", "output_tokens": 80,
+                  "cache_read_input_tokens": 30,
+                  "cache_creation_input_tokens": 5},
+    }, collected)
+    assert collected["input_tokens"] == 12000, (
+        f"non-numeric message_delta input_tokens corrupted the "
+        f"running total; collected={collected}")
+    assert collected["output_tokens"] == 80, (
+        f"non-numeric message_delta input_tokens blocked the rest of "
+        f"the loop from overwriting output_tokens; collected={collected}")
+    print("  parser refuses to overwrite a positive message_start input "
+          "count with a zero (placeholder) message_delta value, but "
+          "accepts a positive overwrite and tolerates non-numeric input")
 
 
 def test_plan_no_longer_at_cap_after_messages_finish():
