@@ -1409,23 +1409,56 @@ _warm = asyncio.Event()
 _warmup_lock = asyncio.Lock()
 
 
+@contextlib.asynccontextmanager
+async def warm_gate():
+    """Serialize the first call so a token refresh races exactly once.
+
+    Yields a dict with a single boolean key `success` (default True). The body
+    sets it to False when the body reports a logical failure that should leave
+    the gate closed -- no exception raised, but no real success either. The
+    mcp_bridge run_session uses this when a terminal error was already
+    resolved on the session's turn_future (no payload produced, no exception
+    escaping): the gate stays closed so the next caller acquires the lock and
+    retries alone, exactly the success-only semantics today's `invoke` had.
+
+    Three paths:
+
+    * Fast path -- `_warm` is already set: the lock is never taken; the body
+      runs in parallel with every other concurrent caller.
+    * Slow path under the lock -- `_warm` was just set by a concurrent caller
+      that beat us to the first run: the body runs again, in parallel from
+      then on.
+    * Solo path -- we are the first caller under the lock: the body runs
+      alone. `_warm` is set ONLY when the body completes without exception
+      AND `success` is still True. Either signal leaves the gate closed, so
+      a follow-up caller acquires the lock and retries alone.
+
+    Bridge-siblings rule: mcp_bridge imports this context manager and wraps
+    `run_session` with it -- the cold-start token-refresh race is a property
+    of the inner CLI, not the bridge that fronts it.
+    """
+    state = {"success": True}
+    if _warm.is_set():
+        yield state
+        return
+    async with _warmup_lock:
+        if _warm.is_set():
+            yield state
+            return
+        yield state
+        if state["success"]:
+            _warm.set()
+            log.info("%s: first call succeeded, releasing full concurrency", PROVIDER)
+
+
 async def invoke(prompt: str, system: str | None, model: str | None,
                 image_paths: list[Path] | None = None,
                 fmt: dict | None = None, *, web: bool = False,
                 effort: str | None = None,
                 thinking: dict | None = None) -> dict:
-    if _warm.is_set():
+    async with warm_gate():
         return await run_cli(prompt, system, model, image_paths, fmt, web=web,
                              effort=effort, thinking=thinking)
-    async with _warmup_lock:
-        if _warm.is_set():                     # someone warmed it while we waited
-            return await run_cli(prompt, system, model, image_paths, fmt,
-                                 web=web, effort=effort, thinking=thinking)
-        payload = await run_cli(prompt, system, model, image_paths, fmt,
-                                web=web, effort=effort, thinking=thinking)
-        _warm.set()
-        log.info("%s: first call succeeded, releasing full concurrency", PROVIDER)
-        return payload
 
 # The CLI reports exhaustion in prose; these are the shapes worth trusting.
 def normalise(text: str) -> str:
@@ -2291,29 +2324,59 @@ def merge_completions(results: list[dict]) -> dict:
 
 
 @contextlib.contextmanager
-def instructions_file(system: str | None):
+def instructions_file(system: str | None, dir: "Path | None" = None):
     """Yield the argv fragment that overrides this CLI's base instructions.
 
     Codex takes its system prompt as a *file path* in config rather than a flag,
-    so the caller's prompt is written to a temp file per request. That makes it a
+    so the caller's prompt is written to disk per request. That makes it a
     real replacement of the built-in instructions — the same contract as Claude's
     --system-prompt — instead of yet another layer stacked on top.
+
+    With a system prompt and `dir` set (the mcp_bridge path, where the
+    session workdir has its own lifecycle), the prompt is written to
+    `dir/instructions.md` and NOT self-deleted: `cleanup_workdir` owns the
+    session workdir and reclaims it together with everything else. Without
+    `dir`, the legacy tempfile path is kept for callers that have no other
+    home for the file. With no system prompt, the profile's
+    `instructions_default` (`/app/harness/codex-instructions.md`, baked by
+    Dockerfile.sidecar:61) is used verbatim.
 
     Yields ([], system) for CLIs with no such mechanism, leaving the caller's
     text to be folded into the prompt instead.
     """
-    template = PROFILE.get("instructions_arg")
+    # `dir` is the mcp_bridge tool path's signature -- only mcp_bridge's
+    # codex branch sets it (cleanup_workdir owns the workdir lifecycle).
+    # When called from there the inner cli_bridge module's PROVIDER may
+    # not be codex (test fixtures and concurrent-call paths can leave it
+    # on whatever the module happened to load with), so read the codex
+    # profile directly instead of trusting PROFILE -- the OLD lookup
+    # silently no-oped on a non-codex caller PROFILE, dropping the
+    # `-c model_instructions_file=...` fragment on the tool path and
+    # leaving codex to load its full compiled-in base instructions (the
+    # regression #137 closed on the text path).
+    if dir is not None:
+        profile = PROFILES["codex"]
+    else:
+        profile = PROFILE
+    template = profile.get("instructions_arg")
     if not template:
         yield [], system
         return
 
-    path = PROFILE.get("instructions_default")
+    path = profile.get("instructions_default")
     tmp = None
     if system:
-        tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
-        tmp.write(system if system.endswith("\n") else system + "\n")
-        tmp.close()
-        path = tmp.name
+        if dir is not None:
+            # Caller owns the cleanup (cleanup_workdir reclaims the session
+            # workdir with everything else). NOT self-deleted.
+            target = dir / "instructions.md"
+            target.write_text(system if system.endswith("\n") else system + "\n")
+            path = str(target)
+        else:
+            tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+            tmp.write(system if system.endswith("\n") else system + "\n")
+            tmp.close()
+            path = tmp.name
     try:
         # The template is one token like `-c key={path}`; split so the value is
         # passed as a single argv element even when the path contains spaces.

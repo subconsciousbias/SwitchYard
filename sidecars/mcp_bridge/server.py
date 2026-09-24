@@ -1205,7 +1205,6 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
     stays in the argv template so every code path keeps the switchyard tool
     qualifiers.
     """
-    instructions: Path | None = None
     image_paths = image_paths or []
     if PROVIDER == "claude":
         mcp_config = write_claude_mcp_config(workdir, session_id, tools_path)
@@ -1215,12 +1214,14 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
         # mcp_servers.*), so there is no project config to write. The system
         # prompt goes through model_instructions_file, the same override
         # cli_bridge uses -- a real replacement, not an append, and the only key
-        # that measurably cuts codex's own prompt.
+        # that measurably cuts codex's own prompt. With no system prompt the
+        # helper still emits `-c model_instructions_file=...` so the profile's
+        # baked default (/app/harness/codex-instructions.md from
+        # Dockerfile.sidecar:61) stays in play; the `-c` fragment must NOT be
+        # gated on `system`, since dropping it on a system-less request would
+        # leave codex running with its full compiled-in instructions.
         mcp_config = None
         effective_prompt = prompt
-        if system:
-            instructions = workdir / "instructions.md"
-            instructions.write_text(system)
     else:
         # `opencode run` has no system-prompt flag, but the agent's `prompt:`
         # replaces OpenCode's base prompt -- the caller's system prompt goes
@@ -1284,9 +1285,26 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
             argv += ["--system-prompt-file", str(spath)]
         else:
             argv += ["--system-prompt", system]
-    if instructions is not None:
-        argv += ["-c", f"model_instructions_file={instructions}"]
+        # SYSTEM_MODE=replace on the mcp path: keep parity with cli_bridge's
+        # inline and file paths, both of which append `replace_extra_args`
+        # (`--exclude-dynamic-system-prompt-sections`) here. Without this,
+        # the tool-path's replace mode would silently leave the CLI's
+        # injected working-dir / git / env blurbs in place, so the compose
+        # comment on claude-max-sidecar (which says the lane is in replace
+        # mode) would not actually be true on this bridge.
+        if cli_bridge.SYSTEM_MODE == "replace" and cli_bridge.PROFILE.get("replace_extra_args"):
+            argv += list(cli_bridge.PROFILE["replace_extra_args"])
     if PROVIDER == "codex":
+        # Always carry `-c model_instructions_file=...` on the tool path:
+        # cli_bridge.instructions_file writes the caller's system prompt to
+        # workdir/instructions.md (cleanup_workdir reclaims it with the
+        # session workdir) and falls back to the profile's instructions_default
+        # (/app/harness/codex-instructions.md, baked by Dockerfile.sidecar:61)
+        # when the caller sent no system. With no override codex would load
+        # its full compiled-in base instructions -- the same regression that
+        # used to happen on the text path before the helper landed.
+        with cli_bridge.instructions_file(system, dir=workdir) as (instr_args, _):
+            argv += instr_args
         # Without this the caller's bridged tools are hidden inside codex's
         # code-mode `exec` host and its own shell is what the model sees
         # (issue #255). Shared with the text path -- see
@@ -1320,10 +1338,16 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
         argv += ["--session-id", claude_session_uuid(session_id)]
 
     if claude_media:
-        return (cli_bridge.claude_stream_argv(argv),
+        # CLI_EXTRA_ARGS tail-appended on both return paths: the operator
+        # flags are meant to win last (cli_bridge.build_argv has done the
+        # same since the CLI_EXTRA_ARGS knob landed), and the claude-media
+        # path takes the same per-CLI stream-json wrapper the text path
+        # takes -- the extras ride after the wrapper so the override is
+        # visible to the same argv the CLI actually executes.
+        return (cli_bridge.claude_stream_argv(argv) + cli_bridge.EXTRA_ARGS,
                 cli_bridge.claude_media_stdin(effective_prompt,
                                               [Path(p) for p in image_paths]))
-    return argv, (effective_prompt if use_stdin else None)
+    return argv + cli_bridge.EXTRA_ARGS, (effective_prompt if use_stdin else None)
 
 
 # ---------------------------------------------------------------------------
@@ -1470,33 +1494,50 @@ async def run_session(session: Session, argv: list[str],
     attempt exactly once; on a second CliNoTextError the contract 502 names
     the COMBINED usage of both attempts. Every other failure mode stays
     single-attempt.
+
+    The whole attempt block is wrapped in cli_bridge.warm_gate so the cold
+    start token-refresh race (issue #137 parity) is serialized once across
+    the bridge: the first concurrent caller runs alone, every other one
+    waits on the warmup lock and runs solo too. Success is reported only
+    when an attempt produced a payload -- a terminal error that was already
+    resolved on the session's turn_future (payload is None) leaves the gate
+    closed, matching invoke's success-only semantics. The startup selfcheck
+    is the only spawn outside this gate; it is one-shot and doesn't share
+    the per-process credential refresh concern.
     """
     try:
-        try:
-            payload = await _run_session_attempt(session, argv, stdin_data)
-        except cli_bridge.CliNoTextError as exc:
-            if LOG_TEXT_LOST:
-                log.warning("mcp session %s: no text with usage %s; retrying once",
-                            session.id, exc.usage)
+        async with cli_bridge.warm_gate() as gate:
             try:
                 payload = await _run_session_attempt(session, argv, stdin_data)
-            except cli_bridge.CliNoTextError as exc2:
-                combined = cli_bridge._sum_usage(dict(exc.usage), exc2.usage)
+            except cli_bridge.CliNoTextError as exc:
                 if LOG_TEXT_LOST:
-                    log.warning("mcp session %s: text lost on both attempts "
-                                "(combined usage=%s); contract 502",
-                                session.id, combined)
-                session.resolve_final({
-                    "type": "error", "status": 502,
-                    "detail": cli_bridge.format_no_text_detail(PROVIDER, combined)})
+                    log.warning("mcp session %s: no text with usage %s; retrying once",
+                                session.id, exc.usage)
+                try:
+                    payload = await _run_session_attempt(session, argv, stdin_data)
+                except cli_bridge.CliNoTextError as exc2:
+                    combined = cli_bridge._sum_usage(dict(exc.usage), exc2.usage)
+                    if LOG_TEXT_LOST:
+                        log.warning("mcp session %s: text lost on both attempts "
+                                    "(combined usage=%s); contract 502",
+                                    session.id, combined)
+                    session.resolve_final({
+                        "type": "error", "status": 502,
+                        "detail": cli_bridge.format_no_text_detail(PROVIDER, combined)})
+                    # Two text-lost attempts in a row: no real success -- the
+                    # gate stays closed so a follow-up caller serializes
+                    # alone again.
+                    gate["success"] = False
+                    return
+                # Successful retry: attempt 1's tokens are still real, fold them
+                # into the payload so the ledger books both attempts exactly once.
+                payload.setdefault("usage", {})
+                cli_bridge._sum_usage(payload["usage"], exc.usage)
+            if payload is None:
+                # a terminal error was already resolved -- gate stays closed.
+                gate["success"] = False
                 return
-            # Successful retry: attempt 1's tokens are still real, fold them
-            # into the payload so the ledger books both attempts exactly once.
-            payload.setdefault("usage", {})
-            cli_bridge._sum_usage(payload["usage"], exc.usage)
-        if payload is None:
-            return                      # a terminal error was already resolved
-        session.resolve_final({"type": "final", "payload": payload})
+            session.resolve_final({"type": "final", "payload": payload})
     except Exception as exc:                        # never leave a session parked forever
         log.exception("mcp session %s crashed", session.id)
         session.resolve_final({"type": "error", "status": 500, "detail": str(exc)})

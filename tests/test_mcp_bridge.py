@@ -3980,13 +3980,24 @@ def test_codex_mcp_build_argv_appends_the_lockdown():
     feature disabled, the prompt sections off, and the locked-down model
     catalog -- whatever the request looks like."""
     import shutil
-    saved = (server.PROVIDER, server.PROFILE)
+    # The codex branch now goes through cli_bridge.instructions_file
+    # (issue #137 parity -- same helper, same path), which reads
+    # cli_bridge.PROFILE for the `instructions_arg` template. Production
+    # has cli_bridge.PROFILE in sync with mcp_bridge (same env var), but
+    # this test only swaps mcp_bridge's globals, so the inner copy needs
+    # to follow along or the helper yields an empty fragment.
+    saved = (server.PROVIDER, server.PROFILE,
+             server.cli_bridge.PROVIDER, server.cli_bridge.PROFILE,
+             server.cli_bridge.CLI)
     workdir = Path(tempfile.mkdtemp(prefix="mcpb-codex-argv-"))
     tools_path = workdir / "tools.json"
     tools_path.write_text("[]")
     try:
         server.PROVIDER = "codex"
         server.PROFILE = server.MCP_PROFILES["codex"]
+        server.cli_bridge.PROVIDER = "codex"
+        server.cli_bridge.PROFILE = server.cli_bridge.PROFILES["codex"]
+        server.cli_bridge.CLI = server.cli_bridge.PROFILES["codex"]["cli"]
         argv, _ = server.build_argv("hi", "CALLER SYSTEM", "gpt-5.6-terra",
                                     workdir, "sess", tools_path, "")
         for feature in ("shell_tool", "unified_exec", "multi_agent", "code_mode_host"):
@@ -4005,7 +4016,9 @@ def test_codex_mcp_build_argv_appends_the_lockdown():
         assert instr < argv.index("--disable"), argv
         print("  codex MCP argv: bypass + lockdown + locked-down catalog")
     finally:
-        server.PROVIDER, server.PROFILE = saved
+        (server.PROVIDER, server.PROFILE,
+         server.cli_bridge.PROVIDER, server.cli_bridge.PROFILE,
+         server.cli_bridge.CLI) = saved
         shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -6428,6 +6441,288 @@ def test_followup_duplicate_delivery_in_flight_attaches_to_running_turn():
               f"content={result['choices'][0]['message']['content']!r}")
     finally:
         restore()
+
+
+# ----------------------------------------- issue #137: _warm serialization ---
+def _write_event_fake_cli(workdir: Path, marker_path: Path, event: str,
+                          *, sleep: float = 0.0) -> str:
+    """Write a fake CLI into `workdir / event / "fake_cli.py"` that records
+    `<time> <event>_SPAWN` and `<time> <event>_DONE` to the shared
+    `marker_path`, optionally sleeping first, then prints a successful
+    parseable payload.
+
+    Both fakes share the same marker file but use distinct event names
+    so the test can order the events by wall-clock time and assert the
+    warm_gate's serialization semantics:
+
+    * SLOW_FIRST spawn / SLOW_FIRST done -- a deliberately slow first
+      run that the gate must serialize.
+    * FAST_SECOND spawn -- must wait for SLOW_FIRST done before this
+      timestamp is recorded.
+
+    Each fake gets its own subdir under `workdir` (`{event}/fake_cli.py`)
+    so the two subprocesses don't overwrite each other's script -- both
+    would otherwise land at `workdir/fake_cli.py`.
+
+    The test owns `workdir` (it creates and rmtree's it around the
+    run); the helper does not mkdtemp anything of its own, so a normal
+    suite run of the three new tests leaves zero /tmp/mcpb-* dirs
+    behind -- matching every other lock-step test in this file that
+    sets its own `workdir = Path(tempfile.mkdtemp(...))` at the top
+    and `shutil.rmtree(workdir, ignore_errors=True)`s it in `finally`.
+    """
+    body = (
+        "import json, time\n"
+        f"marker = {str(marker_path)!r}\n"
+        f"event = {event!r}\n"
+        f"sleep = {sleep}\n"
+        "with open(marker, 'a') as fh:\n"
+        "    fh.write(f'{time.time()} {event}_SPAWN\\n')\n"
+        "    fh.flush()\n"
+        "if sleep:\n"
+        "    time.sleep(sleep)\n"
+        "with open(marker, 'a') as fh:\n"
+        f"    fh.write(f'{{time.time()}} {event}_DONE\\n')\n"
+        "    fh.flush()\n"
+        "print(json.dumps({'result': event, 'usage': "
+        "{'input_tokens': 1, 'output_tokens': 1}}))\n"
+    )
+    sub = workdir / event
+    sub.mkdir()
+    path = sub / "fake_cli.py"
+    path.write_text(body)
+    return str(path)
+
+
+def _read_marker_events(marker_path: str) -> list[tuple[float, str]]:
+    """Parse the marker file's `<time> <event>` lines into a sorted list.
+
+    Wall-clock writes are append-only and the test's event names are
+    process-unique (SLOW_FIRST / FAST_SECOND), so an unsorted
+    read still preserves the order each fake wrote its lines. The sort
+    by timestamp catches any clock-skew drift on slow CI hosts.
+    """
+    out: list[tuple[float, str]] = []
+    with open(marker_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            t_str, name = line.split(" ", 1)
+            out.append((float(t_str), name))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _first_time(events: list[tuple[float, str]], name: str) -> float | None:
+    for t, n in events:
+        if n == name:
+            return t
+    return None
+
+
+def test_run_session_warm_gate_serializes_concurrent_first_calls():
+    """Issue #137 parity: the cli_bridge text path wraps `invoke` in
+    `warm_gate`, which serializes the first concurrent call so a token
+    refresh races exactly once. The mcp_bridge tool path must do the
+    same -- without it a cold start would have every parallel spawn race
+    to refresh and rewrite the shared credential file.
+
+    Drives two `run_session`s concurrently, the first artificially slow.
+    The shared marker file records each subprocess's spawn and done time.
+    The load-bearing assertion is that the second subprocess's spawn is
+    AT OR AFTER the first's done -- the gate held the lock for the
+    first's full body before the second could proceed. A concurrent
+    spawn race (the bug this guard exists to prevent) would have
+    FAST_SECOND_SPAWN < SLOW_FIRST_DONE.
+
+    We deliberately do NOT pin the strict cross-process chain
+    `slow_spawn < fast_spawn < fast_done` with `<`. `time.time()` is not
+    monotonic; an NTP step on a CI host between two subprocesses'
+    wall-clock writes turns a causally-correct run into a red one, and
+    the gate's correctness is already implied by the load-bearing
+    `fast_spawn >= slow_done` below (a spurious NTP step can't make a
+    value go below a *later* event on the same process).
+
+    `_warm` and `_warmup_lock` are saved and restored: the cli_bridge
+    module is process-shared across every test in this file, and an
+    earlier test that warmed it would otherwise skip the slow path
+    entirely and silently pass without exercising the lock. Session
+    new_turn() must be called inside the event loop (it uses
+    asyncio.get_event_loop().create_future), so the session setup also
+    moves into the async function.
+    """
+    saved_warm = server.cli_bridge._warm
+    saved_lock = server.cli_bridge._warmup_lock
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-warm-"))
+    try:
+        marker_path = workdir / "events.log"
+        marker_path.write_text("")
+        slow_cli = _write_event_fake_cli(workdir, marker_path,
+                                        "SLOW_FIRST", sleep=0.3)
+        fast_cli = _write_event_fake_cli(workdir, marker_path, "FAST_SECOND")
+        s_slow = _new_session()
+        s_fast = _new_session()
+        # Cold start: the gate must take the slow path. Set the new Event /
+        # Lock inside the running loop so they bind to the same loop the
+        # warm_gate body will use; creating them outside the loop works in
+        # Python 3.10/3.11 but the second test in this file runs AFTER the
+        # first asyncio.run() closed its loop, and a fresh asyncio.Lock() in
+        # a thread with no current loop is the wrong shape.
+        async def scenario():
+            server.cli_bridge._warm = asyncio.Event()
+            server.cli_bridge._warmup_lock = asyncio.Lock()
+            s_slow.new_turn()
+            s_fast.new_turn()
+            t_slow = asyncio.create_task(
+                server.run_session(s_slow, [sys.executable, slow_cli]))
+            # Yield once so the slow task grabs the warmup lock first.
+            # Otherwise the gather below could schedule the fast task
+            # ahead of it, and the "fast fake spawns after slow done"
+            # assertion would still hold but for the wrong reason (both
+            # race for the lock at the same time). The yield makes the
+            # contract under test explicit.
+            await asyncio.sleep(0)
+            t_fast = asyncio.create_task(
+                server.run_session(s_fast, [sys.executable, fast_cli]))
+            await asyncio.gather(t_slow, t_fast)
+
+        asyncio.run(scenario())
+
+        # Both calls completed successfully.
+        assert s_slow.turn_future.result()["type"] == "final"
+        assert s_fast.turn_future.result()["type"] == "final"
+
+        # _warm is set after the first call succeeded.
+        assert server.cli_bridge._warm.is_set(), \
+            "_warm must be set after the first run_session succeeded"
+
+        # The slow fake's spawn must come first (it acquired the lock).
+        # The fast fake's spawn must wait for the slow fake's done --
+        # that is exactly what the gate guards: a token-refresh race
+        # would otherwise have both spawns in flight at the same time.
+        events = _read_marker_events(str(marker_path))
+        slow_spawn = _first_time(events, "SLOW_FIRST_SPAWN")
+        slow_done = _first_time(events, "SLOW_FIRST_DONE")
+        fast_spawn = _first_time(events, "FAST_SECOND_SPAWN")
+        fast_done = _first_time(events, "FAST_SECOND_DONE")
+        assert slow_spawn is not None and slow_done is not None, events
+        assert fast_spawn is not None and fast_done is not None, events
+        # The gate holds the warmup lock for the first call's body. The
+        # second call can only enter the body (the spawn above) AFTER the
+        # first call's body has completed and set _warm. A concurrent
+        # spawn race (the bug this guard exists to prevent) would have
+        # FAST_SECOND_SPAWN < SLOW_FIRST_DONE.
+        assert fast_spawn >= slow_done, (
+            f"gate did not serialize the cold-start race: "
+            f"slow_done={slow_done} fast_spawn={fast_spawn} events={events}")
+        print(f"  run_session warm_gate: serialized cold-start race "
+              f"(slow_done={slow_done:.3f} <= fast_spawn={fast_spawn:.3f}); "
+              f"_warm set after first success; fast_done={fast_done}")
+    finally:
+        # Restore the cli_bridge module-level globals so the next test
+        # starts from a known state. Doing this in finally (vs in the
+        # inner scenario) means we always restore, even when the assert
+        # below fires.
+        server.cli_bridge._warm = saved_warm
+        server.cli_bridge._warmup_lock = saved_lock
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_run_session_warm_gate_failed_first_leaves_gate_closed():
+    """A failed first run leaves the gate closed: the next caller
+    serializes alone again, exactly the success-only semantics today's
+    `invoke` had. Without this the gate would treat any error as a
+    success and stop protecting subsequent cold starts.
+
+    Two phases:
+
+    * First run uses a fake CLI that exits 1 with an auth-style stderr
+      -- `_run_session_attempt` resolves the turn_future as 401 and
+      returns None (no payload, no exception). `run_session` reports
+      `gate["success"] = False` and the gate stays closed.
+    * Second run uses a successful fake. The gate was still closed, so
+      this run takes the lock, runs alone, and sets _warm.
+
+    The `_warm` / `_warmup_lock` save/restore is the same isolation
+    pattern as the serialize test above; new_turn() must be called
+    inside the running loop (see comment in the serialize test).
+    """
+    saved_warm = server.cli_bridge._warm
+    saved_lock = server.cli_bridge._warmup_lock
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-warm-"))
+    try:
+        fail_cli = _write_fail_fake_cli(workdir)
+        good_cli = _write_good_fake_cli(workdir)
+        s_fail = _new_session()
+        s_good = _new_session()
+
+        async def scenario():
+            server.cli_bridge._warm = asyncio.Event()
+            server.cli_bridge._warmup_lock = asyncio.Lock()
+            s_fail.new_turn()
+            s_good.new_turn()
+            await server.run_session(s_fail, [sys.executable, fail_cli])
+            # The failed run must NOT have warmed the gate.
+            assert not server.cli_bridge._warm.is_set(), \
+                "a failed first run left _warm set -- gate no longer success-only"
+            await server.run_session(s_good, [sys.executable, good_cli])
+
+        asyncio.run(scenario())
+
+        # The failed run resolved as a 401 (auth-style stderr maps to
+        # that on this branch; cli_bridge._AUTH re is the same regex the
+        # production spawn path uses).
+        failed = s_fail.turn_future.result()
+        assert failed["type"] == "error", failed
+        assert failed["status"] == 401, failed
+
+        # The good run succeeded and warmed the gate.
+        good = s_good.turn_future.result()
+        assert good["type"] == "final", good
+        assert server.cli_bridge._warm.is_set(), \
+            "_warm must be set after the second (successful) run"
+        print("  run_session warm_gate: failed first run leaves gate closed "
+              "(401), good second run sets _warm")
+    finally:
+        server.cli_bridge._warm = saved_warm
+        server.cli_bridge._warmup_lock = saved_lock
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _write_fail_fake_cli(workdir: Path) -> str:
+    """Write a fake CLI into `workdir / "fail" / "fake_cli.py"` that exits 1
+    with auth-style stderr; mapped by `_run_session_attempt` to a 401
+    error envelope (no payload). The test owns `workdir`.
+
+    Each failing/good pair sits in its own subdir under the test's
+    `workdir` so the two scripts don't overwrite each other at
+    `workdir/fake_cli.py`."""
+    body = (
+        "import sys\n"
+        "sys.stderr.write('please run `claude login` to authenticate')\n"
+        "sys.exit(1)\n"
+    )
+    sub = workdir / "fail"
+    sub.mkdir()
+    path = sub / "fake_cli.py"
+    path.write_text(body)
+    return str(path)
+
+
+def _write_good_fake_cli(workdir: Path) -> str:
+    """Write a fake CLI into `workdir / "good" / "fake_cli.py"` that prints a
+    successful parseable payload. The test owns `workdir`."""
+    body = (
+        "import json\n"
+        "print(json.dumps({'result': 'OK', 'usage': "
+        "{'input_tokens': 1, 'output_tokens': 1}}))\n"
+    )
+    sub = workdir / "good"
+    sub.mkdir()
+    path = sub / "fake_cli.py"
+    path.write_text(body)
+    return str(path)
 
 
 def test_followup_reaped_mid_turn_rebuilds_instead_of_500():
