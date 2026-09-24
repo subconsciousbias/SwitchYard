@@ -75,7 +75,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import jsonschema
-import yaml
 
 log = logging.getLogger("cli_bridge")
 
@@ -1195,89 +1194,89 @@ class Config:
 
 _config: Config | None = None
 _config_at = 0.0
+# Last plans.yaml mtime we already logged a load error for. Mirrors the
+# `self._plans_mtime` advance pattern in switchyard/hooks.py:_maybe_reload
+# (~269-279): each new failure is reported once, not on every subsequent
+# config() call while the file is still broken. The next edit gets a new
+# mtime and is tried again.
+_config_mtime: float | None = None
 
 
 def read_config() -> Config:
     """Concurrency and model aliases for this plan, read from plans.yaml.
 
-    The config nests models under their plan, so this reads
-    `plans[<plan>].models` — a plan owns the connection limit, and each model
-    contributes the alias this CLI will accept. An earlier version read a
-    top-level `deployments:` map keyed by plan, which no longer exists; it found
-    no models and silently fell back to the profile defaults, so every sidecar
-    reported a model nobody had configured.
+    This delegates to ``switchyard.models.load`` so the sidecar and the
+    gateway share one parser, one error vocabulary, and one model-shape.
+    An earlier version walked plans.yaml by hand with
+    ``except (OSError, ValueError, TypeError)`` — which silently missed
+    ``yaml.YAMLError`` (issue #141), so a stray tab made every request
+    500 for as long as the file stayed broken. With ``models.load`` we
+    raise on every parse / value / shape error and let ``config()``
+    decide whether to keep the last-good config or serve a cold-start
+    fallback.
 
-    Env vars still win, as an escape hatch when the config is unreadable.
+    A missing plan, ``_models is None`` (deploy bug — Dockerfile.sidecar
+    must COPY switchyard/models.py), and any parse/value error all
+    propagate out of this function: the caller (``config()``) is the
+    one that knows whether there is a last-good to keep or whether this
+    is a cold start.
     """
-    fallback_model = os.environ.get(f"{PROVIDER.upper()}_MODEL") or PROFILE["model"]
-    env_conc = os.environ.get("SIDECAR_CONCURRENCY")
+    if _models is None:
+        # Deploy bug: production has Dockerfile.sidecar's COPY of models.py
+        # + PYTHONPATH=/app, so reaching this branch means the image was
+        # built without models.py or with the PYTHONPATH line dropped.
+        # Caller_environment config (and the model alias allowlist) would
+        # silently degrade, so raise loudly instead.
+        raise RuntimeError(
+            "switchyard.models is not importable here. Dockerfile.sidecar "
+            "must COPY switchyard/models.py to /app/switchyard/models.py "
+            "and set PYTHONPATH=/app."
+        )
 
-    cap: int | None = None
-    parked = 0
+    registry = _models.load(PLANS_PATH)
+    target = PLAN or PROVIDER
+    plan = registry.plans.get(target)
+    if plan is None:
+        raise KeyError(f"no plan {target!r} in {PLANS_PATH}")
+
+    # Concurrency: the configured cap when set, otherwise the seed from
+    # settings.concurrency_learning.seed_cap. Same formula as
+    # switchyard/policy.py:142 — the sidecar has no learner, so the seed
+    # IS the cap when the plan omits an explicit max_parallel. The plan's
+    # own value wins when both are present; settings is the fallback.
+    # Deliberately NOT applied: gate_headroom_slots, max_parallel_ceiling.
+    # The physical gate stays at the configured cap by design
+    # (Settings.gate_headroom_slots docstring, models.py ~267-277) and
+    # the ceiling only bounds the gateway's learner, which the sidecar
+    # does not run.
+    cap = plan.configured_parallel or registry.settings.concurrency_learning.seed_cap
+    parked = plan.max_parked_sessions
+    caller_environment = registry.settings.caller_environment
+
+    # Aliases/default from the plan's live models (enabled and on an
+    # enabled, unexpired plan). Strip the leading LiteLLM provider prefix
+    # only: `openai/claude-opus-5` -> `claude-opus-5`, but
+    # `openai/opencode-go/glm-5.3-flash` keeps the inner provider/model
+    # shape OpenCode actually answers to.
     models: set[str] = set()
     default: str | None = None
-    caller_environment = None
-    target = PLAN or PROVIDER
+    for m in plan.live_models:
+        spec = m.model
+        alias = spec.split("/", 1)[1] if "/" in spec else spec
+        models.add(alias)
+        if default is None:
+            default = alias
 
-    try:
-        with open(PLANS_PATH) as fh:
-            raw = yaml.safe_load(fh) or {}
-        seed = int(((raw.get("settings") or {}).get("concurrency_learning")
-                    or {}).get("seed_cap", 2))
-        ce_raw = (raw.get("settings") or {}).get("caller_environment") or {}
-        if isinstance(ce_raw, dict):
-            if _models is None:
-                # Loud: production has Dockerfile.sidecar's COPY of
-                # models.py + PYTHONPATH=/app, so reaching this branch
-                # means the image was built without models.py or with the
-                # PYTHONPATH=/app line dropped. Caller_environment config
-                # is being dropped on the floor, so a 429-style refusal or
-                # a permissive fallback would silently degrade; surface it.
-                log.error("caller_environment config in %s is being dropped: "
-                          "switchyard.models is not importable here. "
-                          "Dockerfile.sidecar must COPY switchyard/models.py "
-                          "to /app/switchyard/models.py and set "
-                          "PYTHONPATH=/app.",
-                          PLANS_PATH)
-                caller_environment = None
-            else:
-                try:
-                    caller_environment = _models.CallerEnvironmentSettings(**ce_raw)
-                except Exception as exc:
-                    log.error("could not load CallerEnvironmentSettings from %s: %s",
-                              PLANS_PATH, exc, exc_info=True)
-                    caller_environment = None
-        plan = (raw.get("plans") or {}).get(target) or {}
-        if not plan:
-            log.warning("no plan %r in %s; falling back to env", target, PLANS_PATH)
-        else:
-            raw_cap = plan.get("max_parallel", 1)
-            cap = seed if str(raw_cap).lower() == "auto" else int(raw_cap)
-            parked = int(plan.get("max_parked_sessions") or 0)
-            for _key, body in (plan.get("models") or {}).items():
-                body = body or {}
-                if body.get("enabled") is False:
-                    continue
-                spec = body.get("model")
-                if not spec:
-                    continue
-                # Strip the LiteLLM provider prefix: `openai/claude-opus-5` is
-                # `claude-opus-5` to the CLI, and `openai/opencode-go/glm-5.3-flash`
-                # keeps its provider/model shape.
-                alias = spec.split("/", 1)[1] if "/" in spec else spec
-                models.add(alias)
-                if default is None:
-                    default = alias
-    except (OSError, ValueError, TypeError) as exc:
-        log.warning("could not read %s (%s); falling back to env", PLANS_PATH, exc)
-
-    concurrency = int(env_conc) if env_conc else (cap if cap else 1)
+    env_conc = os.environ.get("SIDECAR_CONCURRENCY")
+    fallback_model = os.environ.get(f"{PROVIDER.upper()}_MODEL") or PROFILE["model"]
+    concurrency = int(env_conc) if env_conc else cap
     model = default or fallback_model
     source = "config" if models else "fallback"
     if source == "fallback":
-        # Loud, because this is how a sidecar ends up serving a model nobody
-        # configured: it reads no models, quietly uses the profile default, and
-        # looks healthy while doing it.
+        # Loud, because this is how a sidecar ends up serving a model
+        # nobody configured: a disabled/expired plan reads no models,
+        # quietly uses the profile default, and looks healthy while
+        # doing it.
         log.error("read no models for plan %r from %s — falling back to %r. "
                   "Check SWITCHYARD_PLAN and the plan's `models:` block.",
                   target, PLANS_PATH, model)
@@ -1287,11 +1286,56 @@ def read_config() -> Config:
                   caller_environment=caller_environment)
 
 
+def _fallback_config() -> Config:
+    """Env/profile fallback used on cold start when plans.yaml is unreadable.
+
+    The ``SIDECAR_CONCURRENCY`` / ``<PROVIDER>_MODEL`` escape hatches still
+    apply so an operator can bring a sidecar up by hand. ``source=fallback``
+    keeps /health honest about what is being served: a sidecar that could
+    not read its config is visibly broken, not silently running on the
+    profile default at concurrency 1.
+    """
+    fallback_model = os.environ.get(f"{PROVIDER.upper()}_MODEL") or PROFILE["model"]
+    env_conc = os.environ.get("SIDECAR_CONCURRENCY")
+    concurrency = int(env_conc) if env_conc else 1
+    return Config(concurrency=max(1, concurrency), model=fallback_model,
+                  models={fallback_model}, source="fallback")
+
+
 def config() -> Config:
-    global _config, _config_at
+    global _config, _config_at, _config_mtime
     if _config is None or (time.time() - _config_at) > CONFIG_TTL:
-        _config = read_config()
-        _config_at = time.time()
+        try:
+            _config = read_config()
+            _config_at = time.time()
+        except Exception as exc:
+            # Advance the mtime stamp so a broken file is reported once,
+            # not on every subsequent config() call while the file is
+            # still broken. The next edit gets a new mtime and is tried
+            # again — same shape as switchyard/hooks.py:_maybe_reload
+            # (~269-279).
+            try:
+                mtime: float | None = os.stat(PLANS_PATH).st_mtime
+            except OSError:
+                mtime = None
+            if mtime != _config_mtime:
+                _config_mtime = mtime
+                if _config is not None:
+                    log.warning("could not reload %s (%s: %s); "
+                                "keeping last-good config",
+                                PLANS_PATH, type(exc).__name__, exc)
+                else:
+                    log.warning("could not load %s (%s: %s); "
+                                "no last-good, serving env/profile fallback",
+                                PLANS_PATH, type(exc).__name__, exc)
+            # A warm sidecar must never serve a model it has not already
+            # vetted, so keep the last-good `_config` when one exists.
+            # Cold start (no `_config` yet) gets the fallback Config so
+            # /health still reports `source=fallback` rather than crashing
+            # every request with a load failure.
+            if _config is None:
+                _config = _fallback_config()
+                _config_at = time.time()
     return _config
 
 

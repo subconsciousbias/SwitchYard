@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -508,8 +509,29 @@ def test_sidecar_model_aliases_keep_provider_prefixes_where_needed():
 
 
 def test_a_missing_plan_is_reported_not_papered_over():
-    cfg = _read_for("no-such-plan", "claude")
-    assert cfg.source == "fallback", cfg
+    """A missing plan must reach the caller as `source=fallback`, not as a
+    crash.
+
+    `read_config()` propagates the missing-plan error (so a deploy bug or
+    a typo is loud), but `config()` catches it and serves the fallback
+    Config on cold start so /health still reports `source=fallback`
+    rather than 500ing every request. Drive `config()` with `_config`
+    reset to simulate that cold start -- the same reset pattern the new
+    last-good regression tests use.
+    """
+    import _modules
+    old = dict(os.environ)
+    os.environ.update({"PROVIDER": "claude", "SWITCHYARD_PLAN": "no-such-plan",
+                       "SWITCHYARD_PLANS": PLANS})
+    for key in ("SIDECAR_CONCURRENCY", "CLAUDE_MODEL", "CODEX_MODEL", "OPENCODE_MODEL"):
+        os.environ.pop(key, None)
+    try:
+        mod = _modules.reload(server)
+        mod._config = None
+        cfg = mod.config()
+        assert cfg.source == "fallback", cfg
+    finally:
+        _restore_env_and_reload(old)
     print(f"  unknown plan -> source={cfg.source!r}, /health reports ok=false")
 
 
@@ -2837,6 +2859,279 @@ def test_exit_zero_envelope_error_is_classified_via_http_surface():
     finally:
         server.CLI, server.BARE, server.PROFILE["args"], server.PROFILE["parser"] = \
             real_cli, real_bare, real_args, real_parser
+
+
+# ------------------------------------------- issue #141: last-good on parse err ---
+# `read_config()` previously caught only (OSError, ValueError, TypeError) when
+# walking plans.yaml by hand, so a yaml.YAMLError (a stray tab is a
+# `ScannerError`) fell through uncaught and `config()` raised on every request
+# for as long as the file stayed broken. A value typo (`max_parallel: two`) WAS
+# caught and silently served the profile-default model at concurrency 1.
+#
+# The fix routes read_config() through `models.load`, which raises on every
+# parse / value / shape error, and config() catches to keep the last-good
+# `_config` on the warm path. The four tests below pin each of the four
+# outcomes the issue calls out (issue #141): last-good on bad yaml, last-good
+# on a value error (model unchanged, source stays config), recovery when the
+# file is fixed (new mtime), and the cold-start fallback so /health still
+# reports source=fallback. Each scenario works on a tempfile copy of the
+# tracked fixture; the runner resets `_config`, `_config_at`, and
+# `_config_mtime` between scenarios so a previous test's state cannot leak.
+
+
+def _load_server_with_plans(plans_path: str, *, preserve_escape_hatches: bool = False):
+    """Reload server under `plans_path` and reset module globals.
+
+    Returns (mod, old_env). The caller must `_restore_env_and_reload(old_env)`
+    in a finally block. Resetting `_config`, `_config_at`, and
+    `_config_mtime` puts the module at a cold start, the same way `_read_for`
+    and the new `_fallback_config` path expect.
+
+    `preserve_escape_hatches=True` keeps any SIDECAR_CONCURRENCY /
+    <PROVIDER>_MODEL already in `os.environ` so the cold-start fallback
+    can be driven by them (test (4)). Other tests pop them so an env
+    inherited from a sibling test cannot leak.
+    """
+    import _modules
+    old = dict(os.environ)
+    os.environ.update({"PROVIDER": "claude", "SWITCHYARD_PLAN": "claude-max",
+                       "SWITCHYARD_PLANS": plans_path})
+    if not preserve_escape_hatches:
+        for key in ("SIDECAR_CONCURRENCY", "CLAUDE_MODEL", "CODEX_MODEL", "OPENCODE_MODEL"):
+            os.environ.pop(key, None)
+    mod = _modules.reload(server)
+    mod._config = None
+    mod._config_at = 0.0
+    mod._config_mtime = None
+    return mod, old
+
+
+def test_last_good_kept_on_invalid_yaml():
+    """Good load then invalid YAML -> config() returns the previous config.
+
+    A stray tab makes plans.yaml unparseable. The previous code's
+    `except (OSError, ValueError, TypeError)` missed ``yaml.YAMLError``
+    (issue #141), so every request 500'd for as long as the file stayed
+    broken. With `models.load` driving `read_config()`, parse errors
+    propagate and `config()` keeps the last-good Config so the sidecar
+    serves the previous config until the operator fixes the file.
+    """
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix="clib-141-yaml-"))
+    try:
+        plans = tmp / "plans.yaml"
+        plans.write_text(Path(PLANS).read_text())
+        mod, old = _load_server_with_plans(str(plans))
+        try:
+            cfg_good = mod.config()
+            assert cfg_good.source == "config", cfg_good
+            assert "claude-opus-5" in cfg_good.models, cfg_good.models
+            assert cfg_good.concurrency == 2, cfg_good.concurrency
+
+            # Stray tab in `models:` -> ScannerError (subclass of
+            # YAMLError, not a ValueError), which the old
+            # `except (OSError, ValueError, TypeError)` clause missed.
+            plans.write_text("plans:\n  claude-max:\n\tmodels: tab-indented\n")
+            mod._config_at = 0.0      # force TTL refresh on the next config() call
+            cfg_after = mod.config()
+            # The warm-sidecar rule: a broken plans.yaml must not steal
+            # the config the sidecar was already serving on.
+            assert cfg_after.model == cfg_good.model, (cfg_good.model, cfg_after.model)
+            assert cfg_after.concurrency == cfg_good.concurrency, cfg_after.concurrency
+            assert cfg_after.models == cfg_good.models, cfg_after.models
+            assert cfg_after.source == "config", cfg_after.source
+        finally:
+            _restore_env_and_reload(old)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  invalid YAML (stray tab) -> last-good config preserved")
+
+
+def test_last_good_kept_on_value_error():
+    """Good load then `max_parallel: two` -> previous config, model
+    unchanged (not the profile default), source stays "config".
+
+    A value typo used to fall into the same broad `except ValueError` and
+    silently serve the profile-default model at concurrency 1, looking
+    healthy while doing it. With `models.load` raising on shape errors,
+    `config()` keeps the last-good Config -- the warm-sidecar rule: a
+    transient bad edit must never substitute the profile default for a
+    model the operator vetted.
+    """
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix="clib-141-value-"))
+    try:
+        plans = tmp / "plans.yaml"
+        plans.write_text(Path(PLANS).read_text())
+        mod, old = _load_server_with_plans(str(plans))
+        try:
+            cfg_good = mod.config()
+            assert cfg_good.source == "config", cfg_good
+            opus_model = cfg_good.model
+            assert "claude-opus-5" in cfg_good.models, cfg_good.models
+            # Sanity: the profile default for claude is something else
+            # (PROFILE["model"]), so `cfg_good.model == PROFILE["model"]`
+            # would mean read_config() already silently fell back -- the
+            # very regression this test pins.
+            assert opus_model != mod.PROFILE["model"], \
+                f"sanity: last-good model is NOT the profile default " \
+                f"(got model={opus_model!r}, profile_default={mod.PROFILE['model']!r})"
+
+            # Same plans.yaml but `max_parallel: two` for claude-max.
+            # _parse_plan_max_parallel rejects strings other than "auto"
+            # as a ValueError, which propagates out of read_config().
+            content = Path(PLANS).read_text()
+            claude_max_block = ("  claude-max:\n"
+                                "    label: \"Claude Max $200\"\n"
+                                "    auth: cli_sidecar             # OAuth; "
+                                "the Claude CLI holds the credential\n"
+                                "    monthly_cost: 100\n"
+                                "    max_parallel: 2\n"
+                                "    max_parallel_ceiling: 2       # never probe above it\n")
+            assert claude_max_block in content, "anchor missing — plans.example.yaml moved"
+            plans.write_text(content.replace(
+                claude_max_block,
+                claude_max_block.replace("max_parallel: 2\n", "max_parallel: two\n", 1),
+                1))
+            mod._config_at = 0.0      # force TTL refresh
+            cfg_after = mod.config()
+            # Warm-sidecar rule: model is the last-good (claude-opus-5),
+            # NOT the profile default; source stays config.
+            assert cfg_after.model == opus_model, \
+                f"model unchanged on value error (was {opus_model!r}, " \
+                f"got {cfg_after.model!r})"
+            assert cfg_after.model != mod.PROFILE["model"], \
+                "warm sidecar must never substitute the profile default on a bad edit"
+            assert cfg_after.concurrency == cfg_good.concurrency, cfg_after.concurrency
+            assert cfg_after.models == cfg_good.models, cfg_after.models
+            assert cfg_after.source == "config", \
+                f"source stays config on warm-sidecar last-good (got {cfg_after.source!r})"
+        finally:
+            _restore_env_and_reload(old)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  invalid value (max_parallel: two) -> last-good, model not profile default")
+
+
+def test_fixed_plans_yaml_is_picked_up_after_mtime_advance():
+    """Once the file is fixed and the mtime advances past the logged
+    failure, the next config() call picks up the new config.
+
+    The mtime stamp on the failure is bumped to the broken-file mtime
+    so a subsequent read of the same broken file does NOT log again
+    (mirroring hooks.py:_maybe_reload). An edit that produces a new
+    mtime clears that stamp and the next config() call reloads.
+    """
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix="clib-141-recover-"))
+    try:
+        plans = tmp / "plans.yaml"
+        plans.write_text(Path(PLANS).read_text())
+        mod, old = _load_server_with_plans(str(plans))
+        try:
+            cfg_good = mod.config()
+            assert cfg_good.source == "config", cfg_good
+            assert cfg_good.concurrency == 2, cfg_good.concurrency
+
+            # Break plans.yaml with a value error in the claude-max
+            # block; the anchor below uniquely identifies it.
+            content = Path(PLANS).read_text()
+            claude_max_block = ("  claude-max:\n"
+                                "    label: \"Claude Max $200\"\n"
+                                "    auth: cli_sidecar             # OAuth; "
+                                "the Claude CLI holds the credential\n"
+                                "    monthly_cost: 100\n"
+                                "    max_parallel: 2\n"
+                                "    max_parallel_ceiling: 2       # never probe above it\n")
+            assert claude_max_block in content, "anchor missing — plans.example.yaml moved"
+            plans.write_text(content.replace(
+                claude_max_block,
+                claude_max_block.replace("max_parallel: 2\n", "max_parallel: two\n", 1),
+                1))
+            mod._config_at = 0.0      # force TTL refresh
+            cfg_after_break = mod.config()
+            assert cfg_after_break.concurrency == cfg_good.concurrency
+
+            # Fix the file with a different cap so the new config is
+            # distinguishable from the last-good. Force a new mtime so
+            # any mtime-stamp tracking on the failure path is cleared
+            # before we ask config() to reload. The cap AND its ceiling
+            # have to move together: max_parallel_ceiling must be >=
+            # max_parallel or the loader rejects the file (models.py
+            # _parse_plan_max_parallel_ceiling).
+            plans.write_text(content.replace(
+                claude_max_block,
+                claude_max_block.replace("max_parallel: 2",
+                                         "max_parallel: 3").replace(
+                    "max_parallel_ceiling: 2", "max_parallel_ceiling: 3", 1),
+                1))
+            # Future mtime, well past any stamp on the broken-file
+            # failure so the next config() call's read_config() runs.
+            future = time.time() + 60
+            os.utime(str(plans), (future, future))
+            mod._config_at = 0.0      # force TTL refresh
+            cfg_fixed = mod.config()
+            # New cap is picked up; last-good is no longer served.
+            assert cfg_fixed.concurrency == 3, \
+                f"fixed plans.yaml -> new cap 3 (got {cfg_fixed.concurrency})"
+            assert cfg_fixed.source == "config", cfg_fixed.source
+            assert cfg_fixed.models == cfg_good.models, cfg_fixed.models
+        finally:
+            _restore_env_and_reload(old)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  broken file -> fixed file (new mtime) -> new config picked up")
+
+
+def test_cold_start_on_broken_file_serves_fallback_with_escape_hatches():
+    """A sidecar that boots against a broken plans.yaml (cold start, no
+    last-good) must keep /health reporting source=fallback instead of
+    crashing every request with a load failure.
+
+    The escape hatches (SIDECAR_CONCURRENCY / <PROVIDER>_MODEL) still
+    apply so an operator can steer a freshly-deployed sidecar by hand
+    until plans.yaml is repaired.
+    """
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix="clib-141-cold-"))
+    try:
+        plans = tmp / "plans.yaml"
+        plans.write_text("plans:\n  claude-max:\n\tmodels: tab-indented\n")
+
+        # Cold start: nothing yet in `_config`, broken plans.yaml.
+        # `_load_server_with_plans` resets `_config = None` to simulate
+        # the cold start, the same way the other tests do.
+        mod, old = _load_server_with_plans(str(plans))
+        try:
+            cfg = mod.config()
+            assert cfg.source == "fallback", \
+                f"cold-start fallback reports source=fallback (got {cfg.source!r})"
+            assert cfg.model == mod.PROFILE["model"], \
+                f"cold-start model is the profile default (got {cfg.model!r})"
+            assert cfg.concurrency == 1, \
+                f"cold-start concurrency is 1 (got {cfg.concurrency})"
+        finally:
+            _restore_env_and_reload(old)
+
+        # Escape hatches steer the cold-start fallback so an operator can
+        # bring a freshly-deployed sidecar up by hand. Set them BEFORE
+        # the helper runs, with `preserve_escape_hatches=True` so the
+        # helper does not pop them.
+        os.environ["SIDECAR_CONCURRENCY"] = "7"
+        os.environ["CLAUDE_MODEL"] = "claude-escape-hatch"
+        mod, old = _load_server_with_plans(str(plans), preserve_escape_hatches=True)
+        try:
+            cfg = mod.config()
+            assert cfg.source == "fallback", cfg.source
+            assert cfg.model == "claude-escape-hatch", \
+                f"<PROVIDER>_MODEL escape hatch applied (got {cfg.model!r})"
+            assert cfg.concurrency == 7, \
+                f"SIDECAR_CONCURRENCY escape hatch applied (got {cfg.concurrency})"
+        finally:
+            _restore_env_and_reload(old)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  cold start on broken file -> source=fallback (escape hatches honoured)")
 
 
 # -------------------------------------------- issue #292: reasoning propagation ---
