@@ -674,6 +674,144 @@ def test_streamed_messages_upstream_error_still_releases_slot():
 
 
 # ============================================================================
+# Section 4c: streamed /v1/chat/completions disconnect (issue #182)
+# ============================================================================
+def test_streamed_openai_consumer_disconnect_releases_slot_via_aclose():
+    """Streamed ``/v1/chat/completions`` (call_type = ``acompletion``, NOT in
+    ``UNLOGGED_CALL_TYPES``) must still release the slot when the consumer
+    hangs up mid-stream, even though ``async_log_success_event`` owns the
+    success bookkeeping.
+
+    Pre-fix: the bare pass-through ``async for chunk in response: yield chunk``
+    in ``_stream_chunks`` had no ``try/except`` around it, so a client
+    disconnect arriving as ``GeneratorExit`` at a yield left the slot
+    claimed until the staleness sweep eventually dropped it -- exactly the
+    zero-chunk CLI-sidecar leak reported in the issue.
+
+    Post-fix: the same marker-free detached slot-release task that the
+    ``/v1/messages`` branch already uses (idempotent with ``picker.release``
+    and ``_stop_heartbeat``, deliberately does NOT claim
+    ``ctx[_TERMINATED]`` so ``async_log_success_event`` can still book
+    partial usage when chunks were non-empty) is scheduled from the new
+    ``except BaseException`` arm.
+
+    Variant A exercises the ``GeneratorExit`` arm: the consumer takes one
+    OpenAI-shaped chunk then ``gen.aclose()`` (which throws ``GeneratorExit``
+    into the suspended generator).
+    """
+    h, _reg, slots, _ledger, _policy, _redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="acompletion")  # NOT in UNLOGGED_CALL_TYPES
+    request_data = {"metadata": _meta_for(ctx)}
+
+    class _Chunk:
+        choices = []
+        def __init__(self):
+            pass
+
+    async def produce():
+        yield _Chunk()
+        yield _Chunk()
+
+    async def consume_one_chunk():
+        h._start_heartbeat(pick.plan.key, pick.model.ref, pick.request_id)
+        gen = h.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=None, response=produce(), request_data=request_data,
+        )
+        # Take one chunk only, then bail (mimics a client that hung up
+        # after reading the start of an OpenAI stream).
+        async for _ in gen:
+            break
+        # Force-close the iterator so the detached slot-release task
+        # gets scheduled and runs.
+        await gen.aclose()
+        await asyncio.sleep(0.1)
+
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 1
+    asyncio.run(consume_one_chunk())
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 0, (
+        "client disconnect left the slot claimed on a streamed "
+        "/v1/chat/completions call")
+    assert pick.request_id not in h._beats, (
+        f"heartbeat for disconnected request still alive: {h._beats}")
+    print("  streamed /v1/chat/completions client cancel (GeneratorExit) "
+          "released the slot; detach task ran after aclose")
+
+
+def test_streamed_openai_consumer_disconnect_releases_slot_via_task_cancel():
+    """Variant B: the zero-chunk CLI-sidecar shape.
+
+    The CLI-sidecar pattern that surfaced as the reported bug: the
+    upstream provider (the sidecar) takes a long time before sending
+    any chunk, the client hangs up, no chunk was ever pulled. A
+    never-started generator's ``aclose()`` is a no-op and would not
+    exercise the fix, so we start a consumer task that is suspended on
+    the producer's first ``__anext__`` (the producer hangs on
+    ``asyncio.Event().wait()`` to mimic a slow sidecar), then cancel
+    the task. ``CancelledError`` propagates through the async
+    generator's ``async for chunk in response: yield chunk`` into the
+    new ``except BaseException`` arm, which schedules the marker-free
+    detached slot release.
+
+    Note: this test does NOT drive ``async_log_success_event`` -- the
+    reported case is exactly the disconnect-before-any-chunk path, so
+    the iterator-side cleanup is the sole cleanup. Success accounting
+    is still owned by ``async_log_success_event`` when it does fire
+    (asserted by ``test_logged_call_type_is_not_double_finished_by_streaming_hook``).
+    """
+    h, _reg, slots, _ledger, _policy, _redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="acompletion")  # NOT in UNLOGGED_CALL_TYPES
+    request_data = {"metadata": _meta_for(ctx)}
+
+    async def produce():
+        # Sidecar-style slow producer: never yields a chunk in this test.
+        # The `if False: yield` keeps this an async generator so the
+        # streaming hook accepts it.
+        await asyncio.Event().wait()
+        if False:
+            yield  # pragma: no cover -- never reached
+
+    async def consume_zero_chunks():
+        h._start_heartbeat(pick.plan.key, pick.model.ref, pick.request_id)
+        gen = h.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=None, response=produce(), request_data=request_data,
+        )
+        # Park on the producer's first ``__anext__`` (which awaits
+        # ``asyncio.Event().wait()`` and never completes). ``drive()``
+        # cancels the surrounding task, throwing ``CancelledError``
+        # into the async generator at its suspended point.
+        async for _ in gen:
+            pass  # unreachable in this variant
+
+    async def drive():
+        # Run the consumer in a separate task so we can cancel it from
+        # outside. The consumer parks on the producer's ``await
+        # asyncio.Event().wait()`` (which never completes); cancelling
+        # the task throws ``CancelledError`` into the async generator
+        # at its suspended point.
+        consumer = asyncio.create_task(consume_zero_chunks())
+        # Yield long enough for the consumer to start and park.
+        await asyncio.sleep(0.05)
+        consumer.cancel()
+        try:
+            await consumer
+        except asyncio.CancelledError:
+            pass
+        # Let the detached slot-release task run.
+        await asyncio.sleep(0.1)
+
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 1
+    asyncio.run(drive())
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 0, (
+        "zero-chunk client disconnect left the slot claimed on a "
+        "streamed /v1/chat/completions call (CLI-sidecar leak)")
+    assert pick.request_id not in h._beats, (
+        f"heartbeat for disconnected request still alive: {h._beats}")
+    print("  streamed /v1/chat/completions zero-chunk cancel "
+          "(CancelledError) released the slot; detach task ran after "
+          "task.cancel")
+
+
+# ============================================================================
 # Section 4b: streamed error race (review blocker on PR #67)
 # ============================================================================
 def test_streamed_messages_error_race_books_partial_usage_as_failure():

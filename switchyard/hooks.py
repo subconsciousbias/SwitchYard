@@ -795,8 +795,12 @@ class SwitchyardHandler(CustomLogger):
            note + limit headers have to happen here. ``_stream_chunks`` wraps
            the upstream iterator with usage parsing and a detached finalize
            task, so client cancellation cannot leave the slot claimed. OpenAI
-           streamed routes are still owned by ``async_log_success_event``; the
-           call_type gate below keeps us out of their way.
+           streamed routes ALSO get iterator-side disconnect cleanup -- the
+           bare pass-through below is wrapped in ``try/except BaseException``
+           that schedules the marker-free detached slot release -- but their
+           success accounting is still owned by ``async_log_success_event``;
+           the call_type gate keeps the streamed-success finalize out of
+           their way.
 
         Cancellation safety: the finalize is a detached asyncio task scheduled
         from the iterator's `try/except/else` arms, so the iterator itself
@@ -886,12 +890,27 @@ class SwitchyardHandler(CustomLogger):
                 yield chunk
             return
 
-        # Only this call type needs streamed finish. OpenAI-shaped routes
-        # still own their success logging through async_log_success_event, so
-        # we yield through and let the hook above do the reasoning split.
+        # OpenAI-shaped routes (and any other non-``anthropic_messages``
+        # call type) still own their success logging through
+        # ``async_log_success_event`` -- but the streaming iterator is the
+        # only place that observes a mid-stream client disconnect, so wrap
+        # the bare pass-through in ``try/except BaseException`` that
+        # schedules the marker-free detached slot release. The helper
+        # intentionally does NOT claim ``ctx[_TERMINATED]`` (one documented
+        # deviation from the issue's sketch, mirroring the sibling
+        # ``/v1/messages`` design at hooks.py:925-934 / hooks.py:989-1051) so
+        # ``async_log_success_event`` can still book partial usage when
+        # chunks were non-empty; on the zero-chunk CLI-sidecar leak (the
+        # reported case) this arm is the sole cleanup. ``picker.release``
+        # and ``_stop_heartbeat`` are idempotent, so a double-release is a
+        # no-op if ``async_log_success_event`` later wins the race.
         if ctx.get("call_type") not in UNLOGGED_CALL_TYPES:
-            async for chunk in response:
-                yield chunk
+            try:
+                async for chunk in response:
+                    yield chunk
+            except BaseException:
+                self._schedule_stream_slot_release(ctx, request_data)
+                raise
             return
 
         collected: dict[str, int] = {}
