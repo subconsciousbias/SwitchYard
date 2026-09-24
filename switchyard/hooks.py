@@ -505,6 +505,7 @@ class SwitchyardHandler(CustomLogger):
                 "platform": ce.platform,
                 "shell": ce.shell,
                 "source": ce.source,
+                "git": ce.git,
             }
         except Exception:                       # never fail the request over a label
             log.debug("caller_env resolution skipped for this request", exc_info=True)

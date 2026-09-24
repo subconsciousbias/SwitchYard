@@ -1037,6 +1037,74 @@ def test_render_system_block_tells_a_windows_model_about_paths_and_shell():
         assert block.endswith("the caller\nenvironment above is authoritative."), block
     print("  Windows note on win32/windows/Windows_NT only; POSIX block unchanged")
 
+
+# --------------------------------------------- git flag carries through the wire ---
+def test_resolve_preserves_git_flag_on_request_source():
+    """The git flag parsed off the caller's prompt (Claude Code's `Is a
+    git repository: true`) survives `caller_env.resolve()` at the request
+    tier. The forced-config branch correctly strips it (plans.yaml never
+    forces git) and the host fallback returns git=None -- verified here
+    as the request path that the chain test depends on."""
+    cfg = _StubCfg()
+    request_data = {"messages": [
+        {"role": "system", "content": CLAUDE_CODE_ENV_SECTION},
+        {"role": "user", "content": "hi"}]}
+    env = caller_env.resolve(request_data, cfg)
+    assert env.git is True, env
+    assert env.source == "request", env
+    # Config-forced branch: plans.yaml never carries git, so it must be None.
+    cfg_forced = _StubCfg(platform="darwin", cwd="/etc", shell="zsh")
+    forced = caller_env.resolve(request_data, cfg_forced)
+    assert forced.source == "config" and forced.git is None, forced
+    # Host fallback: hard-codes git=None too.
+    host = caller_env.resolve({}, _StubCfg(fallback_platform="darwin"))
+    assert host.source == "host" and host.git is None, host
+    print(f"  resolve() preserves git at request tier (and only there): "
+        f"request={env.git} config={forced.git} host={host.git}")
+
+
+def test_git_flag_round_trips_through_from_wire_metadata():
+    """The chain test: caller_env.resolve() yields git=True; the hooks
+    stamp dict carries it; caller_env.from_wire_metadata() returns it.
+    This is the wire path the gateway -> sidecar transport uses."""
+    cfg = _StubCfg()
+    request_data = {"messages": [
+        {"role": "system", "content": CLAUDE_CODE_ENV_SECTION},
+        {"role": "user", "content": "hi"}]}
+    env = caller_env.resolve(request_data, cfg)
+    assert env.git is True and env.source == "request", env
+    # Simulate the hooks' caller_env stamp dict.
+    stamp = {"cwd": env.cwd, "platform": env.platform, "shell": env.shell,
+             "source": env.source, "git": env.git}
+    parsed = caller_env.from_wire_metadata(stamp)
+    assert parsed is not None
+    assert parsed.git is True, parsed
+    assert parsed.source == "request", parsed        # honored as-is, not re-labeled
+    assert parsed.cwd == env.cwd and parsed.platform == env.platform, parsed
+    print(f"  resolve -> hooks stamp -> from_wire_metadata: git={parsed.git} "
+        f"source={parsed.source}")
+
+
+def test_from_wire_metadata_strict_bool_git_coercion():
+    """`git` is caller-controlled (it is the bool the caller's prompt
+    advertised about its cwd). The wire layer accepts ONLY a real bool;
+    anything else coerces to None so a misbehaving caller cannot stamp
+    a truthy git flag that did not come from a prompt parse. False is
+    honored because it IS a real bool."""
+    base = {"cwd": "/u/proj", "platform": "darwin", "shell": "zsh",
+            "source": "request"}
+    # True / False honored (these are real bools).
+    assert caller_env.from_wire_metadata({**base, "git": True}).git is True
+    assert caller_env.from_wire_metadata({**base, "git": False}).git is False
+    # Anything else coerces to None.
+    for bad in ("yes", "no", 1, 0, "true", "false", [], {}, "True"):
+        parsed = caller_env.from_wire_metadata({**base, "git": bad})
+        assert parsed is not None and parsed.git is None, (bad, parsed)
+    # Absent key -> None (a legacy stamp that never carried the field).
+    assert caller_env.from_wire_metadata(base).git is None
+    print("  from_wire_metadata: bool honored, non-bool coerces to None")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

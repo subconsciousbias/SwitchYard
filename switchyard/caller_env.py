@@ -206,6 +206,14 @@ def from_wire_metadata(meta: dict | None) -> CallerEnvironment | None:
     cwd = meta.get("cwd")
     platform = meta.get("platform")
     shell = meta.get("shell")
+    # The `git` field is caller-controlled (it is the same bool the
+    # caller's prompt advertised about its cwd). Accept only a real
+    # boolean -- anything else from the wire (`"yes"`, `1`, an
+    # accident of JSON, a legacy stamp that never carried the field)
+    # coerces to None so a misbehaving caller cannot stamp a truthy
+    # git flag that did not come from the prompt parse.
+    git = meta.get("git")
+    git = git if isinstance(git, bool) else None
     if not (cwd or platform or shell):
         return None
     raw_source = meta.get("source")
@@ -223,7 +231,7 @@ def from_wire_metadata(meta: dict | None) -> CallerEnvironment | None:
     else:
         return None              # None, "unknown", unknown labels -> passive parse
     return CallerEnvironment(cwd=cwd, platform=platform, shell=shell,
-                             source=source)
+                             source=source, git=git)
 
 
 # ---------------------------------------------------------------------------
@@ -814,8 +822,15 @@ def resolve(data: dict[str, Any], cfg: Any,
     def _set_source(env: CallerEnvironment | None, source: str) -> CallerEnvironment | None:
         if env is None:
             return None
+        # Carry `git` through so the flag parsed off the caller's prompt
+        # (Claude Code's `Is a git repository: true` / OpenCode's
+        # `Is directory a git repo: yes`) survives the resolve() round-trip
+        # at the request and probe tiers. The forced-config branch above
+        # correctly keeps git=None (plans.yaml never forces git), and the
+        # host fallback below hard-codes git=None as well.
         return CallerEnvironment(cwd=env.cwd, platform=env.platform,
-                                 shell=env.shell, source=source)
+                                 shell=env.shell, source=source,
+                                 git=env.git)
 
     forced = CallerEnvironment(
         cwd=getattr(cfg, "cwd", None),

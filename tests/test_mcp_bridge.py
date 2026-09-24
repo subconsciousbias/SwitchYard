@@ -741,6 +741,23 @@ def test_tool_path_argv_carries_the_effort_and_env_rides_the_carrier():
     print("  tool path: --effort carried; caller_env read from the extra_body carrier")
 
 
+def test_resolve_env_carries_git_from_stamp():
+    """A wire stamp carrying `git: True` flows through `_resolve_env` to
+    the returned CallerEnvironment so the sidecar's mirror of the
+    caller's cwd is `git init`ed to match. `from_wire_metadata` is the
+    strict-bool gate, so a stray `git: "yes"` on the wire coerces to
+    None rather than sneaking through as truthy."""
+    env = server._resolve_env({"switchyard": {"caller_env": {
+        "cwd": "/Users/x/proj", "platform": "darwin", "shell": "zsh",
+        "source": "request", "git": True}}})
+    assert env is not None and env.git is True, env
+    bad = server._resolve_env({"switchyard": {"caller_env": {
+        "cwd": "/Users/x/proj", "platform": "darwin", "shell": "zsh",
+        "source": "request", "git": "yes"}}})
+    assert bad is not None and bad.git is None, bad
+    print("  stamp git: True honored; 'yes' coerced to None at the wire gate")
+
+
 def test_call_id_round_trips_the_session_id():
     session = _new_session()
     call_id = session.mint_call_id()
