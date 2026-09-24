@@ -212,6 +212,216 @@ def test_opencode_session_config_carries_the_caller_system_prompt():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+TINY_PDF = (b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+            b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 144]/Contents 4 0 R"
+            b"/Resources<</Font<</F1 5 0 R>>>>>>endobj\n"
+            b"4 0 obj<</Length 55>>stream\nBT /F1 24 Tf 20 60 Td (HOST PDF MARKER) Tj ET\n"
+            b"endstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
+            b"trailer<</Root 1 0 R>>\n%%EOF")
+
+
+class _FakePoppler:
+    """pdftotext / pdftoppm stand-ins on PATH: deterministic text, two pages."""
+
+    def __init__(self, text_fails: bool = False):
+        self.text_fails = text_fails
+
+    def __enter__(self):
+        import stat
+        self.dir = Path(tempfile.mkdtemp(prefix="fake-poppler-"))
+        (self.dir / "pdftotext").write_text(
+            "#!/bin/sh\necho broken >&2; exit 1\n" if self.text_fails
+            else "#!/bin/sh\necho EXTRACTED TEXT\n")
+        (self.dir / "pdftoppm").write_text(
+            "#!/bin/sh\nfor last; do :; done\n"
+            "printf PNG1 > \"$last-1.png\"; printf PNG2 > \"$last-2.png\"\n")
+        for tool in ("pdftotext", "pdftoppm"):
+            (self.dir / tool).chmod(stat.S_IRWXU)
+        self.path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self.dir}:{self.path}"
+        return self
+
+    def __exit__(self, *exc):
+        import shutil
+        os.environ["PATH"] = self.path
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def test_pdf_tool_results_reach_claude_and_codex_as_text_and_page_images():
+    """Claude Code saves an MCP PDF to a sidecar path the model cannot open;
+    codex drops it or dumps base64 (verified on the pinned CLIs). Every PDF
+    shape a tool result can carry becomes extracted text + one image per
+    page, which both CLIs pass to the model."""
+    import base64
+    b64 = base64.b64encode(TINY_PDF).decode()
+    shapes = {
+        "litellm image_url": {"type": "image_url",
+                              "image_url": {"url": f"data:application/pdf;base64,{b64}"}},
+        "openai file": {"type": "file", "file": {"filename": "a.pdf",
+                                                 "file_data": f"data:application/pdf;base64,{b64}"}},
+        "anthropic document": {"type": "document", "source": {
+            "type": "base64", "media_type": "application/pdf", "data": b64}},
+    }
+    saved = server.PROVIDER
+    try:
+        with _FakePoppler():
+            for provider in ("claude", "codex"):
+                server.PROVIDER = provider
+                for label, part in shapes.items():
+                    blocks, is_error = server.openai_tool_content_to_mcp(
+                        [{"type": "text", "text": "read a.pdf:"}, part])
+                    assert not is_error, (provider, label)
+                    assert blocks[0] == {"type": "text", "text": "read a.pdf:"}
+                    assert "EXTRACTED TEXT" in blocks[1]["text"], (provider, label, blocks[1])
+                    assert "2 page(s)" in blocks[1]["text"], blocks[1]
+                    pages = [b for b in blocks if b["type"] == "image"]
+                    assert [base64.b64decode(b["data"]) for b in pages] == [b"PNG1", b"PNG2"]
+                    assert all(b["mimeType"] == "image/png" for b in pages)
+        print("  PDF (image_url / file / document) -> text + page PNGs on claude and codex")
+    finally:
+        server.PROVIDER = saved
+
+
+def test_pdf_tool_result_stays_a_pdf_on_opencode():
+    """OpenCode passes a PDF to a PDF-capable model natively (as a file part)."""
+    import base64
+    b64 = base64.b64encode(TINY_PDF).decode()
+    saved = server.PROVIDER
+    try:
+        server.PROVIDER = "opencode"
+        blocks, _ = server.openai_tool_content_to_mcp([{"type": "image_url",
+            "image_url": {"url": f"data:application/pdf;base64,{b64}"}}])
+        assert blocks == [{"type": "image", "mimeType": "application/pdf", "data": b64}], blocks
+        print("  opencode: PDF passed through natively")
+    finally:
+        server.PROVIDER = saved
+
+
+def test_an_unrenderable_pdf_is_said_not_dropped():
+    import base64
+    saved = (server.PROVIDER, os.environ.get("PATH", ""))
+    try:
+        server.PROVIDER = "claude"
+        os.environ["PATH"] = "/nonexistent"          # no poppler at all
+        blocks, _ = server.openai_tool_content_to_mcp([{"type": "document", "source": {
+            "type": "base64", "media_type": "application/pdf",
+            "data": base64.b64encode(TINY_PDF).decode()}}])
+        assert len(blocks) == 1 and "could not be rendered" in blocks[0]["text"], blocks
+        print("  unrenderable PDF -> an explicit notice to the model")
+    finally:
+        server.PROVIDER, os.environ["PATH"] = saved
+
+
+def test_partial_pdf_render_says_what_is_missing():
+    """pdftotext failing while pages render: the pages go through and the
+    note says no text could be extracted (not a bare empty line)."""
+    import base64
+    saved = server.PROVIDER
+    try:
+        server.PROVIDER = "claude"
+        with _FakePoppler(text_fails=True):
+            blocks = server.pdf_to_mcp_blocks(base64.b64encode(TINY_PDF).decode())
+        assert "2 page(s)" in blocks[0]["text"], blocks[0]
+        assert "no text could be extracted" in blocks[0]["text"], blocks[0]
+        assert [b["type"] for b in blocks[1:]] == ["image", "image"], blocks
+    finally:
+        server.PROVIDER = saved
+
+
+def test_non_pdf_documents_and_files_in_a_tool_result():
+    """Images inside `document` / `file` parts pass through as images; text
+    files become text; anything undeliverable is isError with a notice that
+    names it (never an empty block)."""
+    import base64
+    png = base64.b64encode(b"\x89PNG fake").decode()
+    blocks, is_error = server.openai_tool_content_to_mcp([{"type": "document", "source": {
+        "type": "base64", "media_type": "image/png", "data": png}}])
+    assert (blocks, is_error) == ([{"type": "image", "mimeType": "image/png", "data": png}],
+                                  False), blocks
+    blocks, is_error = server.openai_tool_content_to_mcp([{"type": "file", "file": {
+        "file_data": f"data:image/png;base64,{png}"}}])
+    assert (blocks, is_error) == ([{"type": "image", "mimeType": "image/png", "data": png}],
+                                  False), blocks
+    blocks, is_error = server.openai_tool_content_to_mcp([{"type": "file", "file": {
+        "file_data": "data:text/plain;base64,aGVsbG8gd29ybGQ="}}])
+    assert (blocks, is_error) == ([{"type": "text", "text": "hello world"}], False), blocks
+    for part, expect in (
+            ({"type": "document", "source": {"type": "base64", "media_type": "audio/wav",
+                                             "data": "AAAA"}}, "audio/wav"),
+            ({"type": "file", "file": {"file_data": "data:audio/wav;base64,AAAA"}}, "audio/wav"),
+            ({"type": "file", "file": {"file_id": "file-abc"}}, "remote or missing"),
+            ({"type": "document", "source": {"type": "url", "url": "https://x/a.pdf"}}, "url")):
+        blocks, is_error = server.openai_tool_content_to_mcp([part])
+        assert is_error, part
+        assert len(blocks) == 1 and expect in blocks[0]["text"], (part, blocks)
+        assert "could not be delivered" in blocks[0]["text"], blocks
+    assert server.carries_pdf([{"type": "image_url", "image_url": {
+        "url": "data:application/pdf;base64,AAAA"}}])
+    assert not server.carries_pdf([{"type": "text", "text": "application/pdf"}])
+    assert not server.carries_pdf("data:application/pdf;base64,AAAA")
+    print("  document/file: images and text pass, the rest is a named isError")
+
+
+def test_pdf_followup_renders_off_the_event_loop():
+    """A PDF tool result is rendered in a worker thread: the parked call gets
+    the rendered blocks, and the loop keeps running meanwhile."""
+    import base64
+    import threading
+    loop_threads = set()
+
+    real = server.openai_tool_content_to_mcp
+
+    def recording(content):
+        loop_threads.add(threading.current_thread() is threading.main_thread())
+        return real(content)
+
+    async def scenario():
+        session = _new_session()
+        session.new_turn()
+        parked = asyncio.create_task(server.register_tool_call(session.id, "read", {}))
+        call = (await session.turn_future)["calls"][0]
+        pdf = f"data:application/pdf;base64,{base64.b64encode(TINY_PDF).decode()}"
+        msgs = [{"role": "tool", "tool_call_id": call.id,
+                 "content": [{"type": "image_url", "image_url": {"url": pdf}}]}]
+        body = {"model": "m", "messages": [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": call.id, "type": "function",
+                 "function": {"name": "read", "arguments": "{}"}}]}, *msgs]}
+        followup = asyncio.create_task(server.handle_followup(body, msgs))
+        result = await parked
+        session.resolve_final({"type": "final", "payload": {"result": "ok"}})
+        await followup
+        return result
+
+    saved = server.PROVIDER
+    server.openai_tool_content_to_mcp = recording
+    try:
+        server.PROVIDER = "claude"
+        with _FakePoppler():
+            result = asyncio.run(scenario())
+    finally:
+        server.openai_tool_content_to_mcp = real
+        server.PROVIDER = saved
+    assert loop_threads == {False}, "PDF rendered on the event-loop thread"
+    assert "EXTRACTED TEXT" in result["content"][0]["text"], result
+    assert [b["type"] for b in result["content"][1:]] == ["image", "image"], result
+
+
+def test_pdf_renders_with_real_poppler_when_present():
+    """With the poppler the sidecar image ships, the real text comes out."""
+    import base64
+    import shutil as _sh
+    if not (_sh.which("pdftotext") and _sh.which("pdftoppm")):
+        print("  skipped: poppler not installed here (the sidecar image has it)")
+        return
+    blocks = server.pdf_to_mcp_blocks(base64.b64encode(TINY_PDF).decode())
+    assert "HOST PDF MARKER" in blocks[0]["text"], blocks[0]
+    assert [b["type"] for b in blocks[1:]] == ["image"], blocks
+    assert base64.b64decode(blocks[1]["data"]).startswith(b"\x89PNG"), "not a PNG"
+    print("  real poppler: text extracted, 1 page rendered as PNG")
+
+
 def test_tool_path_web_search_enables_each_clis_own_search():
     """With caller tools AND a web-search request, the session's CLI gets
     its own search too: Claude's WebSearch, codex live search, OpenCode's

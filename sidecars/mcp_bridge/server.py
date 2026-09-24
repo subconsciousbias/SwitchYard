@@ -836,15 +836,105 @@ def stringify_tool_content(content) -> str:
     return str(content) if content is not None else ""
 
 
+# A PDF in a caller's tool result -- what Claude Code's Read returns for a
+# PDF -- reaches the model intact only on OpenCode (as a file part, when the
+# model takes PDFs). Verified on the pinned CLIs with a stub MCP server:
+# Claude Code saves an MCP PDF to a file INSIDE the sidecar and gives the
+# model that path, which it cannot open (native Read is locked away); codex
+# drops it ("image content omitted") or dumps the base64 as text. For those
+# two the bridge sends what both do pass through: the PDF's extracted text
+# and one PNG per page (poppler, baked into the sidecar image). Rendering
+# is blocking work, so handle_followup runs the whole conversion in a thread
+# (asyncio.to_thread): the event loop keeps serving other sessions meanwhile.
+PDF_PAGE_LIMIT = int(os.environ.get("MCP_PDF_PAGE_LIMIT", "20"))
+PDF_RENDER_DPI = int(os.environ.get("MCP_PDF_RENDER_DPI", "100"))
+
+
+def pdf_to_mcp_blocks(pdf_b64: str) -> list[dict]:
+    """A base64 PDF as MCP content: extracted text, then page images."""
+    import base64
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-pdf-"))
+    try:
+        pdf = workdir / "document.pdf"
+        pdf.write_bytes(base64.b64decode(pdf_b64))
+        pages = subprocess.run(
+            ["pdftoppm", "-png", "-r", str(PDF_RENDER_DPI), "-l", str(PDF_PAGE_LIMIT),
+             str(pdf), str(workdir / "page")], capture_output=True, text=True, timeout=60)
+        images = sorted(workdir.glob("page-*.png"),
+                        key=lambda p: int(p.stem.rsplit("-", 1)[1]))
+        text = subprocess.run(["pdftotext", "-layout", "-l", str(PDF_PAGE_LIMIT), str(pdf), "-"],
+                              capture_output=True, text=True, timeout=30)
+        extracted = text.stdout.strip() if text.returncode == 0 else ""
+        if text.returncode != 0:
+            log.warning("pdftotext failed on a PDF tool result: %s",
+                        text.stderr.strip()[:200] or f"exit {text.returncode}")
+        if not images and not extracted:
+            raise RuntimeError((pages.stderr or text.stderr).strip()[:200]
+                               or f"exit {pages.returncode}")
+        shown = (f"{len(images)} page(s) shown as images below"
+                 f"{f' (first {PDF_PAGE_LIMIT} only)' if len(images) >= PDF_PAGE_LIMIT else ''}"
+                 if images else "no page images could be rendered")
+        told = "its extracted text follows" if extracted else "no text could be extracted"
+        note = f"[PDF from the tool result: {shown}; {told}]"
+        blocks = [{"type": "text", "text": f"{note}\n{extracted}".rstrip()}]
+        blocks += [{"type": "image", "mimeType": "image/png",
+                    "data": base64.b64encode(page.read_bytes()).decode()} for page in images]
+        return blocks
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        log.warning("could not render a PDF tool result: %s", exc)
+        return [{"type": "text", "text": f"[A PDF was returned by the tool but could not "
+                                         f"be rendered here: {exc}]"}]
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def carries_pdf(content) -> bool:
+    """Whether tool content has a PDF part (the only kind that renders)."""
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        source = part.get("source") if isinstance(part.get("source"), dict) else {}
+        file = part.get("file") if isinstance(part.get("file"), dict) else {}
+        image = part.get("image_url") if isinstance(part.get("image_url"), dict) else {}
+        if source.get("media_type") == "application/pdf" or any(
+                str(url or "").startswith("data:application/pdf")
+                for url in (file.get("file_data"), image.get("url"))):
+            return True
+    return False
+
+
+def _pdf_block(pdf_b64: str) -> list[dict]:
+    if PROVIDER == "opencode":         # passes a PDF to capable models natively
+        return [{"type": "image", "mimeType": "application/pdf", "data": pdf_b64}]
+    return pdf_to_mcp_blocks(pdf_b64)
+
+
+def _undeliverable(part: str, shape, media: str) -> dict:
+    """The notice for a tool-result part the bridge cannot hand to the model."""
+    what = f"{part} ({shape}{', ' + media if media else ''})"
+    log.warning("tool result %s could not be passed through; surfacing as isError", what)
+    return {"type": "text", "text": f"[The tool result included a {what} that could "
+                                    "not be delivered to the model here.]"}
+
+
 def openai_tool_content_to_mcp(content) -> tuple[list[dict], bool]:
     """OpenAI tool message content -> MCP tool result content blocks.
 
-    Three shapes arrive here: a plain string (kept as one text block), an
-    Anthropic-style image block with `source.type == "base64"`, and an
-    OpenAI image_url block whose `url` is a `data:` URL. Anything we cannot
-    decode into bytes (a remote http(s) URL the sidecar has no way to fetch)
-    becomes a loud isError text block, never a silent drop — the caller's
-    model would otherwise happily hallucinate a reading of it.
+    A plain string is kept as one text block. A list is walked part by part:
+      * `text` -- a text block;
+      * `image` -- Anthropic base64 image, passed through;
+      * `image_url` -- a `data:` URL: a PDF (LiteLLM's shape for an Anthropic
+        PDF document) goes through _pdf_block, any other media passes through;
+      * `document` -- Anthropic document: base64 PDF -> _pdf_block, plain
+        text source -> text, base64 image -> image;
+      * `file` -- OpenAI file part with a `data:` URL: PDF -> _pdf_block,
+        text/* -> text, image/* -> image.
+    Anything else (a remote http(s) URL the sidecar has no way to fetch, an
+    unsupported media type, a part with no data) becomes an isError text
+    block naming what could not be delivered, never a silent drop -- the
+    caller's model would otherwise happily hallucinate a reading of it.
 
     Returns (content_blocks, is_error). The contract matches what
     tool_server.py hands back to the CLI over stdio.
@@ -858,6 +948,39 @@ def openai_tool_content_to_mcp(content) -> tuple[list[dict], bool]:
             ptype = part.get("type")
             if ptype == "text":
                 blocks.append({"type": "text", "text": str(part.get("text") or "")})
+            elif ptype == "document":
+                # Anthropic document block (e.g. a PDF from Claude Code's Read).
+                src = part.get("source") if isinstance(part.get("source"), dict) else {}
+                media = str(src.get("media_type") or "")
+                if src.get("type") == "base64" and media == "application/pdf" and src.get("data"):
+                    blocks += _pdf_block(src["data"])
+                elif src.get("type") == "text":
+                    blocks.append({"type": "text", "text": str(src.get("data") or "")})
+                elif src.get("type") == "base64" and media.startswith("image/") and src.get("data"):
+                    blocks.append({"type": "image", "mimeType": media, "data": src["data"]})
+                else:
+                    blocks.append(_undeliverable("document", src.get("type"), media))
+                    is_error = True
+            elif ptype == "file":
+                # OpenAI file part: {"file": {"file_data": "data:<mime>;base64,...", ...}}
+                data_url = (part.get("file") or {}).get("file_data") \
+                    if isinstance(part.get("file"), dict) else None
+                decoded = cli_bridge._decode_data_url(data_url or "")
+                if decoded and decoded[0] == "application/pdf":
+                    blocks += _pdf_block(data_url.split(",", 1)[1])
+                elif decoded and decoded[0].startswith("text/"):
+                    blocks.append({"type": "text", "text": decoded[1].decode("utf-8", "replace")})
+                elif decoded and decoded[0].startswith("image/"):
+                    blocks.append({"type": "image", "mimeType": decoded[0],
+                                   "data": data_url.split(",", 1)[1]})
+                elif decoded:
+                    blocks.append(_undeliverable("file", "data URL", decoded[0]))
+                    is_error = True
+                else:
+                    blocks.append(_undeliverable(
+                        "file", "remote or missing file_data" if not str(data_url or "")
+                        .startswith("data:") else "undecodable data URL", ""))
+                    is_error = True
             elif ptype == "image":
                 # Anthropic-style: source.base64 / source.media_type.
                 src = part.get("source") if isinstance(part.get("source"), dict) else {}
@@ -873,7 +996,10 @@ def openai_tool_content_to_mcp(content) -> tuple[list[dict], bool]:
                 url = (part.get("image_url") or {}).get("url") \
                     if isinstance(part.get("image_url"), dict) else None
                 media, _b = cli_bridge._decode_data_url(url or "") or (None, None)
-                if media and url and url.startswith("data:") and "," in url:
+                if media == "application/pdf" and url and "," in url:
+                    # LiteLLM turns an Anthropic PDF document into this shape.
+                    blocks += _pdf_block(url.split(",", 1)[1])
+                elif media and url and url.startswith("data:") and "," in url:
                     blocks.append({"type": "image", "mimeType": media,
                                     "data": url.split(",", 1)[1]})
                 else:
@@ -2355,7 +2481,13 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
             continue          # already resolved, or a stale id -- tolerate rather than fail
         if call.future.done():
             continue
-        mcp_content, content_is_error = openai_tool_content_to_mcp(m.get("content"))
+        # A PDF part is rendered with poppler: blocking, so off the event loop.
+        # Everything else converts inline, with no extra scheduling hop.
+        if carries_pdf(m.get("content")):
+            mcp_content, content_is_error = await asyncio.to_thread(
+                openai_tool_content_to_mcp, m.get("content"))
+        else:
+            mcp_content, content_is_error = openai_tool_content_to_mcp(m.get("content"))
         call.future.set_result({
             "content": mcp_content,
             # isError is OR'd, not replaced: the caller's explicit flag still wins
