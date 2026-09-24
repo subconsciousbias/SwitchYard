@@ -28,6 +28,32 @@ name: ${SWITCHYARD_PROJECT:?run compose from the main checkout — see CLAUDE.md
 
 x-common: &common
   restart: unless-stopped
+  # Issue #131: every sidecar / token-proxy must get SIGTERM through uvicorn
+  # directly (PID 1, set via `exec uvicorn` in the Dockerfile CMDs). Two
+  # pieces back this up at the compose layer:
+  #
+  #   * `init: true` makes docker compose attach a tiny PID-1 (tini).
+  #     Useful on its own: tini reaps zombie children, which matters for
+  #     the cli_bridge image where the inner vendor CLIs (claude, codex,
+  #     opencode) spawn subprocesses of their own and exit without
+  #     wait()-ing. It is NOT a backstop for a regression that drops the
+  #     Dockerfile's `exec uvicorn` -- tini forwards SIGTERM to its
+  #     IMMEDIATE child only. With `init: true` AND a sh-as-PID-1
+  #     regression, tini -> sh -> uvicorn, and the SIGTERM dies with sh;
+  #     uvicorn never sees it. The Dockerfile tests
+  #     (test_dockerfile_sidecar_uses_exec_uvicorn_with_graceful_shutdown_bound
+  #     and the token-proxy twin) are what catch that regression. Cost:
+  #     ~250 KiB, no other side effect.
+  #   * `stop_grace_period: 45s` is the upper bound docker compose gives the
+  #     container to exit after SIGTERM. It is set deliberately to exceed
+  #     uvicorn's `--timeout-graceful-shutdown 30` (see Dockerfile.sidecar /
+  #     Dockerfile.token_proxy) by enough margin to cover the mcp_bridge
+  #     shutdown drain (reaper cancellation + cleanup of every live session's
+  #     parked futures, turns and CLI subprocesses), but well under the
+  #     apply.sh drain grace window so a stuck sidecar never holds up a
+  #     drain past its budget.
+  init: true
+  stop_grace_period: 45s
 
 services:
 

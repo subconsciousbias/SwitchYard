@@ -27,4 +27,11 @@ ENV SWITCHYARD_PROVIDER=xai \
     PYTHONPATH=/app
 
 EXPOSE 8090 8091
-CMD ["sh", "-c", "cd /app/token_proxy && uvicorn server:app --host 0.0.0.0 --port ${PROXY_PORT:-8090}"]
+# `exec uvicorn` so uvicorn replaces sh as PID 1 and receives SIGTERM directly
+# when docker compose stop sends it (issue #131: with sh as PID 1 the signal
+# reached sh, not uvicorn, and the sidecar took the full stop_grace_period to
+# die). The `cd /app/token_proxy` still runs under sh first, so the
+# `${PROXY_PORT}` variable expansion resolves before the exec. The
+# `--timeout-graceful-shutdown 30` flag bounds uvicorn's own drain well
+# inside compose's 45s stop_grace_period.
+CMD ["sh", "-c", "cd /app/token_proxy && exec uvicorn server:app --host 0.0.0.0 --port ${PROXY_PORT:-8090} --timeout-graceful-shutdown 30"]

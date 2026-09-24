@@ -1296,9 +1296,83 @@ async def reap_loop() -> None:
                 await reap_session(session)
 
 
+# Module-level handle to the reaper task so the shutdown handler can cancel
+# it. Without this, the task was created with `asyncio.create_task(...)` and
+# immediately garbage-collected if no other reference held it -- the loop
+# kept running but the cancellation path had nothing to point at. Issue
+# #131: SIGTERM has to drain live sessions AND stop the reaper, otherwise
+# the reaper's next tick could race uvicorn's shutdown and call reap_session
+# on a session that has already been torn down, raising in a logger whose
+# event loop is closing.
+_REAPER_TASK: asyncio.Task | None = None
+
+
 @app.on_event("startup")
 async def _start_reaper() -> None:
-    asyncio.create_task(reap_loop())
+    global _REAPER_TASK
+    _REAPER_TASK = asyncio.create_task(reap_loop())
+
+
+async def _shutdown_drain() -> None:
+    """Release every live session before uvicorn's --timeout-graceful-shutdown
+    fires (issue #131).
+
+    Reuses the existing reap_session cleanup path: it already fails pending
+    parked futures (fail_pending), sets an exception on the unfinished
+    turn_future, kills the live CLI subprocess, and pops the session from
+    SESSIONS via end_session. Driving the same path on shutdown means the
+    contract a caller sees is identical to the idle-TTL reap -- the parked
+    call's future gets a RuntimeError (which register_tool_call surfaces as
+    a 504) and the CLI subprocess is gone, so tool_server.py's blocked POST
+    will return without anything to wait on.
+
+    Done as one pass BEFORE uvicorn's shutdown drain rather than per-session
+    inside it: with --timeout-graceful-shutdown 30 and docker compose's
+    stop_grace_period 45s (see x-common in docker-compose.yml) there is
+    headroom for a few seconds of cleanup, but a single async-for over
+    SESSIONS is faster and easier to reason about than racing the reaper.
+
+    Cancellation semantics: the `except (asyncio.CancelledError, Exception)`
+    below intentionally catches BOTH `_REAPER_TASK`'s own cancellation (the
+    one we just delivered with `.cancel()`) AND any outer cancellation
+    targeted at `_on_shutdown` (uvicorn at --timeout-graceful-shutdown
+    raises CancelledError into the surrounding task). It is safe to
+    swallow both here because the very next `await reap_session(...)` is a
+    fresh cancellation point -- if the outer task was cancelled, the
+    CancelledError is re-delivered there. Do not insert non-awaiting work
+    between this block and the reap loop: any code that catches only
+    `Exception` between two awaits would accidentally swallow the
+    cancellation entirely. The repo's CI guards against this by running
+    `python3 -m pytest -q tests/test_mcp_bridge.py` which exercises the
+    async-for path under a real event loop.
+    """
+    if _REAPER_TASK is not None:
+        _REAPER_TASK.cancel()
+        try:
+            await _REAPER_TASK
+        except (asyncio.CancelledError, Exception):
+            pass
+    sessions = list(SESSIONS.values())
+    if not sessions:
+        log.info("mcp_bridge shutdown drain: no live sessions")
+        return
+    log.info("mcp_bridge shutdown drain: reaping %d live session(s)", len(sessions))
+    for session in sessions:
+        # Snapshot dead/idle before the await so a reaper tick that fires
+        # mid-drain cannot resurrect a session we are about to reap (its
+        # last_active is already in the past).
+        if session.dead:
+            continue
+        try:
+            await reap_session(session)
+        except Exception as exc:                # noqa: BLE001 -- shutdown must not raise
+            log.warning("shutdown drain: reap_session(%s) failed: %s",
+                        session.id, exc, exc_info=True)
+
+
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    await _shutdown_drain()
 
 
 # ---------------------------------------------------------------------------

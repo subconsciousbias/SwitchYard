@@ -91,4 +91,13 @@ ENV HOME=/home/node \
 
 ENV PROVIDER=claude SWITCHYARD_PLANS=/app/config/plans.yaml PYTHONPATH=/app
 EXPOSE 8081 8082 8083 8084
-CMD ["sh", "-c", "cd /app/${BRIDGE:-cli}_bridge && uvicorn server:app --host 0.0.0.0 --port ${SIDECAR_PORT:-8081}"]
+# `exec uvicorn` so uvicorn replaces sh as PID 1 and receives SIGTERM directly
+# when docker compose stop sends it (issue #131: with sh as PID 1 the signal
+# reached sh, not uvicorn, and the sidecar took the full stop_grace_period to
+# die). The `cd /app/${BRIDGE:-cli}_bridge` still runs under sh first, so the
+# variable expansion on `${BRIDGE}` / `${SIDECAR_PORT}` resolves before the
+# exec, and uvicorn inherits the session-workdir-style cwd. The
+# `--timeout-graceful-shutdown 30` flag bounds uvicorn's own drain so the
+# mcp_bridge cleanup path (release parked futures / turns / CLI subprocesses)
+# finishes well inside compose's 45s stop_grace_period.
+CMD ["sh", "-c", "cd /app/${BRIDGE:-cli}_bridge && exec uvicorn server:app --host 0.0.0.0 --port ${SIDECAR_PORT:-8081} --timeout-graceful-shutdown 30"]

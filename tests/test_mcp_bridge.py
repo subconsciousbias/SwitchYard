@@ -241,6 +241,305 @@ def test_reap_abandoned_session():
     print(f"  reaped: parked call failed with {message!r}, session dropped from SESSIONS")
 
 
+# ------------------------------------------------- issue #131: shutdown drain ---
+def test_shutdown_drain_cancels_reaper_and_reaps_all_live_sessions():
+    """Issue #131: when SIGTERM lands (uvicorn PID 1, --timeout-graceful-shutdown
+    30), the mcp_bridge shutdown handler MUST cancel its reaper task AND
+    reap every live session before the drain deadline. Without this, parked
+    calls (whose tool_server.py POSTs are still waiting) and the CLI
+    subprocesses (still blocked on stdio) outlive the container, leaving
+    `docker compose stop` to hit the full stop_grace_period every time.
+
+    Drives _shutdown_drain directly: two live sessions, each with a parked
+    call and a turn_future (the exact shape a working mcp_bridge leaves
+    behind mid-loop). After _shutdown_drain returns, both sessions are
+    popped from SESSIONS, both parked futures have been failed (so their
+    consumer — register_tool_call — surfaces 504), and both turn_futures
+    carry a RuntimeError. The reaper task is cancelled and awaited; the
+    task object reflects cancellation.
+    """
+    async def scenario():
+        saved_reaper = server._REAPER_TASK
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+
+        # Two live sessions with parked calls + a turn_future each.
+        # The turn_future is consumed (the model emitted tool_calls and the
+        # batch window fired) -- this matches the production shape: a
+        # working mcp_bridge leaves a parked session with its turn_future
+        # already done. Shutdown drain must not touch it.
+        sessions: list = []
+        parked_tasks: list = []
+        for _ in range(2):
+            session = _new_session()
+            session.new_turn()
+            session.awaiting_followup = True
+            parked = asyncio.create_task(
+                server.register_tool_call(session.id, "slow", {}))
+            await asyncio.sleep(0)
+            turn = await session.turn_future
+            assert turn["type"] == "tool_calls"
+            sessions.append(session)
+            parked_tasks.append(parked)
+
+        assert len(server.SESSIONS) == 2, server.SESSIONS
+
+        # Spin up a reaper task we can cancel. The handler MUST cancel this
+        # and await the cancellation before returning.
+        async def _never():
+            await asyncio.sleep(3600)
+        reaper = asyncio.create_task(_never())
+        server._REAPER_TASK = reaper
+
+        await server._shutdown_drain()
+
+        # Reaper was cancelled (and awaited: its done() is True).
+        assert reaper.cancelled() or reaper.done(), \
+            "reaper task must be cancelled during shutdown drain"
+        # Every live session was reaped: SESSIONS is empty, every session
+        # is dead, the consumed turn_future is still done with its
+        # tool_calls result (shutdown must NOT touch a turn_future the
+        # normal flow already resolved), and every parked future failed
+        # so register_tool_call surfaces 504.
+        assert server.SESSIONS == {}, server.SESSIONS
+        for s in sessions:
+            assert s.dead, s
+            assert s.id not in server.SESSIONS
+            assert s.turn_future.done(), s
+            assert s.turn_future.exception() is None, \
+                "consumed turn_future must keep its tool_calls result " \
+                f"(got exception={s.turn_future.exception()!r})"
+        for parked in parked_tasks:
+            try:
+                await parked
+            except server.HTTPException as exc:
+                assert exc.status_code == 504, exc
+            else:
+                raise AssertionError("parked call must 504 after shutdown drain")
+
+        server._REAPER_TASK = saved_reaper
+        server.SESSIONS.clear()
+        server.SESSIONS.update(saved_sessions)
+        return len(sessions)
+
+    n = asyncio.run(scenario())
+    print(f"  shutdown drain: {n} live session(s) reaped, reaper cancelled, "
+          "parked calls 504'd")
+
+
+def test_shutdown_drain_with_no_live_sessions_cancels_reaper_and_returns_cleanly():
+    """An idle sidecar still has to cancel its reaper, but it has no work
+    to do. _shutdown_drain must not raise on the empty case — uvicorn is
+    about to exit and a raise here would log a noisy traceback on every
+    clean restart."""
+    async def scenario():
+        saved_reaper = server._REAPER_TASK
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+
+        async def _never():
+            await asyncio.sleep(3600)
+        reaper = asyncio.create_task(_never())
+        server._REAPER_TASK = reaper
+
+        await server._shutdown_drain()                  # must not raise
+
+        assert reaper.cancelled() or reaper.done(), \
+            "reaper task must be cancelled even when no sessions are live"
+        server._REAPER_TASK = saved_reaper
+        server.SESSIONS.update(saved_sessions)
+
+    asyncio.run(scenario())
+    print("  shutdown drain: idle path cancels reaper and returns cleanly")
+
+
+def test_shutdown_drain_tolerates_an_already_cancelled_reaper_task():
+    """The handler runs at most once per process, but tests in this file
+    install their own _REAPER_TASK repeatedly. Two branches matter:
+    no reaper installed (None), and a reaper whose .cancel() was already
+    called before _shutdown_drain runs (so .cancelled() is True). Both
+    must not raise: the whole point of shutdown drain is to be
+    unconditional about cleanup. Pins the current `_shutdown_drain` body
+    — which re-cancels unconditionally and awaits the task — against a
+    future refactor that, say, only awaits if the task was created here.
+    """
+    async def scenario():
+        saved_reaper = server._REAPER_TASK
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+
+        # Branch 1: no reaper installed at all.
+        server._REAPER_TASK = None
+        await server._shutdown_drain()                  # must not raise
+
+        # Branch 2: an already-cancelled reaper task. Spin one up,
+        # .cancel() it, await it (so its cancelled() is True), then hand
+        # it to _shutdown_drain. Re-cancelling an already-cancelled task
+        # is a no-op and the `await` returns immediately, so the function
+        # returns cleanly without raising.
+        async def _never():
+            await asyncio.sleep(3600)
+        cancelled = asyncio.create_task(_never())
+        cancelled.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancelled
+        assert cancelled.cancelled(), \
+            "test setup: task must be cancelled before _shutdown_drain sees it"
+        server._REAPER_TASK = cancelled
+        await server._shutdown_drain()                  # must not raise
+
+        server._REAPER_TASK = saved_reaper
+        server.SESSIONS.update(saved_sessions)
+
+    asyncio.run(scenario())
+    print("  shutdown drain: None reaper and already-cancelled reaper both no-op")
+
+
+def test_startup_records_the_reaper_task_so_shutdown_can_cancel_it():
+    """The startup hook must keep a reference to the reaper task on
+    `server._REAPER_TASK`; the old `asyncio.create_task(reap_loop())` lost
+    its only handle immediately and the cancellation path had nothing to
+    point at (issue #131). Call _start_reaper() directly: the reaper task
+    must end up bound to the module-level name, and it must NOT be done
+    yet (the loop runs forever).
+
+    `asyncio.create_task` schedules on the running loop, so we have to
+    cancel the task before returning to keep the test idempotent across
+    re-runs.
+    """
+    async def scenario():
+        saved = server._REAPER_TASK
+        try:
+            server._REAPER_TASK = None
+            await server._start_reaper()
+            assert server._REAPER_TASK is not None, \
+                "_start_reaper must keep a module-level handle"
+            assert not server._REAPER_TASK.done(), \
+                "reaper loop must be live immediately after startup"
+            # Cancel so the loop's `sleep(REAP_INTERVAL)` raises CancelledError
+            # and the task winds down cleanly before the test loop ends.
+            server._REAPER_TASK.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await server._REAPER_TASK
+        finally:
+            server._REAPER_TASK = saved
+
+    asyncio.run(scenario())
+    print("  startup: reaper task retained on server._REAPER_TASK")
+
+
+# --------------------------------------- issue #131: Dockerfile / compose shape ---
+def _read_text(path: str) -> str:
+    return Path(os.path.join(ROOT, path)).read_text()
+
+
+def test_dockerfile_sidecar_uses_exec_uvicorn_with_graceful_shutdown_bound():
+    """Issue #131: sidecar's CMD must `exec` uvicorn (so uvicorn is PID 1 and
+    receives SIGTERM directly, not sh), keep `${BRIDGE:-cli}_bridge` and
+    `${SIDECAR_PORT:-8081}` on the shell side so runtime variable expansion
+    still works, AND add `--timeout-graceful-shutdown 30` to bound uvicorn's
+    drain inside compose's stop_grace_period. Asserts the literal shapes the
+    Dockerfile requires — a regression that drops `exec` (re-opens the bug)
+    or removes the flag (re-opens the stop_grace_period hang) fails here.
+    """
+    dockerfile = _read_text("Dockerfile.sidecar")
+    # Locate the CMD line (the file uses heredoc-style strings elsewhere; we
+    # pin the exact line that starts the array, not a substring match, so a
+    # future comment containing "exec uvicorn" elsewhere does not pass).
+    cmd_lines = [ln.strip() for ln in dockerfile.splitlines() if ln.lstrip().startswith("CMD ")]
+    assert cmd_lines, "Dockerfile.sidecar has no CMD line"
+    cmd = cmd_lines[-1]
+    # uvicorn is exec'd (replaces sh), not backgrounded.
+    assert "exec uvicorn" in cmd, \
+        f"sidecar CMD must exec uvicorn (uvicorn= PID 1), got: {cmd!r}"
+    # Runtime env vars still expand under sh before the exec.
+    assert "${BRIDGE:-cli}_bridge" in cmd, \
+        f"sidecar CMD must still expand BRIDGE under sh, got: {cmd!r}"
+    assert "${SIDECAR_PORT:-8081}" in cmd, \
+        f"sidecar CMD must still expand SIDECAR_PORT under sh, got: {cmd!r}"
+    # The graceful-shutdown bound is present at the literal value uvicorn reads.
+    assert "--timeout-graceful-shutdown 30" in cmd, \
+        f"sidecar CMD must bound uvicorn drain at 30s, got: {cmd!r}"
+    # Sanity: not bare `uvicorn` without exec — the regression we are guarding.
+    bare = re.compile(r"&& uvicorn server:app")
+    assert not bare.search(cmd), \
+        f"sidecar CMD must not run uvicorn without exec (re-opens issue #131), got: {cmd!r}"
+    print("  Dockerfile.sidecar CMD: exec uvicorn + --timeout-graceful-shutdown 30; "
+          "${BRIDGE} + ${SIDECAR_PORT} still expand under sh")
+
+
+def test_dockerfile_token_proxy_uses_exec_uvicorn_with_graceful_shutdown_bound():
+    """Same shape as the sidecar Dockerfile: `exec uvicorn`, runtime variable
+    expansion under sh, --timeout-graceful-shutdown 30. Different env var
+    (PROXY_PORT), but the same exec+graceful-shutdown contract."""
+    dockerfile = _read_text("Dockerfile.token_proxy")
+    cmd_lines = [ln.strip() for ln in dockerfile.splitlines() if ln.lstrip().startswith("CMD ")]
+    assert cmd_lines, "Dockerfile.token_proxy has no CMD line"
+    cmd = cmd_lines[-1]
+    assert "exec uvicorn" in cmd, \
+        f"token-proxy CMD must exec uvicorn (uvicorn= PID 1), got: {cmd!r}"
+    assert "${PROXY_PORT:-8090}" in cmd, \
+        f"token-proxy CMD must still expand PROXY_PORT under sh, got: {cmd!r}"
+    assert "--timeout-graceful-shutdown 30" in cmd, \
+        f"token-proxy CMD must bound uvicorn drain at 30s, got: {cmd!r}"
+    bare = re.compile(r"&& uvicorn server:app")
+    assert not bare.search(cmd), \
+        f"token-proxy CMD must not run uvicorn without exec, got: {cmd!r}"
+    print("  Dockerfile.token_proxy CMD: exec uvicorn + --timeout-graceful-shutdown 30; "
+          "${PROXY_PORT} still expands under sh")
+
+
+def test_compose_xcommon_declares_init_true_and_stop_grace_period_45s():
+    """The shared x-common anchor in docker-compose.yml must set `init: true`
+    and `stop_grace_period: 45s` so every sidecar / token-proxy / gateway /
+    portal has the SIGTERM plumbing (issue #131). The 45s figure exceeds
+    uvicorn's --timeout-graceful-shutdown 30 by enough margin to cover the
+    mcp_bridge shutdown drain (reaper cancel + reap all live sessions), but
+    stays well under apply.sh's drain_grace_secs (120s) so a stuck sidecar
+    never holds up a drain past its budget. Asserts the literal value here —
+    a regression that changes the figure fails the test before the stack
+    even reaches docker compose config.
+    """
+    compose_text = _read_text("docker-compose.yml")
+    # The x-common anchor and its merged fields must be present, in source.
+    # The `services:` block itself uses <<: *common, so the inheritance is
+    # verified by compose at deploy time; here we pin the anchor.
+    assert "x-common: &common" in compose_text, \
+        "docker-compose.yml must keep the x-common anchor"
+    # Both keys, in the anchor block, at the literal values the plan requires.
+    init_pattern = re.compile(
+        r"x-common:\s*&\s*common[\s\S]+?init:\s*true", re.MULTILINE)
+    assert init_pattern.search(compose_text), \
+        "x-common anchor must set init: true (tini PID-1 backstop)"
+    grace_pattern = re.compile(
+        r"x-common:\s*&\s*common[\s\S]+?stop_grace_period:\s*45s", re.MULTILINE)
+    assert grace_pattern.search(compose_text), \
+        "x-common anchor must set stop_grace_period: 45s"
+    # And the values must actually flow through to the sidecars: every
+    # sidecar / token-proxy declares `<<: *common` and does NOT override
+    # either field. A regression that pinned init: false on a single
+    # service (e.g. to work around a tini bug) would re-open the SIGTERM
+    # hole on that one container — and the regression would still pass the
+    # anchor check above.
+    for svc in ("claude-max-sidecar", "codex-sidecar", "opencode-go-sidecar",
+                "opencode-go2-sidecar", "xai-token-proxy"):
+        # Each service block: anchor merge + no per-service override of
+        # `init:` or `stop_grace_period:`. `init:` and `stop_grace_period:`
+        # are inherited; setting either at the service level would shadow
+        # the anchor.
+        block_match = re.search(
+            rf"^\s{{2}}{re.escape(svc)}:\s*$([\s\S]*?)(?=^\s{{2}}\w|\Z)",
+            compose_text, re.MULTILINE)
+        assert block_match, f"could not isolate service block for {svc}"
+        block = block_match.group(1)
+        assert "init:" not in block, \
+            f"{svc} must inherit init: true from x-common (no override): {block[:200]!r}"
+        assert "stop_grace_period:" not in block, \
+            f"{svc} must inherit stop_grace_period: 45s from x-common (no override): {block[:200]!r}"
+    print("  docker-compose.yml x-common: init=true + stop_grace_period=45s "
+          "inherited by every sidecar and token-proxy")
+
+
 # ---------------------------------------------------- tool_server.py, real pipe ---
 class _StubCallback(http.server.BaseHTTPRequestHandler):
     """Stands in for server.py's /internal/tools/call. Replies "slow" calls
