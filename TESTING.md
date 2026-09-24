@@ -661,6 +661,42 @@ docker compose exec -T claude-max-sidecar claude -p --output-format json \
 `bare_args_images` list is the one in use: Read is the only built-in, and
 the `--allowed-tools Read(<dir>/**)` rule is what lets it reach the file.
 
+### 4i. Upgrading a pinned CLI — prove the tool path is still host-mirrored
+
+The tool path is only as locked down as the CLI release under it: each break
+in issue #264's history (#195, #255, #256, OpenCode's hidden-but-runnable
+built-ins) arrived with a CLI version. After raising a pin in
+`Dockerfile.sidecar`, run three layers, cheapest first:
+
+1. **Offline, pinned CLI vs a fake model** (free) — CI's `cli-lockdown` job
+   installs exactly the pinned versions and runs `tests/test_lockdown_*.py`;
+   locally, run a test file inside the built image (no network, as `node`).
+2. **Startup self-check** (free) — after `scripts/apply.sh --build`, every
+   mcp sidecar's `/health` must show `host_mirror.status: passed`:
+
+   ```bash
+   for s in claude-max-sidecar:8081 codex-sidecar:8082 opencode-go-sidecar:8084 opencode-go2-sidecar:8085; do
+     docker compose exec -T ${s%%:*} python3 -c "import json,urllib.request;print('${s%%:*}', json.load(urllib.request.urlopen('http://127.0.0.1:${s#*:}/health'))['host_mirror'])"
+   done
+   ```
+
+3. **Live, real login** (spends a few cheap calls per plan) — the only layer
+   that sees tools the real backend adds (a ChatGPT login's server-side
+   `web.run` was found this way):
+
+   ```bash
+   python3 scripts/live_host_mirror_check.py            # every mcp sidecar
+   python3 scripts/live_host_mirror_check.py codex-sidecar
+   ```
+
+   Positive checks: the first action is the caller's bridged tool; the
+   model lists all of the caller's tools (including a Claude Code-style
+   `mcp__github__get_issue`) and uses the MCP one with the right arguments;
+   it lists and reads the caller's working directory by host paths; it
+   names the host OS, cwd and git state. Negative checks: no live web tool
+   (tool and text path), no native shell (`uid=1000(node)` in an answer is a
+   fail). Exits non-zero on any failure.
+
 ## 5. Behaviour tests
 
 ### 5a. Ordered fill and total capacity

@@ -939,6 +939,24 @@ def test_codex_catalog_failure_refuses_with_502():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_codex_lockdown_disables_the_live_web_search_tool():
+    """On a ChatGPT login codex's model has a working server-side web search
+    (`web.run`) that neither the feature switches nor the patched catalog
+    remove; live-verified, `web_search="disabled"` does. A fake model never
+    sees it, so this pins the override itself."""
+    assert 'web_search="disabled"' in server.CODEX_CONFIG_OVERRIDES
+    saved = (server.PROVIDER, server.PROFILE, server.CLI)
+    try:
+        server.PROVIDER = "codex"
+        server.PROFILE = server.PROFILES["codex"]
+        server.CLI = server.PROFILE["cli"]
+        argv, _ = server.build_argv("hi", None, None)
+        assert argv[argv.index('web_search="disabled"') - 1] == "-c", argv
+        print('  codex argv carries -c web_search="disabled"')
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved
+
+
 def test_codex_text_path_argv_carries_the_lockdown():
     """The text path's codex has the same shell, patch tool and code-mode
     host as the tool path's -- and before this, nothing but the missing

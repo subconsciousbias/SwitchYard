@@ -17,7 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # call open before timing it out. An unpinned `npm install -g` re-resolves to
 # whatever is newest at build time, so an unrelated rebuild could silently swap
 # the CLI under a verified profile -- exactly how a starlette bump quietly broke
-# the portal. Raise these deliberately, then re-run the checks in TESTING.md.
+# the portal. Raise these deliberately, then re-run the checks in TESTING.md
+# (section 4i covers the tool-path lockdown).
 RUN npm install -g \
       @anthropic-ai/claude-code@2.1.278 \
       @openai/codex@0.155.1 \

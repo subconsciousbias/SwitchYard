@@ -934,6 +934,11 @@ CODEX_DISABLED_FEATURES = (
     "workspace_dependencies",
 )
 CODEX_CONFIG_OVERRIDES = (
+    # A ChatGPT login gets a live, server-side `web.run` search tool that the
+    # tool-feature switches and the catalog do not remove -- found by
+    # scripts/live_host_mirror_check.py; invisible to any fake-model check.
+    # The only mode that takes it away is `disabled` (verified live).
+    'web_search="disabled"',
     "include_environment_context=false",
     "include_permissions_instructions=false",
     "include_collaboration_mode_instructions=false",
