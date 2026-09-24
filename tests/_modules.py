@@ -43,3 +43,37 @@ def reload(mod):
     """
     mod.__spec__.loader.exec_module(mod)
     return mod
+
+
+class FakePoppler:
+    """pdftotext / pdftoppm stand-ins on PATH: deterministic text, two pages.
+
+    `text_fails` / `pages_fail` make that half exit 1 with nothing produced
+    (both -> a PDF poppler can make nothing of)."""
+
+    def __init__(self, text_fails: bool = False, pages_fail: bool = False):
+        self.text_fails = text_fails
+        self.pages_fail = pages_fail
+
+    def __enter__(self):
+        import stat
+        import tempfile
+        from pathlib import Path
+        self.dir = Path(tempfile.mkdtemp(prefix="fake-poppler-"))
+        (self.dir / "pdftotext").write_text(
+            "#!/bin/sh\necho broken >&2; exit 1\n" if self.text_fails
+            else "#!/bin/sh\necho EXTRACTED TEXT\n")
+        (self.dir / "pdftoppm").write_text(
+            "#!/bin/sh\necho unrenderable >&2; exit 1\n" if self.pages_fail
+            else "#!/bin/sh\nfor last; do :; done\n"
+                 "printf PNG1 > \"$last-1.png\"; printf PNG2 > \"$last-2.png\"\n")
+        for tool in ("pdftotext", "pdftoppm"):
+            (self.dir / tool).chmod(stat.S_IRWXU)
+        self.path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self.dir}:{self.path}"
+        return self
+
+    def __exit__(self, *exc):
+        import shutil
+        os.environ["PATH"] = self.path
+        shutil.rmtree(self.dir, ignore_errors=True)

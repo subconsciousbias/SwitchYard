@@ -613,8 +613,12 @@ shows). The fix stages the bytes to disk and tells each CLI how to carry
 them: `claude -p --input-format stream-json` gets the prompt and its image
 and PDF blocks inline as one stdin message (no Read, no file path the model
 could hand to the caller's tools), `codex exec` gets a repeatable `-i FILE`,
-and `opencode run` gets a repeatable `-f FILE`. PDFs reach Claude only; the
-other two refuse them with `400 images_unsupported` rather than drop them.
+and `opencode run` gets a repeatable `-f FILE`. A PDF reaches Claude as a
+document block; codex (`-i` is images-only) and OpenCode (its attachment docs
+reject PDF) get what they do take -- the PDF's extracted text at its place in
+the prompt plus one PNG per page on `-i` / `-f` (poppler; first
+`MCP_PDF_PAGE_LIMIT` pages). Only a PDF poppler can make neither text nor
+pages of is refused, with `400 images_unsupported`, never dropped.
 
 The test is the magenta-swatch round-trip. Generate the bytes once,
 base64 them, and POST through `forge` (which spills to the CLI-backed

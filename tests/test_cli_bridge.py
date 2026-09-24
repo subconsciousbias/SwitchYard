@@ -1292,37 +1292,162 @@ def test_claude_media_markers_name_no_relay_path():
             shutil.rmtree(d, ignore_errors=True)
 
 
-def test_pdf_refused_on_non_claude_providers():
-    """codex -i takes images only and opencode -f needs a PDF-capable model: a
-    PDF is refused loudly there (400 images_unsupported), never dropped. Claude
-    takes it inline."""
-    saved = server.PROVIDER
-    pdf_msg = lambda: [{"role": "user", "content": [  # noqa: E731
+def _pdf_msg(data: bytes = b"%PDF-1.4") -> list[dict]:
+    return [{"role": "user", "content": [
         {"type": "text", "text": "summarise"},
         {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                        "data": base64.b64encode(b"%PDF-1.4").decode()}}]}]
+                                        "data": base64.b64encode(data).decode()}},
+        {"type": "text", "text": "and this:"},
+        {"type": "image_url", "image_url": {
+            "url": "data:image/png;base64," + base64.b64encode(PNG_MAGENTA).decode()}}]}]
+
+
+def _run_pdf_chat(provider: str) -> dict:
+    """Drive _handle_chat with a PDF + an image on `provider`; the fake
+    invoke records the prompt and the argv the CLI would get (built while
+    the staged files still exist)."""
+    import asyncio
+    seen: dict = {}
+
+    async def fake_invoke(prompt, system, model, image_paths=None, *, web=False, effort=None):
+        paths = list(image_paths or [])
+        argv, stdin_data = server.build_argv(prompt, system, model, image_paths=paths)
+        seen.update(prompt=prompt, paths=paths, argv=argv, stdin=stdin_data,
+                    bytes=[p.read_bytes() for p in paths])
+        return {"result": "ok", "usage": {}}
+
+    real = (server.invoke, server.PROVIDER, server.PROFILE, server.CLI)
     try:
+        server.invoke = fake_invoke
+        server.PROVIDER = provider
+        server.PROFILE = server.PROFILES[provider]
+        server.CLI = server.PROFILE["cli"]
+        asyncio.run(server._handle_chat({"model": "m", "messages": _pdf_msg()}))
+    finally:
+        server.invoke, server.PROVIDER, server.PROFILE, server.CLI = real
+    return seen
+
+
+def test_pdf_prompt_on_codex_and_opencode_is_text_plus_page_images():
+    """codex -i is images-only and OpenCode's attachment docs reject PDF, so
+    a PDF in the prompt goes as what both DO take: its extracted text at its
+    place in the prompt, one PNG per page on -i / -f. No 400, nothing
+    dropped, and the image note counts what was actually attached."""
+    from _modules import FakePoppler
+    for provider, flag in (("codex", "-i"), ("opencode", "-f")):
+        with FakePoppler():
+            seen = _run_pdf_chat(provider)
+        paths = seen["paths"]
+        assert [p.name for p in paths] == ["page-1.png", "page-2.png", "02.png"], paths
+        assert seen["bytes"][:2] == [b"PNG1", b"PNG2"], seen["bytes"]
+        assert seen["bytes"][2] == PNG_MAGENTA
+        attached = [seen["argv"][i + 1] for i, a in enumerate(seen["argv"]) if a == flag]
+        assert attached == [str(p) for p in paths], (provider, seen["argv"])
+        assert not any(a.endswith(".pdf") for a in seen["argv"]), seen["argv"]
+        prompt = seen["prompt"]
+        assert "[document 1: PDF, 2 page(s) attached as images:" in prompt, prompt
+        assert "extracted text follows]\nEXTRACTED TEXT" in prompt, prompt
+        # the text sits where the PDF was: between the two caller texts
+        assert prompt.index("summarise") < prompt.index("EXTRACTED TEXT") \
+            < prompt.index("and this:") < prompt.index("[image 2:"), prompt
+        assert "[3 image(s) attached to this prompt:" in prompt, prompt
+    print("  PDF prompt: codex -i / opencode -f get page PNGs, text inline, no 400")
+
+
+def test_pdf_prompt_cut_at_the_page_limit_says_so():
+    import shutil
+    from _modules import FakePoppler
+    msgs = _pdf_msg()
+    saved = (server.PROVIDER, server.PDF_PAGE_LIMIT)
+    try:
+        server.PROVIDER, server.PDF_PAGE_LIMIT = "codex", 2
+        with FakePoppler():
+            paths, img_dir = server.stage_or_fail(msgs)
+        shutil.rmtree(img_dir, ignore_errors=True)
+    finally:
+        server.PROVIDER, server.PDF_PAGE_LIMIT = saved
+    assert len(paths) == 3, paths
+    assert "2 page(s) (first 2 only) attached as images" in msgs[0]["content"][1]["text"], msgs
+
+
+def test_pdf_prompt_partial_render_still_delivers():
+    """Text but no pages (or pages but no text) is still a delivery; the
+    marker says which half is missing. Text alone attaches nothing."""
+    from _modules import FakePoppler
+    saved = server.PROVIDER
+    try:
+        server.PROVIDER = "opencode"
+        msgs = _pdf_msg()[:1]
+        msgs[0]["content"] = msgs[0]["content"][:2]
+        with FakePoppler(pages_fail=True):
+            paths, img_dir = server.stage_or_fail(msgs)
+        assert (paths, img_dir) == ([], None), (paths, img_dir)
+        marker = msgs[0]["content"][1]["text"]
+        assert "no page images could be rendered" in marker and "EXTRACTED TEXT" in marker, marker
+        msgs = _pdf_msg()
+        with FakePoppler(text_fails=True):
+            paths, img_dir = server.stage_or_fail(msgs)
+        import shutil
+        shutil.rmtree(img_dir, ignore_errors=True)
+        assert len(paths) == 3, paths
+        assert "no text could be extracted" in msgs[0]["content"][1]["text"], msgs
+    finally:
+        server.PROVIDER = saved
+
+
+def test_unrenderable_pdf_prompt_is_a_400_on_codex_and_opencode():
+    """Poppler producing neither text nor pages: refused loudly (400
+    images_unsupported), never a PDF dropped from the prompt unseen."""
+    import asyncio
+    from fastapi import HTTPException
+    from _modules import FakePoppler
+
+    async def fake_invoke(*a, **k):
+        raise AssertionError("the CLI ran without the PDF")
+
+    real = (server.invoke, server.PROVIDER, server.PROFILE, server.CLI)
+    try:
+        server.invoke = fake_invoke
         for provider in ("codex", "opencode"):
             server.PROVIDER = provider
-            try:
-                server.stage_or_fail(pdf_msg())
-            except server.ImageUnsupportedError as e:
-                assert "PDF" in str(e), e
-            else:
-                raise AssertionError(f"{provider} accepted a PDF")
+            server.PROFILE = server.PROFILES[provider]
+            server.CLI = server.PROFILE["cli"]
+            with FakePoppler(text_fails=True, pages_fail=True):
+                try:
+                    asyncio.run(server._handle_chat({"model": "m", "messages": _pdf_msg()}))
+                except HTTPException as exc:
+                    assert exc.status_code == 400, exc.status_code
+                    assert exc.detail["error"]["type"] == "images_unsupported", exc.detail
+                    assert "PDF" in exc.detail["error"]["message"], exc.detail
+                else:
+                    raise AssertionError(f"{provider} accepted an unrenderable PDF")
+        print("  unrenderable PDF prompt -> 400 images_unsupported on codex and opencode")
+    finally:
+        server.invoke, server.PROVIDER, server.PROFILE, server.CLI = real
+
+
+def test_pdf_prompt_on_claude_stays_an_inline_document():
+    """Claude takes the PDF itself (stream-json document block): no render,
+    even with poppler failing; the marker names no relay path."""
+    from _modules import FakePoppler
+    saved = server.PROVIDER
+    msgs = _pdf_msg()
+    try:
         server.PROVIDER = "claude"
-        paths, img_dir = server.stage_or_fail(pdf_msg())
+        with FakePoppler(text_fails=True, pages_fail=True):
+            paths, img_dir = server.stage_or_fail(msgs)
         try:
-            assert [p.suffix for p in paths] == [".pdf"], paths
+            assert [p.suffix for p in paths] == [".pdf", ".png"], paths
             assert paths[0].read_bytes() == b"%PDF-1.4"
+            assert msgs[0]["content"][1] == {"type": "text", "text": "[document 1: attached]"}
         finally:
             import shutil
             shutil.rmtree(img_dir, ignore_errors=True)
-        assert server.has_image_blocks(pdf_msg())
+        assert server.has_image_blocks(_pdf_msg())
         assert not server.has_image_blocks([{"role": "user", "content": [
             {"type": "document", "source": {"type": "text", "media_type": "text/plain",
                                             "data": "hi"}}]}])
-        print("  PDF: refused on codex/opencode, staged for claude")
+        print("  PDF prompt on claude: staged as the PDF, sent inline")
     finally:
         server.PROVIDER = saved
 

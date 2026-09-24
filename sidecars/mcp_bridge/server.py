@@ -860,11 +860,13 @@ def stringify_tool_content(content) -> str:
 # model that path, which it cannot open (native Read is locked away); codex
 # drops it ("image content omitted") or dumps the base64 as text. For those
 # two the bridge sends what both do pass through: the PDF's extracted text
-# and one PNG per page (poppler, baked into the sidecar image). Rendering
-# is blocking work, so handle_followup runs the whole conversion in a thread
-# (asyncio.to_thread): the event loop keeps serving other sessions meanwhile.
-PDF_PAGE_LIMIT = int(os.environ.get("MCP_PDF_PAGE_LIMIT", "20"))
-PDF_RENDER_DPI = int(os.environ.get("MCP_PDF_RENDER_DPI", "100"))
+# and one PNG per page (poppler, baked into the sidecar image) -- the same
+# cli_bridge.render_pdf that turns a PDF in a codex/opencode PROMPT into
+# text + page images. Rendering is blocking work, so handle_followup runs
+# the whole conversion in a thread (asyncio.to_thread): the event loop keeps
+# serving other sessions meanwhile.
+PDF_PAGE_LIMIT = cli_bridge.PDF_PAGE_LIMIT
+PDF_RENDER_DPI = cli_bridge.PDF_RENDER_DPI
 
 
 def pdf_to_mcp_blocks(pdf_b64: str) -> list[dict]:
@@ -874,23 +876,9 @@ def pdf_to_mcp_blocks(pdf_b64: str) -> list[dict]:
     try:
         pdf = workdir / "document.pdf"
         pdf.write_bytes(base64.b64decode(pdf_b64))
-        pages = subprocess.run(
-            ["pdftoppm", "-png", "-r", str(PDF_RENDER_DPI), "-l", str(PDF_PAGE_LIMIT),
-             str(pdf), str(workdir / "page")], capture_output=True, text=True, timeout=60)
-        images = sorted(workdir.glob("page-*.png"),
-                        key=lambda p: int(p.stem.rsplit("-", 1)[1]))
-        text = subprocess.run(["pdftotext", "-layout", "-l", str(PDF_PAGE_LIMIT), str(pdf), "-"],
-                              capture_output=True, text=True, timeout=30)
-        extracted = text.stdout.strip() if text.returncode == 0 else ""
-        if text.returncode != 0:
-            log.warning("pdftotext failed on a PDF tool result: %s",
-                        text.stderr.strip()[:200] or f"exit {text.returncode}")
-        if not images and not extracted:
-            raise RuntimeError((pages.stderr or text.stderr).strip()[:200]
-                               or f"exit {pages.returncode}")
-        shown = (f"{len(images)} page(s) shown as images below"
-                 f"{f' (first {PDF_PAGE_LIMIT} only)' if len(images) >= PDF_PAGE_LIMIT else ''}"
-                 if images else "no page images could be rendered")
+        extracted, images = cli_bridge.render_pdf(pdf, workdir, PDF_PAGE_LIMIT, PDF_RENDER_DPI)
+        shown = (f"{cli_bridge.pdf_pages_note(len(images), PDF_PAGE_LIMIT)} shown as images below"
+                 if images else cli_bridge.pdf_pages_note(0))
         told = "its extracted text follows" if extracted else "no text could be extracted"
         note = f"[PDF from the tool result: {shown}; {told}]"
         blocks = [{"type": "text", "text": f"{note}\n{extracted}".rstrip()}]
@@ -1893,7 +1881,7 @@ async def handle_fresh(body: dict, tools: list[dict],
     # into the prompt text. An unsupported image (a remote URL we cannot
     # fetch) is an error here, not a silent drop -- the bug fix in #30.
     try:
-        image_paths, img_dir = cli_bridge.stage_or_fail(messages)
+        image_paths, img_dir = await cli_bridge.stage_or_fail_async(messages)
     except cli_bridge.ImageUnsupportedError as exc:
         raise exc.http() from exc
     # Mirror cli_bridge's _handle_chat: the img_dir is owned here until
@@ -2136,8 +2124,9 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
 
     `image_paths` are appended to the CLI's argv per profile (see build_argv);
     they are the only thing build_argv needs. `img_dir`, when set, is the
-    caller's separate temp staging dir (cli_bridge.stage_or_fail always mints
-    one -- even on a fresh request, which has its own workdir): this function
+    caller's separate temp staging dir (cli_bridge.stage_or_fail mints one
+    whenever it attaches anything -- even on a fresh request, which has its
+    own workdir): this function
     owns its cleanup, since the workdir is unrelated. `workdir` is cleaned
     separately by end_session (called above for the final case, park_session
     for the parked case); on an exception it is cleaned below.
@@ -2327,7 +2316,7 @@ async def resume_gone_session(body: dict, tools: list[dict], session_id: str,
     # The new workdir does not exist yet (start_session creates it), so the
     # staging dir is a separate temp dir the call owns and cleans up.
     try:
-        image_paths, img_dir = cli_bridge.stage_or_fail(messages)
+        image_paths, img_dir = await cli_bridge.stage_or_fail_async(messages)
     except cli_bridge.ImageUnsupportedError as exc:
         raise exc.http() from exc
     # Same broadened cleanup as handle_fresh: anything that escapes between

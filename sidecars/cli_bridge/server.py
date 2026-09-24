@@ -576,8 +576,15 @@ CLAUDE_LOCKDOWN = ("--strict-mcp-config", "--setting-sources", "",
 #                            (claude_media_stdin). Staging for a native Read
 #                            leaked relay paths the model then handed to the
 #                            caller's Read tool (issue #264).
-#   codex 0.153.4 `exec`  -- native `-i FILE`, repeatable.
-#   opencode 1.18.32 `run`-- native `-f FILE(s)`, repeatable.
+#   codex 0.153.4 `exec`  -- native `-i FILE`, repeatable. Images only.
+#   opencode 1.18.32 `run`-- native `-f FILE(s)`, repeatable. Its attachment
+#                            docs list PNG/JPEG/GIF/WebP as image media and
+#                            reject PDF.
+# So a PDF in the prompt reaches codex and opencode as what they DO take:
+# its extracted text at the PDF's place in the prompt plus one PNG per page
+# attached with -i / -f (render_pdf, poppler -- the same conversion the tool
+# path does for a PDF in a tool result). Only a PDF poppler can make nothing
+# of is refused.
 # Any image block that cannot be carried that way -- a plain http(s) URL, a
 # corrupt payload -- is an error, never a silent drop: a wrong answer is the
 # one failure a caller cannot distinguish from a real reading.
@@ -669,6 +676,72 @@ def _stage_image(block: dict, img_dir: Path, n: int) -> Path:
     return path
 
 
+# A PDF becomes extracted text + page PNGs for a CLI that cannot take one
+# (codex/opencode prompts, claude/codex tool results). Env names keep the
+# MCP_ prefix they were introduced under (#280); both bridges read them.
+PDF_PAGE_LIMIT = int(os.environ.get("MCP_PDF_PAGE_LIMIT", "20"))
+PDF_RENDER_DPI = int(os.environ.get("MCP_PDF_RENDER_DPI", "100"))
+
+
+def render_pdf(pdf: Path, out_dir: Path, page_limit: int | None = None,
+               dpi: int | None = None) -> tuple[str, list[Path]]:
+    """(extracted text, [page PNG paths]) for a PDF on disk, via poppler.
+
+    Pages land in `out_dir` as page-<n>.png, in page order, at most
+    `page_limit` of them. Either half may be empty -- a scanned PDF has no
+    text, a broken renderer no pages -- but not both: that raises
+    RuntimeError (and a missing poppler raises OSError), so the caller can
+    say the PDF was not delivered instead of sending nothing. Blocking:
+    run it off the event loop.
+    """
+    page_limit = PDF_PAGE_LIMIT if page_limit is None else page_limit
+    dpi = PDF_RENDER_DPI if dpi is None else dpi
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pages = subprocess.run(
+        ["pdftoppm", "-png", "-r", str(dpi), "-l", str(page_limit),
+         str(pdf), str(out_dir / "page")], capture_output=True, text=True, timeout=60)
+    images = sorted(out_dir.glob("page-*.png"),
+                    key=lambda p: int(p.stem.rsplit("-", 1)[1]))
+    text = subprocess.run(["pdftotext", "-layout", "-l", str(page_limit), str(pdf), "-"],
+                          capture_output=True, text=True, timeout=30)
+    extracted = text.stdout.strip() if text.returncode == 0 else ""
+    if text.returncode != 0:
+        log.warning("pdftotext failed on a PDF: %s",
+                    text.stderr.strip()[:200] or f"exit {text.returncode}")
+    if not images and not extracted:
+        raise RuntimeError((pages.stderr or text.stderr).strip()[:200]
+                           or f"exit {pages.returncode}")
+    return extracted, images
+
+
+def pdf_pages_note(n_pages: int, page_limit: int | None = None) -> str:
+    """How many page images went along, and whether the PDF was cut."""
+    page_limit = PDF_PAGE_LIMIT if page_limit is None else page_limit
+    if not n_pages:
+        return "no page images could be rendered"
+    return (f"{n_pages} page(s)"
+            f"{f' (first {page_limit} only)' if n_pages >= page_limit else ''}")
+
+
+def _expand_pdf(pdf: Path, n: int) -> tuple[str, list[Path]]:
+    """A staged PDF for a CLI that takes images only: (marker, page PNGs).
+
+    The marker carries the extracted text in the PDF's place in the prompt;
+    the pages are attached with the CLI's image flag. Nothing usable ->
+    ImageUnsupportedError, a 400, never a PDF dropped unseen."""
+    try:
+        text, pages = render_pdf(pdf, pdf.parent / f"{pdf.stem}-pages")
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise ImageUnsupportedError(
+            f"{PROVIDER} cannot take a PDF in the prompt, and document {n} "
+            f"could not be rendered to text or page images here: {exc}") from exc
+    shown = (f"{pdf_pages_note(len(pages))} attached as images: "
+             f"{', '.join(str(p) for p in pages)}" if pages
+             else pdf_pages_note(0))
+    told = "extracted text follows" if text else "no text could be extracted"
+    return f"[document {n}: PDF, {shown}; {told}]\n{text}".rstrip(), pages
+
+
 def stage_images(messages: list[dict], img_dir: Path) -> list[Path]:
     """Decode every image content block into `img_dir`, in place.
 
@@ -678,8 +751,12 @@ def stage_images(messages: list[dict], img_dir: Path) -> list[Path]:
     messages, system, and `tool` messages alike -- the rebuild path in
     mcp_bridge relies on the last of those. Blocks that cannot be decoded
     raise ImageUnsupportedError rather than vanishing.
+
+    On codex/opencode a PDF is expanded (_expand_pdf): its marker carries the
+    extracted text and the returned paths are its page PNGs, not the PDF.
     """
     staged: list[Path] = []
+    blocks = 0
     for m in messages:
         content = m.get("content")
         if not isinstance(content, list):
@@ -687,8 +764,14 @@ def stage_images(messages: list[dict], img_dir: Path) -> list[Path]:
         replaced: list = []
         for block in content:
             if is_media_block(block):
-                n = len(staged) + 1
+                blocks += 1
+                n = blocks
                 path = _stage_image(block, img_dir, n)
+                if path.suffix == ".pdf" and PROVIDER != "claude":
+                    marker, pages = _expand_pdf(path, n)
+                    staged += pages
+                    replaced.append({"type": "text", "text": marker})
+                    continue
                 staged.append(path)
                 kind = "document" if path.suffix == ".pdf" else "image"
                 # Claude gets the bytes inline (claude_media_stdin), so its
@@ -787,17 +870,23 @@ def stage_or_fail(messages: list[dict]) -> tuple[list[Path], Path | None]:
     # silent `swimg-*` dir leak on every retry until the temp partition fills.
     try:
         paths = stage_images(messages, img_dir / "img")
-        if PROVIDER != "claude" and any(p.suffix == ".pdf" for p in paths):
-            # Only claude takes a PDF in the prompt (claude_media_stdin); codex
-            # attaches images only (-i), and opencode's -f needs a PDF-capable
-            # model. Refused rather than dropped from the prompt unseen.
-            raise ImageUnsupportedError(
-                f"{PROVIDER} cannot take a PDF in the prompt on this plan; "
-                "route PDF input to a plan that can")
+        if not paths:
+            # Only PDFs that rendered to text alone: nothing to attach.
+            shutil.rmtree(img_dir, ignore_errors=True)
+            return [], None
         return paths, img_dir
     except BaseException:
         shutil.rmtree(img_dir, ignore_errors=True)
         raise
+
+
+async def stage_or_fail_async(messages: list[dict]) -> tuple[list[Path], Path | None]:
+    """stage_or_fail off the event loop when there is media to stage: a PDF
+    on codex/opencode is rendered with poppler (blocking, up to seconds), and
+    other sessions must keep being served meanwhile."""
+    if not has_image_blocks(messages):
+        return [], None
+    return await asyncio.to_thread(stage_or_fail, messages)
 
 # Per-provider invocation. `prompt` and `system` are substituted; `system` is
 # dropped entirely when the CLI has no equivalent flag.
@@ -2684,7 +2773,7 @@ async def _complete(body: dict) -> dict:
     # A request with an unsupported image (a remote URL we cannot fetch) is
     # an error, never a silent drop — that is the bug fix in #30.
     try:
-        image_paths, img_dir = stage_or_fail(messages)
+        image_paths, img_dir = await stage_or_fail_async(messages)
     except ImageUnsupportedError as exc:
         raise exc.http() from exc
     try:

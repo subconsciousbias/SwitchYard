@@ -76,8 +76,11 @@ Knobs read by the running bridges (all read once at import time):
     `MCP_RESUME_WAIT_SECONDS`, `MCP_REBUILD_LOST`, `MCP_PREEMPTED_MEMORY`,
     `MCP_RECLAIM_POLL_SECONDS`, `MCP_PROCESS_TIMEOUT_SECONDS`,
     `MCP_BATCH_WINDOW_SECONDS`, `MCP_REMEMBERED_TOOLS_LIMIT`,
-    `MCP_PDF_PAGE_LIMIT`, `MCP_PDF_RENDER_DPI`, `LOG_TEXT_LOST`
-    — mcp_bridge knobs.
+    `LOG_TEXT_LOST` — mcp_bridge knobs.
+  - `MCP_PDF_PAGE_LIMIT`, `MCP_PDF_RENDER_DPI` — the PDF render
+    (`cli_bridge.render_pdf`, poppler): pages rendered and their DPI, for a
+    PDF in a tool result (claude/codex) and a PDF in a codex/opencode
+    prompt. Defined in cli_bridge, reused by mcp_bridge.
 
 The tool path runs each inner CLI in a mirror of the caller's cwd
 (`mcp_bridge.acquire_mirror`, issue #264). `MCP_MIRROR_LIMIT` caps how many

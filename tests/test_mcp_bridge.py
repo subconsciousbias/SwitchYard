@@ -222,31 +222,7 @@ TINY_PDF = (b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
             b"trailer<</Root 1 0 R>>\n%%EOF")
 
 
-class _FakePoppler:
-    """pdftotext / pdftoppm stand-ins on PATH: deterministic text, two pages."""
-
-    def __init__(self, text_fails: bool = False):
-        self.text_fails = text_fails
-
-    def __enter__(self):
-        import stat
-        self.dir = Path(tempfile.mkdtemp(prefix="fake-poppler-"))
-        (self.dir / "pdftotext").write_text(
-            "#!/bin/sh\necho broken >&2; exit 1\n" if self.text_fails
-            else "#!/bin/sh\necho EXTRACTED TEXT\n")
-        (self.dir / "pdftoppm").write_text(
-            "#!/bin/sh\nfor last; do :; done\n"
-            "printf PNG1 > \"$last-1.png\"; printf PNG2 > \"$last-2.png\"\n")
-        for tool in ("pdftotext", "pdftoppm"):
-            (self.dir / tool).chmod(stat.S_IRWXU)
-        self.path = os.environ.get("PATH", "")
-        os.environ["PATH"] = f"{self.dir}:{self.path}"
-        return self
-
-    def __exit__(self, *exc):
-        import shutil
-        os.environ["PATH"] = self.path
-        shutil.rmtree(self.dir, ignore_errors=True)
+from _modules import FakePoppler as _FakePoppler  # noqa: E402
 
 
 def test_pdf_tool_results_reach_claude_and_codex_as_text_and_page_images():
@@ -328,6 +304,44 @@ def test_partial_pdf_render_says_what_is_missing():
         assert [b["type"] for b in blocks[1:]] == ["image", "image"], blocks
     finally:
         server.PROVIDER = saved
+
+
+def test_fresh_tool_session_attaches_a_prompt_pdf_as_page_images():
+    """The tool path stages the prompt the way the text path does
+    (cli_bridge.stage_or_fail_async): on codex / opencode a PDF in the
+    prompt becomes its text in the prompt and its pages on -i / -f."""
+    import base64
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-pdfprompt-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    cb = server.cli_bridge
+    saved = (server.PROVIDER, server.PROFILE, cb.PROVIDER)
+    try:
+        for provider, flag in (("codex", "-i"), ("opencode", "-f")):
+            server.PROVIDER, server.PROFILE = provider, server.MCP_PROFILES[provider]
+            cb.PROVIDER = provider
+            messages = [{"role": "user", "content": [
+                {"type": "text", "text": "read this"},
+                {"type": "file", "file": {"file_data": "data:application/pdf;base64,"
+                                          + base64.b64encode(TINY_PDF).decode()}}]}]
+            with _FakePoppler():
+                paths, img_dir = asyncio.run(cb.stage_or_fail_async(messages))
+            try:
+                prompt, _ = cb.flatten(messages)
+                prompt += cb.image_note(paths)
+                argv, stdin = server.build_argv(prompt, None, "m", workdir, "sess",
+                                                tools_path, "", image_paths=paths)
+                attached = [argv[i + 1] for i, a in enumerate(argv) if a == flag]
+                assert attached == [str(p) for p in paths], (provider, argv)
+                assert [Path(p).name for p in attached] == ["page-1.png", "page-2.png"]
+                sent = stdin if stdin is not None else "\n".join(argv)
+                assert "EXTRACTED TEXT" in sent and "[2 image(s) attached" in sent, sent
+            finally:
+                shutil.rmtree(img_dir, ignore_errors=True)
+        print("  tool path: prompt PDF -> page PNGs on codex -i / opencode -f + text")
+    finally:
+        server.PROVIDER, server.PROFILE, cb.PROVIDER = saved
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def test_non_pdf_documents_and_files_in_a_tool_result():
