@@ -304,6 +304,26 @@ PROFILE = MCP_PROFILES[PROVIDER]
 # the still-running CLI process, which remembers its own turns, so a
 # follow-up request only ever needs to deliver tool results, never replay text.
 # ---------------------------------------------------------------------------
+class _SupersedeSignal(RuntimeError):
+    """Mid-turn supersede signal (issue #96).
+
+    Raised on the in-flight `turn_future` by `supersede_session` when a
+    parallel follow-up has won the race for the session's tool_call_ids.
+    The reason string is attached so the catching code in
+    `_continue_followup` (and the 503 mapping in `await_turn`) can tell
+    this specific supersede race apart from any other RuntimeError that
+    happens to mention "superseded" in its message. The signal carries
+    its reason on the exception object itself, which is what makes the
+    race-free design work: a parallel `supersede_session`'s
+    `end_session` call cannot lose the marker to a reset because there
+    is no shared marker to reset.
+    """
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 @dataclass
 class ParkedCall:
     id: str
@@ -1490,7 +1510,8 @@ async def supersede_session(session: Session, reason: str) -> None:
     session.fail_pending(f"session {session.id} superseded ({reason})")
     if session.turn_future is not None and not session.turn_future.done():
         session.turn_future.set_exception(
-            RuntimeError(f"session {session.id} superseded ({reason})"))
+            _SupersedeSignal(
+                f"session {session.id} superseded ({reason})", reason))
     if session.proc is not None and session.proc.returncode is None:
         with contextlib.suppress(ProcessLookupError):
             session.proc.kill()
@@ -1593,6 +1614,17 @@ async def await_turn(session: Session, request: "Request | None") -> dict:
             # but it keeps the log honest about why the turn ended.
             raise HTTPException(status_code=499,
                                  detail="caller disconnected; session dropped") from exc
+        if isinstance(exc, _SupersedeSignal):
+            # Mid-turn supersede (issue #96): the session was just rebuilt
+            # against because a parallel follow-up won the race for its
+            # tool_call_ids. Map to a retryable 503 with Retry-After so a
+            # gateway retry of follow-up #1 sees a clean retry, not a 500.
+            # Same shape as resume_gone_session's "no slot freed" 503.
+            raise HTTPException(
+                status_code=503,
+                detail=f"session {session.id} superseded mid-turn "
+                       f"({exc.reason}); retry against the rebuilt session",
+                headers={"Retry-After": "5"}) from exc
         raise
     finally:
         watcher.cancel()
@@ -2607,6 +2639,62 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
                 "tool_calls response rather than rebuilding",
                 session.id, len(delivered_ids))
             return session.last_response
+        # Duplicate-delivery-in-flight (issue #96 owner comment): the session
+        # is mid-turn (not parked), the delivered ids do not match anything
+        # parked here, and a turn_future that is still running means the CLI
+        # is working on the original turn that minted those ids. Superseding
+        # it would race the CLI and throw the caller's tool results away;
+        # rebuilding from the request would mint a fresh CLI and skip the
+        # work already in flight. Attach the retry to the running turn
+        # instead: when it lands, return its rendered response. The
+        # supersede+rebuild path below is reserved for the case where no
+        # turn is running, i.e. the ids are from a turn that already
+        # finished and left the session parked or already taken by a
+        # parallel batch.
+        if (not session.awaiting_followup
+                and session.turn_future is not None
+                and not session.turn_future.done()):
+            log.info(
+                "live mcp_bridge session %s received a duplicate delivery "
+                "while its turn is still in flight; attaching to the "
+                "running turn rather than superseding", session.id)
+            try:
+                result = await await_turn(session, request)
+                response = render_turn(session, result, body.get("model"))
+                session.last_response = response
+                if result["type"] != "tool_calls":
+                    await end_session(session)
+                else:
+                    await park_session(session)
+            except BaseException as exc:
+                # Same teardown contract as the main path below
+                # (PR #306 review): a 503 from await_turn (a parallel
+                # supersede race -- issue #96) or an error envelope from
+                # render_turn used to escape here without running
+                # end_session. The session kept its gate slot until the
+                # 1800 s idle reaper came round, which on a 2-connection
+                # plan is most of its capacity (issue #80). end_session's
+                # dead-guard makes the call idempotent against the
+                # 499-already-reaped path await_turn can raise when the
+                # caller disconnects mid-turn. Same second-cancel
+                # hardening: swallow anything the cleanup raises so the
+                # ORIGINAL exception still propagates.
+                with contextlib.suppress(BaseException):
+                    await end_session(session)
+                # Issue #96 (test path, request=None): the in-flight
+                # turn_future was failed by supersede_session with a
+                # `_SupersedeSignal`. Rebuild like the main path so a
+                # follow-up that lost the in-flight race returns the
+                # same rebuilt response the winning follow-up is also
+                # getting. In production (request set) await_turn maps
+                # the signal to a retryable 503 first, so this branch
+                # only fires for in-process callers.
+                if isinstance(exc, _SupersedeSignal):
+                    return await resume_gone_session(
+                        body, body.get("tools") or [], session.id, request,
+                        why="superseded mid-turn")
+                raise
+            return response
         # Could be a lost session, ids from a parallel batch we already
         # finished mid-turn, or just garbled input. Rebuilding from the
         # request keeps the caller moving instead of throwing a 400 they
@@ -2641,7 +2729,7 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
             await end_session(session)
         else:
             await park_session(session)
-    except BaseException:
+    except BaseException as exc:
         # Same teardown contract as start_session: every CLI failure mode
         # makes render_turn raise HTTPException, which used to escape here
         # without running end_session -- the session stayed in SESSIONS
@@ -2656,6 +2744,19 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
         # reaper stays the last-resort backstop. (PR #82 review round 1.)
         with contextlib.suppress(BaseException):
             await end_session(session)
+        # Issue #96: a parallel follow-up raced us mid-turn and won; our
+        # `turn_future` was failed by supersede_session with a
+        # `_SupersedeSignal`. The winning follow-up already rebuilt the
+        # session against the same history, so the caller of THIS
+        # follow-up gets the same rebuilt response by going through
+        # resume_gone_session. Without this catch the signal escapes and
+        # the gateway sees a 500 (in tests, with request=None) or a 503
+        # (in production, where await_turn has already mapped it). Every
+        # other exception still re-raises unchanged below.
+        if isinstance(exc, _SupersedeSignal):
+            return await resume_gone_session(
+                body, body.get("tools") or [], session.id, request,
+                why="superseded mid-turn")
         raise
     return response
 

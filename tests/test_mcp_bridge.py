@@ -5856,6 +5856,208 @@ def test_mcp_bridge_render_turn_passes_session_thinking_to_to_openai():
           "to_openai(reasoning_display=...) honours omitted contract")
 
 
+def test_followup_superseded_mid_turn_rebuilds_instead_of_500():
+    """Regression for issue #96.
+
+    Two follow-ups race on the same mcp_bridge session: follow-up #1 resolves
+    its parked tool_call_ids, calls unpark_session, then awaits the new
+    turn_future while the CLI is still working. While that turn is pending,
+    the winning follow-up #2 calls supersede_session on the same session
+    (its tool_call_ids do not match because follow-up #1 already consumed
+    them). supersede_session fails the pending turn_future with a
+    `_SupersedeSignal`.
+
+    Before this fix, that exception escaped the `except BaseException`
+    teardown in `_continue_followup` and the gateway saw a 500. After this
+    fix, the catch recognises the typed signal, rebuilds via
+    `resume_gone_session`, and returns the rebuilt response the winning
+    follow-up is also getting. Reverting the server.py change reproduces
+    the production error verbatim.
+    """
+    captured: list = []
+    restore = _stub_start_session(captured)
+    try:
+        async def scenario():
+            session = _new_session()
+            session.new_turn()
+            # Parked with a real parked call whose id the follow-up WILL name
+            # so the resolve loop resolves ONE call (the normal continue
+            # path) -- not the resolved == 0 branch the parallel-batch test
+            # exercises. `register_tool_call` is what tool_server.py invokes
+            # from its inner CLI; it blocks until `set_result` is called
+            # from `_continue_followup`'s resolve loop. `new_turn()` is
+            # called first because Session.enqueue's _flush only resolves a
+            # turn_future that exists.
+            parked = asyncio.create_task(
+                server.register_tool_call(session.id, "get_weather",
+                                          {"city": "Oslo"}))
+            await asyncio.sleep(0)
+            turn = await session.turn_future
+            assert turn["type"] == "tool_calls", turn
+            session.awaiting_followup = True
+            parked_id = next(iter(session.pending))
+
+            # Concurrent supersede -- 50 ms after _continue_followup starts
+            # awaiting the new turn_future. The gap mirrors the production
+            # race window (two follow-ups from the same GUI arriving a few
+            # ms apart, the second winning the resolve). Using the same
+            # reason string the resolved == 0 branch uses so a future
+            # refactor that flips which branch fires doesn't change the
+            # test's contract.
+            async def race():
+                await asyncio.sleep(0.05)
+                await server.supersede_session(
+                    session,
+                    "no parked call matched delivered ids (rebuilding)")
+
+            supersede_task = asyncio.create_task(race())
+
+            body = {"model": "m",
+                    "tools": [{"type": "function", "function": {
+                        "name": "get_weather", "description": "",
+                        "parameters": {"type": "object",
+                                       "properties": {}}}}],
+                    "messages": [
+                        {"role": "user", "content": "weather in Oslo?"},
+                        {"role": "assistant", "content": None, "tool_calls": [
+                            {"id": parked_id, "type": "function",
+                             "function": {"name": "get_weather",
+                                          "arguments": '{"city":"Oslo"}'}}]},
+                        {"role": "tool", "tool_call_id": parked_id,
+                         "content": '{"temp_c":-3}'},
+                    ]}
+            tool_msgs = body["messages"][2:]
+            # Drive _continue_followup directly with request=None (the test
+            # path through await_turn skips its RuntimeError-to-HTTPException
+            # mapping and propagates the underlying error -- which is exactly
+            # the surface _continue_followup's catch handles).
+            try:
+                result = await server._continue_followup(body, session.id,
+                                                         tool_msgs, None)
+                await supersede_task
+                return result, session
+            finally:
+                # The parked call's future was resolved by _continue_followup
+                # BEFORE supersede fired, so the register_tool_call task
+                # returns cleanly. Consume it here so asyncio does not log
+                # a "future exception was never retrieved" warning if the
+                # race ordering ever shifts.
+                with contextlib.suppress(Exception):
+                    await parked
+
+        result, session = asyncio.run(scenario())
+        # The rebuild fired -- start_session was called exactly once.
+        assert len(captured) == 1, captured
+        # And the caller got the rebuilt response back, NOT the
+        # `_SupersedeSignal` (or pre-fix RuntimeError) that used to
+        # escape and surface as a 500.
+        assert result == {"stubbed": True}, result
+        # The superseded session is gone from SESSIONS and marked dead.
+        # The exception that would have escaped pre-fix had the same
+        # "_SupersedeSignal" message text, so a future regression that
+        # drops the catch reproduces the exact production error.
+        assert session.id not in server.SESSIONS, dict(server.SESSIONS)
+        assert session.dead, session
+        print(f"  follow-up caught its own supersede and rebuilt: "
+              f"start_session called once; session {session.id[:8]}... "
+              f"ended")
+    finally:
+        restore()
+
+
+def test_followup_duplicate_delivery_in_flight_attaches_to_running_turn():
+    """Regression for issue #96's owner comment / PR #306.
+
+    A follow-up whose `tool_call_id` matches nothing parked here BUT
+    whose original turn is still in flight (mid-turn, not parked,
+    `turn_future` not done) attaches to the running turn rather than
+    superseding it. Superseding here would race the CLI and throw the
+    caller's tool results away; rebuilding from the request would mint
+    a fresh CLI and skip the work already in flight. Reverting the
+    new branch takes the supersede+rebuild path, which is wrong on a
+    session whose CLI is still working.
+    """
+    captured = []
+    restore = _stub_start_session(captured)
+    try:
+        async def scenario():
+            session = _new_session()
+            # Start the original turn (the one the follow-up is
+            # duplicating). We do NOT call register_tool_call: this
+            # branch fires when the follow-up's ids match nothing
+            # parked (resolved == 0) but the session is mid-turn.
+            session.new_turn()
+            session.awaiting_followup = False   # mid-turn state
+            # Mark the old id as already-resolved so the follow-up is
+            # unambiguously a duplicate (not in pending, but already
+            # consumed). The resolve loop iterates pending; an empty
+            # pending means resolved stays at 0, which is what the new
+            # branch's condition requires.
+            old_id = "call_old_1"
+            session.mark_resolved(old_id)
+
+            # Resolve the turn with a final payload, AFTER yielding so
+            # _continue_followup has a chance to reach its `await_turn`
+            # before `turn_future.done()` flips True.
+            async def resolve_turn():
+                await asyncio.sleep(0)
+                session.resolve_final({
+                    "type": "final",
+                    "payload": {"result": "Oslo is cold"},
+                })
+            resolve_task = asyncio.create_task(resolve_turn())
+
+            body = {"model": "m",
+                    "tools": [{"type": "function", "function": {
+                        "name": "get_weather", "description": "",
+                        "parameters": {"type": "object",
+                                       "properties": {}}}}],
+                    "messages": [
+                        {"role": "user", "content": "weather in Oslo?"},
+                        {"role": "assistant", "content": None, "tool_calls": [
+                            {"id": old_id, "type": "function",
+                             "function": {"name": "get_weather",
+                                          "arguments": '{}'}}]},
+                        {"role": "tool", "tool_call_id": old_id,
+                         "content": "{}"},
+                    ]}
+            tool_msgs = body["messages"][2:]
+            try:
+                result = await server._continue_followup(body, session.id,
+                                                         tool_msgs, None)
+                await resolve_task
+                return result, session, captured
+            finally:
+                # The branch ends with end_session on a final result;
+                # if it parked instead, drain the parked-future warning.
+                if (session.id in server.SESSIONS
+                        and session.turn_future is not None
+                        and not session.turn_future.done()):
+                    with contextlib.suppress(Exception):
+                        await session.turn_future
+
+        result, session, captured = asyncio.run(scenario())
+        # The duplicate-delivery-in-flight branch fired: it attached
+        # to the running turn rather than supersede+rebuild. start_session
+        # was NOT called.
+        assert captured == [], captured
+        # The branch ends with the running turn's final response,
+        # rendered through the normal render_turn path (to_openai
+        # picks `payload["result"]` for content, finish_reason="stop"
+        # for the final type).
+        assert result["choices"][0]["message"]["content"] == "Oslo is cold", result
+        assert result["choices"][0]["finish_reason"] == "stop", result
+        # And the session is gone (final turn -> end_session) -- the
+        # branch did not leave it parked or holding the slot.
+        assert session.id not in server.SESSIONS, dict(server.SESSIONS)
+        assert session.dead, session
+        print(f"  duplicate delivery attached to running turn: "
+              f"start_session not called, finish_reason=stop, "
+              f"content={result['choices'][0]['message']['content']!r}")
+    finally:
+        restore()
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
