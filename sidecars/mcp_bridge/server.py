@@ -740,7 +740,11 @@ def _maybe_probe(body: dict, tools: list[dict]) -> "asyncio.Future | None":
 def translate_tool(openai_tool: dict) -> dict | None:
     """One OpenAI tool -> one MCP tool. `inputSchema` and `parameters` are
     near-identical JSON Schema, so this is close to a rename."""
-    fn = openai_tool.get("function") if openai_tool.get("type") == "function" else openai_tool
+    # Anthropic's typed client tools (bash, text editor, memory, computer)
+    # arrive with no usable schema; they get their documented one.
+    fn = cli_bridge.typed_client_tool(openai_tool)
+    if fn is None:
+        fn = openai_tool.get("function") if openai_tool.get("type") == "function" else openai_tool
     if not isinstance(fn, dict) or not fn.get("name"):
         return None
     return {
@@ -751,7 +755,14 @@ def translate_tool(openai_tool: dict) -> dict | None:
 
 
 def translate_tools(openai_tools: list[dict]) -> list[dict]:
-    pairs = [(tool, translate_tool(tool)) for tool in (openai_tools or [])]
+    # Web search/fetch (served by the CLI's own search) and tool search
+    # (nothing to run) are never caller tools, whichever path the list came
+    # by -- a remembered or rebuilt tool list still carries the web tools,
+    # because wants_web_search reads them from the body.
+    openai_tools = [tool for tool in (openai_tools or [])
+                    if not (cli_bridge.is_web_search_tool(tool)
+                            or cli_bridge.is_tool_search_tool(tool))]
+    pairs = [(tool, translate_tool(tool)) for tool in openai_tools]
     dropped = [tool for tool, translated in pairs if translated is None]
     if dropped:
         # Server-side tools (web search, code execution...) and malformed
@@ -2654,8 +2665,21 @@ async def models() -> dict:
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     body = await request.json()
+    # A server-executed tool no CLI can run (code execution, MCP connector,
+    # OpenAI file search...) is refused before any probe, session or spawn:
+    # a 4xx the router spills to a plan that runs it, never a parked call
+    # handed to a client that cannot execute it.
+    server_tools = cli_bridge.server_only_tools(body)
+    if server_tools:
+        raise cli_bridge.server_tool_refusal(server_tools)
     # A server-side web-search tool is not a caller tool to bridge; the CLI's
     # own search serves it (cli_bridge.wants_web_search reads the body).
+    # Tool search has nothing to run: the inner CLI sees every tool anyway.
+    # It is taken out of the body itself, not just this list: start_session
+    # remembers body["tools"] for tool-less follow-ups (issue #260).
+    if any(cli_bridge.is_tool_search_tool(t) for t in body.get("tools") or []):
+        body = {**body, "tools": [t for t in body["tools"]
+                                  if not cli_bridge.is_tool_search_tool(t)]}
     tools = [t for t in body.get("tools") or [] if not cli_bridge.is_web_search_tool(t)]
     if not tools:
         # A follow-up answering one of OUR tool calls is a tool-loop turn even

@@ -133,6 +133,44 @@ def test_claude_tool_path_offers_only_the_callers_tools():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_claude_tool_path_offers_a_typed_bash_tool_with_its_schema():
+    """An Anthropic typed tool ({"type": "bash_20250124", "name": "bash"},
+    as LiteLLM forwards it) reaches the pinned claude as a caller tool WITH
+    its documented input schema, not an empty one (issue #264)."""
+    try:
+        claude = _pinned_clis.require("claude")
+    except _pinned_clis.Skip as why:
+        print(f"  skipped: {why}")
+        return
+    root = Path(tempfile.mkdtemp(prefix="lockdown-claude-typed-"))
+    _login_dir(root)
+    saved = (server.PROVIDER, server.PROFILE)
+    try:
+        server.PROVIDER = "claude"
+        server.PROFILE = dict(server.MCP_PROFILES["claude"], cli=claude)
+        workdir = root / "session"
+        workdir.mkdir()
+        tools_path = workdir / "tools.json"
+        mcp_tools = server.translate_tools([{"type": "bash_20250124", "name": "bash"}])
+        tools_path.write_text(json.dumps(mcp_tools))
+        argv, _ = server.build_argv("hello", None, "claude-sonnet-5", workdir,
+                                    uuid.uuid4().hex, tools_path, "mcp__switchyard__bash")
+        with _fake_model.FakeModel([{"text": "ok"}]) as fake:
+            done = _run(argv, fake, root, workdir)
+        assert done.returncode == 0, done.stderr[-500:]
+        offered = [t for r in fake.tool_requests() for t in r["body"].get("tools") or []
+                   if t.get("name") == "mcp__switchyard__bash"]
+        assert offered, [_fake_model.advertised_tools(r["body"]) for r in fake.requests]
+        props = (offered[0].get("input_schema") or {}).get("properties") or {}
+        assert props.get("command", {}).get("type") == "string", offered[0]
+        print(f"  claude {_pinned_clis.installed_version('claude')}: typed bash offered "
+              "as mcp__switchyard__bash with a `command` property")
+    finally:
+        server.PROVIDER, server.PROFILE = saved
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_claude_text_path_offers_no_tools():
     try:
         claude = _pinned_clis.require("claude")

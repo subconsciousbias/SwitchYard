@@ -284,6 +284,204 @@ def wants_web_search(body: dict) -> bool:
         is_web_search_tool(tool) for tool in body.get("tools") or [])
 
 
+# ----------------------------------------------------------- typed tools ---
+# LiteLLM forwards Anthropic's versioned tool types to the sidecar verbatim,
+# as {"type": "bash_20250124", "name": "bash"} -- no input schema at all --
+# and a computer tool as a function whose `parameters` is the tool's own
+# config ({"type": "computer_20250124", "display_width_px": ...}), which is
+# not a JSON Schema (issue #264). Three kinds, three outcomes:
+#
+#   * CLIENT-executed typed tools (bash, text editor, memory, computer): the
+#     Anthropic client runs them, so they are caller tools like any other.
+#     They get their documented input schema here, under the caller's own
+#     tool name, so the inner CLI can call them and the parked call goes back
+#     under that name (LiteLLM maps it back to a tool_use).
+#   * Tool search (tool_search_tool_*): dropped. Every tool is shown to the
+#     inner CLI anyway, and `defer_loading` on the others is ignored.
+#   * SERVER-executed tools with no executor here (Anthropic code execution,
+#     MCP connector; OpenAI file search, code interpreter, ...): refused with
+#     400 server_tool_unsupported so the router spills to a plan that runs
+#     them. Handing such a call back to the client, or answering without it,
+#     is the silent degraded 200 the issue is about.
+# Web search / web fetch are server tools too, but the CLIs serve them with
+# their own search (wants_web_search above); they are none of the above.
+_TYPED_TOOL_RE = re.compile(r"^(bash|text_editor|memory|computer)_\d{8}$")
+
+_TEXT_EDITOR_PROPS = {
+    "command": {"type": "string",
+                "enum": ["view", "create", "str_replace", "insert", "undo_edit"]},
+    "path": {"type": "string", "description": "Absolute path to the file or directory."},
+    "file_text": {"type": "string", "description": "create: the whole content of the new file."},
+    "old_str": {"type": "string",
+                "description": "str_replace: the exact text to replace; must match exactly once."},
+    "new_str": {"type": "string", "description": "str_replace: the replacement text."},
+    "insert_line": {"type": "integer",
+                    "description": "insert: the line number after which to insert (0 = top of file)."},
+    "insert_text": {"type": "string", "description": "insert: the text to insert."},
+    "view_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2,
+                   "description": "view: [start_line, end_line], 1-indexed; -1 as end means end of file."},
+}
+
+
+def _text_editor_tool(version: str) -> tuple[str, dict]:
+    props = dict(_TEXT_EDITOR_PROPS)
+    if version == "20250124":
+        # The first version has undo_edit and takes insert's text in new_str.
+        props["new_str"] = {"type": "string",
+                            "description": "str_replace: the replacement text; insert: the text to insert."}
+        del props["insert_text"]
+        commands = "view, create, str_replace, insert, undo_edit"
+    else:
+        props["command"] = {**props["command"],
+                            "enum": ["view", "create", "str_replace", "insert"]}
+        commands = "view, create, str_replace, insert"
+    return (f"View, create and edit text files. Commands: {commands}. view shows a file "
+            "with line numbers (or lists a directory); create writes file_text to path; "
+            "str_replace replaces old_str (which must occur exactly once) with new_str; "
+            "insert adds text after insert_line.",
+            {"type": "object", "properties": props, "required": ["command", "path"]})
+
+
+def _computer_tool(config: dict) -> tuple[str, dict]:
+    width, height = config.get("display_width_px"), config.get("display_height_px")
+    size = f" The display is {width}x{height} pixels." if width and height else ""
+    return (("Control the computer's mouse and keyboard and take screenshots." + size
+             + " Actions: key (press a key or combination, e.g. ctrl+s, in text), "
+             "type (type text), mouse_move (to coordinate), left_click, right_click, "
+             "middle_click, double_click, triple_click (at coordinate, text may hold "
+             "modifier keys), left_click_drag (to coordinate), left_mouse_down, "
+             "left_mouse_up, scroll (at coordinate, scroll_direction up/down/left/right, "
+             "scroll_amount), hold_key (text for duration seconds), wait (duration "
+             "seconds), screenshot, cursor_position, zoom (a region "
+             "[x1, y1, x2, y2] at full resolution)."),
+            {"type": "object",
+             "properties": {
+                 "action": {"type": "string", "description": "The action to perform."},
+                 "coordinate": {"type": "array", "items": {"type": "integer"},
+                                "minItems": 2, "maxItems": 2,
+                                "description": "[x, y] in screen pixels."},
+                 "text": {"type": "string",
+                          "description": "Text to type, key(s) to press, or modifier keys."},
+                 "scroll_direction": {"type": "string",
+                                      "enum": ["up", "down", "left", "right"]},
+                 "scroll_amount": {"type": "integer"},
+                 "duration": {"type": "number", "description": "Seconds (hold_key, wait)."},
+                 "region": {"type": "array", "items": {"type": "integer"},
+                            "minItems": 4, "maxItems": 4,
+                            "description": "zoom: [x1, y1, x2, y2]."},
+             },
+             "required": ["action"]})
+
+
+_TYPED_TOOLS = {
+    "bash": lambda version, tool: (
+        "Run a command in a persistent bash shell session. State (working "
+        "directory, environment variables) persists between calls. Set restart "
+        "to true to restart the shell.",
+        {"type": "object",
+         "properties": {"command": {"type": "string", "description": "The bash command to run."},
+                        "restart": {"type": "boolean",
+                                    "description": "Restart the shell session."}}}),
+    "text_editor": lambda version, tool: _text_editor_tool(version),
+    "memory": lambda version, tool: (
+        "Read and write a persistent memory directory (/memories) that survives "
+        "across conversations. Commands: view (a directory or a file, optional "
+        "view_range), create (path, file_text), str_replace (path, old_str, "
+        "new_str), insert (path, insert_line, insert_text), delete (path), "
+        "rename (old_path, new_path).",
+        {"type": "object",
+         "properties": {
+             "command": {"type": "string", "enum": ["view", "create", "str_replace",
+                                                    "insert", "delete", "rename"]},
+             "path": {"type": "string", "description": "A path under /memories."},
+             "file_text": {"type": "string"},
+             "old_str": {"type": "string"},
+             "new_str": {"type": "string"},
+             "insert_line": {"type": "integer"},
+             "insert_text": {"type": "string"},
+             "old_path": {"type": "string"},
+             "new_path": {"type": "string"},
+             "view_range": {"type": "array", "items": {"type": "integer"},
+                            "minItems": 2, "maxItems": 2},
+         },
+         "required": ["command"]}),
+    "computer": lambda version, tool: _computer_tool(tool),
+}
+
+
+def typed_client_tool(tool) -> dict | None:
+    """{name, description, parameters} for an Anthropic client-executed typed
+    tool (bash/text editor/memory/computer), in either shape LiteLLM sends;
+    None for anything else. The caller's tool name is kept."""
+    if not isinstance(tool, dict):
+        return None
+    kind, config = str(tool.get("type") or ""), tool
+    if kind == "function":
+        # LiteLLM's computer shape: the tool config sits in `parameters`.
+        fn = tool.get("function") or {}
+        config = fn.get("parameters") if isinstance(fn, dict) else None
+        if not isinstance(config, dict):
+            return None
+        kind = str(config.get("type") or "")
+        if not kind.startswith("computer_"):
+            return None
+        name = fn.get("name")
+    else:
+        name = tool.get("name")
+    m = _TYPED_TOOL_RE.match(kind)
+    if not m:
+        return None
+    family, version = m.group(1), kind.rsplit("_", 1)[1]
+    description, parameters = _TYPED_TOOLS[family](version, config)
+    default_name = {"bash": "bash", "text_editor": "str_replace_based_edit_tool",
+                    "memory": "memory", "computer": "computer"}[family]
+    return {"name": name or default_name, "description": description,
+            "parameters": parameters}
+
+
+def is_tool_search_tool(tool) -> bool:
+    """Anthropic's tool search (regex/bm25): nothing to run -- the inner CLI
+    sees every tool anyway."""
+    return isinstance(tool, dict) and str(tool.get("type", "")).startswith("tool_search_tool")
+
+
+# Server-executed tools no CLI plan can run. OpenAI types match exactly
+# (`computer_use_preview` must not be taken for Anthropic's computer_*).
+OPENAI_SERVER_TOOL_TYPES = frozenset({
+    "file_search", "code_interpreter", "image_generation", "computer_use_preview",
+    "computer_use", "mcp", "local_shell"})
+ANTHROPIC_SERVER_TOOL_PREFIXES = ("code_execution", "mcp_toolset")
+
+
+def server_only_tools(body: dict) -> list[str]:
+    """The server-executed tools in this request that no CLI plan has an
+    executor for -- sorted type names, plus `mcp_servers` for Anthropic's
+    MCP connector body parameter. Empty when there are none."""
+    found = set()
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        kind = str(tool.get("type") or "")
+        if kind in OPENAI_SERVER_TOOL_TYPES or kind.startswith(ANTHROPIC_SERVER_TOOL_PREFIXES):
+            found.add(kind)
+    if body.get("mcp_servers"):
+        found.add("mcp_servers")
+    return sorted(found)
+
+
+def server_tool_refusal(kinds: list[str]) -> HTTPException:
+    """400 server_tool_unsupported: a 4xx the router spills to another plan
+    (e.g. an API plan that runs code execution) instead of a degraded 200."""
+    return HTTPException(
+        status_code=400,
+        detail={"error": {
+            "message": (f"{PROVIDER} is a CLI-backed plan and has no executor for the "
+                        f"server-side tool(s) {', '.join(kinds)}; route this request "
+                        "to a plan whose API runs them."),
+            "type": "server_tool_unsupported",
+            "param": "tools"}})
+
+
 # -------------------------------------------- effort and output cap ---
 # The caller's reasoning effort, in any of the shapes it reaches a sidecar:
 # `reasoning_effort` (OpenAI chat), `reasoning.effort` (Responses),
@@ -2243,9 +2441,15 @@ async def _handle_chat(body: dict):
     # A server-side web-search tool is not a caller tool: it asks for the
     # CLI's own provider-side search (wants_web_search), so it is taken out
     # of `tools` rather than refused.
+    # A server-side tool no CLI can run gets the more specific refusal, so
+    # the router knows why it is spilling. Tool search is dropped outright.
+    server_tools = server_only_tools(body)
+    if server_tools:
+        raise server_tool_refusal(server_tools)
     web = wants_web_search(body)
-    if web and body.get("tools"):
-        body = {**body, "tools": [t for t in body["tools"] if not is_web_search_tool(t)]}
+    if body.get("tools"):
+        body = {**body, "tools": [t for t in body["tools"]
+                                  if not (is_web_search_tool(t) or is_tool_search_tool(t))]}
     if body.get("tools"):
         raise HTTPException(
             status_code=400,

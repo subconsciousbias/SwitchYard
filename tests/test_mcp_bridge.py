@@ -171,8 +171,9 @@ def test_fit_tool_surface_maps_names_and_states_tool_choice():
 
 
 def test_translate_tools_logs_what_it_drops():
-    """A server-side tool (web search) or a malformed entry has no
-    caller-side executor; it is dropped, but never silently."""
+    """An unrecognised non-function tool or a malformed entry has no
+    caller-side executor; it is dropped, but never silently. (Web and tool
+    search are left out on purpose, not dropped: see the typed-tools tests.)"""
     import logging
     records = []
     handler = logging.Handler()
@@ -181,11 +182,11 @@ def test_translate_tools_logs_what_it_drops():
     try:
         out = server.translate_tools([
             {"type": "function", "function": {"name": "ok", "parameters": {}}},
-            {"type": "web_search_preview"}])
+            {"type": "some_future_server_tool"}])
     finally:
         server.log.removeHandler(handler)
     assert [t["name"] for t in out] == ["ok"], out
-    assert any("web_search_preview" in r.getMessage() for r in records), \
+    assert any("some_future_server_tool" in r.getMessage() for r in records), \
         [r.getMessage() for r in records]
     print("  dropped non-function tool is logged")
 
@@ -474,6 +475,234 @@ def test_web_only_request_to_the_mcp_bridge_takes_the_text_path():
     finally:
         server.cli_bridge._handle_chat = real
     print("  web-only request -> text path (which runs the CLI's own search)")
+
+
+# ------------------------------------------------------------- typed tools ---
+# What LiteLLM 1.101 forwards for Anthropic's typed tools (issue #264).
+_COMPUTER_FN = {"type": "function", "function": {
+    "name": "computer",
+    "parameters": {"type": "computer_20250124", "display_width_px": 1024,
+                   "display_height_px": 768}}}
+
+
+def _props(mcp_tool: dict) -> dict:
+    return mcp_tool["inputSchema"]["properties"]
+
+
+def test_typed_client_tools_get_their_documented_schemas():
+    """bash/text editor/memory/computer reach the inner CLI with real input
+    schemas, under the caller's tool name, instead of an empty schema."""
+    out = {t["name"]: t for t in server.translate_tools([
+        {"type": "bash_20250124", "name": "bash"},
+        {"type": "text_editor_20250728", "name": "str_replace_based_edit_tool"},
+        {"type": "text_editor_20250124", "name": "str_replace_editor"},
+        {"type": "memory_20250818", "name": "memory"},
+        _COMPUTER_FN,
+        {"type": "computer_20251124", "name": "screen",
+         "display_width_px": 1280, "display_height_px": 800}])}
+    assert set(out) == {"bash", "str_replace_based_edit_tool", "str_replace_editor",
+                        "memory", "computer", "screen"}, out
+    assert _props(out["bash"])["command"]["type"] == "string", out["bash"]
+    assert _props(out["bash"])["restart"]["type"] == "boolean", out["bash"]
+    assert out["bash"]["description"], out["bash"]
+
+    new = out["str_replace_based_edit_tool"]["inputSchema"]
+    assert new["required"] == ["command", "path"] and "additionalProperties" not in new, new
+    assert "undo_edit" not in new["properties"]["command"]["enum"], new
+    assert {"file_text", "old_str", "new_str", "insert_line", "insert_text",
+            "view_range"} <= set(new["properties"]), new
+    old = out["str_replace_editor"]["inputSchema"]
+    assert "undo_edit" in old["properties"]["command"]["enum"], old
+
+    mem = _props(out["memory"])
+    assert set(mem["command"]["enum"]) == {"view", "create", "str_replace", "insert",
+                                           "delete", "rename"}, mem
+    assert {"old_path", "new_path", "insert_text"} <= set(mem), mem
+
+    for name, size in (("computer", "1024x768"), ("screen", "1280x800")):
+        schema = out[name]["inputSchema"]
+        assert schema["type"] == "object" and schema["required"] == ["action"], schema
+        assert {"coordinate", "text", "scroll_direction", "scroll_amount",
+                "duration", "region"} <= set(schema["properties"]), schema
+        assert size in out[name]["description"], out[name]["description"]
+        assert "left_click_drag" in out[name]["description"]
+    print("  bash/text_editor/memory/computer (typed + function shape) -> real schemas")
+
+
+def test_plain_function_tools_named_like_typed_ones_are_untouched():
+    """Only the typed shapes are rewritten: a caller's own `computer` or
+    `bash` function keeps the schema it was given."""
+    own = {"type": "object", "properties": {"x": {"type": "string"}}}
+    out = server.translate_tools([
+        {"type": "function", "function": {"name": "computer", "parameters": own}},
+        {"type": "function", "function": {"name": "bash", "parameters": own}}])
+    assert [t["inputSchema"] for t in out] == [own, own], out
+    assert server.cli_bridge.typed_client_tool({"type": "computer_use_preview"}) is None
+    print("  plain function tools keep their own schemas")
+
+
+def _stub_tool_path():
+    """Replace handle_tool_request and the text path with recorders."""
+    calls = {"tool": [], "text": []}
+
+    async def tool_path(body, tools, request=None):
+        calls["tool"].append(tools)
+        return {"tool": True}
+
+    async def text_path(body):
+        calls["text"].append(body)
+        return {"text": True}
+
+    saved = (server.handle_tool_request, server.cli_bridge._handle_chat)
+    server.handle_tool_request = tool_path
+    server.cli_bridge._handle_chat = text_path
+    return calls, saved
+
+
+def _restore_tool_path(saved) -> None:
+    server.handle_tool_request, server.cli_bridge._handle_chat = saved
+
+
+def test_tool_search_is_dropped_not_refused():
+    calls, saved = _stub_tool_path()
+    try:
+        messages = [{"role": "user", "content": "hi"}]
+        fn = {"type": "function", "function": {"name": "f", "parameters": {}}}
+        search = {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}
+        body = {"model": "m", "messages": messages, "tools": [search, fn]}
+        assert asyncio.run(server.chat(_JsonRequest(body))) == {"tool": True}
+        assert calls["tool"] == [[fn]], calls
+        body = {"model": "m", "messages": messages,
+                "tools": [{"type": "tool_search_tool_bm25_20251119", "name": "s"}]}
+        assert asyncio.run(server.chat(_JsonRequest(body))) == {"text": True}
+    finally:
+        _restore_tool_path(saved)
+    print("  tool_search_tool_* dropped; alone it takes the text path")
+
+
+def test_tool_search_stays_dropped_on_a_tool_less_followup():
+    """The body handed on (whose tools start_session remembers) carries no
+    tool search, and a remembered or rebuilt list that still has tool search
+    or web tools translates to the caller tools alone (PR #285 review)."""
+    seen = []
+
+    async def tool_path(body, tools, request=None):
+        seen.append((body, tools))
+        return {"tool": True}
+
+    saved = server.handle_tool_request
+    saved_entries = dict(server.REMEMBERED_TOOLS)
+    server.handle_tool_request = tool_path
+    fn = {"type": "function", "function": {"name": "f", "parameters": {}}}
+    search = {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}
+    web = {"type": "web_search_20250305", "name": "web_search"}
+    try:
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "tools": [search, web, fn]}
+        asyncio.run(server.chat(_JsonRequest(body)))
+        handed, tools = seen[-1]
+        assert handed["tools"] == [web, fn] and tools == [fn], seen[-1]
+        # What start_session would remember from that body, then a follow-up
+        # that sends no tools (issue #260).
+        server.remember_tools("sess285", handed["tools"])
+        followup = {"model": "m", "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "tool_calls": [{"id": "call_sess285_1", "type": "function",
+                                                  "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_sess285_1", "content": "ok"}]}
+        asyncio.run(server.chat(_JsonRequest(followup)))
+        _, tools = seen[-1]
+        assert [t["name"] for t in server.translate_tools(tools)] == ["f"], tools
+        # Even a list remembered before this fix translates without them.
+        assert [t["name"] for t in server.translate_tools([search, web, fn])] == ["f"]
+    finally:
+        server.handle_tool_request = saved
+        server.REMEMBERED_TOOLS.clear()
+        server.REMEMBERED_TOOLS.update(saved_entries)
+    print("  tool search stays out of remembered tools and resumed sessions")
+
+
+def test_server_only_tools_are_refused_before_the_tool_path():
+    """Code execution, the MCP connector and OpenAI server tools have no
+    executor on a CLI plan: 400 server_tool_unsupported, before any probe,
+    session or spawn (handle_tool_request is never reached)."""
+    from fastapi import HTTPException
+    calls, saved = _stub_tool_path()
+    fn = {"type": "function", "function": {"name": "f", "parameters": {}}}
+    messages = [{"role": "user", "content": "hi"}]
+    cases = [
+        ({"tools": [fn, {"type": "code_execution_20250825", "name": "code_execution"}]},
+         "code_execution_20250825"),
+        ({"tools": [{"type": "mcp_toolset", "mcp_server_name": "x"}]}, "mcp_toolset"),
+        ({"tools": [fn], "mcp_servers": [{"type": "url", "url": "https://x", "name": "x"}]},
+         "mcp_servers"),
+        ({"tools": [{"type": "code_interpreter"}, {"type": "file_search"}]}, "file_search"),
+        ({"tools": [{"type": "image_generation"}]}, "image_generation"),
+        ({"tools": [{"type": "computer_use_preview"}]}, "computer_use_preview"),
+        ({"tools": [{"type": "mcp", "server_label": "x"}]}, "mcp"),
+        ({"tools": [{"type": "local_shell"}]}, "local_shell"),
+    ]
+    try:
+        for shape, kind in cases:
+            body = {"model": "m", "messages": messages, **shape}
+            try:
+                asyncio.run(server.chat(_JsonRequest(body)))
+            except HTTPException as exc:
+                assert exc.status_code == 400, exc
+                err = exc.detail["error"]
+                assert err["type"] == "server_tool_unsupported", err
+                assert err["param"] == "tools" and kind in err["message"], err
+            else:
+                raise AssertionError(f"{kind} was not refused")
+        assert calls == {"tool": [], "text": []}, calls
+    finally:
+        _restore_tool_path(saved)
+    print(f"  {len(cases)} server-only tool shapes -> 400 before the tool path")
+
+
+def test_text_path_refuses_server_tools_specifically():
+    """cli_bridge's own text path gives the same specific 400 (not the
+    generic tools_unsupported) and drops tool search like the MCP bridge."""
+    from fastapi import HTTPException
+    cli = server.cli_bridge
+    messages = [{"role": "user", "content": "hi"}]
+    try:
+        asyncio.run(cli._handle_chat({"model": "m", "messages": messages, "tools": [
+            {"type": "code_execution_20250825", "name": "code_execution"}]}))
+    except HTTPException as exc:
+        assert exc.detail["error"]["type"] == "server_tool_unsupported", exc.detail
+    else:
+        raise AssertionError("code execution was not refused on the text path")
+    try:
+        asyncio.run(cli._handle_chat({"model": "m", "messages": messages, "tools": [
+            {"type": "bash_20250124", "name": "bash"}]}))
+    except HTTPException as exc:
+        assert exc.detail["error"]["type"] == "tools_unsupported", exc.detail
+    else:
+        raise AssertionError("a caller tool was not refused on the text path")
+    print("  text path: server tool -> server_tool_unsupported, caller tool -> tools_unsupported")
+
+
+def test_web_tools_are_unaffected_by_typed_tool_handling():
+    """web_search_* / web_fetch_* are none of client typed, tool search or
+    server-only: they still go to the CLI's own search (#278)."""
+    cli = server.cli_bridge
+    for tool in ({"type": "web_search_20250305", "name": "web_search"},
+                 {"type": "web_fetch_20250910", "name": "web_fetch"},
+                 {"type": "web_search_preview"}):
+        assert cli.is_web_search_tool(tool), tool
+        assert cli.typed_client_tool(tool) is None and not cli.is_tool_search_tool(tool), tool
+        assert cli.server_only_tools({"tools": [tool]}) == [], tool
+    calls, saved = _stub_tool_path()
+    try:
+        fn = {"type": "function", "function": {"name": "f", "parameters": {}}}
+        body = {"model": "m", "messages": [{"role": "user", "content": "q"}],
+                "tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}, fn]}
+        assert asyncio.run(server.chat(_JsonRequest(body))) == {"tool": True}
+        assert calls["tool"] == [[fn]], calls
+    finally:
+        _restore_tool_path(saved)
+    print("  web tools: still served by the CLI's own search")
 
 
 def test_tool_path_argv_carries_the_effort_and_env_rides_the_carrier():

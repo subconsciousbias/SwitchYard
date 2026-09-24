@@ -593,6 +593,16 @@ tool-carrying requests around it — but no plan sets it today.
 **A 200 with no `tool_calls` would be the bug**: it would mean the definitions
 were silently dropped rather than either served or refused.
 
+Anthropic's typed tools follow the same rule on the CLI-backed plans. The
+client-executed ones (`bash_*`, `text_editor_*`, `memory_*`, `computer_*`)
+are served as caller tools with their documented input schemas;
+`tool_search_tool_*` is dropped (the inner CLI sees every tool anyway); and a
+server-executed tool no CLI can run (`code_execution_*`, `mcp_toolset` /
+`mcp_servers`, OpenAI's `file_search`, `code_interpreter`, ...) is refused
+with `400 server_tool_unsupported` so the router spills it to a plan whose
+API runs it. Offline: `tests/test_mcp_bridge.py` (typed-tools section) and
+`tests/test_lockdown_claude.py`.
+
 ### 4h. Vision through the CLI-backed lanes
 
 Image blocks used to be flattened away by the sidecars: a screenshot came
