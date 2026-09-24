@@ -372,17 +372,19 @@ CLAUDE_LOCKDOWN = ("--strict-mcp-config", "--setting-sources", "",
 #
 # The fix stages the bytes to disk and lets each CLI carry them the way that
 # CLI actually can (verified against the installed versions):
-#   claude 2.1.278 `-p`   -- no image flag; stage to disk and let the model
-#                            Read() the files (--add-dir + an allowed-tools
-#                            Read rule; the image variant's `--tools Read`
-#                            is what makes Read exist at all).
+#   claude 2.1.278 `-p`   -- no image flag, but `--input-format stream-json`
+#                            takes image AND document (PDF) blocks inline
+#                            (claude_media_stdin). Staging for a native Read
+#                            leaked relay paths the model then handed to the
+#                            caller's Read tool (issue #264).
 #   codex 0.153.4 `exec`  -- native `-i FILE`, repeatable.
 #   opencode 1.18.32 `run`-- native `-f FILE(s)`, repeatable.
 # Any image block that cannot be carried that way -- a plain http(s) URL, a
 # corrupt payload -- is an error, never a silent drop: a wrong answer is the
 # one failure a caller cannot distinguish from a real reading.
 MEDIA_TYPES = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
-               "image/webp": "webp"}
+               "image/webp": "webp", "application/pdf": "pdf"}
+EXT_MEDIA = {ext: media for media, ext in MEDIA_TYPES.items()}
 
 
 class ImageUnsupportedError(Exception):
@@ -441,6 +443,22 @@ def _stage_image(block: dict, img_dir: Path, n: int) -> Path:
         decoded = _decode_data_url(url)
         if decoded:
             media, data = decoded
+    elif block.get("type") == "document":
+        # Anthropic document block -- a PDF from Claude Code's Read, typically.
+        source = block.get("source") if isinstance(block.get("source"), dict) else {}
+        if source.get("type") == "base64" and source.get("media_type") == "application/pdf":
+            media = "application/pdf"
+            try:
+                data = base64.b64decode(source.get("data") or "")
+            except (binascii.Error, ValueError):
+                data = None
+    elif block.get("type") == "file":
+        # OpenAI file part: {"file": {"file_data": "data:application/pdf;base64,..."}}
+        file_data = (block.get("file") or {}).get("file_data") \
+            if isinstance(block.get("file"), dict) else None
+        decoded = _decode_data_url(file_data)
+        if decoded and decoded[0] == "application/pdf":
+            media, data = decoded
     if not data:
         raise ImageUnsupportedError(
             f"image block {n} carries no inline base64 data (a remote URL "
@@ -469,11 +487,16 @@ def stage_images(messages: list[dict], img_dir: Path) -> list[Path]:
             continue
         replaced: list = []
         for block in content:
-            if isinstance(block, dict) and block.get("type") in ("image", "image_url"):
+            if is_media_block(block):
                 n = len(staged) + 1
                 path = _stage_image(block, img_dir, n)
                 staged.append(path)
-                replaced.append({"type": "text", "text": f"[image {n}: {path}]"})
+                kind = "document" if path.suffix == ".pdf" else "image"
+                # Claude gets the bytes inline (claude_media_stdin), so its
+                # marker must not name a relay path the model could hand to
+                # one of the caller's tools.
+                where = "attached" if PROVIDER == "claude" else str(path)
+                replaced.append({"type": "text", "text": f"[{kind} {n}: {where}]"})
             else:
                 replaced.append(block)
         m["content"] = replaced
@@ -484,25 +507,70 @@ def image_note(paths: list[Path]) -> str:
     """The line appended to the prompt that makes the model look instead of
     guess. Without it the path markers were just decoration: the model answered
     from its prior about what such a screenshot usually shows."""
-    listing = "\n".join(f"- {p}" for p in paths)
     if PROVIDER in ("codex", "opencode"):
         return (f"\n\n[{len(paths)} image(s) attached to this prompt: "
                 f"{', '.join(str(p) for p in paths)}]")
-    return ("\n\nThe images above are saved as files:\n" + listing
-            + "\nRead each file with your Read tool to see it before answering "
-              "-- do not guess at its contents.")
+    # claude: the media ride inline in the same message (claude_media_stdin).
+    return (f"\n\n[{len(paths)} attachment(s) follow this text, in order -- look at "
+            "them before answering; do not guess at their contents.]")
+
+
+def is_media_block(block) -> bool:
+    """An image (any shape) or a PDF (Anthropic document, OpenAI file part)."""
+    if not isinstance(block, dict):
+        return False
+    kind = block.get("type")
+    if kind in ("image", "image_url"):
+        return True
+    if kind == "document":
+        source = block.get("source") if isinstance(block.get("source"), dict) else {}
+        return source.get("media_type") == "application/pdf"
+    if kind == "file":
+        data = (block.get("file") or {}).get("file_data") \
+            if isinstance(block.get("file"), dict) else ""
+        return str(data or "").startswith("data:application/pdf")
+    return False
 
 
 def has_image_blocks(messages: list[dict]) -> bool:
-    """Whether any message carries an image content block in either shape."""
+    """Whether any message carries an image or PDF content block."""
     for m in messages or []:
         content = m.get("content")
         if not isinstance(content, list):
             continue
         for b in content:
-            if isinstance(b, dict) and b.get("type") in ("image", "image_url"):
+            if is_media_block(b):
                 return True
     return False
+
+
+def claude_media_stdin(prompt: str, paths: list[Path]) -> str:
+    """The stream-json user message that gives Claude the prompt and its media
+    inline: `claude -p --input-format stream-json` passes image and document
+    blocks straight to the model (verified on the pinned 2.1.278), so nothing
+    is staged for a native Read and no relay path reaches the model -- which
+    used to hand those paths to the CALLER's Read tool (issue #264)."""
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for path in paths:
+        media = EXT_MEDIA.get(path.suffix.lstrip("."), "image/png")
+        kind = "document" if media == "application/pdf" else "image"
+        content.append({"type": kind, "source": {
+            "type": "base64", "media_type": media,
+            "data": base64.b64encode(path.read_bytes()).decode()}})
+    return json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n"
+
+
+CLAUDE_STREAM_ARGS = ("--input-format", "stream-json", "--verbose")
+
+
+def claude_stream_argv(argv: list[str]) -> list[str]:
+    """Switch a claude argv to stream-json in and out (in requires out)."""
+    argv = list(argv)
+    if "--output-format" in argv:
+        argv[argv.index("--output-format") + 1] = "stream-json"
+    else:
+        argv += ["--output-format", "stream-json"]
+    return argv + list(CLAUDE_STREAM_ARGS)
 
 
 def stage_or_fail(messages: list[dict]) -> tuple[list[Path], Path | None]:
@@ -519,7 +587,15 @@ def stage_or_fail(messages: list[dict]) -> tuple[list[Path], Path | None]:
     # write_bytes (full disk, permission flip mid-request) is otherwise a
     # silent `swimg-*` dir leak on every retry until the temp partition fills.
     try:
-        return stage_images(messages, img_dir / "img"), img_dir
+        paths = stage_images(messages, img_dir / "img")
+        if PROVIDER != "claude" and any(p.suffix == ".pdf" for p in paths):
+            # Only claude takes a PDF in the prompt (claude_media_stdin); codex
+            # attaches images only (-i), and opencode's -f needs a PDF-capable
+            # model. Refused rather than dropped from the prompt unseen.
+            raise ImageUnsupportedError(
+                f"{PROVIDER} cannot take a PDF in the prompt on this plan; "
+                "route PDF input to a plan that can")
+        return paths, img_dir
     except BaseException:
         shutil.rmtree(img_dir, ignore_errors=True)
         raise
@@ -552,13 +628,8 @@ PROFILES: dict[str, dict] = {
         # container, not the caller's workspace, and the caller never sees them.
         # `--tools ""` is an allowlist of zero built-ins (see CLAUDE_LOCKDOWN).
         "bare_args": ["--max-turns", "1", "--tools", "", *CLAUDE_LOCKDOWN],
-        # Image requests need Read for the staged files (see image_note) and
-        # more than one turn -- reading the image and then answering is two
-        # agentic turns, and --max-turns 1 would kill the answer with
-        # error_max_turns. Read is the only built-in, and build_argv's
-        # `--allowed-tools Read(<imgdir>/**)` is the only path it may use:
-        # any other Read would prompt, and --permission-prompts none denies it.
-        "bare_args_images": ["--max-turns", "4", "--tools", "Read", *CLAUDE_LOCKDOWN],
+        # No image variant: media ride inline on stdin (claude_media_stdin),
+        # so an image request needs no Read and no extra turn.
         # Only valid alongside --system-prompt. Drops the CLI's dynamically
         # injected sections (working directory, git state, environment), which
         # are pure noise when the caller supplies its own prompt — and which the
@@ -1157,8 +1228,10 @@ def build_argv(prompt: str, system: str | None,
     cannot read raw bytes anyway.
     """
     model = model or config().model
-    use_stdin = over_argv_limit(prompt)
     image_paths = image_paths or []
+    # claude with media: the prompt and its media ride stdin together as one
+    # stream-json message (claude_media_stdin), whatever the prompt's size.
+    use_stdin = (PROVIDER == "claude" and bool(image_paths)) or over_argv_limit(prompt)
 
     def fill(tpl: str) -> str:
         return tpl.replace("{model}", model).replace("{system}", system or "")
@@ -1201,22 +1274,17 @@ def build_argv(prompt: str, system: str | None,
         argv += [fill(a) for a in PROFILE[key]]
 
     if BARE and PROFILE.get("bare_args"):
-        # Image requests get the image-variant list: Read available (the
-        # files can only be seen through it) and enough turns to use it.
-        bare_key = "bare_args_images" if image_paths else "bare_args"
-        argv += [fill(a) for a in PROFILE[bare_key]]
+        argv += [fill(a) for a in PROFILE["bare_args"]]
     if web and PROVIDER == "claude":
+        # Adds WebSearch/WebFetch to --tools and raises --max-turns in place;
+        # independent of media, which only switch the input to stream-json.
         argv += claude_web_args(argv)
 
     if key == "system_args_replace" and system and PROFILE.get("replace_extra_args"):
         argv += [fill(a) for a in PROFILE["replace_extra_args"]]
 
-    if image_paths:
-        if PROVIDER == "claude":
-            img_dir = image_paths[0].parent
-            argv += ["--add-dir", str(img_dir),
-                     "--allowed-tools", f"Read({img_dir}/**)"]
-        elif PROVIDER == "codex":
+    if image_paths and PROVIDER != "claude":   # claude: inline, see the return
+        if PROVIDER == "codex":
             for path in image_paths:          # repeatable `-i` per file
                 argv += ["-i", str(path)]
         else:   # opencode: `-f FILE(s)` attaches to the message
@@ -1229,6 +1297,9 @@ def build_argv(prompt: str, system: str | None,
         argv += codex_lockdown_args(web=web)
 
     argv += effort_args(effort)
+    if PROVIDER == "claude" and image_paths:
+        # Media ride inline on stdin as stream-json, with the prompt.
+        return claude_stream_argv(argv) + EXTRA_ARGS, claude_media_stdin(prompt, image_paths)
     return argv + EXTRA_ARGS, (prompt if use_stdin else None)
 
 
@@ -1322,7 +1393,15 @@ def parse_output(stdout: str, kind: str | None = None) -> dict:
     kind = kind or PROFILE["parser"]
 
     if kind == "claude_json":
-        return json.loads(stdout)
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError:
+            # --output-format stream-json (media requests): one event per line;
+            # the final `result` event has the same shape as the json output.
+            for evt in reversed(list(iter_json_objects(stdout))):
+                if evt.get("type") == "result":
+                    return evt
+            raise
 
     if kind in ("events_json", "codex_jsonl"):
         # Two different event shapes, both verified against real output.

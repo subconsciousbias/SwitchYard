@@ -3318,22 +3318,14 @@ def test_flatten_with_tool_history_includes_image_markers_after_staging():
 
 
 def test_mcp_build_argv_passes_images_through_claude_profile():
-    """The claude MCP profile must carry image files the same way the
-    text-path build_argv does: --add-dir <imgdir> + --allowed-tools
-    Read(<imgdir>/**). Without these flags the staged files are
-    unreachable to the CLI's harness, and the model never sees them.
-
-    Images also make Read the one built-in that exists (`--tools Read`);
-    without it the model could not Read the staged file (the bug fix in
-    PR #32 review). The MCP-tools --allowed-tools allowlist survives in
-    either path.
-    """
+    """The claude MCP profile carries media the way the text path does:
+    inline, as one stream-json stdin message (cli_bridge.claude_media_stdin).
+    No Read, no --add-dir, so no relay path the model could hand to the
+    caller's own Read tool (issue #264). The MCP-tools --allowed-tools
+    allowlist and --session-id survive."""
     import shutil
     workdir = Path(tempfile.mkdtemp(prefix="mcpb-argv-"))
     tools_path = workdir / "tools.json"
-    # Use a real tool list (not "[]") so the {allowed_tools} substitution has
-    # something to qualify -- the regression we care about is that the MCP
-    # tool qualifiers stay on the argv when images are present.
     mcp_tools = [{"name": "get_weather", "description": "",
                   "inputSchema": {"type": "object", "properties": {}}}]
     tools_path.write_text("[]")
@@ -3346,26 +3338,23 @@ def test_mcp_build_argv_passes_images_through_claude_profile():
                            for t in mcp_tools)
         argv, stdin_data = server.build_argv("look at this", None, "m", workdir,
                                               "sess", tools_path, allowed, [img])
-        assert "--add-dir" in argv, argv
-        assert str(img_dir) in argv, argv
-        # The MCP template already uses --allowed-tools for the MCP tools,
-        # then a second one is appended for Read(<imgdir>/**). Match the
-        # second by pattern, not by position.
-        allowed_pairs = [a for a in argv
-                         if a.startswith("Read(") and a.endswith("/**)")]
-        assert allowed_pairs, argv
-        assert allowed_pairs[0] == f"Read({img_dir}/**)", allowed_pairs[0]
-        # The MCP-tools allowlist survives: the {allowed_tools} slot must
-        # still be substituted into argv even when an image request also
-        # appends its own Read(...) entry.
+        assert "--add-dir" not in argv, argv
+        assert not any(a.startswith("Read(") for a in argv), argv
+        assert argv[argv.index("--tools") + 1] == "", argv
         assert any("mcp__switchyard__get_weather" in a for a in argv), argv
-        # Read is the only built-in in the image variant.
-        assert argv[argv.index("--tools") + 1] == "Read", argv
-        assert "--disallowed-tools" not in argv, argv
-        assert stdin_data is None
-        print(f"  mcp_bridge claude build_argv(image) -> --add-dir={img_dir}, "
-              f"--allowed-tools={allowed_pairs[0]}, --tools Read, "
-              f"mcp__switchyard__get_weather still present")
+        assert "--session-id" in argv, argv
+        assert argv[argv.index("--input-format") + 1] == "stream-json", argv
+        assert argv[argv.index("--output-format") + 1] == "stream-json", argv
+        assert argv.count("--output-format") == 1, argv
+        assert not any("look at this" in a for a in argv), argv
+        msg = json.loads(stdin_data)
+        content = msg["message"]["content"]
+        assert content[0]["type"] == "text" and "look at this" in content[0]["text"], content
+        assert content[1]["type"] == "image", content
+        assert base64.b64decode(content[1]["source"]["data"]) == PNG_MAGENTA
+        assert str(img_dir) not in stdin_data
+        print("  mcp_bridge claude build_argv(image) -> stream-json stdin, --tools '', "
+              "mcp__switchyard__get_weather still present")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

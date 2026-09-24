@@ -1095,8 +1095,9 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
     (see STDIN_PROMPT_LIMIT for why). The caller passes the second element
     straight into run_session.
 
-    `image_paths`, when present, are added per-profile: claude gets
-    `--add-dir` + an explicit Read allowlist; codex gets one `-i FILE` per
+    `image_paths`, when present, are added per-profile: claude gets them
+    inline as one stream-json stdin message (cli_bridge.claude_media_stdin,
+    the prompt included); codex gets one `-i FILE` per
     path; opencode gets one `-f FILE` per path. The text bridge's
     build_argv does the same work for non-tool sessions, and the per-CLI
     mechanism is the same one (see cli_bridge/server.py's build_argv for
@@ -1148,7 +1149,10 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
     # The {prompt} slot is handled outside fill(): on the argv path it is
     # substituted directly, on the stdin path codex's "-" placeholder stays in
     # the template and claude/opencode drop the element entirely.
-    use_stdin = over_argv_limit(effective_prompt)
+    # claude with media: the prompt and its media ride stdin together as one
+    # stream-json message (cli_bridge.claude_media_stdin), whatever the size.
+    claude_media = PROVIDER == "claude" and bool(image_paths)
+    use_stdin = claude_media or over_argv_limit(effective_prompt)
     argv = [PROFILE["cli"]]
     terminator = PROFILE.get("prompt_terminator")
     for element in PROFILE["argv"]:
@@ -1194,23 +1198,17 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
         # cli_bridge.CODEX_DISABLED_FEATURES.
         argv += cli_bridge.codex_lockdown_args(web=web)
 
-    # claude only: the built-in allowlist is conditional because an image
-    # session needs Read for its staged files (restricted to them by the
-    # `--allowed-tools Read(<imgdir>/**)` below). Everything else -- Bash,
-    # Agent, Skill, ToolSearch, AskUserQuestion, and any built-in a future
-    # CLI adds -- is simply not in the list. See cli_bridge.CLAUDE_LOCKDOWN.
+    # claude only: no built-in tools at all -- Bash, Agent, Skill, ToolSearch,
+    # AskUserQuestion and any built-in a future CLI adds are simply not in
+    # the list (cli_bridge.CLAUDE_LOCKDOWN). Media no longer need Read: they
+    # ride inline on stdin (below), so no relay path ever reaches the model.
     if PROVIDER == "claude":
-        argv += ["--tools", "Read" if image_paths else "",
-                 *cli_bridge.CLAUDE_LOCKDOWN]
+        argv += ["--tools", "", *cli_bridge.CLAUDE_LOCKDOWN]
         if web:     # the caller asked for web search: Claude Code's own
             argv += cli_bridge.claude_web_args(argv)
 
-    if image_paths:
-        if PROVIDER == "claude":
-            img_dir = Path(image_paths[0]).parent
-            argv += ["--add-dir", str(img_dir),
-                     "--allowed-tools", f"Read({img_dir}/**)"]
-        elif PROVIDER == "codex":
+    if image_paths and not claude_media:   # claude: inline, see the return below
+        if PROVIDER == "codex":
             for path in image_paths:
                 argv += ["-i", str(path)]
         else:   # opencode: `-f FILE(s)` attaches to the message
@@ -1225,6 +1223,10 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
         # that directory -- "newest transcript" would read the other one.
         argv += ["--session-id", claude_session_uuid(session_id)]
 
+    if claude_media:
+        return (cli_bridge.claude_stream_argv(argv),
+                cli_bridge.claude_media_stdin(effective_prompt,
+                                              [Path(p) for p in image_paths]))
     return argv, (effective_prompt if use_stdin else None)
 
 

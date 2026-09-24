@@ -599,11 +599,11 @@ Image blocks used to be flattened away by the sidecars: a screenshot came
 back as a confident near-white hex (e.g. `#EDF6EC` for a magenta swatch --
 the model answering from its prior over what such a screenshot "usually"
 shows). The fix stages the bytes to disk and tells each CLI how to carry
-them: `claude -p` gets `--add-dir` + an explicit `Read` allowlist (and
-`--tools Read`, so Read is the only built-in that exists), `codex exec` gets a
-repeatable `-i FILE`, and `opencode run` gets a repeatable `-f FILE`. None
-of the CLIs accept raw base64 in the prompt, which is why staging is the
-shape they all share.
+them: `claude -p --input-format stream-json` gets the prompt and its image
+and PDF blocks inline as one stdin message (no Read, no file path the model
+could hand to the caller's tools), `codex exec` gets a repeatable `-i FILE`,
+and `opencode run` gets a repeatable `-f FILE`. PDFs reach Claude only; the
+other two refuse them with `400 images_unsupported` rather than drop them.
 
 The test is the magenta-swatch round-trip. Generate the bytes once,
 base64 them, and POST through `forge` (which spills to the CLI-backed
@@ -650,16 +650,19 @@ docker compose exec -T opencode-go-sidecar opencode run --format json \
   --model opencode-go/glm-5.3-flash -f /tmp/magenta.png \
   'Reply with only the hex colour of the swatch.'
 
-docker compose exec -T claude-max-sidecar claude -p --output-format json \
-  --model opus --max-turns 4 \
-  --tools Read --strict-mcp-config --setting-sources '' --permission-prompts none \
-  --add-dir /tmp/magenta-stage --allowed-tools 'Read(/tmp/magenta-stage/**)' \
-  'The image is saved as /tmp/magenta-stage/01.png. Read it with your Read tool and reply with only its hex colour.'
+python3 -c 'import base64,json; print(json.dumps({"type":"user","message":{"role":"user","content":[
+  {"type":"text","text":"Reply with only the hex colour of the swatch."},
+  {"type":"image","source":{"type":"base64","media_type":"image/png",
+   "data":base64.b64encode(open("/tmp/magenta.png","rb").read()).decode()}}]}}))' \
+| docker compose exec -T claude-max-sidecar claude -p --model opus --max-turns 1 \
+  --tools '' --strict-mcp-config --setting-sources '' --permission-prompts none \
+  --input-format stream-json --output-format stream-json --verbose | tail -1
 ```
 
-**Expect** a magenta-family hex from each. The Claude one proves the
-`bare_args_images` list is the one in use: Read is the only built-in, and
-the `--allowed-tools Read(<dir>/**)` rule is what lets it reach the file.
+(Copy `/tmp/magenta.png` into the codex and opencode containers first with
+`docker compose cp`.) **Expect** a magenta-family hex from each. The Claude
+one proves the inline path: no built-in exists, so the only way the model
+can see the swatch is the image block on stdin.
 
 ### 4i. Upgrading a pinned CLI — prove the tool path is still host-mirrored
 

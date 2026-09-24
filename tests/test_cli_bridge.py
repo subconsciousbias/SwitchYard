@@ -1175,40 +1175,176 @@ def test_opencode_argv_carries_one_minus_f_per_image():
         shutil.rmtree(img.parent, ignore_errors=True)
 
 
-def test_claude_argv_uses_add_dir_and_allows_read_for_images():
-    """Claude Code has no image flag; the staged files must be reachable via
-    Read. `--add-dir <imgdir>` adds the directory and `--allowed-tools
-    Read(<imgdir>/**)` pre-approves it for the staged files only. The image
-    variant's bare_args_images is the one used: `--tools Read` makes Read
-    the only built-in that exists (the plain variant has `--tools ""`).
-    """
+def test_claude_media_ride_inline_on_stdin_not_via_read():
+    """Claude Code has no image flag, and staging the files for a native Read
+    put relay paths (/tmp/swimg-*/img/01.png) in front of the model, which
+    handed them to the CALLER's Read tool (issue #264). Media now ride inline:
+    `--input-format stream-json` + one stdin user message carrying the prompt
+    and the base64 blocks. No Read, no --add-dir, no prompt in argv."""
     import shutil
-    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
+    saved = (server.PROVIDER, server.PROFILE, server.CLI, server.BARE)
+    img_dir = Path(tempfile.mkdtemp(prefix="cli-imgargv3-"))
     try:
         server.PROVIDER = "claude"
         server.PROFILE = server.PROFILES["claude"]
         server.CLI = server.PROFILE["cli"]
-        img_dir = Path(tempfile.mkdtemp(prefix="cli-imgargv3-"))
-        img = img_dir / "img" / "00.png"
+        server.BARE = True
+        img = img_dir / "img" / "01.png"
         img.parent.mkdir(parents=True)
         img.write_bytes(PNG_MAGENTA)
-        argv, _ = server.build_argv("look at this", None, None,
-                                      image_paths=[img])
-        # --add-dir <imgdir> + --allowed-tools Read(<imgdir>/**).
-        assert "--add-dir" in argv, argv
-        assert str(img.parent) in argv, argv
-        assert "--allowed-tools" in argv, argv
-        allowed = argv[argv.index("--allowed-tools") + 1]
-        assert allowed.startswith("Read(") and allowed.endswith("/**)"), allowed
-        # The image variant's bare_args_images is in argv: max-turns 4 and
-        # Read as the only built-in.
-        assert "4" in argv, argv
-        assert argv[argv.index("--tools") + 1] == "Read", argv
-        assert "--disallowed-tools" not in argv, argv
-        print(f"  claude argv: --add-dir={img.parent}, --allowed-tools={allowed}")
+        pdf = img_dir / "img" / "02.pdf"
+        pdf.write_bytes(b"%PDF-1.4 marker")
+        argv, stdin_data = server.build_argv("look at this", None, None,
+                                             image_paths=[img, pdf])
+        assert "--add-dir" not in argv and "--allowed-tools" not in argv, argv
+        assert argv[argv.index("--tools") + 1] == "", argv
+        assert argv[argv.index("--max-turns") + 1] == "1", argv
+        assert argv[argv.index("--input-format") + 1] == "stream-json", argv
+        assert argv[argv.index("--output-format") + 1] == "stream-json", argv
+        assert argv.count("--output-format") == 1, argv
+        assert "--verbose" in argv, argv
+        assert "look at this" not in argv and not any(str(img_dir) in a for a in argv), argv
+        msg = json.loads(stdin_data)
+        assert msg["type"] == "user", msg
+        content = msg["message"]["content"]
+        assert content[0] == {"type": "text", "text": "look at this"}, content[0]
+        assert content[1]["type"] == "image", content[1]
+        assert content[1]["source"]["media_type"] == "image/png", content[1]
+        assert base64.b64decode(content[1]["source"]["data"]) == PNG_MAGENTA
+        assert content[2]["type"] == "document", content[2]
+        assert content[2]["source"]["media_type"] == "application/pdf", content[2]
+        assert base64.b64decode(content[2]["source"]["data"]) == b"%PDF-1.4 marker"
+        assert str(img_dir) not in stdin_data, "relay path leaked to the model"
+        print("  claude media: stream-json stdin with image + document, no Read")
     finally:
-        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
+        server.PROVIDER, server.PROFILE, server.CLI, server.BARE = saved
         shutil.rmtree(img_dir, ignore_errors=True)
+
+
+def test_claude_media_with_web_and_effort_compose():
+    """Web and media are independent on the claude text path: web adds
+    WebSearch/WebFetch and raises --max-turns (claude_web_args), media switch
+    the input to stream-json, and effort still lands its flag -- the media
+    return must not skip any of them."""
+    import shutil
+    saved = (server.PROVIDER, server.PROFILE, server.CLI, server.BARE)
+    img_dir = Path(tempfile.mkdtemp(prefix="cli-imgweb-"))
+    try:
+        server.PROVIDER = "claude"
+        server.PROFILE = server.PROFILES["claude"]
+        server.CLI = server.PROFILE["cli"]
+        server.BARE = True
+        img = img_dir / "01.png"
+        img.write_bytes(PNG_MAGENTA)
+        argv, stdin_data = server.build_argv("look and search", None, None,
+                                             image_paths=[img], web=True, effort="high")
+        assert argv[argv.index("--tools") + 1] == "WebSearch,WebFetch", argv
+        assert argv[argv.index("--allowed-tools") + 1] == "WebSearch,WebFetch", argv
+        assert int(argv[argv.index("--max-turns") + 1]) >= 4, argv
+        assert argv[argv.index("--input-format") + 1] == "stream-json", argv
+        assert argv[argv.index("--output-format") + 1] == "stream-json", argv
+        assert argv[argv.index("--effort") + 1] == "high", argv
+        assert "Read" not in argv[argv.index("--tools") + 1], argv
+        assert json.loads(stdin_data)["message"]["content"][1]["type"] == "image"
+        print("  claude web + media + effort compose on one argv")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI, server.BARE = saved
+        shutil.rmtree(img_dir, ignore_errors=True)
+
+
+def test_claude_media_markers_name_no_relay_path():
+    """The in-prompt placeholder for a staged block must not carry the relay
+    path on claude (the bytes are inline); codex/opencode keep the path since
+    it is the file they attach."""
+    import shutil
+    saved = server.PROVIDER
+    msgs = lambda: [{"role": "user", "content": [  # noqa: E731
+        {"type": "text", "text": "what colour?"},
+        {"type": "image_url", "image_url": {
+            "url": "data:image/png;base64," + base64.b64encode(PNG_MAGENTA).decode()}},
+        {"type": "file", "file": {
+            "file_data": "data:application/pdf;base64," + base64.b64encode(b"%PDF-1.4").decode()}}]}]
+    dirs = []
+    try:
+        server.PROVIDER = "claude"
+        m = msgs()
+        d = Path(tempfile.mkdtemp(prefix="cli-marker-"))
+        dirs.append(d)
+        paths = server.stage_images(m, d)
+        texts = [b["text"] for b in m[0]["content"]]
+        assert texts[1] == "[image 1: attached]", texts
+        assert texts[2] == "[document 2: attached]", texts
+        assert [p.suffix for p in paths] == [".png", ".pdf"], paths
+        assert "attachment(s) follow" in server.image_note(paths)
+        assert str(d) not in server.image_note(paths)
+        server.PROVIDER = "codex"
+        m = msgs()[:1]
+        m[0]["content"] = m[0]["content"][:2]
+        d = Path(tempfile.mkdtemp(prefix="cli-marker-"))
+        dirs.append(d)
+        paths = server.stage_images(m, d)
+        assert m[0]["content"][1]["text"] == f"[image 1: {paths[0]}]", m
+        print("  markers: claude 'attached', codex keeps its -i path")
+    finally:
+        server.PROVIDER = saved
+        for d in dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_pdf_refused_on_non_claude_providers():
+    """codex -i takes images only and opencode -f needs a PDF-capable model: a
+    PDF is refused loudly there (400 images_unsupported), never dropped. Claude
+    takes it inline."""
+    saved = server.PROVIDER
+    pdf_msg = lambda: [{"role": "user", "content": [  # noqa: E731
+        {"type": "text", "text": "summarise"},
+        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                        "data": base64.b64encode(b"%PDF-1.4").decode()}}]}]
+    try:
+        for provider in ("codex", "opencode"):
+            server.PROVIDER = provider
+            try:
+                server.stage_or_fail(pdf_msg())
+            except server.ImageUnsupportedError as e:
+                assert "PDF" in str(e), e
+            else:
+                raise AssertionError(f"{provider} accepted a PDF")
+        server.PROVIDER = "claude"
+        paths, img_dir = server.stage_or_fail(pdf_msg())
+        try:
+            assert [p.suffix for p in paths] == [".pdf"], paths
+            assert paths[0].read_bytes() == b"%PDF-1.4"
+        finally:
+            import shutil
+            shutil.rmtree(img_dir, ignore_errors=True)
+        assert server.has_image_blocks(pdf_msg())
+        assert not server.has_image_blocks([{"role": "user", "content": [
+            {"type": "document", "source": {"type": "text", "media_type": "text/plain",
+                                            "data": "hi"}}]}])
+        print("  PDF: refused on codex/opencode, staged for claude")
+    finally:
+        server.PROVIDER = saved
+
+
+def test_claude_json_parser_reads_stream_json_result():
+    """Media requests switch claude to --output-format stream-json; the
+    parser takes the final `result` event, which has the json output's shape."""
+    stream = "\n".join(json.dumps(e) for e in [
+        {"type": "system", "subtype": "init"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "#ff00ff"}]}},
+        {"type": "result", "subtype": "success", "result": "#ff00ff", "is_error": False,
+         "usage": {"input_tokens": 3, "output_tokens": 2}}]) + "\n"
+    out = server.parse_output(stream, "claude_json")
+    assert out["type"] == "result" and out["result"] == "#ff00ff", out
+    single = json.dumps({"type": "result", "result": "plain"})
+    assert server.parse_output(single, "claude_json")["result"] == "plain"
+    try:
+        server.parse_output("not json at all\n", "claude_json")
+    except json.JSONDecodeError:
+        pass
+    else:
+        raise AssertionError("garbage parsed")
+    print("  claude_json parser: stream-json result event accepted")
 
 
 def test_claude_text_path_allows_no_builtin_tools():
