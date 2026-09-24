@@ -181,6 +181,17 @@ def test_drain_migrate_rewrites_n_leases_to_the_sibling_ref():
     pointed at the drained plan must end up on the sibling. A session that
     was on a different plan already is left alone (the SET only has leases
     pointing at the drained plan).
+
+    The migration must NOT leave an in-flight slot claim on the sibling:
+    `picker.pick` claims a slot the same way a real request would (the
+    picker is what knows how to claim, and the migrator wants the same
+    answer about which ref is reachable), but no real request is in
+    flight, so the claim has to be released by the migrator. Without that
+    release each migrated session leaks one inflight slot on the sibling
+    plan until the staleness sweep notices — which is exactly what
+    strangles the next migration that lands on the same plan. The lease
+    is the persistent record; the slot claim is the temporary one and is
+    gone after the migration finishes.
     """
     async def go():
         reg, slots, picker = _build()
@@ -221,13 +232,29 @@ def test_drain_migrate_rewrites_n_leases_to_the_sibling_ref():
         other_lease = await slots.get_lease("s-other")
         sibling_lease = await slots.get_lease("s-sibling")
 
+        # After migration the slot table must be clean on every plan the
+        # migration touched. The drained plan was never claimed during the
+        # migrate loop (its refs are excluded from the pick), so its
+        # inflight count started and ends at zero. The sibling plan was
+        # the destination of every migrated pick; without the explicit
+        # release the migrator added, this would be 3 — one phantom slot
+        # per migrated session, visible to the next picker that walks
+        # this plan until the inflight staleness sweep (15 minutes)
+        # noticed. The `other` plan is the lane member that was never
+        # chosen, included here to pin the "no pan-planet claim" contract.
+        inflight_drained = await slots.in_flight(drained_plan)
+        inflight_sibling = await slots.in_flight(sibling.plan_key)
+        inflight_other = await slots.in_flight(other.plan_key)
+
         return (before_drained, count, migrated, after_drained,
                 new_leases, other_lease, sibling_lease,
-                drained_plan, target, sibling, other, drained_refs)
+                drained_plan, target, sibling, other, drained_refs,
+                inflight_drained, inflight_sibling, inflight_other)
 
     (before_drained, count, migrated, after_drained,
      new_leases, other_lease, sibling_lease,
-     drained_plan, target, sibling, other, drained_refs) = _run(go())
+     drained_plan, target, sibling, other, drained_refs,
+     inflight_drained, inflight_sibling, inflight_other) = _run(go())
 
     assert before_drained == ["s-drain-1", "s-drain-2", "s-drain-3"], \
         before_drained
@@ -249,9 +276,222 @@ def test_drain_migrate_rewrites_n_leases_to_the_sibling_ref():
     # Sessions that were NOT on the drained plan are untouched.
     assert other_lease == other.ref, other_lease
     assert sibling_lease == sibling.ref, sibling_lease
+    # Slot table cleanliness: no leaked inflight claim on any plan the
+    # migration touched. The sibling plan is the important one — three
+    # migrated sessions claim-and-release a slot each on the way past,
+    # and the regression we pin is exactly that the count is back at 0
+    # once the lease rewrites are done.
+    assert inflight_drained == 0, (
+        f"drained plan {drained_plan} must have no in-flight claims after "
+        f"migration; got {inflight_drained}")
+    assert inflight_sibling == 0, (
+        f"sibling plan {sibling.plan_key} must have no in-flight claims "
+        f"after migration (the picker claim from each migrated session "
+        f"must be released by migrate itself; the lease is the persistent "
+        f"record, the claim is not); got {inflight_sibling}")
+    assert inflight_other == 0, (
+        f"untouched plan {other.plan_key} must have no in-flight claims "
+        f"after migration; got {inflight_other}")
     print(f"  migrated {count} sessions off {drained_plan}: "
           f"{sorted(new_leases.items())}; other untouched ({other_lease}), "
-          f"sibling untouched ({sibling_lease}); drained SET cleared")
+          f"sibling untouched ({sibling_lease}); drained SET cleared; "
+          f"in_flight drained/sibling/other = "
+          f"{inflight_drained}/{inflight_sibling}/{inflight_other}")
+
+
+def test_drain_migrate_continues_past_release_failure():
+    """A Redis error in `picker.release` after a successful pick must NOT
+    abort the migrate loop — every not-yet-processed session would be
+    orphaned on the plan `apply.sh` is about to take out of service, which
+    is strictly worse than the leak being fixed.
+
+    The pick itself already wrote the lease on the sibling (the picker's
+    `_visit_ref` calls `set_lease` before returning the `Pick`), so the
+    orphaned state is just one stale claim — the staleness sweep reclaims
+    it within `inflight_max_age_seconds`. The remaining sessions still
+    get migrated.
+
+    We patch `picker.release` on the instance to throw on the first call
+    only: the loop must log the failure and continue to the next two
+    sessions, all three of which must have reached the `release` call (i.e.
+    the loop did NOT abort partway through). SET iteration order is not
+    guaranteed across runs, so the assertions check the COUNT and the
+    presence/absence of the failed session in `migrated`, not specific
+    session ids.
+    """
+    async def go():
+        reg, slots, picker = _build()
+        lane = "forge"
+        target = next(m for m in reg.lane_members(lane)
+                      if m.plan_key == "minimax-ultra")
+        drained_plan = target.plan_key
+        ttl = reg.settings.lease_ttl_seconds
+
+        # Three sessions on the drained plan.
+        await slots.set_lease("s-drain-1", target.ref, ttl, drained_plan)
+        await slots.set_lease("s-drain-2", target.ref, ttl, drained_plan)
+        await slots.set_lease("s-drain-3", target.ref, ttl, drained_plan)
+
+        # First call to release throws; calls 2 and 3 go through to the
+        # real implementation. Tracking the call count also pins the
+        # "loop did not abort" contract — three picks means three release
+        # attempts, so the loop saw all three sessions.
+        original_release = picker.release
+        calls: list[tuple[str, str, str]] = []
+        async def failing_release(plan_key, request_id, model_ref):
+            calls.append((plan_key, request_id, model_ref))
+            if len(calls) == 1:
+                raise ConnectionError("simulated redis drop")
+            return await original_release(
+                plan_key, request_id, model_ref)
+        picker.release = failing_release
+
+        count, migrated = await migrate(drained_plan, slots, picker,
+                                        ttl=ttl)
+        # The pick for the session that hit the failing release already
+        # wrote its lease on the sibling — confirm it landed on a non-
+        # drained ref so the only orphaned state is the stale claim.
+        leases = {s: await slots.get_lease(s)
+                  for s in ("s-drain-1", "s-drain-2", "s-drain-3")}
+        return (count, sorted(migrated), calls, drained_plan, leases,
+                target.plan_key)
+
+    (count, migrated, calls, drained_plan, leases,
+     drained_ref) = _run(go())
+    assert count == 2, f"expected 2 successful migrations, got {count}"
+    assert len(migrated) == 2, migrated
+    # All three picks must have reached release: the loop did not abort.
+    assert len(calls) == 3, (
+        f"loop must NOT abort on a release failure: expected 3 release "
+        f"calls (one per pick), got {len(calls)}")
+    # The session whose release threw is the one whose pick happened first
+    # in SET iteration order — i.e. the session NOT in `migrated`. Its
+    # lease must still be on a non-drained ref (the picker's `_visit_ref`
+    # wrote it before the failing release), so the only orphaned state is
+    # one stale claim.
+    failed = next(s for s in ("s-drain-1", "s-drain-2", "s-drain-3")
+                  if s not in migrated)
+    assert failed in leases and "/" in (leases[failed] or ""), (
+        f"failed session {failed!r} must have a lease on a non-drained "
+        f"ref (pick wrote it before release threw), got "
+        f"{leases[failed]!r}")
+    assert leases[failed].split("/", 1)[0] != drained_ref, (
+        f"failed session {failed!r} lease must not be on the drained "
+        f"plan {drained_ref!r}; got {leases[failed]!r}")
+    # The two migrated sessions have leases on the sibling (drained plan
+    # cleared, drain migrate re-leased them).
+    for s in migrated:
+        assert s in leases and leases[s] is not None, (
+            f"migrated session {s!r} has no lease after migrate")
+        assert leases[s].split("/", 1)[0] != drained_ref, (
+            f"migrated session {s!r} lease must not be on the drained "
+            f"plan {drained_ref!r}; got {leases[s]!r}")
+    print(f"  drained {drained_plan}: release threw on {failed!r} "
+          f"(1st pick), migrated {count}/3 sessions ({migrated}), "
+          f"all 3 picks reached release (loop did not abort); {failed!r} "
+          f"lease on {leases[failed]!r} — only the claim is orphaned "
+          f"(sweep reclaims)")
+
+
+def test_drain_migrate_continues_past_set_lease_failure():
+    """A Redis error in the explicit `slots.set_lease` re-write after a
+    successful pick+release must NOT abort the migrate loop — same
+    contract as the release-fail case, different dirty state.
+
+    The pick's `_visit_ref` already wrote the lease on the sibling, and
+    `picker.release` already reclaimed the slot. The only consequence of
+    this failure is that the lease ages out at the registry default TTL
+    instead of the operator's `--ttl`. No dirty state remains.
+
+    We patch `slots.set_lease` on the instance to throw on the first call
+    only: the loop must log the failure and continue to the next two
+    sessions, all three of which must have reached `set_lease` (i.e. the
+    loop did NOT abort partway through). SET iteration order is not
+    guaranteed across runs, so the assertions check the COUNT and the
+    presence/absence of the failed session in `migrated`, not specific
+    session ids. Every session still has its lease on the sibling — only
+    the failed one's TTL is the registry default rather than `ttl`.
+    """
+    async def go():
+        reg, slots, picker = _build()
+        lane = "forge"
+        target = next(m for m in reg.lane_members(lane)
+                      if m.plan_key == "minimax-ultra")
+        sibling = next(m for m in reg.lane_members(lane)
+                       if m.plan_key != target.plan_key
+                       and not reg.is_tail(lane, m.ref))
+        drained_plan = target.plan_key
+        ttl = reg.settings.lease_ttl_seconds
+
+        # Three sessions on the drained plan.
+        await slots.set_lease("s-drain-1", target.ref, ttl, drained_plan)
+        await slots.set_lease("s-drain-2", target.ref, ttl, drained_plan)
+        await slots.set_lease("s-drain-3", target.ref, ttl, drained_plan)
+
+        # Fail on every even-numbered call. With one session per pick and
+        # one set_lease call per pick in `_visit_ref`, the per-session
+        # pattern is "picker's set_lease (odd N), migrate's explicit
+        # set_lease (even N)". Failing the migrate-side calls exercises
+        # the new try/except without breaking the picker's internal call
+        # (which would turn this test into a `picker.pick`-failure test
+        # via the per-lane SKIP branch).
+        original_set_lease = slots.set_lease
+        calls: list[tuple[str, str, int, str]] = []
+        async def failing_set_lease(session, ref, lease_ttl, plan_key):
+            calls.append((session, ref, lease_ttl, plan_key))
+            if len(calls) % 2 == 0:
+                raise ConnectionError("simulated redis drop")
+            return await original_set_lease(
+                session, ref, lease_ttl, plan_key)
+        slots.set_lease = failing_set_lease
+
+        count, migrated = await migrate(drained_plan, slots, picker,
+                                        ttl=ttl)
+        # All three picks reached release (succeeded) and the migrate-
+        # side set_lease (failed). All three sessions are effectively
+        # migrated — only the lease TTL is the registry default rather
+        # than `ttl`. The sibling's in-flight count must be 0: release
+        # ran for all three.
+        leases = {s: await slots.get_lease(s)
+                  for s in ("s-drain-1", "s-drain-2", "s-drain-3")}
+        inflight_sibling = await slots.in_flight(sibling.plan_key)
+        return (count, sorted(migrated), calls, drained_plan, leases,
+                target.plan_key, inflight_sibling)
+
+    (count, migrated, calls, drained_plan, leases, drained_ref,
+     inflight_sibling) = _run(go())
+    # All three migrate-side set_lease calls failed, so nothing landed
+    # in `migrated` — but every session still has a lease on the sibling
+    # (the picker's `_visit_ref` wrote it) and the loop saw all three
+    # (the per-lane try/except did NOT short-circuit it).
+    assert count == 0, f"expected 0 successful migrations, got {count}"
+    assert migrated == [], migrated
+    # The picker's _visit_ref calls set_lease once per session; the
+    # migrate loop's explicit set_lease is the second call per session.
+    # Three sessions → 6 set_lease calls total. The loop did not abort:
+    # if it had, calls would have stopped short of 6.
+    assert len(calls) == 6, (
+        f"loop must NOT abort on a set_lease failure: expected 6 "
+        f"set_lease calls (1 picker + 1 migrate per session × 3 "
+        f"sessions), got {len(calls)}")
+    # All three sessions have leases on a non-drained ref — the picker's
+    # _visit_ref wrote them before migrate's explicit re-write threw.
+    for s in ("s-drain-1", "s-drain-2", "s-drain-3"):
+        assert s in leases and "/" in (leases[s] or ""), (
+            f"session {s!r} must have a lease (pick wrote it), got "
+            f"{leases[s]!r}")
+        assert leases[s].split("/", 1)[0] != drained_ref, (
+            f"session {s!r} lease must not be on the drained plan "
+            f"{drained_ref!r}; got {leases[s]!r}")
+    # Release ran for all three sessions — sibling in_flight is 0.
+    assert inflight_sibling == 0, (
+        f"sibling in_flight must be 0 after migrate (release ran for all "
+        f"3 sessions), got {inflight_sibling}")
+    print(f"  drained {drained_plan}: migrate's explicit set_lease threw "
+          f"for all 3 sessions; loop saw all 3 ({len(calls)} set_lease "
+          f"calls — no abort); all 3 leases on sibling from pick "
+          f"({leases}); in_flight sibling={inflight_sibling} (release "
+          f"ran for all 3) — no dirty state remains")
 
 
 def test_affinity_drops_lease_when_held_plan_is_draining():

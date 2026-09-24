@@ -28,8 +28,13 @@ async def migrate(plan_key: str, slots: SlotTable, picker: Picker,
 
     Walks the reverse lease index (`slots.sessions_on_plan`) for the plan,
     calls `picker.pick` with the drained plan's refs excluded, and rewrites
-    the lease via `set_lease(session, new_ref, ttl, plan_key)`. Prints one
-    line per migrated session and a final count.
+    the lease via `set_lease(session, new_ref, ttl, plan_key)`. The pick
+    is a placement check only — the slot claim it makes is released
+    immediately afterwards, because no real request is in flight and there
+    is no completion path to release it on its own. The lease is the
+    persistent record of which ref each session now owns, and `set_lease`
+    is what writes it. Prints one line per migrated session and a final
+    count.
 
     The lane argument comes from the registry: a session is migrated through
     any lane that names a ref on the drained plan; the first lane in
@@ -45,6 +50,18 @@ async def migrate(plan_key: str, slots: SlotTable, picker: Picker,
     A session whose every candidate lane has no non-drained capacity is
     left untouched — the caller sees the SKIP line and can decide whether
     to retry or accept the loss.
+
+    A session whose release or lease re-write fails after a successful pick
+    is logged and skipped rather than aborting the loop. The two failure
+    cases leave different dirty state, so the log lines and the comments
+    inside the two `except` blocks distinguish them: a `release` failure
+    leaves one stale claim (the staleness sweep reclaims it within
+    `inflight_max_age_seconds`); a `set_lease` failure here leaves no
+    dirty state at all (the picker's `_visit_ref` already wrote the lease
+    on the sibling, and `picker.release` already ran). In both cases
+    aborting would orphan every not-yet-processed session on the plan
+    `apply.sh` is taking out of service — strictly worse than the leak
+    being fixed.
 
     Returns (count_migrated, list_of_session_ids_migrated). The list is in
     the order sessions were processed (which is the SET iteration order).
@@ -82,7 +99,36 @@ async def migrate(plan_key: str, slots: SlotTable, picker: Picker,
             print(f"{session}: SKIP (no lane could place after drain)",
                   file=sys.stderr)
             continue
-        await slots.set_lease(session, placed.ref, lease_ttl, placed.plan.key)
+        try:
+            await picker.release(placed.plan.key, placed.request_id, placed.ref)
+        except Exception as exc:
+            # release-fail: the slot claim stays on the sibling until the
+            # staleness sweep reclaims it. The lease on the sibling is
+            # already in place (the pick's `_visit_ref` `set_lease`'d it
+            # before returning), so the session is effectively migrated —
+            # only the claim counter is dirty. Aborting here would orphan
+            # every not-yet-processed session on the plan being drained,
+            # which is strictly worse than the leak being fixed.
+            print(f"{session}: release failed ({type(exc).__name__}: {exc}); "
+                  f"stale claim on {placed.ref}, sweep will reclaim",
+                  file=sys.stderr)
+            continue
+        try:
+            await slots.set_lease(session, placed.ref, lease_ttl, placed.plan.key)
+        except Exception as exc:
+            # set_lease-fail: `picker.release` already ran, and the pick's
+            # `_visit_ref` already wrote the lease on the sibling — the
+            # session is fully migrated with no dirty state left. This
+            # explicit re-write is a TTL refresh (the picker's lease uses
+            # the registry default TTL; this call lets the caller pass a
+            # longer one via `--ttl`), so the only consequence of a
+            # failure here is that the lease ages out at the registry
+            # default instead of `ttl`. Aborting here would orphan the
+            # remaining sessions — same logic as the release-fail case.
+            print(f"{session}: lease rewrite failed ({type(exc).__name__}: {exc}); "
+                  f"lease on {placed.ref} already in place from pick",
+                  file=sys.stderr)
+            continue
         migrated.append(session)
         print(f"{session}: {plan_key}/{placed.plan.label} -> {placed.ref}")
     return len(migrated), migrated
