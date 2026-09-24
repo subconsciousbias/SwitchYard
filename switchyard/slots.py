@@ -82,6 +82,47 @@ end
 return 1
 """
 
+# Refresh a live claim's score and re-arm every TTL atomically. Issue #107:
+# the heartbeat previously updated only the score, so the zset TTL fired
+# at `2 * inflight_max_age` regardless of how fresh the score was -- a long
+# CLI call lost its slot mid-flight. This script keeps every TTL alive past
+# the same `inflight_max_age * 2` window `_CLAIM` writes (ARGV[5] there),
+# so claim and heartbeat agree on the backstop and a heartbeating slot is
+# indistinguishable in TTL terms from a freshly claimed one.
+#
+# `XX` never resurrects a member the sweep dropped: a heartbeat against a
+# dead slot is a no-op for the score, and the EXPIRE stays untouched --
+# exactly the contract a "slot was just reaped" caller wants, otherwise a
+# late beat would quietly bring the key back.
+#
+# `CH` is not optional: ZADD XX without it counts only members *added*, which
+# under XX is always zero. Reading that as "the sweep took it" made every
+# heartbeat stop after its first beat, so a request outliving
+# inflight_max_age lost its slot to the sweep while still running -- and a
+# CLI call legitimately runs for minutes.
+#
+# The EXPIRE on the lane hash (KEYS[3]) is gated on `updated > 0` on
+# purpose: a lane-less claim never had a hash, and EXPIRE on a missing key
+# is already a no-op in real Redis, but the gate keeps the liveness
+# contract tight -- a dead slot never keeps a key alive, period.
+# (`inflight_max_age * 2` is the same value `_CLAIM` writes; the gate just
+# refuses to extend any TTL when the member has already been reaped.)
+#
+# KEYS[1] plan inflight zset, KEYS[2] model inflight zset,
+# KEYS[3] lane hash (K_INFLIGHT_LANE)
+# ARGV[1] request id, ARGV[2] now, ARGV[3] ttl (= inflight_max_age * 2)
+# -> plan-zset members updated; 0 = slot gone, heartbeat must stop
+_TOUCH = """
+local updated = redis.call('ZADD', KEYS[1], 'XX', 'CH', ARGV[2], ARGV[1])
+redis.call('ZADD', KEYS[2], 'XX', 'CH', ARGV[2], ARGV[1])
+if updated > 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[3])
+  redis.call('EXPIRE', KEYS[2], ARGV[3])
+  redis.call('EXPIRE', KEYS[3], ARGV[3])
+end
+return updated
+"""
+
 # Atomic INCR + EXPIRE. INCR does not set a TTL on a fresh key, so the plain
 # pair left a window where a worker killed between INCR and EXPIRE would leave
 # the counter without a TTL — the next quiet gap would not drop it, so a plan
@@ -268,6 +309,7 @@ class SlotTable:
         self.redis = redis
         self.inflight_max_age = inflight_max_age
         self._claim = redis.register_script(_CLAIM)
+        self._touch = redis.register_script(_TOUCH)
         self._bump_streak = redis.register_script(_BUMP_STREAK)
         self._bump_and_cool = redis.register_script(_BUMP_AND_COOL)
         self._touch_lease = redis.register_script(_TOUCH_LEASE)
@@ -303,7 +345,7 @@ class SlotTable:
         await self.redis.hdel(K_INFLIGHT_LANE.format(plan=plan), request_id)
 
     async def touch(self, plan: str, request_id: str, model_ref: str) -> bool:
-        """Refresh a live claim's timestamp.
+        """Refresh a live claim's score and re-arm its TTLs atomically.
 
         A slot is only released by the completion hook, which never runs if the
         worker is killed or the client vanishes — so a dead request used to hold
@@ -312,21 +354,25 @@ class SlotTable:
 
         Heartbeating while the request is alive separates "slow" from "dead",
         which lets the sweep be aggressive without cutting off long calls (an
-        OpenCode request legitimately runs for minutes). GT/XX: only update an
-        existing member, never resurrect one the sweep already removed.
+        OpenCode request legitimately runs for minutes). XX: only update an
+        existing member, never resurrect one the sweep already removed. CH: the
+        return value carries the liveness signal — `0` means the slot is gone
+        and the heartbeat must stop, and `> 0` means the beat was accepted.
+
+        Issue #107: the heartbeat must also keep the *key* alive past
+        `2 * inflight_max_age`. `_CLAIM` writes that TTL on first claim, and
+        touch() now resets it on every beat via `_TOUCH`, so claim and heartbeat
+        agree on the same backstop window and a heartbeating slot survives
+        until the actual sweep notices it.
         """
         now = time.time()
-        pipe = self.redis.pipeline()
-        # CH is not optional: ZADD XX without it counts only members *added*,
-        # which under XX is always zero. Reading that as "the slot is gone" made
-        # every heartbeat stop after its first beat, so a request outliving
-        # inflight_max_age lost its slot to the sweep while still running — and
-        # a CLI call legitimately runs for minutes.
-        pipe.zadd(K_INFLIGHT.format(plan=plan), {request_id: now}, xx=True, ch=True)
-        pipe.zadd(K_INFLIGHT_MODEL.format(ref=model_ref), {request_id: now},
-                  xx=True, ch=True)
-        updated = await pipe.execute()
-        return bool(updated and updated[0])
+        result = await self._touch(
+            keys=[K_INFLIGHT.format(plan=plan),
+                  K_INFLIGHT_MODEL.format(ref=model_ref),
+                  K_INFLIGHT_LANE.format(plan=plan)],
+            args=[request_id, now, self.inflight_max_age * 2],
+        )
+        return bool(result)
 
     async def in_flight_model(self, ref: str) -> int:
         key = K_INFLIGHT_MODEL.format(ref=ref)

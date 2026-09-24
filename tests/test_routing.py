@@ -20,6 +20,9 @@ from switchyard import models                      # noqa: E402
 from switchyard.hooks import SwitchyardHandler, _tool_name  # noqa: E402
 from switchyard.picker import LaneSaturated, Picker  # noqa: F401  # noqa: E402
 from switchyard.slots import SlotTable             # noqa: E402
+from switchyard.slots import K_INFLIGHT             # noqa: E402
+from switchyard.slots import K_INFLIGHT_LANE        # noqa: E402
+from switchyard.slots import K_INFLIGHT_MODEL       # noqa: E402
 from switchyard.usage import Ledger                # noqa: E402
 from tests.fake_redis import FakeRedis             # noqa: E402
 
@@ -1096,6 +1099,64 @@ def test_a_heartbeat_keeps_a_long_request_past_the_staleness_sweep():
     plan, ref = run(go())
     print(f"  {plan}/{ref.split('/')[-1]}: heartbeat held the slot past the sweep, "
           f"release freed both counters")
+
+
+def test_a_heartbeat_keeps_the_inflight_key_alive_past_double_max_age():
+    """Issue #107 fast-suite gate: the heartbeat must also re-arm the *key*'s TTL.
+
+    The Lua suite (`tests/test_slots_lua.py::test_107_inflight_zset_ttl`) is
+    the source-of-truth repro, but it SKIPs on hosts without `fakeredis[lua]`.
+    This regression lives on FakeRedis so a no-deps `pytest` invocation covers
+    the same property end to end through the picker: every beat is True, the
+    rival claim stays refused, the fake's per-key TTL survives past
+    `2 * inflight_max_age`, and a slot that was released refuses to refresh
+    any TTL.
+
+    Pins issue #107 from the issue's exact repro ("claim at cap 1 … while
+    heartbeating … assert touch stays alive and a rival claim returns 0").
+    """
+    async def go():
+        reg, slots, picker = build()
+        slots.inflight_max_age = 1          # 2 × this = 2 s TTL on claim
+        pick = await picker.pick("forge", None)
+        plan, ref, rid = pick.plan.key, pick.ref, pick.request_id
+
+        # Beat every 0.5 s for 3 s — comfortably past 2 × inflight_max_age.
+        for _ in range(6):
+            await asyncio.sleep(0.5)
+            assert await slots.touch(plan, rid, ref) is True, \
+                "live claim must keep reporting alive under heartbeats"
+
+        # Rival claim at the same cap is refused the whole way: 0 / -2.
+        for _ in range(6):
+            rival = await slots.try_claim(plan, 1, "rid-rival",
+                                          model_ref=ref, model_cap=1)
+            assert rival in (0, -2), \
+                f"rival claim must be refused at cap 1, got {rival}"
+
+        # The fake's per-key TTL survived the heartbeat storm. #107's
+        # under-count on the board was caused by the lane hash quietly
+        # ageing out: assert each of the three keys carries a positive
+        # remaining TTL after the loop.
+        plan_ttl = await slots.redis.ttl(K_INFLIGHT.format(plan=plan))
+        model_ttl = await slots.redis.ttl(K_INFLIGHT_MODEL.format(ref=ref))
+        lane_ttl = await slots.redis.ttl(K_INFLIGHT_LANE.format(plan=plan))
+        assert plan_ttl > 0, f"plan zset TTL must survive heartbeats, got {plan_ttl}"
+        assert model_ttl > 0, f"model zset TTL must survive heartbeats, got {model_ttl}"
+        assert lane_ttl > 0, f"lane hash TTL must survive heartbeats, got {lane_ttl}"
+
+        # After release, touch on the dead slot stops reporting alive and
+        # does NOT refresh any TTL — the contract that keeps a quietly
+        # dropped slot from resurrecting itself.
+        await picker.release(plan, rid, ref)
+        assert await slots.touch(plan, rid, ref) is False, \
+            "dead slot must not report alive"
+        return plan, ref
+
+    plan, ref = run(go())
+    print(f"  {plan}/{ref.split('/')[-1]}: heartbeat kept every inflight TTL "
+          f"alive past 2*inflight_max_age; rival claim refused the whole way; "
+          f"a released slot stops touching")
 
 
 def test_the_generated_config_declares_no_general_fallbacks():

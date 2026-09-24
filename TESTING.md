@@ -66,8 +66,11 @@ Python shadow in `tests/fake_redis.py`. `tests/test_slots_lua.py` runs the
 real Lua against every script in `SlotTable` and compares its observable
 state with the shadow, so a broken `KEYS`/`ARGV` slot, a Lua typo, or a
 drifted mirror all fail loudly. The in-flight zset TTL under heartbeat
-([#107](https://github.com/Fledgewing/SwitchYard/issues/107)) is pinned as
-loud `xfail` until that routing-core bug lands.
+([#107](https://github.com/Fledgewing/SwitchYard/issues/107)) is the hard
+regression gate: `_TOUCH` re-arms every inflight TTL on each beat, so a
+heartbeating slot survives `2 * inflight_max_age` and the matrix-vs-shadow
+comparison plus `test_107_inflight_zset_ttl` together pin the fix from
+both sides.
 
 The fast run uses an embedded Lua-capable backend — install `fakeredis`
 with its optional Lua dependency:
@@ -78,9 +81,10 @@ python3 tests/test_slots_lua.py
 ```
 
 **Expect:** `scenario matrix: 16 scenarios, identical on Lua (...) and fake
-backends`, the Lua-only TTL assertions, and a labelled `xfail (#107)` line
-saying the heartbeat does not yet refresh the zset TTL. Exits 0 (xfail is
-informational today).
+backends`, the Lua-only TTL assertions, and a `regression gate (#107)`
+line confirming the heartbeat kept the inflight key alive past
+`2 * inflight_max_age` (the heartbeat now re-arms every TTL). Exits 0;
+a regression at this layer fails the suite.
 
 To run against a real Redis instead, spin one up and point the suite at it:
 

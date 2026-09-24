@@ -29,3 +29,18 @@ litellm>=1.101.0,<2
 # (Dockerfile.sidecar installs it); pinned here so the tests do not rely on
 # litellm pulling it in.
 jsonschema>=4.17,<5
+# fakeredis[lua]: the embedded Lua-capable backend that tests/test_slots_lua.py
+# uses in CI (TESTING.md "Fast run"). Without it the file's three Lua tests
+# (test_scenario_matrix_lua_and_fake_match, test_lua_only_ttl_assertions,
+# test_107_inflight_zset_ttl) silently SKIP — including the #107 regression
+# gate. Pin>=2.30 for the modern asyncio API; lupa is the Lua runtime and
+# ships as fakeredis's [lua] extra.
+fakeredis[lua]>=2.30
+# redis: fakeredis 2.x predates redis-py 8.x's activate_maint_notifications
+# path (which subscribes via a host string fakeredis's FakeServer does not
+# satisfy), and dev installs transitively pull the latest redis>=5 the moment
+# nothing pins it. Pin to <6 so a fresh `pip install -r requirements-dev.txt`
+# keeps the lua backend working. Production keeps the unconstrained
+# redis>=5 from requirements.txt (only used by the portal + sidecar images,
+# which never import fakeredis).
+redis>=5.0,<6

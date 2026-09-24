@@ -27,6 +27,7 @@ from switchyard.slots import (
     _DROP_LEASE,
     _DROP_LEASE_IF,
     _SET_LEASE,
+    _TOUCH,
     _TOUCH_LEASE,
 )
 
@@ -42,6 +43,7 @@ _SCRIPT_SOURCE_TO_SHADOW = {
     _CLAIM:           "_shadow_claim",
     _BUMP_AND_COOL:   "_shadow_bump_and_cool",
     _BUMP_STREAK:     "_shadow_bump_streak",
+    _TOUCH:           "_shadow_touch",
     _TOUCH_LEASE:     "_shadow_touch_lease",
     _DROP_LEASE:      "_shadow_drop_lease",
     _DROP_LEASE_IF:   "_shadow_drop_lease_if",
@@ -459,6 +461,31 @@ class FakeRedis:
         v = await self.incr(streak_key)
         await self.expire(streak_key, int(args[0]))
         return v
+
+    async def _shadow_touch(self, keys, args):
+        # Mirror the Lua's exact-source shadow for `_TOUCH` (issue #107).
+        # The plan-zset ZADD result is the liveness signal: CH is not
+        # optional (ZADD XX without CH always returns 0), and a dead slot
+        # returns 0 here too, which is what makes touch() report the slot
+        # gone so the heartbeat loop stops. Model zset ZADD is performed
+        # unconditionally (the Lua does the same); the EXPIRE block is
+        # gated on the plan zset saying the slot is still alive so a dead
+        # slot never keeps any of the three TTLs alive.
+        inflight_key, model_key, lane_key = keys
+        rid, now, ttl = args
+        changed = await self.zadd(inflight_key, {rid: now},
+                                  xx=True, ch=True)
+        await self.zadd(model_key, {rid: now}, xx=True, ch=True)
+        if changed:
+            # Same backstop window `_CLAIM` writes: refresh every TTL
+            # only when the slot is still alive. EXPIRE on the absent
+            # lane hash is already a no-op in real Redis, but the gate is
+            # the documented contract — a dead slot never keeps a key alive.
+            ttl = int(ttl)
+            await self.expire(inflight_key, ttl)
+            await self.expire(model_key, ttl)
+            await self.expire(lane_key, ttl)
+        return changed
 
     async def _shadow_touch_lease(self, keys, args):
         # Mirror the Lua: GET lease, return 0 if absent (and skip the EXPIRE

@@ -12,10 +12,11 @@ The same scenario matrix runs on both backends, asserting identical return
 values and resulting key state after each step. A broken KEYS/ARGV index, a
 Lua typo, or a drifted Python mirror all fail loudly.
 
-The in-flight zset TTL under heartbeat (#107) is pinned as xfail: today the
-heartbeat updates the score but does not refresh the EXPIRE, so a long-lived
-slot expires after `2 * inflight_max_age`. The gate flips to a hard pass and
-prints XPASS when #107 lands.
+The in-flight zset TTL under heartbeat (#107) is the regression gate for
+issue #107 (now landed): `touch()` must keep the zset, model zset, and lane
+hash alive past `2 * inflight_max_age` so a long-lived slot is not reaped
+mid-flight. The matrix-vs-shadow comparison and the dedicated
+`test_107_inflight_zset_ttl` together pin both halves of the fix.
 
 Backend resolution: SWITCHYARD_TEST_REDIS_URL -> `redis.asyncio.from_url`;
 elif `fakeredis` with `lua=True` is importable -> that; else print a loud
@@ -61,8 +62,9 @@ OTHER_PLAN = "ultra"
 OTHER_MODEL = "ultra/m"
 LEASE_TTL = 1000
 INFLIGHT_MAX_AGE = 1                 # claim TTL is 2 × this = 2s
-# #107 xfail: heartbeat loop must wait past 2 × INFLIGHT_MAX_AGE (= 2s).
-# 5 beats × 0.5s = 2.5s, comfortably past the TTL window.
+# #107 regression gate: heartbeat loop must wait past 2 × INFLIGHT_MAX_AGE
+# (= 2s). 5 beats × 0.5s = 2.5s, comfortably past the TTL window; a working
+# `_TOUCH` keeps every beat alive the whole way.
 HEARTBEAT_STEP = 0.5
 HEARTBEAT_OVERRUN = 5
 
@@ -456,24 +458,25 @@ async def lua_ttl_assertions(r, slots):
 
 
 # --------------------------------------------------------- #107 acceptance
-# The bug: claim sets the zset TTL to `inflight_max_age * 2`, but touch()
-# updates only the score. After `2 * inflight_max_age` the key expires, so a
-# long-lived slot is lost even with a fresh heartbeat. The fix should make
-# touch() also refresh the EXPIRE; when that lands, this test flips from
-# XFAIL to XPASS and the gate is re-tightened to a hard assertion.
+# The bug (issue #107, now landed): claim sets the zset TTL to
+# `inflight_max_age * 2`, but `touch()` previously updated only the score,
+# so a slot older than `2 * inflight_max_age` was reaped even with a fresh
+# heartbeat. `_TOUCH` now re-arms every TTL on each beat, so this scenario
+# is the regression gate that keeps the fix honest.
 
-async def xfail_inflight_zset_ttl_under_heartbeat(r, slots):
+async def inflight_zset_ttl_under_heartbeat(r, slots):
     """claim() under continuous heartbeats must outlive 2*inflight_max_age.
 
-    Today the heartbeat updates only the score; the zset key's TTL is set
-    only at claim time, so a slot older than `2 * inflight_max_age` is
-    collected by Redis. When #107 lands (touch refreshes EXPIRE) the
-    heartbeat keeps the key alive past the window, the EXISTS comes back 1,
-    and the gate reports XPASS so the maintainer can convert it to a hard pass.
+    Issue #107: the zset, model zset, and lane hash TTLs are set once at claim
+    time, so a heartbeat loop that beats past `2 * inflight_max_age` will
+    find the keys reaped and the next claim succeed. After the `_TOUCH`
+    landing, every beat refreshes the backstop window -- the key survives
+    the full `HEARTBEAT_OVERRUN` loops, the next claim is still refused, and
+    `touch()` stays True the whole way.
     """
-    plan = "xfail-107"
+    plan = "regress-107"
     rid = "rid-heartbeat"
-    ref = "xfail-107/m"
+    ref = "regress-107/m"
     cap = 1
 
     # Fresh claim.
@@ -482,16 +485,15 @@ async def xfail_inflight_zset_ttl_under_heartbeat(r, slots):
 
     # Advance past `2 * inflight_max_age` with only heartbeats: a
     # HEARTBEAT_STEP-second sleep per beat, HEARTBEAT_OVERRUN beats total.
-    # The slot's TTL is set once at claim time, so a beat at the edge of the
-    # window will find the key still alive; the next beat, after the TTL has
-    # fired, will find it gone. When #107 lands the touch refreshes the TTL
-    # each beat and the key survives every beat in the loop.
+    # The TTL is re-armed on every beat via `_TOUCH`, so the key survives
+    # the whole loop; the next beat, were the fix to regress, would find
+    # the key gone and the next claim succeed.
     final_touch = None
     for _ in range(HEARTBEAT_OVERRUN):
         await asyncio.sleep(HEARTBEAT_STEP)
         final_touch = await slots.touch(plan, rid, ref)
 
-    # The acceptance contract: the key survived, and the next claim attempt
+    # The regression gate: the key survived, and the next claim attempt
     # is refused because the live slot still occupies the cap.
     exists = await r.exists(K_INFLIGHT.format(plan=plan))
     next_claim = await slots.try_claim(plan, cap, "rid-new",
@@ -599,11 +601,14 @@ def test_lua_only_ttl_assertions():
           "tfail sliding TTL, lease, reverse-index SET)")
 
 
-def test_xfail_107_inflight_zset_ttl():
-    """#107 acceptance: claim must outlive 2*inflight_max_age under heartbeats.
+def test_107_inflight_zset_ttl():
+    """#107 regression gate: claim must outlive 2*inflight_max_age under heartbeats.
 
-    Gated as xfail so the suite stays green today; flips to XPASS (and the
-    gate to a hard pass) when issue #107 lands.
+    Each beat must keep the zset, model zset, and lane hash alive long enough
+    for the next claim to still be refused (0 / -2). Issue #107 fix lands via
+    `_TOUCH` in `switchyard/slots.py`; if the script's `updated > 0` EXPIRE
+    branch is dropped, or the score-only pipeline quietly comes back, the key
+    TTL fires and the next claim succeeds — this test fails loudly then.
     """
     resolved = _skip_or_skip()
     if resolved is None:
@@ -614,27 +619,15 @@ def test_xfail_107_inflight_zset_ttl():
         r = await _make_redis(factory)
         try:
             slots = SlotTable(r, inflight_max_age=INFLIGHT_MAX_AGE)
-            return await xfail_inflight_zset_ttl_under_heartbeat(r, slots)
+            return await inflight_zset_ttl_under_heartbeat(r, slots)
         finally:
             await _maybe_aclose(r)
 
     outcome = asyncio.run(go_async())
-    survived = outcome["exists"] == 1
-    refused = outcome["next_claim_refused"]
-    alive = outcome["touch_alive"]
-    print()
-    if survived and refused and alive:
-        # XPASS: the bug is fixed. Flip the gate to a hard assertion and
-        # remove the xfail label.
-        print("  xfail (#107): XPASS — heartbeat now keeps the slot past "
-              "2*inflight_max_age; EXISTS=1, next claim refused, touch alive. "
-              "Issue #107 appears fixed: tighten the gate to a hard pass.")
-    else:
-        print("  xfail (#107): XFAIL — heartbeat does not refresh the zset "
-              "TTL; slot expired before the next claim was refused. "
-              f"observed: {outcome}. Tracked in issue #107.")
-    # xfail is informational today; never fail the suite on this test.
-    assert True
+    assert outcome["exists"] == 1 and outcome["next_claim_refused"] \
+        and outcome["touch_alive"], f"#107 regressed: {outcome}"
+    print("  regression gate (#107): heartbeat kept the inflight key alive "
+          "past 2*inflight_max_age; EXISTS=1, next claim refused, touch alive")
 
 
 # ---------------------------------------------------------------- main entry
