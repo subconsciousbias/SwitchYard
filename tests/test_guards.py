@@ -167,9 +167,10 @@ GUARD = os.path.join(ROOT, ".claude", "hooks", "guard.sh")
 def _feed_guard(cmd, tool_name="Bash", cwd=ROOT):
     """Pipe a JSON PreToolUse payload to guard.sh, return CompletedProcess.
 
-    Default cwd=ROOT — the test runner itself typically sits in a worktree,
-    so `is_worktree=1` is on for any worktree-only pattern test. Pass an
-    explicit standalone-repo cwd to exercise the `is_worktree=0` branch.
+    Default cwd=ROOT, which is a worktree only on a developer machine that
+    runs the suite from one -- CI uses a plain clone. A test that needs
+    `is_worktree=1` must pass `cwd=` a `_spawn_worktree()` path; pass a
+    `_standalone_repo()` path to exercise the `is_worktree=0` branch.
     """
     payload = json.dumps({"tool_name": tool_name, "tool_input": {"command": cmd}})
     return subprocess.run(
@@ -308,24 +309,31 @@ def test_worktree_only_allows_git_merge_and_still_denies_docker_stop_list():
     `git merge` from `WORKTREE_ONLY` — merging origin/<base> into the
     feature branch is a local op and the conflict-fix flow depends on it
     running inside the worktree.
+
+    Runs from a real temporary worktree: CI checks the repo out as a plain
+    clone, where the same commands are (correctly) allowed.
     """
-    for cmd in ["git merge", "git merge main --ff-only", "git merge --no-ff"]:
-        res = _feed_guard(cmd)
-        assert res.returncode == 0, \
-            f"worktree guard must ALLOW {cmd!r} (issue: git merge is no " \
-            f"longer worktree-only), got rc={res.returncode}; " \
-            f"stderr={res.stderr!r}"
-    for cmd in [
-        "docker compose build web",
-        "docker compose up -d",
-        "docker login",
-        "docker logout",
-    ]:
-        res = _feed_guard(cmd)
-        assert res.returncode == 2, \
-            f"worktree guard must still deny {cmd!r}, got rc={res.returncode}; " \
-            f"stderr={res.stderr!r}"
-        assert "refusing" in res.stderr.lower(), res.stderr
+    wt, cleanup = _spawn_worktree()
+    try:
+        for cmd in ["git merge", "git merge main --ff-only", "git merge --no-ff"]:
+            res = _feed_guard(cmd, cwd=wt)
+            assert res.returncode == 0, \
+                f"worktree guard must ALLOW {cmd!r} (issue: git merge is no " \
+                f"longer worktree-only), got rc={res.returncode}; " \
+                f"stderr={res.stderr!r}"
+        for cmd in [
+            "docker compose build web",
+            "docker compose up -d",
+            "docker login",
+            "docker logout",
+        ]:
+            res = _feed_guard(cmd, cwd=wt)
+            assert res.returncode == 2, \
+                f"worktree guard must still deny {cmd!r}, got rc={res.returncode}; " \
+                f"stderr={res.stderr!r}"
+            assert "refusing" in res.stderr.lower(), res.stderr
+    finally:
+        cleanup()
     print("  worktree guard allows git merge (with and without args) while still denying docker stop list")
 
 
@@ -802,11 +810,13 @@ def test_guard_worktree_only_message_uses_human_readable_label():
     literal (`(^|[[:space:]])docker[[:space:]]+compose[[:space:]]+build([[:space:]]|$)`).
     """
     cmd = "docker compose build web"
-    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}})
-    res = subprocess.run(
-        ["bash", GUARD], input=payload,
-        cwd=ROOT, capture_output=True, text=True,
-    )
+    # A real temporary worktree, not ROOT: CI checks out a plain clone,
+    # where the worktree-only rule rightly does not fire.
+    wt, cleanup = _spawn_worktree()
+    try:
+        res = _feed_guard(cmd, cwd=wt)
+    finally:
+        cleanup()
     assert res.returncode == 2, \
         f"worktree-only guard should refuse {cmd!r} from a worktree, " \
         f"got rc={res.returncode}; stderr={res.stderr!r}"

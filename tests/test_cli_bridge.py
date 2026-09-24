@@ -17,12 +17,34 @@ from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-os.environ["PROVIDER"] = "opencode"
+# The provider every test here assumes `server` was loaded under.
+MODULE_PROVIDER = "opencode"
+os.environ["PROVIDER"] = MODULE_PROVIDER
 
 from _modules import load  # noqa: E402
 
 server = load("cli_bridge_server",
               os.path.join(os.path.dirname(HERE), "sidecars", "cli_bridge", "server.py"))
+
+
+def _restore_env_and_reload(old: dict) -> None:
+    """Undo a test's env swap and re-execute `server` under MODULE_PROVIDER.
+
+    `old` cannot be trusted for PROVIDER: pytest imports every test module
+    before running any, and test_mcp_bridge sets PROVIDER=claude at import,
+    so by run time os.environ says claude. Reloading under that turned
+    `server` into the claude profile for every later test in this file --
+    which then fed opencode fixture output to the claude parser.
+    """
+    import _modules
+    os.environ.clear()
+    os.environ.update(old)
+    os.environ["PROVIDER"] = MODULE_PROVIDER
+    try:
+        _modules.reload(server)
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
 
 FIXTURE = os.path.join(HERE, "fixtures", "opencode-events.jsonl")
 
@@ -456,9 +478,7 @@ def _read_for(plan: str, provider: str):
         mod = _modules.reload(server)
         return mod.read_config()
     finally:
-        os.environ.clear()
-        os.environ.update(old)
-        _modules.reload(server)
+        _restore_env_and_reload(old)
 
 
 def test_sidecar_reads_models_from_the_plan():
@@ -687,9 +707,7 @@ def test_the_claude_file_flags_carry_an_oversized_system_prompt():
         finally:
             mod.PROFILE["system_file_args_replace"] = saved
     finally:
-        os.environ.clear()
-        os.environ.update(old)
-        _modules.reload(server)
+        _restore_env_and_reload(old)
     print("  claude file flags: append + replace(+extras) covered; "
           "replace without the key stays no-op; temp files cleaned up")
 
@@ -1388,7 +1406,7 @@ def test_text_path_no_tools_passthrough_with_metadata_still_parses():
                     == "tools_unsupported"):
                 raise AssertionError(
                     f"text path must not 400 on tools when no tools present: "
-                    f"{exc.detail}")
+                    f"{exc.detail}") from exc
             assert exc.status_code in (429, 502), (
                 f"unexpected HTTPException from _handle_chat: "
                 f"{exc.status_code} {exc.detail}")
@@ -1458,9 +1476,7 @@ def test_text_path_system_mode_replace_argv_unchanged_apart_from_system():
     finally:
         # Restore env AND reload the module to flush SYSTEM_MODE=replace
         # state so subsequent tests see the original (append-mode) profile.
-        os.environ.clear()
-        os.environ.update(old)
-        _modules.reload(server)
+        _restore_env_and_reload(old)
 
 
 # ----------------------------------------- issue #70: enforce max_tokens post-hoc ---

@@ -449,11 +449,15 @@ def _run_with_stripped_path(tmp: Path, script: Path, *banned: str):
             name = entry.name
             if name in banned_set or name in seen:
                 continue
+            # OSError, not just FileNotFoundError: on macOS some entries under
+            # /usr/sbin (e.g. authserver/) raise PermissionError from both
+            # resolve() and is_file(), and one unreadable system entry must
+            # not abort building the curated PATH.
             try:
                 resolved = entry.resolve(strict=True)
-            except (FileNotFoundError, RuntimeError):
-                continue
-            if not resolved.is_file() or not os.access(resolved, os.X_OK):
+                if not resolved.is_file() or not os.access(resolved, os.X_OK):
+                    continue
+            except (OSError, RuntimeError):
                 continue
             link = curated_bin / name
             try:

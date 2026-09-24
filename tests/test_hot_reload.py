@@ -58,13 +58,24 @@ except Exception as exc:                           # litellm missing, mostly
     hooks = None
     _HOOKS_UNAVAILABLE = f"{type(exc).__name__}: {exc}"
 
+class _DropWatcherNoise(logging.Filter):
+    """Drop records logged from the config-watcher thread."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.threadName != "switchyard-config-watcher"
+
+
 if hooks is not None:
     # Importing hooks builds the module-level singleton, whose watcher thread
     # dials a Redis that is not there in a test run. Its warnings are about
     # ITS redis, tell us nothing about the code under test, and would only
-    # bury the assertions' own output; the capture test below re-enables the
-    # logger for exactly as long as it needs records.
-    hooks.log.disabled = True
+    # bury the assertions' own output -- so they are filtered off hooks' own
+    # stdout handler. NOT `hooks.log.disabled = True`: pytest imports every
+    # test module before running any, so a disabled "switchyard" logger stays
+    # disabled for the whole run and every other module's log-capturing test
+    # (test_messages_hooks, test_routing) sees zero records.
+    for _handler in hooks.log.handlers:
+        _handler.addFilter(_DropWatcherNoise())
 
 
 def run(coro):
@@ -323,7 +334,6 @@ def test_a_router_shaped_edit_keeps_the_running_registry():
         return
     path = _write_copy()
     capture = _Capture()
-    hooks.log.disabled = False
     hooks.log.addHandler(capture)
     try:
         with _config_path(path):
@@ -342,7 +352,6 @@ def test_a_router_shaped_edit_keeps_the_running_registry():
         print("  router-shaped edit: registry kept, operator told to reload.sh")
     finally:
         hooks.log.removeHandler(capture)
-        hooks.log.disabled = True
         os.unlink(path)
 
 

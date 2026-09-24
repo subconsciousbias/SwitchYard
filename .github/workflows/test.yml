@@ -1,11 +1,17 @@
 # Offline CI: lint + the unit suite. Mirrors `scripts/test.sh` so a green
-# gate matches a green local run, and runs on every push and PR.
+# gate matches a green local run, and runs on every PR and every push to main.
 #
 # No services, no providers, no docker-in-docker: conftest.py blocks every
 # non-loopback socket, so the suite is fast and free.
+#
+# `push` is limited to main: a push to a PR branch already triggers the
+# pull_request run for that same commit, and running both doubled every job.
 name: test
 
-on: [push, pull_request]
+on:
+  pull_request:
+  push:
+    branches: [main]
 
 jobs:
   test:
@@ -36,3 +42,35 @@ jobs:
         env:
           LITELLM_LOCAL_MODEL_COST_MAP: "True"
         run: python tests/render_preview.py
+  cli-lockdown:
+    # The bridges keep each vendor CLI's own tools, prompt sections and
+    # login-dir files away from the model (issue #264). Whether they do is a
+    # property of the CLI release, so this job installs exactly the versions
+    # Dockerfile.sidecar pins and runs tests/test_lockdown_*.py against them:
+    # each CLI, driven by the bridges' real argv, talks to a loopback fake
+    # model (tests/_fake_model.py) -- no network, no credentials, no quota.
+    # SWITCHYARD_REQUIRE_CLIS=1 turns a missing or mismatched CLI into a
+    # failure; without it (local runs) those tests skip.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install requirements
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Install the CLIs Dockerfile.sidecar pins
+        run: npm install -g $(python tests/_pinned_clis.py)
+      - name: CLI lockdown tests
+        env:
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          SWITCHYARD_REQUIRE_CLIS: "1"
+        run: python -m pytest -q tests/test_lockdown_*.py
