@@ -123,6 +123,9 @@ services:
       # and os.environ/OPENCODE_ORG_ID2 from plans.yaml; one per Go subscription.
       OPENCODE_ORG_ID: ${OPENCODE_ORG_ID:-}
       OPENCODE_ORG_ID2: ${OPENCODE_ORG_ID2:-}
+      # Probe code reads os.environ/GLM_API_KEY from the glm plan's
+      # probe.headers.Authorization in plans.yaml.
+      GLM_API_KEY: ${GLM_API_KEY:-}
     depends_on:
       redis: {condition: service_healthy}
 

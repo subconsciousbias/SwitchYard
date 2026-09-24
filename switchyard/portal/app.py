@@ -860,7 +860,23 @@ async def collect_plans() -> list[dict]:
         if pace and not pace.get("allowance"):
             alerting.append("pacing idle: no allowance known")
         if probe and probe["needs_reauth"]:
-            alerting.append("quota probe needs a fresh session cookie")
+            # Cookie probes fail with "session rejected" when the operator's
+            # pasted cookie has expired -- the actionable fix is to paste a
+            # new one. Every other probe kind reads its credential from
+            # somewhere else (an API key in the environment, the sidecar's
+            # own CLI login, the OAuth proxy's grant), so the right message
+            # is the probe's own last_error -- e.g. "probe needs
+            # GLM_API_KEY (header Authorization) set in .env" for the glm
+            # plan -- rather than the cookie-reauth wording that does not
+            # apply. The `kind` branch keeps the legacy string verbatim for
+            # cookie-kind plans so the operator-facing wording on the long-
+            # standing cookie probes does not change.
+            if plan.probe.kind == "cookie":
+                alerting.append("quota probe needs a fresh session cookie")
+            else:
+                alerting.append(
+                    f"quota probe failing: {probe.get('last_error') or 'probe is misconfigured — check portal logs'}"
+                )
         # A provider refusing us on connection count means max_parallel is set
         # higher than the plan allows. Different fix from a quota wall, so it
         # gets its own warning instead of looking like rate limiting.

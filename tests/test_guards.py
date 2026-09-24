@@ -41,10 +41,14 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+from plans_path import EXAMPLE as PLANS_EXAMPLE  # noqa: E402
 
 # Test (a): worktree refusal ----------------------------------------------
 
@@ -815,6 +819,112 @@ def test_guard_worktree_only_message_uses_human_readable_label():
         f"worktree-only error must NOT print the regex literal "
         f"'[[:space:]]'; got: {res.stderr!r}")
     print("  worktree-only error: human-readable label, not regex literal")
+
+
+# Test (f): compose↔plans parity for the portal's probe env vars --------
+#
+# Regression for issue where the portal's probe code reads
+# `os.environ/NAME` from plans.yaml's `probe.headers` (e.g. `Authorization:
+# os.environ/GLM_API_KEY` on the glm plan) but the variable is missing
+# from `services.portal.environment` in docker-compose.yml -- the probe
+# fails every poll with the misleading "quota probe needs a fresh session
+# cookie" wording, and the operator cannot tell the variable is missing
+# from .env. Cookie-kind plans store their credential in Redis (not the
+# portal's env), and plan-level `api_base`/`api_key` are gateway-only, so
+# only the `os.environ/NAME` references actually under a plan's
+# `probe.headers` block belong in `services.portal.environment`.
+#
+# A future plan that adds a new probe header mapping must surface the new
+# variable here too -- this test fires on the moment the drift appears
+# rather than waiting for the live probe to fail.
+
+
+def _probe_header_env_vars(plans_text: str) -> set[str]:
+    """Walk plans.yaml text and collect every NAME in `os.environ/NAME`
+    found under any plan's `probe.headers` mapping.
+
+    Other surfaces carry credential references but do NOT bind to the
+    portal's environment:
+
+      * `probe.headers` -- the only block the portal reads; its values
+        are rendered as `Authorization: $NAME` against `os.environ`,
+        so a missing `services.portal.environment.NAME` makes the probe
+        fail every poll with the wrong wording.
+      * `api_base` / `api_key` at plan top-level -- gateway-only.
+      * `probe.cookie` storage -- Redis-backed, not an env var.
+
+    A real YAML walk (PyYAML safe_load) keeps the assertion honest: a
+    regex on raw text would false-positive on a comment that names an
+    env var in prose, and miss a multi-line `headers:` block whose values
+    sit on indented lines.
+    """
+    import yaml
+    plans = yaml.safe_load(plans_text) or {}
+    names: set[str] = set()
+    for plan in (plans.get("plans") or {}).values():
+        if not isinstance(plan, dict):
+            continue
+        probe = plan.get("probe")
+        if not isinstance(probe, dict):
+            continue
+        headers = probe.get("headers")
+        if not isinstance(headers, dict):
+            continue
+        for value in headers.values():
+            if not isinstance(value, str):
+                continue
+            prefix = "os.environ/"
+            if not value.startswith(prefix):
+                continue
+            name = value[len(prefix):]
+            if name:
+                names.add(name)
+    return names
+
+
+def test_compose_portal_environment_covers_every_probe_header_env_var():
+    """Every `os.environ/NAME` under any plan's `probe.headers` is a key of
+    `services.portal.environment` in docker-compose.yml.
+
+    Failure message names the missing variable -- the test is the
+    canonical "you added a probe header but forgot the portal env var"
+    trip wire.
+    """
+    with open(os.path.join(ROOT, "docker-compose.yml")) as fh:
+        compose_text = fh.read()
+    import yaml
+    compose = yaml.safe_load(compose_text) or {}
+    portal_env = ((compose.get("services") or {})
+                  .get("portal", {}).get("environment") or {})
+    portal_keys = set(portal_env.keys())
+
+    with open(PLANS_EXAMPLE) as fh:
+        plans_text = fh.read()
+    needed = _probe_header_env_vars(plans_text)
+
+    missing = sorted(needed - portal_keys)
+    assert not missing, (
+        f"docker-compose.yml services.portal.environment is missing "
+        f"variable(s) referenced by a plan's probe.headers in "
+        f"{PLANS_EXAMPLE!r}: {missing}. Each probe header "
+        f"`os.environ/NAME` reads through the portal container, so the "
+        f"name must be present in services.portal.environment or the "
+        f"probe fails every poll with the cookie-reauth wording "
+        f"regardless of probe.kind. Cookie-kind plans store their "
+        f"credential in Redis, not the environment, so they do not "
+        f"appear here."
+    )
+    # And the assertion's direction holds: at least one variable is
+    # currently required, so a future plans.yaml that drops every
+    # probe.headers reference cannot silently zero out the test.
+    assert needed, (
+        "expected at least one probe header env var in "
+        f"{PLANS_EXAMPLE!r} (e.g. GLM_API_KEY on the glm plan); "
+        "if plans.yaml really has none, the test needs an explicit "
+        "fixture update rather than a silent green."
+    )
+    print(f"  portal.environment covers {len(needed)} probe-header env var(s): "
+          f"{sorted(needed)}")
 
 
 if __name__ == "__main__":

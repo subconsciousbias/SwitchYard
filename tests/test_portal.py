@@ -1362,6 +1362,104 @@ def test_allowlist_normalises_uppercase_bare_hostname_entries():
             os.environ["PORTAL_ALLOWED_ORIGINS"] = saved_origins
 
 
+# ============================================================================
+# Issue: GLM probe needs GLM_API_KEY in portal env, not a cookie.
+#
+# When a probe is flagged `needs_reauth`, the board's alert message used to
+# be the cookie-reauth wording for every plan, regardless of probe kind.
+# The cookie wording is correct for cookie-kind probes (the operator pastes
+# the cookie and rotates it; the portal stores it in Redis), but wrong for
+# every other kind (api_key probes read the credential from the portal's
+# own environment, sidecar-backed probes read it from the CLI's login).
+# Pin the branch: cookie-kind plans still get the cookie wording, the rest
+# get the probe's own last_error (e.g. "probe needs GLM_API_KEY (header
+# Authorization) set in .env") so the operator knows the variable to set.
+#
+# Inserted BEFORE the `if __name__ == "__main__":` runner so the discovery
+# loop picks it up. See tests/CLAUDE.md -- anything appended after the
+# runner is defined too late and silently does not run.
+# ============================================================================
+
+
+def test_plans_fragment_branches_probe_needs_reauth_message_by_kind():
+    """When a probe is `needs_reauth`, the board's alert wording branches
+    on `plan.probe.kind`:
+
+      * `kind: cookie` -- "quota probe needs a fresh session cookie"
+        (the existing wording; the operator fixes it by pasting a new
+        cookie via the probes panel).
+      * anything else (e.g. `kind: none`) -- "quota probe failing: <last_error>"
+        carrying the probe's own diagnostic, so an api_key plan whose
+        credential is missing from .env points at the missing variable
+        instead of misdirecting the operator to the cookie panel.
+
+    Pin both branches in one test, against the live example fixture's glm
+    (`kind: none`) and minimax-ultra (`kind: cookie`) plans, so a
+    regression that collapses them back into a single cookie-only string
+    fires immediately.
+    """
+    with _make_client() as client:
+        # The example fixture ships glm with `kind: none` and
+        # minimax-ultra with `kind: cookie` -- the exact two cases the
+        # branch has to distinguish. Pull them from the live registry
+        # rather than hardcoding, so a future fixture rename still
+        # exercises the right plan.
+        reg = models.load()
+        glm_plan = next(p for p in reg.plans.values()
+                        if p.probe is not None and p.probe.kind != "cookie")
+        cookie_plan = next(p for p in reg.plans.values()
+                           if p.probe is not None and p.probe.kind == "cookie")
+        # Sanity: the two plans the test names exist and are distinct.
+        assert glm_plan.key != cookie_plan.key, \
+            "test fixture needs at least one non-cookie and one cookie probe"
+        assert glm_plan.probe.kind != "cookie"
+        assert cookie_plan.probe.kind == "cookie"
+
+        fake = portal_app.state["slots"].redis
+        glm_error = ("probe needs GLM_API_KEY (header Authorization) "
+                     "set in .env")
+        cookie_error = "session rejected (HTTP 401)"
+        try:
+            # Phase 1: glm only -- the non-cookie branch.
+            fake.hashes[f"sy:probe:{glm_plan.key}"] = {
+                "needs_reauth": "1", "last_error": glm_error,
+            }
+            fake.hashes[f"sy:probe:{cookie_plan.key}"] = {
+                "needs_reauth": "0", "last_error": "",
+            }
+            html = client.get("/fragments/plans").text
+            # The cookie wording must NOT appear when only glm is
+            # needs_reauth -- a regression that dropped the kind
+            # branch would render it for glm too.
+            assert "quota probe needs a fresh session cookie" not in html, html
+            # The glm-specific diagnostic MUST appear, carrying the
+            # last_error verbatim so the operator knows which env var
+            # to set.
+            assert "quota probe failing:" in html, html
+            assert glm_error in html, html
+
+            # Phase 2: cookie plan only -- the cookie branch.
+            fake.hashes[f"sy:probe:{glm_plan.key}"] = {
+                "needs_reauth": "0", "last_error": "",
+            }
+            fake.hashes[f"sy:probe:{cookie_plan.key}"] = {
+                "needs_reauth": "1", "last_error": cookie_error,
+            }
+            html = client.get("/fragments/plans").text
+            # Cookie wording MUST still render for a cookie-kind probe --
+            # the branch must not regress the legacy path that has been
+            # correct all along.
+            assert "quota probe needs a fresh session cookie" in html, html
+            # And the non-cookie "quota probe failing:" prefix must
+            # NOT appear for a cookie-kind probe even when its
+            # last_error happens to be a string we seeded.
+            assert "quota probe failing:" not in html, html
+        finally:
+            # Wipe both probe hashes so sibling tests see a clean slate.
+            fake.hashes.pop(f"sy:probe:{glm_plan.key}", None)
+            fake.hashes.pop(f"sy:probe:{cookie_plan.key}", None)
+
+
 if __name__ == "__main__":
     # Plain-script runner: discovers tests from globals(), like the rest of
     # tests/*.py. See CLAUDE.md — appending below this block would silently
