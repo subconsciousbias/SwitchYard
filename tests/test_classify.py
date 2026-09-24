@@ -284,6 +284,250 @@ def test_extract_no_text_tokens_returns_none_for_unrelated_prose():
     assert extract_no_text_tokens("upstream 502 bad gateway") is None
 
 
+def test_429_with_rate_limit_phrasing_outranks_prose():
+    """A 429 carrying rate-limit phrasing must land as RATE_LIMITED even when
+    the message also reads as CONTEXT ("too many tokens per minute") or
+    QUOTA_EXHAUSTED ("rate limit reached for … tokens per min"). Without this
+    pre-prose rule the message hits the prose block first and the per-minute
+    wall becomes a 15-minute quota park (or, worse, "our fault" and never
+    cooled at all).
+    """
+    rows = [
+        # The verbatim issue: 429 "Rate limit reached for ... tokens per min"
+        # was being classified as QUOTA_EXHAUSTED, parking the plan for 15
+        # minutes over a per-minute wall.
+        (429, "Rate limit reached for 16384 tokens per min",
+         Outcome.RATE_LIMITED, lambda c: 5 <= c <= 300),
+        # "too many tokens per minute" used to match _CONTEXT (it's our
+        # fault, never cool). It is not: the provider is throttling by
+        # tokens-per-minute, which is a rate-limit signal.
+        (429, "too many tokens per minute, slow down",
+         Outcome.RATE_LIMITED, lambda c: 5 <= c <= 300),
+        # Same shape with a different window unit — per-second, per-hour.
+        (429, "request rate limit: 100 per second, slow down",
+         Outcome.RATE_LIMITED, lambda c: 5 <= c <= 300),
+        (429, "you exceeded 5000 RPM for this model",
+         Outcome.RATE_LIMITED, lambda c: 5 <= c <= 300),
+        (429, "TPM cap reached, retry in 30s",
+         Outcome.RATE_LIMITED, lambda c: 5 <= c <= 300),
+    ]
+    for status, message, expected, cd_pred in rows:
+        v = classify(status, message)
+        assert v.outcome is expected, f"{status} {message!r}: got {v.outcome}, want {expected}: {v}"
+        assert cd_pred(v.cooldown_seconds), f"{status} {message!r}: cooldown {v.cooldown_seconds}: {v}"
+        assert v.detail == "rate limited", v
+    # The "too many tokens per minute" branch is explicitly NOT our fault.
+    v = classify(429, "too many tokens per minute, slow down")
+    assert v.is_our_fault is False, v
+    # And retry_after must still be honoured when supplied: >0 means use it
+    # (clamped to 5..300), absent/0 means fall back to 30s.
+    v = classify(429, "tokens per min, slow down", retry_after=10)
+    assert v.cooldown_seconds == 10, v
+    v = classify(429, "tokens per min, slow down", retry_after=600)
+    assert v.cooldown_seconds == 300, v  # clamped to the 300 ceiling
+    v = classify(429, "tokens per min, slow down", retry_after=2)
+    assert v.cooldown_seconds == 5, v    # clamped to the 5 floor
+
+
+def test_500_authentication_prose_falls_through_to_transient():
+    """A 5xx body that mentions 'authentication service unavailable' is an
+    upstream service outage, not a credential rejection. Before this fix the
+    _AUTH prose matched any 'authentication' substring regardless of status,
+    so a 500/502 from an auth-subsystem outage was mis-classified as AUTH and
+    the plan was cooled for 30 minutes (1800s) instead of the 60s TRANSIENT
+    ladder.
+
+    After the fix _AUTH prose only fires when status is None — the only
+    case where 'unauthorized' / 'authentication' really can be read as
+    'this caller did not send credentials', because there is no HTTP context
+    to contradict that reading.
+    """
+    # 500 with AUTH prose → TRANSIENT, not AUTH.
+    v = classify(500, "Internal error: authentication service unavailable")
+    assert v.outcome is Outcome.TRANSIENT, v
+    assert v.cooldown_seconds == 60, v
+    # 502 with the same phrasing → TRANSIENT (it's an upstream bad-gateway).
+    v = classify(502, "BadGateway: authentication subsystem returned 502")
+    assert v.outcome is Outcome.TRANSIENT, v
+    assert v.cooldown_seconds == 60, v
+    # status=None with the same prose → still AUTH (no HTTP context, the
+    # caller's AUTH gate is the only thing that could have produced this).
+    v_none = classify(None, "authentication service unavailable")
+    assert v_none.outcome is Outcome.AUTH, v_none
+    assert v_none.cooldown_seconds == 1800, v_none
+    # status=None with 'unauthorized' → AUTH (prose fallback for no-HTTP).
+    v_none2 = classify(None, "unauthorized")
+    assert v_none2.outcome is Outcome.AUTH, v_none2
+    assert v_none2.cooldown_seconds == 1800, v_none2
+    # And 401 with 'invalid api key' → AUTH (status-driven, unchanged).
+    v_401 = classify(401, "invalid api key")
+    assert v_401.outcome is Outcome.AUTH, v_401
+    assert v_401.cooldown_seconds == 1800, v_401
+
+
+def test_auth_prose_strict_gate_4xx_does_not_fall_back_to_prose():
+    """The strict _AUTH gate (`status is None` for prose) is broader than
+    "5xx" — it means *any* HTTP status code on the wire defers to the
+    status branch. The PR description and the code comment in
+    `classify.py` frame the change as the 5xx case, but a 4xx (non-401/403)
+    body that mentions "unauthorized" / "authentication" also falls through
+    to the 4xx status branch — and lands as BAD_REQUEST 0s, not AUTH 1800s.
+
+    That is the intentional design per issue #185 (the gate is
+    `status in (None, 401, 403)` — anything else, prose is ignored), but
+    it is a real behavior change worth pinning: a provider that
+    mis-classifies an auth failure as 400 (with "unauthorized" in the
+    body) used to trigger an AUTH alert + lease drop (`hooks.py:1210`);
+    now it lands as a no-cooldown BAD_REQUEST and the plan keeps getting
+    re-fed against a broken credential. The other cases are unaffected
+    by the strict gate because the status branch already gives them the
+    correct verdict.
+
+    The status=None case is the only one where the prose fallback really
+    can be read as "this caller did not send credentials" — there is no
+    HTTP context to contradict that reading.
+    """
+    # 400 + 'unauthorized' → BAD_REQUEST 0s (strict gate: status branch wins).
+    # A provider that mis-classifies an auth failure as 400 with the word
+    # 'unauthorized' in the body used to be AUTH 1800s; the strict gate
+    # routes it to BAD_REQUEST instead.
+    v_400 = classify(400, "unauthorized")
+    assert v_400.outcome is Outcome.BAD_REQUEST, v_400
+    assert v_400.cooldown_seconds == 0, v_400
+    # 404 + 'unauthorized' → BAD_REQUEST 0s (same reasoning).
+    v_404 = classify(404, "unauthorized")
+    assert v_404.outcome is Outcome.BAD_REQUEST, v_404
+    assert v_404.cooldown_seconds == 0, v_404
+    # 400 + 'authentication failed' → BAD_REQUEST 0s (not AUTH).
+    v_400b = classify(400, "authentication failed")
+    assert v_400b.outcome is Outcome.BAD_REQUEST, v_400b
+    assert v_400b.cooldown_seconds == 0, v_400b
+    # 429 + 'unauthorized access' → RATE_LIMITED 30s (status 429 wins;
+    # the 429 rate-limit rule does not match 'unauthorized access' and
+    # the strict AUTH gate ignores the prose).
+    v_429 = classify(429, "unauthorized access")
+    assert v_429.outcome is Outcome.RATE_LIMITED, v_429
+    # And the AUTH-prose outcomes the strict gate preserves: status=None
+    # is the only case where the prose fallback fires.
+    v_none = classify(None, "unauthorized")
+    assert v_none.outcome is Outcome.AUTH, v_none
+    assert v_none.cooldown_seconds == 1800, v_none
+    # 401/403 status-driven AUTH is unchanged.
+    v_401 = classify(401, "invalid api key")
+    assert v_401.outcome is Outcome.AUTH, v_401
+    assert v_401.cooldown_seconds == 1800, v_401
+    v_403 = classify(403, "forbidden")
+    assert v_403.outcome is Outcome.AUTH, v_403
+    assert v_403.cooldown_seconds == 1800, v_403
+
+
+def test_prose_rules_preserve_genuine_message_classification():
+    """The narrowed _EXHAUSTED and _CONTEXT regexes must still cover the
+    load-bearing genuine-message shapes. Each row is a real vendor message
+    (or close paraphrase) — the row's expected outcome is the contract a
+    broken regex would silently break.
+    """
+    rows = [
+        # --- MiniMax ---------------------------------------------------------
+        # 1008 prose, no body — hits _EXHAUSTED via 'insufficient balance'.
+        (500, "insufficient balance", {"family": "minimax"},
+         Outcome.QUOTA_EXHAUSTED, lambda c: c >= 900, None),
+        # 1008 with the (1008) in the body — vendor-code branch fires and
+        # surfaces the code so the audit ledger can attribute the spend.
+        (500, "insufficient balance (1008)",
+         {"family": "minimax",
+          "body": {"error": {"message": "insufficient balance (1008)"}}},
+         Outcome.QUOTA_EXHAUSTED, lambda c: c >= 900, 1008),
+        # --- Z.AI prose without an explicit code -----------------------------
+        # 1308 prose: 'usage limit; resets…' matches via 'usage limit' even
+        # though the narrowed 'limit reached' no longer matches it directly.
+        (429, "usage limit; resets in 24h", {},
+         Outcome.QUOTA_EXHAUSTED, lambda c: c >= 900, None),
+        # 1310 prose: 'weekly limit reached' matches via 'weekly limit'
+        # (the narrowed 'limit reached' alternative also covers it via the
+        # explicit weekly-prefix form, so the test asserts both paths).
+        (429, "weekly limit reached", {},
+         Outcome.QUOTA_EXHAUSTED, lambda c: c >= 900, None),
+        # Z.AI 1302 'rate limit exceeded' as 429, no body — the new 429
+        # rate-limit rule fires via 'rate limit' phrasing, no vendor code
+        # needed. The cooldown uses the 30s fallback (no retry_after) and
+        # lands in the 5..300 clamp.
+        (429, "rate limit exceeded", {},
+         Outcome.RATE_LIMITED, lambda c: 5 <= c <= 300, None),
+        # --- OpenAI ----------------------------------------------------------
+        # 'maximum context length is N tokens' on 400 — CONTEXT, our fault,
+        # zero cooldown (we never park a plan over a prompt the caller
+        # could fix).
+        (400, "This model's maximum context length is 8192 tokens.", {},
+         Outcome.CONTEXT, lambda c: c == 0, None),
+        # And the OpenAI-shaped 400 with an 'invalid_request_error' code
+        # in the body — also CONTEXT, still is_our_fault.
+        (400, "context window exceeded: please shorten the prompt",
+         {"body": {"error": {"code": "context_length_exceeded"}}},
+         Outcome.CONTEXT, lambda c: c == 0, None),
+    ]
+    for status, message, kwargs, expected, cd_pred, expected_code in rows:
+        v = classify(status, message, **kwargs)
+        assert v.outcome is expected, \
+            f"({status!r}, {message!r}, {kwargs!r}): got {v.outcome}, want {expected}: {v}"
+        assert cd_pred(v.cooldown_seconds), \
+            f"({status!r}, {message!r}, {kwargs!r}): cooldown {v.cooldown_seconds}: {v}"
+        if expected_code is not None:
+            assert v.vendor_code == expected_code, \
+                f"({status!r}, {message!r}, {kwargs!r}): vendor_code {v.vendor_code}, want {expected_code}: {v}"
+    # is_our_fault is a separate predicate the table doesn't carry: CONTEXT
+    # rows must be our fault, the RATE_LIMITED/QUOTA rows must not be.
+    v_ctx = classify(400, "This model's maximum context length is 8192 tokens.")
+    assert v_ctx.is_our_fault is True, v_ctx
+    v_rl = classify(429, "rate limit exceeded")
+    assert v_rl.is_our_fault is False, v_rl
+
+
+def test_429_negative_guards_remain_classified():
+    """The 429 pre-prose rule must NOT swallow genuine non-rate-limit 429s.
+    Each row is a real shape the system produces today, and a regression
+    here would mean a CONCURRENCY signal becomes RATE_LIMITED (the
+    concurrency learner stops seeing the backpressure), a quota wall
+    becomes a per-minute sit-out (the plan re-admits itself too soon), or
+    an AUTH signal never reaches the credential-rejection path.
+    """
+    rows = [
+        # 'sidecar at capacity (N)' is the bridge's own backpressure phrase;
+        # it must stay CONCURRENCY 20s, matching MiniMax 1041.
+        (429, "sidecar at capacity (4)", {},
+         Outcome.CONCURRENCY, lambda c: c == 20),
+        # 'usage limit reached' (no per-minute / rate-limit / RPM / TPM
+        # phrasing) — stays QUOTA_EXHAUSTED, parked for the default
+        # cooldown window.
+        (429, "usage limit reached", {},
+         Outcome.QUOTA_EXHAUSTED, lambda c: c >= 900),
+        # 401 'invalid api key' — status-driven AUTH, 1800s.
+        (401, "invalid api key", {},
+         Outcome.AUTH, lambda c: c == 1800),
+        # status=None 'unauthorized' — prose-fallback AUTH when no HTTP
+        # context is available.
+        (None, "unauthorized", {},
+         Outcome.AUTH, lambda c: c == 1800),
+        # 'connection limit reached' on 429 — no rate-limit phrasing, so
+        # the 429 rule doesn't fire. _CONCURRENCY prose catches it (the
+        # bare 'limit reached' was the path the regex narrowing removed,
+        # and 'connection limit' is still in the regex).
+        (429, "connection limit reached", {},
+         Outcome.CONCURRENCY, lambda c: c == 20),
+        # 'too many tokens' on a status other than 429 with no
+        # context|prompt|input pairing and no per-minute phrasing — must
+        # fall through to TRANSIENT, NOT CONTEXT.
+        (500, "we sent too many tokens last call", {},
+         Outcome.TRANSIENT, lambda c: c == 60),
+    ]
+    for status, message, kwargs, expected, cd_pred in rows:
+        v = classify(status, message, **kwargs)
+        assert v.outcome is expected, \
+            f"{status!r} {message!r} {kwargs!r}: got {v.outcome}, want {expected}: {v}"
+        assert cd_pred(v.cooldown_seconds), \
+            f"{status!r} {message!r} {kwargs!r}: cooldown {v.cooldown_seconds}: {v}"
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

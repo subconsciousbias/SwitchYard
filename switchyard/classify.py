@@ -106,7 +106,15 @@ _OVERRIDES_STATUS = {Outcome.QUOTA_EXHAUSTED, Outcome.PLAN_DEAD, Outcome.CONCURR
 _EXHAUSTED = re.compile(
     r"(usage limit|quota exceeded|quota exhausted|insufficient (balance|quota|credit)"
     r"|out of credit|credit limit|monthly limit|weekly limit|plan limit"
-    r"|limit reached|no remaining|exceeded your current quota"
+    # Bare "limit reached" used to swallow unrelated "connection limit reached"
+    # / "rate limit reached" strings; the noun prefix keeps it anchored to a
+    # quota wall while leaving "usage limit", "weekly limit", etc. intact.
+    # The separators inside and after the group are literal spaces — `?.` /
+    # bare `.` would match any single character, which is misleading for the
+    # next reader and lets "usageXlimit reached" / "tokenXquota limit reached"
+    # through on shape alone (no provider emits those today, but a future
+    # upstream prose change could).
+    r"|(?:usage|monthly|weekly|daily|plan|token quota) limit reached|no remaining|exceeded your current quota"
     r"|resource_exhausted|arrearage"
     # xAI via OpenCode says this when a SuperGrok subscription's quota is spent:
     # "personal-team-blocked:spending-limit: You have run out of credits or need a
@@ -115,7 +123,19 @@ _EXHAUSTED = re.compile(
     r"|spending.?limit|run out of credits)",
     re.I,
 )
-_CONTEXT = re.compile(r"(context (length|window)|too many tokens|maximum context|prompt is too long)", re.I)
+# "too many tokens" only counts as a context-window hit when the message also
+# names context|prompt|input somewhere in the same sentence — a free-floating
+# "too many tokens per minute, slow down" is a per-minute rate-limit signal,
+# not our prompt. OpenAI's real "maximum context length is N tokens" already
+# matches via `maximum context`, so the pairing form only has to catch
+# nonstandard phrasings.
+_CONTEXT = re.compile(
+    r"(context (length|window)"
+    r"|(?:(?:context|prompt|input)[^.]{0,80}?too many tokens"
+    r"|too many tokens[^.]{0,80}?(?:in|for|to).{0,40}(?:context|prompt|input))"
+    r"|maximum context|prompt is too long)",
+    re.I,
+)
 _AUTH = re.compile(r"(invalid api key|unauthorized|authentication|invalid token|expired token)", re.I)
 # "sidecar at capacity" is the exact phrase SwitchYard's own bridges emit on a
 # full gate (mcp_bridge/server.py, cli_bridge/server.py) — the number after it
@@ -251,7 +271,19 @@ def classify(
             cooldown = int(retry_after) if retry_after and retry_after > 60 else default_cooldown
         return Verdict(outcome, cooldown, f"{family} code {code}", code)
 
-    # 2. Unambiguous prose, which can outrank a misleading status (a 500 that
+    # 2. status-429 with explicit rate-limit phrasing — a per-minute / per-second
+    #    wall must land as RATE_LIMITED, not QUOTA_EXHAUSTED (which would park
+    #    the plan for 15 minutes) and not CONTEXT (which would label the
+    #    provider's throttle as our fault and never cool the plan at all).
+    #    This sits before the prose block so a "429 + 'tokens per min'"
+    #    message wins over _CONTEXT and _EXHAUSTED.
+    if status == 429 and re.search(
+        r"per.(min(ute)?|second|hour)|rate.?limit|RPM|TPM", msg, re.I,
+    ):
+        secs = int(retry_after) if retry_after and retry_after > 0 else 30
+        return Verdict(Outcome.RATE_LIMITED, max(5, min(secs, 300)), "rate limited", code)
+
+    # 3. Unambiguous prose, which can outrank a misleading status (a 500 that
     #    says "insufficient balance" is not a server problem we should retry).
     if _CONTEXT.search(msg):
         return Verdict(Outcome.CONTEXT, 0, "context window exceeded", code)
@@ -272,8 +304,19 @@ def classify(
         # TEXT_LOST failures keep writing 10s and the plan re-admits itself.
         return Verdict(Outcome.TEXT_LOST, 10, "cli lost the text", code)
 
-    # 3. HTTP status.
-    if status in (401, 403) or _AUTH.search(msg):
+    # 4. HTTP status. _AUTH prose is gated behind status is None, which is
+    #    broader than just the "5xx" case mentioned in issue #185: ANY HTTP
+    #    status on the wire defers to the status branch — 4xx non-401/403
+    #    bodies that mention "authentication" / "unauthorized" fall through
+    #    to BAD_REQUEST, 5xx bodies fall through to TRANSIENT, and only the
+    #    no-HTTP-context case keeps the prose-driven AUTH fallback. The
+    #    strict gate is the issue #185 spec ("_AUTH prose: only when status
+    #    in (None, 401, 403)") and the rationale is "trust HTTP status
+    #    first" — the prose is only safe to read as "this caller did not
+    #    send credentials" when there is no HTTP status to contradict it.
+    if status in (401, 403):
+        return Verdict(Outcome.AUTH, 1800, "credential rejected", code)
+    elif status is None and _AUTH.search(msg):
         return Verdict(Outcome.AUTH, 1800, "credential rejected", code)
     if status == 402:
         return Verdict(Outcome.QUOTA_EXHAUSTED, default_cooldown, "payment required", code)
