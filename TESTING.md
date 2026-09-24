@@ -1552,16 +1552,27 @@ them first if something misbehaves:
 7. **Real token allowances.** Everything works without them, but pacing stays
    idle and headroom stays estimated until either you set them or a plan hits a
    wall once and the observed-allowance learning records it.
-8. **`CountTokens handler: 404 for /v1/responses/input_tokens` from the
-   claude-max-sidecar is EXPECTED.** LiteLLM's CountTokens handler posts there
-   to ask a vendor for an exact token figure; the bridge has no such route
-   (only `/usage`, `/health`, `/v1/models`, `/v1/chat/completions`), so the
-   call 404s. LiteLLM falls back to its local tokenizer and answers
-   `/v1/messages/count_tokens` with 200, which is what the "Post-deploy
-   check: the token-counter patch" section above verifies. The bridges
-   cannot count vendor tokens without spending a turn on it, so the local
-   fallback is the honest number rather than a wrong one; no sidecar
-   change is planned.
+8. **`CountTokens` handler for `*-sidecar` plans: an ERROR-free local
+   count is expected.** Dockerfile.gateway now patches litellm's
+   `OpenAITokenCounter.count_tokens` at build time (sibling of the
+   `_format_type` patch in `Dockerfile.gateway`, sibling test in
+   `tests/test_litellm_patch.py`) so any api_base whose hostname ends
+   in `-sidecar` short-circuits the vendor `/v1/responses/input_tokens`
+   call entirely and falls back to litellm's local tokenizer. The
+   bridges still expose only `/usage`, `/health`, `/v1/models` and
+   `/v1/chat/completions`, and the local fallback is the honest number
+   rather than a wrong one. Issue #198's evidence is the
+   `HTTP error in CountTokens handler ... 404` ERROR log lines that
+   `count_tokens` burned on every Claude Code token-count request; on
+   a `*-sidecar` plan those should disappear after the patched image
+   rolls out, and `/v1/messages/count_tokens` should keep answering 200
+   with the same local-count figure it already did before the patch
+   (just without the doomed hop). The previous behaviour — the
+   `HTTP error in CountTokens handler ... 404` line against the
+   sidecar's `/v1/responses/input_tokens` followed by a `status=404`
+   warning — should no longer appear in the gateway logs.
+   `docker compose logs gateway | grep -i "CountTokens handler"`
+   is expected to stay empty for any `*-sidecar` plan.
 9. **Live worktree refusal of `apply.sh` / `reload.sh`.** The offline suite
    in `tests/test_guards.py` already creates a real `git worktree add`,
    runs both scripts from it, and asserts rc==2 + the refusal message. To

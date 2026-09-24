@@ -40,6 +40,20 @@ no Redis, no internet.
    Dockerfile.gateway patches the file at build time; this audit confirms
    the patch is actually present on the running image and that the
    items=string array case still renders conventionally.
+
+4. LiteLLM's `OpenAITokenCounter.count_tokens` must still short-circuit
+   `*-sidecar` api_base hosts to the local tokenizer (issue #198).
+   Switchyard's `*-sidecar` plans (claude-max-sidecar, codex-sidecar,
+   opencode-go-sidecar, ...) are internal CLI bridges that expose only
+   /usage, /health, /v1/models and /v1/chat/completions; none of them
+   speak the Responses API /input_tokens route, so the unpatched
+   counter's vendor hop always 404s (96 ERROR lines in ~6h on one plan
+   per the issue). Dockerfile.gateway patches the file at build time;
+   this audit confirms the patch is actually present on the running
+   image. A regression here is silent from a routing point of view:
+   requests still flow, only the 404 ERROR log lines + a `status=404`
+   warning come back, with no startup-time CRITICAL to surface it -
+   the very regression issue #198 is closing.
 """
 from __future__ import annotations
 
@@ -516,6 +530,103 @@ def _audit_token_counter_patch() -> None:
     )
 
 
+def _audit_count_tokens_sidecar_patch() -> None:
+    """(f) litellm OpenAITokenCounter.count_tokens must short-circuit
+    `*-sidecar` api_base hosts to the local tokenizer (issue #198).
+
+    The `_format_type` audit above catches the `_format_type` pin-drift.
+    This one catches the *sibling* `OpenAITokenCounter` pin-drift: a
+    litellm upgrade that moves or renames the `api_base` assignment
+    would silently unpatch the sidecar short-circuit and bring back
+    the 404 ERROR lines that issue #198 closes.
+
+    Switchyard's `*-sidecar` plans (claude-max-sidecar, codex-sidecar,
+    opencode-go-sidecar, opencode-go2-sidecar, ...) are internal CLI
+    bridges that expose only /usage, /health, /v1/models and
+    /v1/chat/completions - none of them speak the Responses API
+    /input_tokens route. LiteLLM's `OpenAITokenCounter.count_tokens`
+    always asks the vendor's /v1/responses/input_tokens endpoint for
+    an exact count, then falls back to its local tokenizer if the
+    vendor returns None. The vendor hop 404s every time and
+    OpenAITokenCounter logs a `status=404 ...` warning before falling
+    through; the 404 ERROR line itself comes from the upstream
+    CountTokens handler, which is the line issue #198 names as its
+    evidence.
+
+    Dockerfile.gateway patches the file at build time: an api_base
+    whose hostname ends in `-sidecar` short-circuits to None directly
+    (the same local-count path litellm uses when no API key is set),
+    with an `isinstance(api_base, str)` guard that prevents
+    `None.split(...)` AttributeError on vendors that omit an explicit
+    api_base. This audit confirms the patch is actually present on
+    the running image - a partial build that somehow bypassed the
+    Dockerfile.gateway RUN layer is the regression to scream about.
+
+    We only do a static check here (no live call): the function
+    path on a `*-sidecar` api_base is "return None", which is
+    impossible to distinguish from the upstream's "no api_key set"
+    short-circuit without mocking litellm itself. The fixture-driven
+    test in `tests/test_litellm_patch.py` exercises the live call
+    shape against a pinned v1.101.0 fragment so the function's
+    behaviour is still pinned end-to-end.
+    """
+    try:
+        import litellm
+    except Exception as exc:                 # noqa: BLE001 - report with reason
+        _critical(
+            "could not import litellm to verify the count_tokens build-time "
+            f"patch: {type(exc).__name__}: {exc}"
+        )
+        return
+
+    pkg_dir = os.path.dirname(litellm.__file__)
+    src_path = os.path.join(
+        pkg_dir, "llms", "openai", "responses", "count_tokens",
+        "token_counter.py",
+    )
+    try:
+        with open(src_path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError as exc:
+        _critical(
+            f"could not read {src_path} for count_tokens sidecar patch "
+            f"check: {exc}"
+        )
+        return
+
+    # Static check: the endswith("-sidecar") short-circuit line must
+    # appear in the file. We match the exact (indented) continuation
+    # line so a docstring or comment that quotes the expression does
+    # not satisfy the count by accident. The 12-space indent matches
+    # the patched continuation line under the `if (... and`
+    # continuation in OpenAITokenCounter.count_tokens; if a future
+    # refactor reindents that block, the Dockerfile patch and this
+    # audit move together (they are pinned by
+    # `tests/test_litellm_patch.py::test_anchor_strings_match_dockerfile_literals`).
+    short_circuit_marker = (
+        '            [-1].split("/")[0].split(":")[0]'
+        '.endswith("-sidecar")):'
+    )
+    if short_circuit_marker not in src:
+        _critical(
+            "litellm OpenAITokenCounter.count_tokens is missing the "
+            "endswith('-sidecar') api_base short-circuit - the "
+            "Dockerfile.gateway build-time patch was not applied (or "
+            "the litellm base-image pin drifted past it). Rebuild the "
+            "gateway image per the PIN POLICY at the top of "
+            "Dockerfile.gateway, or issue #198 will come back silently "
+            "(*-sidecar plans 404 against /v1/responses/input_tokens, "
+            "the upstream CountTokens handler logs 'HTTP error in "
+            "CountTokens handler ... 404' once per call)."
+        )
+        return
+
+    log.info(
+        "  ok  litellm OpenAITokenCounter.count_tokens: *-sidecar "
+        "api_base short-circuits to local counting (issue #198)"
+    )
+
+
 # -- dynamic probe ------------------------------------------------------------
 
 class _Stub(BaseHTTPRequestHandler):
@@ -765,7 +876,7 @@ def _litellm_version() -> str:
 
 
 def _static_audit() -> None:
-    """Run all five startup checks. Each prints its own ok/fail line."""
+    """Run all six startup checks. Each prints its own ok/fail line."""
     import litellm.router
     import litellm.proxy
     router_src = inspect.getsource(litellm.router)
@@ -774,6 +885,7 @@ def _static_audit() -> None:
     _audit_num_retries_early_raise(router_src)
     _audit_proxy_pre_call_hook_present()
     _audit_token_counter_patch()
+    _audit_count_tokens_sidecar_patch()
 
 
 async def main_async() -> int:

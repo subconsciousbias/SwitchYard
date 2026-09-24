@@ -119,6 +119,113 @@ print(
 )
 PY
 
+# Patch litellm.llms.openai.responses.count_tokens.token_counter at build time
+# so any plan whose api_base points at a `*-sidecar` service short-circuits
+# the vendor /v1/responses/input_tokens call and falls back to the local
+# tokenizer (issue #198).
+#
+# Switchyard's `*-sidecar` plans (claude-max-sidecar, codex-sidecar,
+# opencode-go-sidecar, opencode-go2-sidecar, ...) are internal CLI bridges
+# that expose only /usage, /health, /v1/models and /v1/chat/completions.
+# None of them speak the Responses API /input_tokens endpoint, so litellm's
+# OpenAITokenCounter.count_tokens — which always asks the vendor first —
+# burns a request and 404s; the upstream CountTokens handler logs
+# `HTTP error in CountTokens handler ... 404` once per call (the
+# evidence issue #198 cites: 96 ERROR lines in ~6h on one Claude plan).
+#
+# The patch short-circuits the call for any api_base whose hostname ends
+# in "-sidecar" (the network-alias suffix docker-compose.yml uses for
+# every `*-sidecar` service the gateway dials). Real vendor lanes
+# (api.openai.com, api.x.ai, api.z.ai, ...) do not end with "-sidecar"
+# and still get the real vendor count endpoint.
+#
+# Same PIN POLICY posture as the _format_type patch above: the anchor is
+# asserted to appear EXACTLY once, and replace() is checked for a non-
+# no-op result, so a future litellm pin that renames the function or
+# rewrites the assignment fails the build loudly here instead of
+# silently reinstating the 404 (issue #59 / #308 precedent).
+#
+# Merge-order note: open PR #206 ("fix: count_tokens 404 on CLI sidecars,
+# full-suite test isolation, smoke.py for any config") patches the same
+# anchor with a different replacement (a `_sy_urlparse(...).hostname
+# .endswith('-sidecar')` form wrapped in `try/except`). Both patches
+# preserve the anchor line, so applying both sequentially would insert
+# a second if-block right after the same assignment - at best a
+# redundant second short-circuit, at worst a broken-indent SyntaxError
+# that surfaces as a selfcheck CRITICAL on the next gateway restart.
+# Do NOT merge both: close #206 as superseded by this PR (PR #315) at
+# merge time, or rebase #206 on top and delete one of the two blocks.
+# Whichever patch survives, the anchor-uniqueness assertion here
+# means a half-applied state still fails the build loudly - but the
+# operator experience is a confusing build failure rather than a
+# targeted one.
+RUN python3 - <<'PY'
+import os, sys
+
+import litellm
+pkg_dir = os.path.dirname(litellm.__file__)
+target = os.path.join(
+    pkg_dir, "llms", "openai", "responses", "count_tokens", "token_counter.py"
+)
+if not os.path.isfile(target):
+    sys.exit(f"switchyard: expected litellm token_counter.py at {target}")
+
+with open(target, encoding="utf-8") as fh:
+    src = fh.read()
+
+# Anchor: the api_base assignment in OpenAITokenCounter.count_tokens.
+# We expect this exact line - 8-space indent included, so the count is
+# not artificially inflated by any docstring or comment that quotes the
+# same expression - to appear EXACTLY once in the file.
+anchor = "        api_base: Final = litellm_params.get(\"api_base\")"
+count = src.count(anchor)
+if count != 1:
+    sys.exit(
+        "switchyard: count_tokens.py anchor line "
+        "(api_base: Final = litellm_params.get(\"api_base\")) appeared "
+        f"{count} times, expected 1. The pinned litellm base image has "
+        "drifted past the patch; re-derive this patch against the new "
+        "litellm pin before rebuilding, per the PIN POLICY at the top "
+        "of Dockerfile.gateway."
+    )
+
+# Replacement: parse the api_base hostname and short-circuit any plan
+# whose api_base points at a `*-sidecar` service. The slicing handles
+# URLs of the form "http://claude-max-sidecar:8081/v1" — split("//")
+# takes the part after the scheme, split("/")[0] takes the host:port,
+# split(":")[0] strips the port, and endswith("-sidecar") catches every
+# docker-compose alias that runs the CLI bridge. Real vendor lanes
+# (api.openai.com, api.x.ai, api.z.ai, ...) do not end with "-sidecar"
+# and are unaffected.
+#
+# The if-condition spans two source lines (open-paren on line 1, close-
+# paren + colon on line 2) so Python's implicit continuation treats it
+# as one expression - without the parens, `api_base.split("//")` closes
+# its call at the line break and the next line starts a new statement,
+# which is a SyntaxError. The single-expression form is the only shape
+# that compiles while keeping the line break the test fixture mirrors.
+patched = (
+    anchor + "\n"
+    "        if (isinstance(api_base, str) and api_base.split(\"//\")\n"
+    "            [-1].split(\"/\")[0].split(\":\")[0].endswith(\"-sidecar\")):\n"
+    "            return None  # switchyard: *-sidecar plans have "
+    "no /v1/responses/input_tokens route; count locally (issue #198)"
+)
+new_src = src.replace(anchor, patched, 1)
+if new_src == src:
+    sys.exit(
+        "switchyard: count_tokens.py replace() returned the same source; "
+        "aborting rather than silently no-op'ing the patch."
+    )
+
+with open(target, "w", encoding="utf-8") as fh:
+    fh.write(new_src)
+print(
+    "switchyard: count_tokens.py patched (api_base endswith '-sidecar' "
+    "short-circuits to local counting; real vendor lanes unaffected)"
+)
+PY
+
 COPY switchyard /switchyard/switchyard
 COPY docker/gateway-entrypoint.sh /switchyard/entrypoint.sh
 RUN chmod +x /switchyard/entrypoint.sh
