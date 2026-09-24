@@ -386,14 +386,30 @@ elif [ "${#to_drain[@]}" -eq 0 ] && [ "$portal_needs" -eq 0 ] && [ "$gateway_nee
   echo "==> nothing to recreate — every service is up to date"
 else
   # ---- 4a. drain + recreate sidecars, unload-first ----
+  # The drain flag is a TTL'd sentinel: EX (grace + 10 minutes) so an
+  # un-trap-able SIGKILL self-heals, and an EXIT trap DELs the flag on
+  # any other exit path so a Ctrl-C or SIGTERM mid-grace doesn't strand
+  # the plan. INT/TERM are routed through `exit N` so the shell unwinds
+  # through the EXIT trap; `|| true` + `2>/dev/null` keep set -e from
+  # letting a failing DEL (redis already down) clobber the script's exit
+  # status.
+  clear_drain_flag() {
+    [ -n "${plan:-}" ] || return 0   # set -u: $plan is unset before the loop
+    docker compose exec -T redis redis-cli -n 1 DEL "sy:drain:${plan}" >/dev/null 2>&1 || true
+  }
+  trap clear_drain_flag EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   for svc in "${to_drain[@]}"; do
     plan="${plan_for_svc[$svc]}"
     echo "==> draining $svc (plan=$plan, in_flight=${score_for_svc[$svc]})"
 
     # (1) flip the picker gate. SET (not SETNX) — a previous apply that
     # died before clearing its flag should be overwritten, not left
-    # blocking traffic forever.
-    docker compose exec -T redis redis-cli -n 1 SET "sy:drain:${plan}" 1 \
+    # blocking traffic forever. The TTL covers the SIGKILL case (no
+    # trap can run): the flag expires on its own within the grace
+    # window plus ten minutes of slack.
+    docker compose exec -T redis redis-cli -n 1 SET "sy:drain:${plan}" 1 EX "$((drain_grace_secs + 600))" \
       >/dev/null
 
     # (2) hand off in-flight sessions to lane siblings. WORKSTREAM 1 must

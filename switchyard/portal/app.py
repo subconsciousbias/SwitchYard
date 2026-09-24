@@ -732,6 +732,18 @@ async def collect_capacity() -> dict:
         binding = hr.get("binding") or {}
         quota[plan.key] = {"pct_used": binding.get("pct_used"),
                            "window": binding.get("window")}
+    # Drain state is per-plan but the capacity board renders per-model rows.
+    # A drained plan's every model row needs the same chip, so we read it
+    # once per plan and merge it onto each lane row (mirrors the `quota`
+    # merge above). Two extra Redis calls per plan: ttl() on a missing key
+    # returns -2 cheaply, so an undrained plan costs two round-trips of
+    # nothing.
+    drain_by_plan: dict[str, tuple[bool, int]] = {}
+    for plan in reg.plans.values():
+        draining = await state["slots"].is_draining(plan.key)
+        drain_remaining = max(0, await state["slots"].drain_ttl(plan.key)) \
+            if draining else 0
+        drain_by_plan[plan.key] = (draining, drain_remaining)
     # Group structure for the capacity board: each lane gets a `groups` list
     # that walks `Registry.lane_nodes()` so the template can render strategy
     # tags + weights/pointer inline. Flat lanes (no Groups in the body) get
@@ -741,6 +753,10 @@ async def collect_capacity() -> dict:
     for lane in lanes:
         for row in lane["plans"]:
             row["quota"] = quota.get(row["plan"], {})
+            draining, drain_ttl = drain_by_plan.get(
+                row["plan"], (False, 0))
+            row["draining"] = draining
+            row["drain_ttl"] = drain_ttl
         lane["exhausted"] = sorted({
             row["plan"] for row in lane["plans"]
             if (row["quota"].get("pct_used") or 0) >= 100 and not row["tail"]})
@@ -776,6 +792,8 @@ async def collect_plans() -> list[dict]:
             d["prompt_tokens"] + d["completion_tokens"] for d in series if d["day"].startswith(month)
         )
         cooled, ttl, reason = await slots.cooldown_state(plan.key)
+        draining = await slots.is_draining(plan.key)
+        drain_remaining = max(0, await slots.drain_ttl(plan.key)) if draining else 0
         in_flight = await slots.in_flight(plan.key)
         facts = await ledger.quota_facts(plan.key)
         capacity = await policy.effective(plan)
@@ -909,6 +927,8 @@ async def collect_plans() -> list[dict]:
             "cooled": cooled,
             "cooldown_remaining": ttl,
             "cooldown_reason": reason,
+            "draining": draining,
+            "drain_ttl": drain_remaining,
             "alerting": alerting,
             "lanes": lanes_used_in,
             "series": series[-14:],
@@ -956,6 +976,7 @@ async def api_state() -> dict:
                 "days_left": r["plan"].days_left,
                 "cap": r["plan"].max_parallel, "in_flight": r["in_flight"],
                 "cooled": r["cooled"], "cooldown_reason": r["cooldown_reason"],
+                "draining": r["draining"], "drain_ttl": r["drain_ttl"],
                 "quota": r["headroom"],
                 "effective_cap": r["capacity"].cap,
                 "learned_cap": r["capacity"].learned,

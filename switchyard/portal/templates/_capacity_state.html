@@ -1,13 +1,19 @@
 {# State badge cell for a single row. Expects `p` (a per-model dict).
 
    The chip ladder, in priority order:
-     1. `cooled` -- the plan is under an active cooldown (red `bad` tag).
-     2. transient streak >= streak_alert -- escalated-cooldown ladder
+     1. `draining` -- apply.sh has set the drain gate; the picker is
+        skipping this plan until the TTL expires (yellow `warn` tag).
+        Renders ABOVE `cooled` because a drained plan is *also* cooled
+        from the picker's point of view, and the operator's question
+        is "what does apply.sh need from me" -- which is "wait, or
+        re-run" -- not "what cooldown reason to read".
+     2. `cooled` -- the plan is under an active cooldown (red `bad` tag).
+     3. transient streak >= streak_alert -- escalated-cooldown ladder
         tripped, but the plan still accepts work (yellow `warn` tag).
-     3. cap == 0 -- the row advertises no slots; the chip shows WHY
+     4. cap == 0 -- the row advertises no slots; the chip shows WHY
         (e.g. "tail disabled (pacing)" or "paced to 0 of 4"). This is
         where the smoke.py grep `tail disabled (pacing)` matches.
-     4. otherwise: in_flight / cap + a possible `cap_reason` chip if the
+     5. otherwise: in_flight / cap + a possible `cap_reason` chip if the
         cap diverged from cap_configured for an external reason (spend,
         learning), plus a days_left tag if the plan expires soon.
 
@@ -23,7 +29,13 @@
    they carry information the title alone wouldn't — with visible text
    truncated to 24 chars and the full reason kept in the `title`
    attribute. #}
-{% if p.cooled %}
+{% if p.draining|default(false) %}
+  {# Minutes form to match the adjacent cooldown chip (`Xm`) — drain TTL
+     is bounded by grace + 600s (≥ 10 min for any sane grace), so seconds
+     just reads as a noisier number than its neighbour chip. The // 60
+     floor matches the cooldown convention: operator sees floor, not raw. #}
+  <div style="margin-bottom:3px"><span class="tag warn" title="apply.sh drain gate set — picker is skipping this plan; self-expires via TTL">draining · {{ (p.drain_ttl // 60) }}m</span></div>
+{% elif p.cooled %}
   <div style="margin-bottom:3px"><span class="tag bad">{{ p.cooldown_reason.replace('_',' ') }} · {{ (p.cooldown_remaining // 60) }}m</span></div>
 {% elif p.transient_streak and p.transient_streak >= (p.streak_alert or 3) %}
   {# Distinct from `cooled`: this plan is on the ladder but still

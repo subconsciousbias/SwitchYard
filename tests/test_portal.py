@@ -1362,6 +1362,122 @@ def test_allowlist_normalises_uppercase_bare_hostname_entries():
             os.environ["PORTAL_ALLOWED_ORIGINS"] = saved_origins
 
 
+def test_capacity_row_shows_draining_chip_and_api_state_reflects_it():
+    """The board chip and /api/state agree on a drained plan.
+
+    apply.sh sets the drain gate before migrating a plan; an interrupted
+    apply.sh previously left the gate set forever. The board now exposes
+    the gate as a "draining · Nm" warn chip so the operator can see the
+    self-healing TTL counting down, and /api/state carries the same
+    `draining`/`drain_ttl` fields so a CLI or dashboard reading the JSON
+    does not have to scrape the fragment HTML.
+
+    The test pins both surfaces against the FakeRedis the portal is built
+    against: SET the drain key (importing K_DRAIN so the test does not
+    hardcode the key shape — that would silently break if the prefix
+    changes), then assert the chip is on the capacity fragment AND
+    /api/state reports it; then DEL the key and assert both surfaces
+    flip back to "not draining". A drained plan without a TTL would
+    surface as `drain_ttl: 0` (the `max(0, ttl)` clamp) and the chip
+    would still read "draining · 0m" — what we are NOT pinning is
+    distinguishability of TTL -1 from TTL -2; that is for a future caller
+    that cares.
+    """
+    import asyncio
+    from switchyard.slots import K_DRAIN
+
+    with _make_client() as client:
+        # The portal's startup event populates `portal_app.state` with the
+        # registry, slot table, etc. against the FakeRedis that this test
+        # module patched in. Look up the plans here, inside the context
+        # manager — assertions outside it hit a state that was never built.
+        plan = portal_app.state["registry"].plans["minimax-ultra"]
+        drain_key = K_DRAIN.format(plan=plan.key)
+
+        # SET the drain gate with a TTL via the FakeRedis that backs the
+        # portal. The async call goes through asyncio.run so the test
+        # itself stays sync; the FakeRedis `set(..., ex=...)` writes both
+        # the string and `_expiries`, and `ttl()` then returns the
+        # remaining seconds — the exact contract the production code
+        # reads against.
+        asyncio.run(_FAKE_REDIS.set(drain_key, "1", ex=300))
+        try:
+            # /fragments/capacity: the drained plan's row must show the
+            # chip with a numeric minutes value. The chip is `warn` (yellow),
+            # not `bad` (red), because the state is temporary and
+            # self-healing — see the chip ladder comment in
+            # _capacity_state.html for the priority reasoning.
+            html = client.get("/fragments/capacity").text
+            trs = trs_for(html)
+            row = row_with_ref(trs, plan.key, "m3")
+            assert row is not None, "minimax-ultra/m3 row missing"
+            # The chip text always carries `draining ·` followed by a
+            # numeric `Nm`. Match the prefix and the shape; the exact
+            # minute value depends on how much wall-clock has elapsed
+            # since the SET, so we only assert it is an integer ≥ 0.
+            assert "draining ·" in row, row
+            chip_match = re.search(
+                r"draining · (\d+)m</span>", row)
+            assert chip_match is not None, row
+            chip_minutes = int(chip_match.group(1))
+            assert 0 <= chip_minutes <= 5, chip_minutes
+            # Warn class, not bad: this is the operator-facing distinction
+            # between "needs human attention" (cooldown) and "self-healing,
+            # wait or re-run" (drain).
+            assert 'class="tag warn"' in row, row
+            assert 'class="tag bad"' not in row, row
+
+            # /api/state: the JSON mirrors the board. Every plan entry
+            # carries `draining` (bool) and `drain_ttl` (int ≥ 0) so a
+            # client of the API can surface the same gate state without
+            # scraping the fragment.
+            state = client.get("/api/state").json()
+            entry = next(p for p in state["plans"]
+                         if p["key"] == plan.key)
+            assert entry["draining"] is True, entry
+            assert isinstance(entry["drain_ttl"], int), entry
+            assert 0 <= entry["drain_ttl"] <= 300, entry
+
+            # Drain a different plan and assert the test pin is
+            # plan-specific: the chip appears on the row we drained and
+            # not on rows of plans we did not touch.
+            other = portal_app.state["registry"].plans["local-box"]
+            asyncio.run(_FAKE_REDIS.set(K_DRAIN.format(plan=other.key),
+                                        "1", ex=60))
+            try:
+                html2 = client.get("/fragments/capacity").text
+                trs2 = trs_for(html2)
+                ultra_row = row_with_ref(trs2, plan.key, "m3")
+                gemma_row = row_with_ref(trs2, other.key, "gemma")
+                assert "draining ·" in ultra_row, ultra_row
+                assert "draining ·" in gemma_row, gemma_row
+                # An undrained plan must NOT carry the chip — pinning
+                # that the read path doesn't accidentally light up
+                # every row.
+                state2 = client.get("/api/state").json()
+                clean_entry = next(
+                    p for p in state2["plans"]
+                    if p["key"] not in (plan.key, other.key)
+                    and not p["draining"])
+                assert clean_entry["draining"] is False
+                assert clean_entry["drain_ttl"] == 0
+            finally:
+                asyncio.run(_FAKE_REDIS.delete(K_DRAIN.format(
+                    plan=other.key)))
+        finally:
+            asyncio.run(_FAKE_REDIS.delete(drain_key))
+
+        # After DEL the gate is gone: the chip disappears, /api/state
+        # reports `draining: False` and `drain_ttl: 0`.
+        html = client.get("/fragments/capacity").text
+        assert "draining ·" not in html, html
+        state = client.get("/api/state").json()
+        entry = next(p for p in state["plans"]
+                     if p["key"] == plan.key)
+        assert entry["draining"] is False, entry
+        assert entry["drain_ttl"] == 0, entry
+
+
 # ============================================================================
 # Issue: GLM probe needs GLM_API_KEY in portal env, not a cookie.
 #

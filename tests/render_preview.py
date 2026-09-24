@@ -70,6 +70,19 @@ def fixture(reg):
                 "in_flight": min(cap, 1), "cooled": i == 1,
                 "cooldown_remaining": 540,
                 "cooldown_reason": "quota_exhausted" if i == 1 else "",
+                # Drain gate: apply.sh sets EX (grace + 600) on the gate,
+                # so the rendered TTL on a fresh gate is 720 for the
+                # default grace of 120. Mirroring `cooled: i == 1` lights
+                # up the new chip branch in this preview; the priority
+                # ladder at _capacity_state.html:32 means row 1 renders
+                # the drain chip (not the cooldown chip), exactly as the
+                # live page does when both gates are set, and the rest of
+                # the rows confirm `draining=False` produces no chip.
+                # The `max(0, ttl)` clamp at app.py:744 makes drain_ttl
+                # never negative; the numeric fixture value is what
+                # passes through `// 60` in the chip text.
+                "draining": i == 1,
+                "drain_ttl": 720 if i == 1 else 0,
                 "tail": reg.is_tail(key, model.ref), "days_left": plan.days_left,
                 "shares_plan_with": [m.key for m in reg.siblings(model)],
                 "cli_backed": plan.is_cli_backed,

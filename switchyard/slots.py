@@ -406,6 +406,20 @@ class SlotTable:
     async def is_draining(self, plan: str) -> bool:
         return bool(await self.redis.get(K_DRAIN.format(plan=plan)))
 
+    async def drain_ttl(self, plan: str) -> int:
+        """Seconds left on the drain gate, or -2 if the gate is gone.
+
+        Real Redis semantics: -2 = key missing, -1 = key has no TTL, N = seconds
+        remaining. The board clamps via `max(0, ttl)` so -2 / -1 collapse to a
+        non-positive number the caller can treat as "not draining"; this method
+        surfaces the raw value so a future caller that wants to distinguish
+        "expired this instant" (-1 still, until the next GET) from "never had a
+        TTL" (-1 from the start) can do so without a second round-trip. Mirrors
+        `cooldown_state` which already returns the raw ttl alongside the
+        `(cooled, remaining)` tuple.
+        """
+        return int(await self.redis.ttl(K_DRAIN.format(plan=plan)))
+
     async def sessions_on_plan(self, plan: str) -> list[str]:
         """Session ids currently leased to a ref on `plan`, in SET order.
 
