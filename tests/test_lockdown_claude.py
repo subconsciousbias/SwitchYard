@@ -303,6 +303,86 @@ def test_claude_web_request_offers_only_websearch_and_webfetch():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_claude_json_schema_returns_the_structured_output():
+    """`--json-schema` (cli_bridge.schema_args) gives the model a
+    StructuredOutput tool; a model that answers in prose first is sent
+    back, which only works because the later `--max-turns 3` overrides the
+    text path's `--max-turns 1`. The result is the tool's JSON."""
+    try:
+        claude = _pinned_clis.require("claude")
+    except _pinned_clis.Skip as why:
+        print(f"  skipped: {why}")
+        return
+    cb = server.cli_bridge
+    root = Path(tempfile.mkdtemp(prefix="lockdown-claude-schema-"))
+    _login_dir(root)
+    schema = {"type": "object", "properties": {"answer": {"type": "integer"}},
+              "required": ["answer"], "additionalProperties": False}
+    fmt = cb.response_schema({"response_format": {"type": "json_schema", "json_schema": {
+        "name": "sum", "schema": schema}}})
+    saved = (cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE)
+    try:
+        cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE = ("claude", cb.PROFILES["claude"], claude, True)
+        argv, _ = cb.build_argv("What is 2+3?", None, "claude-sonnet-5")
+        assert argv[argv.index("--max-turns") + 1] == "1", argv
+        script = [{"text": "It is 5."}, {"tool": "StructuredOutput", "input": {"answer": 5}}]
+        with cb.schema_args(fmt) as extra, _fake_model.FakeModel(script) as fake:
+            done = _run(argv + extra, fake, root, root)
+        assert done.returncode == 0, (done.stderr[-500:], done.stdout[-500:])
+        payload = cb.parse_output(done.stdout, "claude_json")
+        assert json.loads(payload["result"]) == {"answer": 5}, payload.get("result")
+        offered = {tuple(_fake_model.advertised_tools(r["body"])) for r in fake.tool_requests()}
+        assert offered == {("StructuredOutput",)}, offered
+        _assert_relay_stays_out(fake)
+        print("  claude --json-schema: prose answer sent back, StructuredOutput JSON returned")
+    finally:
+        cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE = saved
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_claude_json_schema_with_inline_media():
+    """Media ride stream-json stdin (claude_media_stdin); --json-schema on the
+    same argv must still see the image and return StructuredOutput's JSON,
+    which is what lets native_schema enforce claude schemas with media."""
+    try:
+        claude = _pinned_clis.require("claude")
+    except _pinned_clis.Skip as why:
+        print(f"  skipped: {why}")
+        return
+    import shutil
+    cb = server.cli_bridge
+    root = Path(tempfile.mkdtemp(prefix="lockdown-claude-schema-media-"))
+    _login_dir(root)
+    stage = root / "swimg-test" / "img"
+    stage.mkdir(parents=True)
+    (stage / "01.png").write_bytes(PNG_MAGENTA)
+    schema = {"type": "object", "properties": {"colour": {"type": "string"}},
+              "required": ["colour"], "additionalProperties": False}
+    fmt = cb.response_schema({"response_format": {"type": "json_schema", "json_schema": {
+        "name": "c", "schema": schema}}})
+    saved = (cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE)
+    try:
+        cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE = ("claude", cb.PROFILES["claude"], claude, True)
+        assert cb.native_schema(fmt, images=True)
+        argv, stdin_data = cb.build_argv("what colour?", None, "claude-sonnet-5",
+                                         image_paths=[stage / "01.png"])
+        script = [{"text": "Magenta."}, {"tool": "StructuredOutput", "input": {"colour": "magenta"}}]
+        with cb.schema_args(fmt) as extra, _fake_model.FakeModel(script) as fake:
+            done = _run(argv + extra, fake, root, root, stdin_data)
+        assert done.returncode == 0, (done.stderr[-500:], done.stdout[-500:])
+        payload = cb.parse_output(done.stdout, "claude_json")
+        assert json.loads(payload["result"]) == {"colour": "magenta"}, payload.get("result")
+        assert _media_blocks(fake)[:1] == [("image", "image/png")], _media_blocks(fake)
+        offered = {tuple(_fake_model.advertised_tools(r["body"])) for r in fake.tool_requests()}
+        assert offered == {("StructuredOutput",)}, offered
+        _assert_relay_stays_out(fake)
+        print("  claude --json-schema + stream-json media: image seen, StructuredOutput JSON returned")
+    finally:
+        cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

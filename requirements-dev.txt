@@ -25,3 +25,7 @@ pytest>=8.4,<9
 ruff>=0.6
 hypothesis>=6.100
 litellm>=1.101.0,<2
+# jsonschema: the sidecars validate response_format answers with it
+# (Dockerfile.sidecar installs it); pinned here so the tests do not rely on
+# litellm pulling it in.
+jsonschema>=4.17,<5

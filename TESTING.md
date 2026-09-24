@@ -741,6 +741,27 @@ image and PDF in a tool result, requested web search, structured output,
 `n`, `stop`, a streamed tool call, an unsupported server-side tool, and the
 Responses API in both the SDK's and Codex's shape.
 
+### 4k. Request parameters no CLI has a flag for
+
+`stop`, `n` and `response_format` used to come back as a 200 that ignored
+them. Each is now executed or refused (tests/test_request_params.py; the
+native flags are proven on the pinned CLIs in tests/test_lockdown_*.py):
+
+| parameter | text path | tool path |
+|---|---|---|
+| `stop` | applied to the finished text | applied to the final answer |
+| `n` (1-8) | n runs, one after another | `400` (a tool loop cannot fork) |
+| `response_format` | claude `--json-schema`; codex `--output-schema` (strict schemas); otherwise an instruction. Validated either way: a mismatch is `502 structured_output_invalid` | instruction + validation |
+
+```bash
+curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H 'Content-Type: application/json' -d '{"model":"forge","n":2,"stop":["STOPHERE"],
+  "messages":[{"role":"user","content":"Repeat exactly: alpha STOPHERE gamma"}]}' \
+  | python3 -c 'import json,sys; print([c["message"]["content"] for c in json.load(sys.stdin)["choices"]])'
+```
+
+**Expect** two choices, neither containing `gamma`.
+
 ## 5. Behaviour tests
 
 ### 5a. Ordered fill and total capacity

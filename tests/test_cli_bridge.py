@@ -1039,7 +1039,8 @@ def test_web_only_tools_are_not_refused_on_the_text_path():
     import asyncio
     seen = {}
 
-    async def fake_invoke(prompt, system, model, image_paths=None, *, web=False, effort=None):
+    async def fake_invoke(prompt, system, model, image_paths=None, fmt=None, *,
+                          web=False, effort=None):
         seen["web"] = web
         return {"result": "found it", "usage": {}}
 

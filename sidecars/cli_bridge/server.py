@@ -74,6 +74,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import jsonschema
 import yaml
 
 log = logging.getLogger("cli_bridge")
@@ -1139,14 +1140,17 @@ _warmup_lock = asyncio.Lock()
 
 
 async def invoke(prompt: str, system: str | None, model: str | None,
-                image_paths: list[Path] | None = None, *, web: bool = False,
+                image_paths: list[Path] | None = None,
+                fmt: dict | None = None, *, web: bool = False,
                 effort: str | None = None) -> dict:
     if _warm.is_set():
-        return await run_cli(prompt, system, model, image_paths, web=web, effort=effort)
+        return await run_cli(prompt, system, model, image_paths, fmt, web=web, effort=effort)
     async with _warmup_lock:
         if _warm.is_set():                     # someone warmed it while we waited
-            return await run_cli(prompt, system, model, image_paths, web=web, effort=effort)
-        payload = await run_cli(prompt, system, model, image_paths, web=web, effort=effort)
+            return await run_cli(prompt, system, model, image_paths, fmt,
+                                 web=web, effort=effort)
+        payload = await run_cli(prompt, system, model, image_paths, fmt,
+                                web=web, effort=effort)
         _warm.set()
         log.info("%s: first call succeeded, releasing full concurrency", PROVIDER)
         return payload
@@ -1726,6 +1730,195 @@ def enforce_max_tokens(payload: dict, max_tokens: int | None) -> tuple[dict, str
     return payload, "length"
 
 
+# ---------------------------------------------------------- request params ---
+# OpenAI parameters no CLI has a flag for used to be dropped without a word:
+# `stop` came back unapplied, `n: 2` came back as one choice, and a
+# `response_format` schema came back as prose (the #264 conformance matrix).
+# A 200 that ignored what the caller asked for is the one failure the router
+# cannot spill on, so each is now either executed or refused:
+#   stop            -- applied to the finished text (the CLI generates the
+#                      whole answer; the caller sees the same prefix it
+#                      would have got, and pays for what the CLI produced).
+#   n               -- fanned out as n independent runs on the text path;
+#                      refused on the tool path, where a tool loop is one
+#                      conversation that cannot fork.
+#   response_format -- native where the CLI has it (claude --json-schema,
+#                      codex --output-schema for strict schemas), an explicit
+#                      instruction elsewhere, and validated either way: an
+#                      answer that does not match is a 502, never a 200.
+MAX_N = 8
+
+
+def request_n(body: dict) -> int:
+    n = body.get("n")
+    if n is None:
+        return 1
+    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= MAX_N:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": f"n must be an integer from 1 to {MAX_N} on this lane",
+            "type": "invalid_request_error", "param": "n"}})
+    return n
+
+
+def response_schema(body: dict) -> dict | None:
+    """The caller's `response_format` as {"schema", "strict", "json_object"},
+    or None for free text. Anything else -- an unknown type, a typeless or
+    non-object value -- is refused, not ignored."""
+    fmt = body.get("response_format")
+    if fmt is None or (isinstance(fmt, dict) and fmt.get("type") == "text"):
+        return None
+    if not isinstance(fmt, dict):
+        fmt = {"type": type(fmt).__name__}
+    if fmt.get("type") == "json_object":
+        return {"schema": {"type": "object"}, "strict": False, "json_object": True}
+    spec = fmt.get("json_schema") if isinstance(fmt.get("json_schema"), dict) else {}
+    if fmt.get("type") == "json_schema" and isinstance(spec.get("schema"), dict):
+        try:
+            jsonschema.validators.validator_for(spec["schema"]).check_schema(spec["schema"])
+        except jsonschema.SchemaError as exc:
+            raise HTTPException(status_code=400, detail={"error": {
+                "message": f"response_format schema is not a valid JSON Schema: {exc.message}",
+                "type": "invalid_request_error", "param": "response_format"}}) from exc
+        return {"schema": spec["schema"], "strict": bool(spec.get("strict")),
+                "json_object": False}
+    raise HTTPException(status_code=400, detail={"error": {
+        "message": f"response_format {fmt.get('type')!r} is not supported on this lane",
+        "type": "invalid_request_error", "param": "response_format"}})
+
+
+def native_schema(fmt: dict | None, images: bool = False) -> bool:
+    """Whether this CLI enforces the schema itself (see schema_args).
+
+    `images` no longer matters: claude's media ride stream-json stdin on the
+    ordinary text-path argv, and --json-schema alongside them is proven on
+    the pinned CLI (test_lockdown_claude). Kept for callers' signatures."""
+    if not fmt or fmt["json_object"]:
+        return False
+    if PROVIDER == "claude":
+        return True
+    return PROVIDER == "codex" and fmt["strict"]
+
+
+def validate_stop(body: dict) -> None:
+    """`stop` is a string or a list of strings; anything else is a 400
+    before the CLI runs, not a TypeError after the quota is spent."""
+    stop = body.get("stop")
+    if stop is None or isinstance(stop, str) or (
+            isinstance(stop, list) and all(isinstance(s, str) for s in stop)):
+        return
+    raise HTTPException(status_code=400, detail={"error": {
+        "message": "stop must be a string or a list of strings",
+        "type": "invalid_request_error", "param": "stop"}})
+
+
+def schema_instruction(fmt: dict | None, native: bool) -> str:
+    """The prompt line for a schema the CLI is not enforcing itself."""
+    if not fmt or native:
+        return ""
+    if fmt["json_object"]:
+        return ("Respond with only a single JSON object: no prose before or "
+                "after it, no code fences.")
+    return ("Respond with only a JSON value that validates against this JSON "
+            "Schema: no prose before or after it, no code fences.\n"
+            + json.dumps(fmt["schema"]))
+
+
+@contextlib.contextmanager
+def schema_args(fmt: dict | None, web: bool = False):
+    """The argv fragment that makes the CLI enforce the schema natively.
+
+    claude `--json-schema` gives the model a StructuredOutput tool and
+    returns its input as the result (verified on the pinned 2.1.278); a
+    model that answers in text first is sent back once, so it needs a turn
+    more than the text path's one. codex `--output-schema FILE` becomes the
+    API's strict `text.format` json_schema, which the API rejects unless the
+    schema is strict-shaped -- so only a caller-declared strict schema goes
+    that way; anything else gets the instruction and the validation.
+
+    The later `--max-turns` wins, so with `web` it must keep claude_web_args'
+    search-and-answer turns and still add the StructuredOutput retry."""
+    if not native_schema(fmt):
+        yield []
+        return
+    if PROVIDER == "claude":
+        yield ["--json-schema", json.dumps(fmt["schema"]), "--max-turns", "5" if web else "3"]
+        return
+    fd, path = tempfile.mkstemp(prefix="sy-schema-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(fmt["schema"], fh)
+        yield ["--output-schema", path]
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def conform_structured(text: str, fmt: dict) -> str:
+    """The answer as schema-valid JSON text, or a 502 the router can spill on."""
+    body = text.strip()
+    fenced = re.fullmatch(r"```[\w+-]*\s*(.*?)\s*```", body, re.S)
+    if fenced:
+        body = fenced.group(1)
+    try:
+        value = json.loads(body)
+        if fmt["json_object"] and not isinstance(value, dict):
+            raise ValueError("not a JSON object")
+        jsonschema.validate(value, fmt["schema"])
+    except (ValueError, jsonschema.ValidationError) as exc:
+        reason = exc.message if isinstance(exc, jsonschema.ValidationError) else str(exc)
+        raise HTTPException(status_code=502, detail={"error": {
+            "message": f"{PROVIDER} answer does not match response_format: {reason[:200]}",
+            "type": "structured_output_invalid"}}) from exc
+    return body
+
+
+def apply_stop(text: str, stop) -> tuple[str, bool]:
+    """Cut the text at the first stop sequence; report whether one hit."""
+    stops = [stop] if isinstance(stop, str) else \
+        [s for s in stop or [] if isinstance(s, str)]
+    hits = [i for i in (text.find(s) for s in stops if s) if i >= 0]
+    return (text[:min(hits)], True) if hits else (text, False)
+
+
+def finish_completion(result: dict, body: dict) -> dict:
+    """Apply `stop` and `response_format` to a finished completion (both
+    bridges, every choice). A tool-call turn passes untouched. An answer cut
+    short -- by the token cap or by the caller's own stop sequence -- is
+    not expected to validate, so only a complete answer is checked. A stop
+    hit inside a `length` cut reports "stop": the model reached the stop
+    sequence before the cap, which is where the real API would have ended."""
+    fmt = response_schema(body)
+    for choice in result.get("choices") or []:
+        message = choice.get("message") or {}
+        if choice.get("finish_reason") == "tool_calls" or message.get("tool_calls"):
+            continue
+        cut = choice.get("finish_reason") == "length"
+        text, stopped = apply_stop(message.get("content") or "", body.get("stop"))
+        if stopped:
+            choice["finish_reason"] = "stop"
+        if fmt and not (cut or stopped):
+            text = conform_structured(text, fmt)
+        message["content"] = text
+    return result
+
+
+def merge_completions(results: list[dict]) -> dict:
+    """n independent runs as one n-choice completion, usage summed."""
+    merged = dict(results[0])
+    merged["choices"] = [{**r["choices"][0], "index": i} for i, r in enumerate(results)]
+    usage: dict = {}
+    for r in results:
+        for key, value in (r.get("usage") or {}).items():
+            if isinstance(value, dict):
+                inner = usage.setdefault(key, {})
+                for k, v in value.items():
+                    inner[k] = inner.get(k, 0) + (v or 0)
+            elif isinstance(value, (int, float)):
+                usage[key] = usage.get(key, 0) + value
+    merged["usage"] = usage
+    return merged
+
+
 @contextlib.contextmanager
 def instructions_file(system: str | None):
     """Yield the argv fragment that overrides this CLI's base instructions.
@@ -1830,17 +2023,20 @@ def system_prompt_file(system: str | None):
 
 
 async def run_cli(prompt: str, system: str | None, model: str | None = None,
-                image_paths: list[Path] | None = None, *, web: bool = False,
+                image_paths: list[Path] | None = None,
+                fmt: dict | None = None, *, web: bool = False,
                 effort: str | None = None) -> dict:
     prompt, system = fold_system(prompt, system)
-    with instructions_file(system) as (extra_args, system):
-        with system_prompt_file(system) as (sys_args, system):
-            # When system_prompt_file wrote a temp file it None's `system`,
-            # which short-circuits build_argv's inline --system-prompt branch
-            # and the matching replace_extra_args one — the file path now
-            # carries the same content, with the same extras appended above.
-            return await _run_cli(prompt, system, model, extra_args + sys_args,
-                                  image_paths, web=web, effort=effort)
+    with instructions_file(system) as (extra_args, system), \
+            system_prompt_file(system) as (sys_args, system), \
+            schema_args(fmt, web=web) as fmt_args:
+        # When system_prompt_file wrote a temp file it None's `system`,
+        # which short-circuits build_argv's inline --system-prompt branch
+        # and the matching replace_extra_args one — the file path now
+        # carries the same content, with the same extras appended above.
+        return await _run_cli(prompt, system, model,
+                              extra_args + sys_args + fmt_args, image_paths,
+                              web=web, effort=effort)
 
 
 async def _run_cli(prompt: str, system: str | None, model: str | None,
@@ -2299,24 +2495,27 @@ async def sse_from_completion(result: dict, model: str):
     against a bridged plan sees an empty message and no finish_reason it
     recognises.
     """
-    choice = (result.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
+    choices = result.get("choices") or [{}]
     base = {"id": result.get("id"), "object": "chat.completion.chunk",
             "created": result.get("created"), "model": model}
 
-    first = {"role": "assistant"}
-    if message.get("content"):
-        first["content"] = message["content"]
-    if message.get("tool_calls"):
-        first["tool_calls"] = [
-            {"index": i, "id": call.get("id"), "type": call.get("type", "function"),
-             "function": call.get("function", {})}
-            for i, call in enumerate(message["tool_calls"])]
-    yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': first, 'finish_reason': None}]})}\n\n"
+    for choice in choices:
+        message = choice.get("message") or {}
+        first = {"role": "assistant"}
+        if message.get("content"):
+            first["content"] = message["content"]
+        if message.get("tool_calls"):
+            first["tool_calls"] = [
+                {"index": i, "id": call.get("id"), "type": call.get("type", "function"),
+                 "function": call.get("function", {})}
+                for i, call in enumerate(message["tool_calls"])]
+        index = choice.get("index", 0)
+        yield f"data: {json.dumps({**base, 'choices': [{'index': index, 'delta': first, 'finish_reason': None}]})}\n\n"
 
     done = {**base,
-            "choices": [{"index": 0, "delta": {},
-                          "finish_reason": choice.get("finish_reason") or "stop"}],
+            "choices": [{"index": choice.get("index", 0), "delta": {},
+                          "finish_reason": choice.get("finish_reason") or "stop"}
+                         for choice in choices],
             "usage": result.get("usage")}
     yield f"data: {json.dumps(done)}\n\n"
     yield "data: [DONE]\n\n"
@@ -2419,7 +2618,26 @@ async def _handle_chat(body: dict):
     config, same error classification, not a re-implementation of any of it.
     That identity is what "no regression on the text path" means here: there
     is only one code path for it, whichever sidecar is asking.
+
+    `n` > 1 runs `_complete` n times one after another -- each takes and
+    releases its own gate slot, so a lane with concurrency 1 serves it too
+    and it never 429s against itself; `stop` and `response_format` are
+    applied to the finished answer (finish_completion). Both are checked
+    before anything spawns.
     """
+    n = request_n(body)
+    validate_stop(body)
+    response_schema(body)
+    result = merge_completions([await _complete(body) for _ in range(n)])
+    result = finish_completion(result, body)
+    if not body.get("stream"):
+        return result
+    return StreamingResponse(sse_from_completion(result, result.get("model") or ""),
+                             media_type="text/event-stream")
+
+
+async def _complete(body: dict) -> dict:
+    """One CLI run for a text-only request, as a non-streamed completion."""
     # Refuse max_tokens on lanes that cannot honor it honestly (issue #70).
     # Placed BEFORE the tools_refusal block: a request carrying both max_tokens
     # AND tools should report the more specific max_tokens reason rather than a
@@ -2477,6 +2695,10 @@ async def _handle_chat(body: dict):
             # The prompt is what makes the model LOOK at the staged files: the
             # markers on their own are just decoration.
             prompt += image_note(image_paths)
+        fmt = response_schema(body)
+        native = native_schema(fmt, images=bool(image_paths))
+        if schema_instruction(fmt, native):
+            prompt += "\n\n" + schema_instruction(fmt, native)
         model, warning = resolve_model(body.get("model"))
         if warning:
             # Loud, because silently running a weaker model than the lane asked for
@@ -2560,7 +2782,8 @@ async def _handle_chat(body: dict):
                                 detail=f"sidecar at capacity ({limit})",
                                 headers={"Retry-After": "5"})
         try:
-            payload = await invoke(prompt, system, model, image_paths or None, web=web,
+            payload = await invoke(prompt, system, model, image_paths or None,
+                                   fmt if native else None, web=web,
                                    effort=request_effort(body))
         finally:
             await _gate.release()
@@ -2573,11 +2796,7 @@ async def _handle_chat(body: dict):
         # fresh-request dirs. Stage failed before we get here in that case.
         if img_dir is not None:
             shutil.rmtree(img_dir, ignore_errors=True)
-
-    if not body.get("stream"):
-        return result
-    return StreamingResponse(sse_from_completion(result, model),
-                             media_type="text/event-stream")
+    return result
 
 
 @app.post("/v1/chat/completions")

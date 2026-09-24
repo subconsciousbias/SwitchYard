@@ -61,7 +61,7 @@ COPY switchyard/models.py /app/switchyard/models.py
 COPY sidecars/cli_bridge/harness /app/harness
 RUN cp /app/harness/opencode.json /app/opencode.json
 RUN pip install --no-cache-dir --break-system-packages \
-      fastapi "uvicorn[standard]" pyyaml
+      fastapi "uvicorn[standard]" pyyaml jsonschema
 # Build-time assertion: the COPY above lands switchyard/models.py in the
 # image; an edit that drops the COPY (or a copy of the wrong file) would
 # silently turn caller_environment config into None on every request. The

@@ -798,6 +798,9 @@ def fit_tool_surface(mcp_tools: list[dict], system: str | None,
       * `tool_choice` has no CLI flag, so it becomes an explicit
         instruction for this turn. That is advisory: the CLI cannot force
         or forbid a call the way the API parameter does.
+      * `response_format` becomes an instruction for the final answer,
+        which cli_bridge.finish_completion then validates (no native flag
+        here: claude's --json-schema would add a tool of its own).
     """
     qualify = PROFILE["tool_qualifier"]
     limit = DESCRIPTION_LIMITS.get(PROVIDER)
@@ -831,6 +834,9 @@ def fit_tool_surface(mcp_tools: list[dict], system: str | None,
         name = (choice.get("function") or {}).get("name") or choice.get("name")
         if name:
             notes.append(f"For this turn, you must call the tool `{qualify(name)}`.")
+    fmt_note = cli_bridge.schema_instruction(cli_bridge.response_schema(body), native=False)
+    if fmt_note:
+        notes.append(f"When you give your final answer (not a tool call): {fmt_note}")
     extra = "\n\n".join(notes + overflow)
     if extra:
         system = f"{system}\n\n{extra}" if system else extra
@@ -2694,7 +2700,17 @@ async def chat(request: Request):
         # That path already frames a streamed reply.
         return await cli_bridge._handle_chat(body)
 
-    result = await handle_tool_request(body, tools, request)
+    # A tool loop is one conversation parked between turns: it cannot fork
+    # into n. Refused before any session or probe, like a bad schema.
+    if cli_bridge.request_n(body) > 1:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "n > 1 with tools cannot be served by a CLI-backed plan: "
+                       "a tool loop is one conversation",
+            "type": "invalid_request_error", "param": "n"}})
+    cli_bridge.validate_stop(body)
+    cli_bridge.response_schema(body)
+    result = cli_bridge.finish_completion(
+        await handle_tool_request(body, tools, request), body)
     if not body.get("stream"):
         return result
     # A caller that asked for SSE and got a JSON body does not error -- it waits

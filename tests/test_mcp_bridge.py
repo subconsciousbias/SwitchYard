@@ -920,6 +920,60 @@ def test_tool_less_request_without_our_call_ids_stays_on_the_text_path():
     print("  plain chat and foreign tool ids still take the text path")
 
 
+def test_tool_path_request_params_refused_or_applied():
+    """On the tool path `n` > 1 is refused before anything spawns (a tool
+    loop is one conversation), a bad response_format too; the final turn
+    gets `stop` and the schema check, a tool_calls turn passes untouched;
+    and the schema reaches the inner model as an instruction."""
+    from fastapi import HTTPException
+    tools = [{"type": "function", "function": {"name": "x", "parameters": {
+        "type": "object", "properties": {}}}}]
+    base = {"model": "m", "tools": tools, "messages": [{"role": "user", "content": "hi"}]}
+    handled = []
+    answers = iter([
+        {"choices": [{"index": 0, "finish_reason": "stop",
+                      "message": {"role": "assistant", "content": "alpha STOP beta"}}]},
+        {"choices": [{"index": 0, "finish_reason": "tool_calls",
+                      "message": {"role": "assistant", "content": None, "tool_calls": [
+                          {"id": "c1", "type": "function",
+                           "function": {"name": "x", "arguments": "{}"}}]}}]},
+        {"choices": [{"index": 0, "finish_reason": "stop",
+                      "message": {"role": "assistant", "content": "It is 5."}}]}])
+
+    async def fake_tool_request(body, tools, request=None):
+        handled.append(body)
+        return next(answers)
+
+    real = server.handle_tool_request
+    server.handle_tool_request = fake_tool_request
+    try:
+        for bad in ({"n": 2}, {"response_format": {"type": "grammar"}}):
+            try:
+                asyncio.run(server.chat(_JsonRequest({**base, **bad})))
+            except HTTPException as exc:
+                assert exc.status_code == 400, exc.detail
+            else:
+                raise AssertionError(f"{bad} accepted on the tool path")
+        assert handled == [], "refused request reached the session layer"
+        out = asyncio.run(server.chat(_JsonRequest({**base, "stop": "STOP"})))
+        assert out["choices"][0]["message"]["content"] == "alpha ", out
+        schema = {"response_format": {"type": "json_schema", "json_schema": {
+            "name": "s", "schema": {"type": "object"}}}}
+        out = asyncio.run(server.chat(_JsonRequest({**base, **schema})))
+        assert out["choices"][0]["finish_reason"] == "tool_calls", out
+        try:
+            asyncio.run(server.chat(_JsonRequest({**base, **schema})))
+        except HTTPException as exc:
+            assert exc.status_code == 502, exc.detail
+        else:
+            raise AssertionError("prose final answer accepted for a schema")
+    finally:
+        server.handle_tool_request = real
+    _fitted, system = server.fit_tool_surface([], None, schema)
+    assert "final answer" in system and "JSON Schema" in system, system
+    print("  tool path: n>1 / bad format refused early; stop + schema on the final turn")
+
+
 def test_remembered_tools_cover_probe_ids_and_are_bounded():
     """A caller-env probe answer can come back without `tools` too; the
     probe's call id maps to the tools of the request that minted it. The

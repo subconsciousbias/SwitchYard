@@ -165,6 +165,40 @@ def test_codex_text_path_runs_no_builtin_the_model_names():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_codex_output_schema_reaches_the_api_as_strict_json_schema():
+    """A caller's strict response_format rides `--output-schema FILE`
+    (cli_bridge.schema_args, appended after the prompt like every run_cli
+    extra) and reaches the model API as `text.format` json_schema, strict:
+    the API enforces it, not a prompt line."""
+    try:
+        codex = _pinned_clis.require("codex")
+    except _pinned_clis.Skip as why:
+        print(f"  skipped: {why}")
+        return
+    cb = server.cli_bridge
+    root = Path(tempfile.mkdtemp(prefix="lockdown-codex-schema-"))
+    schema = {"type": "object", "properties": {"answer": {"type": "integer"}},
+              "required": ["answer"], "additionalProperties": False}
+    fmt = cb.response_schema({"response_format": {"type": "json_schema", "json_schema": {
+        "name": "sum", "strict": True, "schema": schema}}})
+    saved = (cb.PROVIDER, cb.PROFILE, cb.CLI)
+    try:
+        with _RealCodex(codex, root):
+            cb.PROVIDER, cb.PROFILE, cb.CLI = "codex", cb.PROFILES["codex"], codex
+            argv, _ = cb.build_argv("What is 2+3?", None, MODEL)
+            with cb.schema_args(fmt) as extra, \
+                    _fake_model.FakeModel([{"text": '{"answer": 5}'}]) as fake:
+                done = _run(argv + extra, fake, root, root)
+        assert done.returncode == 0, done.stderr[-500:]
+        formats = [r["body"].get("text", {}).get("format") for r in fake.requests]
+        assert {"type": "json_schema", "strict": True, "schema": schema,
+                "name": "codex_output_schema"} in formats, formats
+        print("  codex --output-schema: strict text.format json_schema on the wire")
+    finally:
+        cb.PROVIDER, cb.PROFILE, cb.CLI = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
