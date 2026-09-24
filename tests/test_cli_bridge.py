@@ -1309,7 +1309,8 @@ def _run_pdf_chat(provider: str) -> dict:
     import asyncio
     seen: dict = {}
 
-    async def fake_invoke(prompt, system, model, image_paths=None, *, web=False, effort=None):
+    async def fake_invoke(prompt, system, model, image_paths=None, fmt=None, *,
+                          web=False, effort=None):
         paths = list(image_paths or [])
         argv, stdin_data = server.build_argv(prompt, system, model, image_paths=paths)
         seen.update(prompt=prompt, paths=paths, argv=argv, stdin=stdin_data,

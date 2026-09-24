@@ -451,6 +451,35 @@ def test_a_swap_keeps_redis_state_and_rebuilds_the_brain():
         os.unlink(shorter_window)
 
 
+def test_a_reload_before_the_first_request_still_gives_the_picker_slots():
+    """Issue #196: the watcher can swap the registry before any request has
+    touched the lazy `slots` property. The swapped-in picker must still get a
+    real SlotTable, and a pick with a session (the affinity path that calls
+    `slots.get_lease`) must not raise."""
+    if hooks is None:
+        print(f"  skipped: switchyard.hooks unavailable ({_HOOKS_UNAVAILABLE})")
+        return
+    policy_only = _write_copy(_retune_pin_wait)
+    try:
+        with _config_path(policy_only):
+            h = _bare_handler(policy_only)
+            # The state right after __init__: nothing built lazily yet.
+            h._slots = None
+            h._policy = None
+            h._picker = None
+            h._swap_registry(models.load(policy_only))
+            assert isinstance(h._slots, SlotTable)
+            assert h._picker.slots is h._slots
+            assert h.slots is h._slots
+            assert h.picker is h._picker
+            lane = next(iter(h.registry.lanes))
+            pick = asyncio.run(h.picker.pick(lane, "session-196"))
+            assert pick is not None
+        print("  swap before first request: picker got a real slot table")
+    finally:
+        os.unlink(policy_only)
+
+
 def _shrink_inflight_window(raw):
     raw["settings"]["inflight_max_age_seconds"] = 60
 
