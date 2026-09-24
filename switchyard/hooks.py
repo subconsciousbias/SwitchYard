@@ -107,6 +107,31 @@ UNLOGGED_CALL_TYPES = frozenset({"anthropic_messages", "aanthropic_messages"})
 # log can show which side ran (mostly for debugging a double-fire surprise).
 _TERMINATED = "_terminated"
 
+# Claude-backed plans are named with a `claude-` prefix by configuration
+# convention. The prefix is what tells us a plan routes through an Anthropic
+# sidecar (and therefore accepts the Claude-side request params -- `thinking`,
+# `output_config`, etc.) rather than through an OpenAI / Codex sidecar (which
+# expects the OpenAI/Responses shape: `reasoning`, `tool_choice`, etc.). The
+# spillover path uses this distinction to drop `thinking` from a request that
+# is being re-routed onto an OpenAI pick; without the strip the OpenAI
+# sidecar's strict request validation rejects `thinking` as an unknown body
+# field and 404s the request.
+_CLAUDE_PLAN_PREFIX = "claude-"
+
+
+def is_claude_plan(plan) -> bool:
+    """A Claude-backed plan by the configured plan-key convention.
+
+    Plans whose key starts with `claude-` are reached through the Claude CLI
+    sidecar (oauth- or CLI-backed Anthropic). They accept Claude-shape
+    request params (`thinking`, `output_config`, ...); an OpenAI-shaped
+    spillover that retains those params 404s at the sidecar. The hook uses
+    this predicate to decide whether to strip Claude-only fields after the
+    pick lands on a non-Claude deployment.
+    """
+    key = getattr(plan, "key", "") or ""
+    return key.startswith(_CLAUDE_PLAN_PREFIX)
+
 
 # -------------------------------------------- what a CLI sidecar must receive ---
 # Two things a CLI-backed plan needs never arrived through LiteLLM (issue #264,
@@ -453,6 +478,17 @@ class SwitchyardHandler(CustomLogger):
 
         self._start_heartbeat(pick.plan.key, pick.model.ref, pick.request_id)
         data["model"] = pick.model.deployment
+        # Claude-side request params must not survive a spillover onto a
+        # non-Claude deployment. A Claude Code (Anthropic-shape) request
+        # spilling onto the OpenAI seat carries `thinking`: the OpenAI
+        # sidecar's request validation rejects it as an unknown body field
+        # and 404s the call. Strip the field here, on the way out, only for
+        # non-Claude picks; a Claude pick keeps it intact because that is
+        # the sidecar's own contract. The strip is keyed off the configured
+        # `claude-` plan-key convention so a future Claude-backed plan
+        # inherits the predicate without any code change here.
+        if not is_claude_plan(pick.plan):
+            data.pop("thinking", None)
         meta = data.setdefault("metadata", {})
         meta[META_KEY] = {
             "lane": lane,
@@ -1320,8 +1356,16 @@ class SwitchyardHandler(CustomLogger):
                 did_cool_atomic = True
         if verdict.should_cool and not did_cool_atomic:
             await self.slots.cool_down(plan.key, cooldown, verdict.outcome.value)
-        if verdict.outcome in (Outcome.QUOTA_EXHAUSTED, Outcome.PLAN_DEAD, Outcome.AUTH) and ctx.get("session"):
-            # Do not strand the session on dead capacity; let it re-lease.
+        # Drop the session lease for the cases that take the served plan
+        # permanently out of rotation: dead quota (QUOTA_EXHAUSTED), dead
+        # subscription (PLAN_DEAD), broken credentials (AUTH), and — the
+        # upstream route/deployment failure case — any verdict the classifier
+        # marked with drop_lease=True (today: HTTP 404). A session leased to
+        # the failing plan would otherwise keep landing on the dead capacity
+        # every turn until the cooldown TTL passed; dropping it lets the
+        # next pick re-lease onto a live sibling.
+        if (verdict.outcome in (Outcome.QUOTA_EXHAUSTED, Outcome.PLAN_DEAD, Outcome.AUTH)
+                or verdict.drop_lease) and ctx.get("session"):
             await self.slots.drop_lease(ctx["session"])
 
     async def _absorb_limit_headers(self, plan_key: str, kwargs: dict) -> None:

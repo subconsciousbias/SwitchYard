@@ -429,6 +429,241 @@ def test_cli_sidecar_requests_carry_effort_and_caller_env_in_extra_body():
     print("  CLI plan: effort + caller_env moved into extra_body.switchyard")
 
 
+def test_thinking_is_kept_on_claude_plans_and_dropped_on_non_claude_picks():
+    """A Claude-side request carries `thinking` -- the Anthropic block that
+    the Claude CLI sets to drive extended reasoning. The Claude Code sidecar
+    accepts it; the OpenAI Codex sidecar does NOT. A Claude Code request
+    that spills onto the OpenAI seat (because the claude-max plan is cooled
+    or full) used to 404 at the Codex sidecar on the unknown `thinking`
+    body field: the Codex /v1/responses endpoint rejects every parameter
+    it does not know.
+
+    The post-pick strip (issue #94) removes `thinking` ONLY for non-Claude
+    picks. The `is_claude_plan` predicate keys on the configured `claude-`
+    plan-key prefix, so the strip fires for the openai/ spillover and
+    NEVER fires for a claude-max/fable pick. The strip is keyed off the
+    placement, not off the inbound CLI or the lane.
+
+    For the Claude pick the policy still has to reach the sidecar. The
+    claude-max plan is CLI-backed, so `carry_to_cli_sidecar` (#292, on
+    main) runs AFTER the strip and lifts `thinking` off the top level onto
+    `extra_body.switchyard.thinking`. The Claude sidecar reads it from the
+    carrier, so it is not silently dropped. The OpenAI plan is ALSO
+    CLI-backed (both fixture plans use `auth: cli_sidecar`), so
+    `carry_to_cli_sidecar` runs for it too -- but the strip has already
+    removed `thinking` by the time it gets there, leaving the lift with
+    nothing to grab from `data.pop("thinking", None)`. The net effect on
+    the OpenAI shape is the same either way: `thinking` is gone.
+
+    Two assertions, one registration, both driven through async_pre_call_hook
+    so the test exercises the real picker pipeline, not a unit-level helper.
+    The Claude case uses a fresh handler with the Claude plan leased in;
+    the OpenAI case uses a separate handler with the Claude plan cooled so
+    the lane spills onto OpenAI. tools + streaming are present on both
+    because the production spillover carries them (a Claude Code turn with
+    `thinking` is, by definition, a tool-using streamed turn); without those
+    fields the test would pass for the wrong reason. The tool name uses
+    an MCP prefix that is NOT in the per-CLI blocklist (claude-code's
+    blocklist drops Read/Bash/Edit, opencode's drops the rest), so the
+    tools array survives the blocklist filter in both branches and the
+    only thing the test is actually proving is the `thinking` shape
+    contract for each side of the predicate.
+    """
+    from switchyard.policy import CapacityPolicy
+
+    async def go():
+        reg = models.load()
+        assert any(p.key.startswith("claude-") for p in reg.plans.values()), (
+            "the fixture must include at least one claude-* plan to anchor "
+            "the Claude-vs-non-Claude predicate")
+
+        # -- Claude pick: claude-max still has capacity, request lands
+        #    on claude-max/fable. `thinking` must survive untouched.
+        redis_claude = FakeRedis()
+        slots_claude = SlotTable(
+            redis_claude, reg.settings.inflight_max_age_seconds)
+        ledger_claude = Ledger(redis_claude)
+        policy_claude = CapacityPolicy(
+            redis_claude, reg.settings, ledger_claude)
+        picker_claude = Picker(reg, slots_claude, policy_claude)
+
+        h_claude = SwitchyardHandler.__new__(SwitchyardHandler)
+        h_claude.__dict__["registry"] = reg
+        h_claude.__dict__["_slots"] = slots_claude
+        h_claude.__dict__["_ledger"] = ledger_claude
+        h_claude.__dict__["_policy"] = policy_claude
+        h_claude.__dict__["_redis"] = redis_claude
+        h_claude.__dict__["_picker"] = picker_claude
+        h_claude.__dict__["_beats"] = {}
+
+        claude_data = {
+            "model": "apex",
+            "messages": [{"role": "user", "content": "hi"}],
+            "proxy_server_request": {"headers": {
+                "x-switchyard-session": "sess-think-claude",
+                "x-switchyard-cli": "claude-code",
+            }},
+            "tools": [{"name": "mcp__switchyard__bash"}],
+            "stream": True,
+            # The Claude Code wire shape: a `thinking` block with the
+            # display/type pair the Anthropic API expects. The hook must
+            # leave this alone on a Claude pick.
+            "thinking": {"type": "enabled", "display": "detailed"},
+            "output_config": {"effort": "high"},
+        }
+        await h_claude.async_pre_call_hook(None, None, claude_data, "acompletion")
+        claude_ctx = claude_data["metadata"]["switchyard"]
+        await h_claude.picker.release(
+            claude_ctx["plan"], claude_ctx["request_id"], claude_ctx["model"])
+
+        # -- OpenAI spillover: a separate handler, fresh registry, with
+        #    the Claude plan cooled so the picker spills the lane onto
+        #    openai/*. `thinking` must be removed so the OpenAI sidecar
+        #    does not reject it as an unknown body field.
+        redis_openai = FakeRedis()
+        slots_openai = SlotTable(
+            redis_openai, reg.settings.inflight_max_age_seconds)
+        ledger_openai = Ledger(redis_openai)
+        policy_openai = CapacityPolicy(
+            redis_openai, reg.settings, ledger_openai)
+        picker_openai = Picker(reg, slots_openai, policy_openai)
+        # Cool the Claude plan to force the spillover. apex lists Claude
+        # first, then OpenAI; with the Claude plan unavailable the lane
+        # walks to the OpenAI member.
+        await slots_openai.cool_down(
+            "claude-max", 300, "transient")
+
+        h_openai = SwitchyardHandler.__new__(SwitchyardHandler)
+        h_openai.__dict__["registry"] = reg
+        h_openai.__dict__["_slots"] = slots_openai
+        h_openai.__dict__["_ledger"] = ledger_openai
+        h_openai.__dict__["_policy"] = policy_openai
+        h_openai.__dict__["_redis"] = redis_openai
+        h_openai.__dict__["_picker"] = picker_openai
+        h_openai.__dict__["_beats"] = {}
+
+        openai_data = {
+            "model": "apex",
+            "messages": [{"role": "user", "content": "hi"}],
+            "proxy_server_request": {"headers": {
+                "x-switchyard-session": "sess-think-openai",
+                "x-switchyard-cli": "claude-code",
+            }},
+            "tools": [{"name": "mcp__switchyard__bash"}],
+            "stream": True,
+            "thinking": {"type": "enabled", "display": "detailed"},
+            "output_config": {"effort": "high"},
+        }
+        await h_openai.async_pre_call_hook(
+            None, None, openai_data, "acompletion")
+        openai_ctx = openai_data["metadata"]["switchyard"]
+        await h_openai.picker.release(
+            openai_ctx["plan"], openai_ctx["request_id"], openai_ctx["model"])
+
+        return (claude_ctx, claude_data, openai_ctx, openai_data)
+
+    claude_ctx, claude_data, openai_ctx, openai_data = run(go())
+    # Claude pick: plan.key starts with the configured prefix, and the
+    # `thinking` policy reaches the sidecar. claude-max is CLI-backed (auth
+    # cli_sidecar), so `carry_to_cli_sidecar` (#292, on main) lifts the
+    # top-level `thinking` onto `extra_body.switchyard.thinking` after the
+    # pick is written. The strip added by this PR (issue #94) does NOT fire
+    # for the Claude pick; the lift is what moves the field off the top
+    # level. Either way, the policy reaches the sidecar -- it is not
+    # silently dropped on the floor.
+    assert claude_ctx["plan"].startswith("claude-"), claude_ctx
+    assert "thinking" not in claude_data, (
+        f"Claude CLI pick leaves top-level thinking stripped because "
+        f"carry_to_cli_sidecar (#292) lifted it onto the carrier; "
+        f"got {claude_data!r}")
+    claude_carrier_thinking = (
+        claude_data
+        .get("extra_body", {})
+        .get("switchyard", {})
+        .get("thinking")
+    )
+    assert claude_carrier_thinking == {"type": "enabled", "display": "detailed"}, (
+        f"Claude pick must lift `thinking` onto extra_body.switchyard "
+        f"so the CLI sidecar still sees the policy; "
+        f"got claude_carrier_thinking={claude_carrier_thinking!r} from "
+        f"claude_data={claude_data!r}")
+    # Stream + tools survive on the Claude side because the strip is
+    # only about Claude-only request params (today: `thinking`).
+    assert claude_data["stream"] is True, claude_data
+    assert claude_data["tools"] == [{"name": "mcp__switchyard__bash"}], claude_data
+    # OpenAI spillover: plan.key does NOT start with the prefix, and the
+    # request leaves WITHOUT `thinking` anywhere -- top level OR the
+    # carrier. The post-pick strip (issue #94) fires first because the
+    # picked plan is not Claude; the OpenAI plan is CLI-backed too (auth:
+    # cli_sidecar) so `carry_to_cli_sidecar` (#292) does run, but it does
+    # so AFTER the strip and finds nothing left to lift -- its own
+    # `data.pop("thinking", None)` is a no-op on an already-empty slot.
+    # The combined effect is "thinking is gone for the OpenAI sidecar's
+    # request shape": this is what stops the 404.
+    assert not openai_ctx["plan"].startswith("claude-"), (
+        f"openai spillover test must land on a non-Claude plan, "
+        f"got {openai_ctx['plan']!r}")
+    assert "thinking" not in openai_data, (
+        f"non-Claude pick must strip `thinking`, got {openai_data!r}")
+    openai_carrier_thinking = (
+        openai_data
+        .get("extra_body", {})
+        .get("switchyard", {})
+        .get("thinking")
+    )
+    assert openai_carrier_thinking is None, (
+        f"non-Claude pick must not have `thinking` on the carrier "
+        f"either -- the OpenAI sidecar has no CLI-sidecar lift to "
+        f"read it from; got {openai_carrier_thinking!r}")
+    assert openai_data["stream"] is True, openai_data
+    assert openai_data["tools"] == [{"name": "mcp__switchyard__bash"}], openai_data
+    # output_config.effort is already moved into extra_body.switchyard for
+    # CLI-backed plans via carry_to_cli_sidecar -- the hook does not strip
+    # it here, the CLI-sidecar helper handles that. The test only owns the
+    # `thinking` shape contract.
+    print(f"  Claude pick: plan={claude_ctx['plan']}, thinking lifted onto "
+          f"extra_body.switchyard.thinking (claude_carrier_thinking="
+          f"{claude_carrier_thinking!r}); "
+          f"OpenAI spillover: plan={openai_ctx['plan']}, thinking gone "
+          f"from top level and from the carrier")
+
+
+def test_is_claude_plan_predicate_follows_the_configured_prefix_convention():
+    """The predicate lives at module level so tests and any future caller
+    can read it without going through the handler. Pin its shape here so
+    the `claude-` prefix convention stays a deliberate configuration
+    surface, not a magic string buried in a hook.
+    """
+    from switchyard.hooks import is_claude_plan
+    reg = models.load()
+    # Every fixture plan whose key starts with `claude-` is a Claude plan.
+    claude_plans = [p for p in reg.plans.values()
+                    if p.key.startswith("claude-")]
+    assert claude_plans, "fixture must still expose a claude-* plan"
+    for plan in claude_plans:
+        assert is_claude_plan(plan) is True, plan.key
+    # And every non-Claude plan (the OpenAI seat, the local box, every
+    # metered provider, etc.) returns False.
+    for plan in reg.plans.values():
+        if plan.key.startswith("claude-"):
+            continue
+        assert is_claude_plan(plan) is False, plan.key
+    # A None / empty-ish plan does not raise -- the hook reaches this
+    # predicate with `pick.plan` only, but the defensive default matters
+    # because tests sometimes pass a bare namespace.
+    assert is_claude_plan(None) is False
+    assert is_claude_plan(object()) is False
+    # And a plan-shaped object whose key is the exact prefix character is
+    # Claude (no `name` or `models` checks needed -- the prefix is the
+    # contract).
+    from types import SimpleNamespace
+    assert is_claude_plan(SimpleNamespace(key="claude-anything")) is True
+    assert is_claude_plan(SimpleNamespace(key="openai")) is False
+    print(f"  is_claude_plan: True on every plan whose key starts with "
+          f"`claude-` ({len(claude_plans)} found), False everywhere else; "
+f"defensive against None / non-plan values")
+
+
 def test_cli_sidecar_requests_carry_thinking_policy_in_extra_body():
     """Issue #292: a `thinking` object travels onto `extra_body.switchyard`
     as a typed policy -- type (enable signal) + display (visibility

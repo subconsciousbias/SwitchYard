@@ -287,6 +287,117 @@ def test_double_count_guard_skips_second_call_with_same_request_id():
           f"-> {s3} (new rid, applied)")
 
 
+def test_transient_with_drop_lease_flag_drops_session_lease():
+    """Verdict.drop_lease=True is the contract that closes the upstream
+    route/deployment failure loop. classify() sets it for HTTP 404 (the sidecar
+    URL is gone), and _apply_verdict reads it to drop the caller's session
+    lease alongside the cooldown -- without that drop the session would keep
+    landing on the dead deployment every turn until the cooldown TTL passed.
+
+    Wiring matches the QUOTA_EXHAUSTED lease-drop test above: a session
+    leased to the same plan, then a TRANSIENT+drop_lease verdict applied,
+    and the sy:lease:{session} key is gone while the sy:cool:{plan} key is
+    present. The TRANSIENT branch still drives the cooldown ladder via
+    bump_and_cool (so a streak of 1 lands), and the verdict is the only
+    thing distinguishing this case from a generic 5xx TRANSIENT that does
+    NOT drop the lease -- which is what a future regression here would
+    surface as.
+    """
+    async def go():
+        h, reg, slots = _build(breaker_enabled=True)
+        plan = _first_plan(reg)
+        session = "sess-404"
+        verdict = Verdict(
+            Outcome.TRANSIENT, 60,
+            "upstream route/deployment missing",
+            drop_lease=True,
+        )
+
+        # Lease the session to this plan first, the way a live conversation
+        # does. The hook must drop it on the verdict.
+        await slots.set_lease(session, plan.key, reg.settings.lease_ttl_seconds)
+        lease_before = await slots.get_lease(session)
+        assert lease_before == plan.key, lease_before
+
+        ctx = {"session": session, "request_id": "req-404"}
+        await h._apply_verdict(plan, verdict, ctx)
+
+        streak = await slots.transient_failure_streak(plan.key)
+        cooled, ttl, reason = await slots.cooldown_state(plan.key)
+        lease_after = await slots.get_lease(session)
+        return streak, cooled, ttl, reason, lease_before, lease_after
+
+    streak, cooled, ttl, reason, lease_before, lease_after = _run(go())
+    # Cooldown ladder ran: streak moved to 1, sy:cool key landed with the
+    # TRANSIENT reason, and the cooldown TTL is in the breaker-allowed range.
+    assert streak == 1, streak
+    assert cooled is True
+    assert reason == "transient", reason
+    assert ttl > 0
+    # The lease-drop side effect is what this test exists to pin.
+    assert lease_before == "minimax-ultra", lease_before
+    assert lease_after is None, (
+        f"drop_lease=True must drop the session lease, got {lease_after!r}")
+    print(f"  TRANSIENT+drop_lease: streak {streak}, cooldown {ttl}s, "
+          f"lease {lease_before} -> None (dropped alongside cool)")
+
+
+def test_transient_without_drop_lease_keeps_session_lease():
+    """A plain TRANSIENT verdict (5xx blip) without drop_lease=True MUST
+    NOT drop the session lease -- the breaker ladder exists exactly so a
+    brief outage stops parking capacity while keeping the session pinned
+    to its plan. Adding TRANSIENT to the unconditional lease-drop list
+    would defeat that contract; this test pins the conditional form.
+
+    The control shape is the exact opposite of
+    `test_transient_with_drop_lease_flag_drops_session_lease`: same
+    TRANSIENT outcome, same cooldown, no drop_lease flag, and the lease
+    must survive. The two tests bracket the new branch in
+    `_apply_verdict` so a future widening (e.g. an unconditional drop on
+    TRANSIENT) is caught here as a "lease should not have been dropped"
+    failure, not as a silent regression in production.
+    """
+    async def go():
+        h, reg, slots = _build(breaker_enabled=True)
+        plan = _first_plan(reg)
+        session = "sess-keep"
+        # Verdict WITHOUT drop_lease. The default of the dataclass is False;
+        # the explicit kwarg is what makes the regression intent obvious
+        # in review and matches what classify() produces for any non-404
+        # TRANSIENT (a plain 5xx).
+        verdict = Verdict(
+            Outcome.TRANSIENT, 60, "upstream 500",
+            drop_lease=False,
+        )
+
+        await slots.set_lease(session, plan.key, reg.settings.lease_ttl_seconds)
+        lease_before = await slots.get_lease(session)
+        assert lease_before == plan.key, lease_before
+
+        ctx = {"session": session, "request_id": "req-keep"}
+        await h._apply_verdict(plan, verdict, ctx)
+
+        streak = await slots.transient_failure_streak(plan.key)
+        cooled, ttl, reason = await slots.cooldown_state(plan.key)
+        lease_after = await slots.get_lease(session)
+        return streak, cooled, ttl, reason, lease_before, lease_after
+
+    streak, cooled, ttl, reason, lease_before, lease_after = _run(go())
+    # Cooldown ladder still runs -- the failure side effect is the same.
+    assert streak == 1, streak
+    assert cooled is True
+    assert reason == "transient", reason
+    assert ttl > 0
+    # Lease survived: a plain 5xx blip is a brief outage, not a session
+    # killer. The breaker cools the plan; the session keeps its pin so
+    # the caller's prompt cache stays warm through the recovery.
+    assert lease_before == "minimax-ultra", lease_before
+    assert lease_after == "minimax-ultra", (
+        f"a TRANSIENT without drop_lease must keep the lease, got {lease_after!r}")
+    print(f"  TRANSIENT without drop_lease: streak {streak}, cooldown {ttl}s, "
+          f"lease preserved ({lease_before} -> {lease_after})")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

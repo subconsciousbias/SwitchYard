@@ -170,6 +170,12 @@ class Verdict:
     cooldown_seconds: int
     detail: str = ""
     vendor_code: int | None = None
+    # True when the verdict's cooldown must also drop the caller's session
+    # lease, so the next pick re-leases onto a sibling instead of being
+    # pinned to the failing deployment. Used for upstream route/deployment
+    # failures (HTTP 404): the sidecar URL is gone and the session lease
+    # would just keep the conversation routed to a dead deployment.
+    drop_lease: bool = False
 
     @property
     def should_cool(self) -> bool:
@@ -327,6 +333,19 @@ def classify(
         return Verdict(Outcome.TRANSIENT, 15, "timeout", code)
     if status and 500 <= status < 600:
         return Verdict(Outcome.TRANSIENT, 60, f"upstream {status}", code)
+    if status == 404:
+        # Upstream route/deployment failure: the sidecar URL is gone (the
+        # image was rolled, the path was renamed, the model was pulled). It
+        # is NOT a caller error -- a 4xx status by itself is not proof the
+        # client did anything wrong -- so cool the plan like a TRANSIENT and
+        # also drop the session lease (drop_lease=True) so the next pick
+        # re-leases onto a live sibling. Without the lease drop the session
+        # would keep landing on the dead deployment every turn until the
+        # cooldown TTL passed.
+        return Verdict(
+            Outcome.TRANSIENT, 60, "upstream route/deployment missing", code,
+            drop_lease=True,
+        )
     if status and 400 <= status < 500:
         return Verdict(Outcome.BAD_REQUEST, 0, f"client error {status}", code)
     return Verdict(Outcome.TRANSIENT, 30, "unclassified", code)

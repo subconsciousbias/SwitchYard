@@ -394,10 +394,19 @@ def test_auth_prose_strict_gate_4xx_does_not_fall_back_to_prose():
     v_400 = classify(400, "unauthorized")
     assert v_400.outcome is Outcome.BAD_REQUEST, v_400
     assert v_400.cooldown_seconds == 0, v_400
-    # 404 + 'unauthorized' → BAD_REQUEST 0s (same reasoning).
+    # 404 + 'unauthorized' → TRANSIENT 60s with drop_lease=True. The strict
+    # gate's "status branch wins" reasoning still applies, but 404 is no
+    # longer a generic 4xx BAD_REQUEST: it is the upstream route/deployment
+    # failure case, so the status branch routes it to TRANSIENT 60s and
+    # asks the hook to drop the caller's session lease so the next pick
+    # re-leases onto a live sibling. See `test_http_404_classifies_as_transient`
+    # for the bare-shape contract; this row pins the strict-gate
+    # interaction with auth-prose so a future AUTH-strict-gate tightening
+    # does not silently drop the lease-drop flag.
     v_404 = classify(404, "unauthorized")
-    assert v_404.outcome is Outcome.BAD_REQUEST, v_404
-    assert v_404.cooldown_seconds == 0, v_404
+    assert v_404.outcome is Outcome.TRANSIENT, v_404
+    assert v_404.cooldown_seconds >= 60, v_404
+    assert v_404.drop_lease is True, v_404
     # 400 + 'authentication failed' → BAD_REQUEST 0s (not AUTH).
     v_400b = classify(400, "authentication failed")
     assert v_400b.outcome is Outcome.BAD_REQUEST, v_400b
@@ -419,6 +428,70 @@ def test_auth_prose_strict_gate_4xx_does_not_fall_back_to_prose():
     v_403 = classify(403, "forbidden")
     assert v_403.outcome is Outcome.AUTH, v_403
     assert v_403.cooldown_seconds == 1800, v_403
+
+
+def test_http_404_classifies_as_transient_upstream_route_failure():
+    """A bare HTTP 404 from an upstream sidecar is an upstream route /
+    deployment failure -- the sidecar URL is gone (image rolled, path
+    renamed, model pulled), NOT a caller error. Treating it as a 4xx
+    BAD_REQUEST would keep feeding requests into a dead deployment forever
+    (BAD_REQUEST never cools, never drops the session lease); treating it
+    as a TRANSIENT 5xx-equivalent with the lease-drop flag lets the
+    breaker ladder park the plan AND frees the session so the next pick
+    re-leases onto a live sibling.
+
+    The shape is bare (no prose, no body) so the status branch is what
+    decides. The case with prose is pinned separately below, so a future
+    prose tightening cannot silently re-route a 404 with an empty message.
+    """
+    v = classify(404, "Not Found")
+    assert v.outcome is Outcome.TRANSIENT, v
+    assert v.cooldown_seconds >= 60, v
+    assert v.detail == "upstream route/deployment missing", v
+    assert v.drop_lease is True, v
+    # should_cool agrees with the cooldown > 0 contract, but the lease
+    # drop is a separate signal; assert it explicitly so a future refactor
+    # that flattens the two does not silently drop the 404 lease-drop.
+    assert v.should_cool is True, v
+    assert v.is_our_fault is False, v
+
+
+def test_http_404_with_exhaustion_prose_still_lands_as_quota_exhausted():
+    """The prose block runs before the 404 status branch, so a 404 carrying
+    a quota-exhausted message still classifies as QUOTA_EXHAUSTED. The
+    business signal wins over the route status: a vendor that says both
+    "404" and "insufficient balance" is genuinely out of quota, and
+    parking the plan on the QUOTA_EXHAUSTED cooldown (which respects the
+    stated reset time) is the right outcome.
+    """
+    body = {"error": {"code": "1008", "message": "insufficient balance (1008)"}}
+    v = classify(404, "insufficient balance (1008)",
+                 family="minimax", body=body)
+    assert v.outcome is Outcome.QUOTA_EXHAUSTED, v
+    # The QUOTA_EXHAUSTED branch does not set drop_lease itself; the hook
+    # applies the lease drop on the outcome. Today this still drops the
+    # lease via the existing QUOTA_EXHAUSTED branch in _apply_verdict.
+    assert v.drop_lease is False, v
+
+
+def test_http_400_still_classifies_as_bad_request():
+    """Regression guard for the 4xx BAD_REQUEST path. The 404 carve-out
+    for upstream route/deployment failures leaves the rest of the 4xx range
+    intact: 400 is still a caller error, still 0 cooldown, still
+    is_our_fault=True, and never drops the session lease.
+    """
+    v = classify(400, "invalid parameter X")
+    assert v.outcome is Outcome.BAD_REQUEST, v
+    assert v.cooldown_seconds == 0, v
+    assert v.should_cool is False, v
+    assert v.is_our_fault is True, v
+    assert v.drop_lease is False, v
+    # And the no-prose bare shape too -- the gate must not regress on
+    # shape and the bare 400 keeps the 4xx BAD_REQUEST contract.
+    v2 = classify(400, "bad request")
+    assert v2.outcome is Outcome.BAD_REQUEST, v2
+    assert v2.cooldown_seconds == 0, v2
+    assert v2.drop_lease is False, v2
 
 
 def test_prose_rules_preserve_genuine_message_classification():
