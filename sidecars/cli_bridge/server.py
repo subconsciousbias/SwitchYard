@@ -190,6 +190,9 @@ SUBPROCESS_ENV_KEYS = (
     # the caller's cwd (mcp_bridge.session_env). Listed so the allowlist
     # stays the one canonical set of keys a CLI can receive.
     "OPENCODE_CONFIG",
+    # Likewise set per spawn, for a web-search request only, to switch on
+    # OpenCode's Exa-backed websearch tool (see wants_web_search).
+    "OPENCODE_ENABLE_EXA",
 )
 
 
@@ -225,7 +228,16 @@ def opencode_config(allow: tuple[str, ...] = (), prompt: str | None = None) -> d
     caller's instructions in the user turn (issue #264). Both bridges pass
     it: bridge-siblings rule.
     """
-    permission = {"*": "deny", **{pattern: "allow" for pattern in allow}}
+    # `"*": "deny"` refuses everything a future OpenCode adds -- but on the
+    # pinned 1.18.31 it also drops EVERY built-in from the tool list, even one
+    # explicitly allowed (verified against a fake model). So when a built-in
+    # is allowed, the other built-ins are denied by name instead.
+    allowed_builtins = [tool for tool in allow if tool in OPENCODE_BUILTIN_TOOLS]
+    permission = {} if allowed_builtins else {"*": "deny"}
+    if allowed_builtins:
+        permission.update({tool: "deny" for tool in OPENCODE_BUILTIN_TOOLS
+                           if tool not in allow})
+    permission.update({pattern: "allow" for pattern in allow})
     config = {
         "$schema": "https://opencode.ai/config.json",
         "permission": permission,
@@ -242,6 +254,34 @@ def opencode_config(allow: tuple[str, ...] = (), prompt: str | None = None) -> d
     if prompt:
         config["agent"]["switchyard"]["prompt"] = prompt
     return config
+
+
+# ------------------------------------------------------------ web search ---
+# A caller that asks for SERVER-SIDE web search -- Claude Code's WebSearch
+# makes a sub-request carrying Anthropic's `web_search_20250305` server tool,
+# which LiteLLM turns into OpenAI's `web_search_options` -- used to get the
+# model's memory presented as "web search results" (issue #264). Such a
+# request now switches on the CLI's OWN provider-side search for that request
+# only: Claude Code's WebSearch (Anthropic-side), codex's `web_search="live"`
+# (OpenAI-side), OpenCode's `websearch`/`webfetch` (Exa). None of them touch
+# the sidecar's filesystem. Without the request, all three stay off.
+# Anthropic's `web_fetch_*` server tool (fetch one URL) reaches the sidecar
+# verbatim through LiteLLM and is served the same way: each CLI's web
+# surface fetches as well as searches (Claude Code's WebFetch, codex's
+# web.run `open`, OpenCode's webfetch).
+WEB_SEARCH_TOOL_PREFIXES = ("web_search",   # web_search, web_search_preview, web_search_20250305
+                            "web_fetch")    # web_fetch_20250910
+
+
+def is_web_search_tool(tool) -> bool:
+    """A server-side web search or web fetch tool."""
+    return isinstance(tool, dict) and str(tool.get("type", "")).startswith(WEB_SEARCH_TOOL_PREFIXES)
+
+
+def wants_web_search(body: dict) -> bool:
+    """True when the caller asked for server-side web search or fetch."""
+    return body.get("web_search_options") is not None or any(
+        is_web_search_tool(tool) for tool in body.get("tools") or [])
 
 
 def subprocess_env() -> dict:
@@ -782,13 +822,13 @@ _warmup_lock = asyncio.Lock()
 
 
 async def invoke(prompt: str, system: str | None, model: str | None,
-                image_paths: list[Path] | None = None) -> dict:
+                image_paths: list[Path] | None = None, *, web: bool = False) -> dict:
     if _warm.is_set():
-        return await run_cli(prompt, system, model, image_paths)
+        return await run_cli(prompt, system, model, image_paths, web=web)
     async with _warmup_lock:
         if _warm.is_set():                     # someone warmed it while we waited
-            return await run_cli(prompt, system, model, image_paths)
-        payload = await run_cli(prompt, system, model, image_paths)
+            return await run_cli(prompt, system, model, image_paths, web=web)
+        payload = await run_cli(prompt, system, model, image_paths, web=web)
         _warm.set()
         log.info("%s: first call succeeded, releasing full concurrency", PROVIDER)
         return payload
@@ -1018,20 +1058,42 @@ def codex_catalog_path() -> Path:
     return CODEX_CATALOG_PATH
 
 
-def codex_lockdown_args() -> list[str]:
-    """The argv fragment that strips codex down to the caller's tools."""
+def codex_lockdown_args(web: bool = False) -> list[str]:
+    """The argv fragment that strips codex down to the caller's tools.
+
+    `web=True` (the caller asked for web search) swaps the web-search
+    override for `web_search="live"`: codex's own server-side search."""
     argv: list[str] = []
     for feature in CODEX_DISABLED_FEATURES:
         argv += ["--disable", feature]
     for override in CODEX_CONFIG_OVERRIDES:
+        if web and override.startswith("web_search="):
+            override = 'web_search="live"'
         argv += ["-c", override]
     argv += ["-c", f'model_catalog_json="{codex_catalog_path()}"']
     return argv
 
 
+def claude_web_args(argv: list[str]) -> list[str]:
+    """Add Claude Code's own WebSearch and WebFetch to an argv (mutating its
+    `--tools` and `--max-turns` in place) and return the extra flags to append.
+
+    WebSearch runs Anthropic-side; WebFetch fetches from the sidecar, which
+    touches nothing of the caller's. A search and an answer are two turns."""
+    if "--tools" in argv:
+        i = argv.index("--tools")
+        tools = [*argv[i + 1].split(","), "WebSearch", "WebFetch"]
+        argv[i + 1] = ",".join(dict.fromkeys(t for t in tools if t))
+    if "--max-turns" in argv:
+        j = argv.index("--max-turns")
+        argv[j + 1] = str(max(int(argv[j + 1]), 4))
+    return ["--allowed-tools", "WebSearch,WebFetch"]
+
+
 def build_argv(prompt: str, system: str | None,
                model: str | None = None,
-               image_paths: list[Path] | None = None) -> tuple[list[str], str | None]:
+               image_paths: list[Path] | None = None,
+               *, web: bool = False) -> tuple[list[str], str | None]:
     """Build the CLI argv, plus the prompt to feed it on stdin (or None).
 
     Returns a pair so an oversized prompt can travel on stdin instead of argv
@@ -1094,6 +1156,8 @@ def build_argv(prompt: str, system: str | None,
         # files can only be seen through it) and enough turns to use it.
         bare_key = "bare_args_images" if image_paths else "bare_args"
         argv += [fill(a) for a in PROFILE[bare_key]]
+    if web and PROVIDER == "claude":
+        argv += claude_web_args(argv)
 
     if key == "system_args_replace" and system and PROFILE.get("replace_extra_args"):
         argv += [fill(a) for a in PROFILE["replace_extra_args"]]
@@ -1113,7 +1177,7 @@ def build_argv(prompt: str, system: str | None,
     if PROVIDER == "codex":
         # The text path's codex has the same shell, patch tool and code-mode
         # host as the tool path's; see CODEX_DISABLED_FEATURES.
-        argv += codex_lockdown_args()
+        argv += codex_lockdown_args(web=web)
 
     return argv + EXTRA_ARGS, (prompt if use_stdin else None)
 
@@ -1439,7 +1503,7 @@ def system_prompt_file(system: str | None):
 
 
 async def run_cli(prompt: str, system: str | None, model: str | None = None,
-                image_paths: list[Path] | None = None) -> dict:
+                image_paths: list[Path] | None = None, *, web: bool = False) -> dict:
     prompt, system = fold_system(prompt, system)
     with instructions_file(system) as (extra_args, system):
         with system_prompt_file(system) as (sys_args, system):
@@ -1448,12 +1512,12 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None,
             # and the matching replace_extra_args one — the file path now
             # carries the same content, with the same extras appended above.
             return await _run_cli(prompt, system, model, extra_args + sys_args,
-                                  image_paths)
+                                  image_paths, web=web)
 
 
 async def _run_cli(prompt: str, system: str | None, model: str | None,
                    extra_args: list,
-                   image_paths: list[Path] | None = None) -> dict:
+                   image_paths: list[Path] | None = None, *, web: bool = False) -> dict:
     """Spawn the CLI, parse its output, and surface errors as HTTPExceptions.
 
     Issue #64: opencode-ai@1.18.31 occasionally emits a step_finish with
@@ -1466,11 +1530,11 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
     """
     try:
         return await _run_cli_attempt(prompt, system, model, extra_args,
-                                      image_paths)
+                                      image_paths, web=web)
     except CliNoTextError as exc:
         try:
             payload = await _run_cli_attempt(prompt, system, model, extra_args,
-                                              image_paths)
+                                              image_paths, web=web)
         except CliNoTextError as exc2:
             combined = _sum_usage(dict(exc.usage), exc2.usage)
             raise HTTPException(
@@ -1486,7 +1550,8 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
 
 async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
                            extra_args: list,
-                           image_paths: list[Path] | None = None) -> dict:
+                           image_paths: list[Path] | None = None, *,
+                           web: bool = False) -> dict:
     """One end-to-end spawn+parse+post-parse check, without the no-text retry.
 
     Raises HTTPException for terminal errors (spawn failure, timeout, auth,
@@ -1495,8 +1560,11 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
     find charged usage; that signals the retriable no-text-with-usage shape
     to _run_cli, which then performs exactly one in-process retry.
     """
-    cmd, stdin_data = build_argv(prompt, system, model, image_paths)
+    cmd, stdin_data = build_argv(prompt, system, model, image_paths, web=web)
     cmd = cmd + list(extra_args)
+    spawn_env = subprocess_env()
+    if web and PROVIDER == "opencode":
+        spawn_env["OPENCODE_ENABLE_EXA"] = "true"
 
     # stdin must be closed explicitly: codex reads "additional input from stdin"
     # and would block forever on an inherited descriptor that never closes.
@@ -1517,7 +1585,8 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
         # happened, cleaned up and classified by the OSError handler below.
         if PROVIDER == "opencode":
             (spawn_cwd / "opencode.json").write_text(
-                json.dumps(opencode_config(prompt=system)))
+                json.dumps(opencode_config(
+                    allow=("websearch", "webfetch") if web else (), prompt=system)))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE if stdin_data is not None
@@ -1530,7 +1599,7 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
             # hand every provider key, the gateway master key and the OAuth
             # grant to the inner CLI -- a single prompt injection exfiltrates
             # all of it (issue #116).
-            env=subprocess_env(),
+            env=spawn_env,
         )
     except OSError as exc:
         shutil.rmtree(spawn_cwd, ignore_errors=True)
@@ -2040,6 +2109,12 @@ async def _handle_chat(body: dict):
     # Refuse tool calls loudly. SwitchYard already routes these away from
     # CLI-backed plans; if one arrives anyway, dropping the definitions silently
     # would look like the model simply choosing not to call anything.
+    # A server-side web-search tool is not a caller tool: it asks for the
+    # CLI's own provider-side search (wants_web_search), so it is taken out
+    # of `tools` rather than refused.
+    web = wants_web_search(body)
+    if web and body.get("tools"):
+        body = {**body, "tools": [t for t in body["tools"] if not is_web_search_tool(t)]}
     if body.get("tools"):
         raise HTTPException(
             status_code=400,
@@ -2150,7 +2225,7 @@ async def _handle_chat(body: dict):
                                 detail=f"sidecar at capacity ({limit})",
                                 headers={"Retry-After": "5"})
         try:
-            payload = await invoke(prompt, system, model, image_paths or None)
+            payload = await invoke(prompt, system, model, image_paths or None, web=web)
         finally:
             await _gate.release()
         payload, finish_reason = enforce_max_tokens(

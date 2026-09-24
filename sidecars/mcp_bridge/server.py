@@ -906,7 +906,8 @@ def write_claude_mcp_config(workdir: Path, session_id: str, tools_path: Path) ->
 
 
 def write_opencode_dir(workdir: Path, session_id: str, tools_path: Path,
-                       images: bool = False, system: str | None = None) -> None:
+                       images: bool = False, system: str | None = None,
+                       web: bool = False) -> None:
     """`opencode run --dir <workdir>` reads project config from that
     directory. This adds one local MCP server and an agent that exposes
     only its tools -- the same pattern cli_bridge/harness/opencode.json uses
@@ -933,6 +934,8 @@ def write_opencode_dir(workdir: Path, session_id: str, tools_path: Path,
     # back. That is opt-in via `images`, since most sessions are text-only
     # and the Read tool would be unnecessary surface area.
     allow = ("switchyard_*", "read") if images else ("switchyard_*",)
+    if web:     # the caller asked for web search: OpenCode's own (Exa) tools
+        allow += ("websearch", "webfetch")
     cfg = cli_bridge.opencode_config(allow=allow, prompt=system)
     cfg["mcp"] = {
         "switchyard": {
@@ -953,7 +956,8 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
                 session_id: str, tools_path: Path,
                 allowed_tools: str,
                 image_paths: list | None = None,
-                spawn_dir: Path | None = None) -> tuple[list[str], str | None]:
+                spawn_dir: Path | None = None,
+                web: bool = False) -> tuple[list[str], str | None]:
     """Build the CLI argv, plus the prompt to feed it on stdin (or None).
 
     Returns a pair so an oversized prompt can travel on stdin instead of argv
@@ -995,7 +999,7 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
         # replaces OpenCode's base prompt -- the caller's system prompt goes
         # there (write_opencode_dir), not into the user turn.
         write_opencode_dir(workdir, session_id, tools_path,
-                           images=bool(image_paths), system=system)
+                           images=bool(image_paths), system=system, web=web)
         mcp_config = None
         effective_prompt = prompt
 
@@ -1057,7 +1061,7 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
         # code-mode `exec` host and its own shell is what the model sees
         # (issue #255). Shared with the text path -- see
         # cli_bridge.CODEX_DISABLED_FEATURES.
-        argv += cli_bridge.codex_lockdown_args()
+        argv += cli_bridge.codex_lockdown_args(web=web)
 
     # claude only: the built-in allowlist is conditional because an image
     # session needs Read for its staged files (restricted to them by the
@@ -1067,6 +1071,8 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
     if PROVIDER == "claude":
         argv += ["--tools", "Read" if image_paths else "",
                  *cli_bridge.CLAUDE_LOCKDOWN]
+        if web:     # the caller asked for web search: Claude Code's own
+            argv += cli_bridge.claude_web_args(argv)
 
     if image_paths:
         if PROVIDER == "claude":
@@ -1944,7 +1950,7 @@ def sweep_mirrors() -> None:
     _save_mirror_manifest()
 
 
-def session_env(env: Any, workdir: Path, spawn_dir: Path) -> dict:
+def session_env(env: Any, workdir: Path, spawn_dir: Path, web: bool = False) -> dict:
     """Additions to the CLI's allowlisted environment for this session.
 
     OpenCode takes its project config from --dir; when --dir is a mirror
@@ -1956,6 +1962,8 @@ def session_env(env: Any, workdir: Path, spawn_dir: Path) -> dict:
     extra: dict = {}
     if PROVIDER == "opencode" and spawn_dir != workdir:
         extra["OPENCODE_CONFIG"] = str(workdir / "opencode.json")
+    if PROVIDER == "opencode" and web:
+        extra["OPENCODE_ENABLE_EXA"] = "true"     # its websearch tool (Exa)
     shell = getattr(env, "shell", None)
     if PROVIDER == "claude" and shell:
         extra["SHELL"] = shell if shell.startswith("/") else f"/bin/{shell}"
@@ -1998,10 +2006,13 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     # The slot was acquired by the caller before getting here; the session owns
     # it from now on, and gives it back when it parks or ends.
     spawn_dir = acquire_mirror(env, session_id) or workdir
+    # Server-side web search the caller asked for (cli_bridge.wants_web_search)
+    # is served by this CLI's own provider-side search, for this session only.
+    web = cli_bridge.wants_web_search(body)
     session = Session(id=session_id, provider=PROVIDER, model=model,
                       workdir=str(workdir), holds_slot=True,
                       spawn_dir=str(spawn_dir),
-                      spawn_env=session_env(env, workdir, spawn_dir))
+                      spawn_env=session_env(env, workdir, spawn_dir, web=web))
     # Inject the env block (system) and the first-turn reminder (prompt).
     # Both are pure functions of (prompt, system, env, first_turn) so a
     # rebuild of the same request produces the same CLI argv.
@@ -2017,7 +2028,7 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
         allowed = ",".join(PROFILE["tool_qualifier"](t["name"]) for t in mcp_tools)
         argv, stdin_data = build_argv(prompt, system, model, workdir, session_id,
                                       tools_path, allowed, image_paths,
-                                      spawn_dir=spawn_dir)
+                                      spawn_dir=spawn_dir, web=web)
     except Exception as exc:
         log.warning("start_session failed to build argv: %s", exc, exc_info=True)
         await cli_bridge._gate.release()
@@ -2502,7 +2513,9 @@ async def models() -> dict:
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     body = await request.json()
-    tools = body.get("tools")
+    # A server-side web-search tool is not a caller tool to bridge; the CLI's
+    # own search serves it (cli_bridge.wants_web_search reads the body).
+    tools = [t for t in body.get("tools") or [] if not cli_bridge.is_web_search_tool(t)]
     if not tools:
         # A follow-up answering one of OUR tool calls is a tool-loop turn even
         # when the client sends `tools` on the first turn only (issue #260):

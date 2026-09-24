@@ -156,6 +156,36 @@ def test_claude_text_path_offers_no_tools():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_claude_web_request_offers_only_websearch_and_webfetch():
+    """A caller's server-side web_search / web_fetch request adds Claude
+    Code's own WebSearch and WebFetch (cli_bridge.claude_web_args), and
+    nothing else: no Bash, no Read, no Agent."""
+    try:
+        claude = _pinned_clis.require("claude")
+    except _pinned_clis.Skip as why:
+        print(f"  skipped: {why}")
+        return
+    cb = server.cli_bridge
+    root = Path(tempfile.mkdtemp(prefix="lockdown-claude-web-"))
+    _login_dir(root)
+    saved = (cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE)
+    try:
+        cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE = ("claude", cb.PROFILES["claude"], claude, True)
+        argv, _ = cb.build_argv("latest python release?", None, "claude-sonnet-5", web=True)
+        with _fake_model.FakeModel([{"text": "3.14"}]) as fake:
+            done = _run(argv, fake, root, root)
+        assert done.returncode == 0, done.stderr[-500:]
+        offered = {name for r in fake.tool_requests()
+                   for name in _fake_model.advertised_tools(r["body"])}
+        assert offered == {"WebSearch", "WebFetch"}, offered
+        _assert_relay_stays_out(fake)
+        print("  claude web request: exactly WebSearch + WebFetch offered")
+    finally:
+        cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE = saved
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

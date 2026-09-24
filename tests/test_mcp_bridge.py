@@ -212,6 +212,60 @@ def test_opencode_session_config_carries_the_caller_system_prompt():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_tool_path_web_search_enables_each_clis_own_search():
+    """With caller tools AND a web-search request, the session's CLI gets
+    its own search too: Claude's WebSearch, codex live search, OpenCode's
+    websearch/webfetch plus OPENCODE_ENABLE_EXA."""
+    import shutil
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-web-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    saved = (server.PROVIDER, server.PROFILE)
+    try:
+        server.PROVIDER, server.PROFILE = "claude", server.MCP_PROFILES["claude"]
+        argv, _ = server.build_argv("q", None, "m", workdir, "s", tools_path, "x", web=True)
+        assert argv[argv.index("--tools") + 1] == "WebSearch,WebFetch", argv
+        i = argv.index("--allowed-tools", argv.index("--tools"))
+        assert argv[i + 1] == "WebSearch,WebFetch", argv
+        server.PROVIDER, server.PROFILE = "codex", server.MCP_PROFILES["codex"]
+        argv, _ = server.build_argv("q", None, "m", workdir, "s", tools_path, "x", web=True)
+        assert 'web_search="live"' in argv, argv
+        server.PROVIDER, server.PROFILE = "opencode", server.MCP_PROFILES["opencode"]
+        server.build_argv("q", None, "m", workdir, "s", tools_path, "x", web=True)
+        cfg = json.loads((workdir / "opencode.json").read_text())["agent"]["switchyard"]
+        assert cfg["tools"]["websearch"] and cfg["permission"]["websearch"] == "allow", cfg
+        assert cfg["permission"]["switchyard_*"] == "allow", cfg
+        assert server.session_env(None, workdir, workdir, web=True) == {"OPENCODE_ENABLE_EXA": "true"}
+        assert server.session_env(None, workdir, workdir) == {}
+        print("  tool path web: claude WebSearch+WebFetch, codex live, opencode websearch+Exa")
+    finally:
+        server.PROVIDER, server.PROFILE = saved
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_web_only_request_to_the_mcp_bridge_takes_the_text_path():
+    """Claude Code's WebSearch sub-request carries only the server web tool;
+    it is not a tool loop and must not reach translate_tools/start_session."""
+    seen = []
+
+    async def text_path(body):
+        seen.append(body)
+        return {"text": True}
+
+    real = server.cli_bridge._handle_chat
+    server.cli_bridge._handle_chat = text_path
+    try:
+        messages = [{"role": "user", "content": "search"}]
+        for shape in ({"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+                      {"web_search_options": {}}):
+            body = {"model": "m", "messages": messages, **shape}
+            assert asyncio.run(server.chat(_JsonRequest(body))) == {"text": True}
+        assert len(seen) == 2 and seen[1].get("web_search_options") == {}, seen
+    finally:
+        server.cli_bridge._handle_chat = real
+    print("  web-only request -> text path (which runs the CLI's own search)")
+
+
 def test_call_id_round_trips_the_session_id():
     session = _new_session()
     call_id = session.mint_call_id()

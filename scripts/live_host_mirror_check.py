@@ -28,9 +28,12 @@ positive -- the caller's world is what the model sees and uses:
                naming a relay path, and report the host's files
   read file    read README.md from the caller (host-only marker content)
   environment  without tools, name the OS (macOS), the host cwd, git = yes
+  web search   a request carrying web_search_options (Claude Code's WebSearch
+               arrives this way) gets a live, sourced answer from the CLI's own
+               provider-side search -- text path and tool path
 negative -- nothing of the relay's own is reachable:
-  web          a live web answer instead of NO WEB TOOL fails (tool path and
-               text path)
+  web          without that request, a live web answer instead of NO WEB TOOL
+               fails (tool path and text path)
   shell        output from the sidecar's own user (uid=1000/node) fails
 
 It runs inside each sidecar via `docker compose exec` and talks to it on
@@ -205,6 +208,26 @@ check("client MCP tool", mcp_tool)
 check("list cwd", listing)
 check("read file", read)
 check("environment (os/cwd/git)", environment)
+def web_requested(tools):
+    # A caller that ASKS for server-side web search (web_search_options, what
+    # LiteLLM makes of Claude Code's WebSearch sub-request) gets the CLI's own
+    # provider-side search: a live answer with a source URL.
+    def _run():
+        messages = [{"role": "user", "content": (
+            "Search the web for the title of the current top story on "
+            "news.ycombinator.com; quote it with the source URL. If you cannot "
+            "search, reply exactly NO WEB TOOL.")}]
+        body = {"model": MODEL, "messages": messages, "web_search_options": {}}
+        if tools:
+            body["tools"] = tools
+        msg = post(body)["choices"][0]["message"]
+        text = msg.get("content") or ""
+        ok = "NO WEB TOOL" not in text.upper() and "http" in text
+        return ok, f"answer {short(text)}"
+    return _run
+
+check("web search when requested (text path)", web_requested(None))
+check("web search when requested (tool path)", web_requested(CALLER_TOOLS))
 check("no web (tool path)", web(CALLER_TOOLS))
 check("no web (text path)", web(None))
 check("no native shell", shell)

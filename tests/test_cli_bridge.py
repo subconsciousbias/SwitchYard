@@ -957,6 +957,106 @@ def test_codex_lockdown_disables_the_live_web_search_tool():
         server.PROVIDER, server.PROFILE, server.CLI = saved
 
 
+def test_wants_web_search_reads_every_request_shape():
+    """LiteLLM turns Claude Code's server-side web_search tool into
+    `web_search_options`; OpenAI-shaped callers may send it directly, or a
+    web_search* tool type."""
+    assert server.wants_web_search({"web_search_options": {}})
+    for kind in ("web_search", "web_search_preview", "web_search_20250305",
+                 "web_fetch_20250910"):
+        assert server.wants_web_search({"tools": [{"type": kind}]}), kind
+    assert not server.wants_web_search({"tools": [{"type": "function",
+                                                   "function": {"name": "web_search"}}]})
+    assert not server.wants_web_search({"messages": []})
+    assert not server.wants_web_search({"tools": [{"type": "code_execution_20250825"}]})
+    print("  web requested via web_search_options or a web_search*/web_fetch* tool type")
+
+
+def test_web_search_request_enables_each_clis_own_search_only_then():
+    """Claude: WebSearch joins the allowlist (and gets turns to search then
+    answer). Codex: web_search flips from disabled to live. Without the
+    request neither changes."""
+    saved = (server.PROVIDER, server.PROFILE, server.CLI, server.BARE)
+    try:
+        server.BARE = True
+        server.PROVIDER, server.PROFILE = "claude", server.PROFILES["claude"]
+        server.CLI = server.PROFILE["cli"]
+        plain, _ = server.build_argv("hi", None, None)
+        web, _ = server.build_argv("hi", None, None, web=True)
+        assert plain[plain.index("--tools") + 1] == "", plain
+        assert web[web.index("--tools") + 1] == "WebSearch,WebFetch", web
+        assert web[web.index("--max-turns") + 1] == "4", web
+        assert web[web.index("--allowed-tools") + 1] == "WebSearch,WebFetch", web
+        again = list(web)
+        server.claude_web_args(again)
+        assert again[again.index("--tools") + 1] == "WebSearch,WebFetch", "duplicated"
+        assert "--allowed-tools" not in plain, plain
+        server.PROVIDER, server.PROFILE = "codex", server.PROFILES["codex"]
+        server.CLI = server.PROFILE["cli"]
+        plain, _ = server.build_argv("hi", None, None)
+        web, _ = server.build_argv("hi", None, None, web=True)
+        assert 'web_search="disabled"' in plain and 'web_search="live"' not in plain
+        assert 'web_search="live"' in web and 'web_search="disabled"' not in web
+        print("  claude: --tools WebSearch,WebFetch; codex: web_search live -- only when asked")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI, server.BARE = saved
+
+
+def test_opencode_text_path_web_search_config_and_env():
+    """OpenCode's websearch needs the tool allowed (by name: `"*": "deny"`
+    drops every built-in) and OPENCODE_ENABLE_EXA=true in its environment."""
+    import asyncio
+    fake_cli = tempfile.NamedTemporaryFile("w", suffix=".py", prefix="clib-ocweb-", delete=False)
+    fake_cli.write(
+        "import json, os\n"
+        "cfg = json.load(open('opencode.json'))['agent']['switchyard']\n"
+        "out = {'perm': cfg['permission'], 'tools': cfg['tools'],"
+        " 'exa': os.environ.get('OPENCODE_ENABLE_EXA')}\n"
+        "print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': json.dumps(out)}}))\n"
+        "print(json.dumps({'type': 'step_finish', 'part': {'type': 'step-finish', "
+        "'tokens': {'input': 1, 'output': 1, 'reasoning': 0}}}))\n")
+    fake_cli.close()
+    real = (server.CLI, server.BARE, server.PROFILE, server.PROVIDER)
+    try:
+        server.CLI, server.BARE, server.PROVIDER = sys.executable, False, "opencode"
+        server.PROFILE = dict(server.PROFILES["opencode"], args=[fake_cli.name])
+        web = json.loads(asyncio.run(server.run_cli("q", None, "m", web=True))["result"])
+        plain = json.loads(asyncio.run(server.run_cli("q", None, "m"))["result"])
+        assert web["exa"] == "true" and plain["exa"] is None, (web["exa"], plain["exa"])
+        assert web["tools"]["websearch"] and web["tools"]["webfetch"], web["tools"]
+        assert web["perm"]["websearch"] == "allow" and "*" not in web["perm"], web["perm"]
+        assert web["perm"]["bash"] == "deny", web["perm"]
+        assert plain["perm"] == {"*": "deny"} and not any(plain["tools"].values()), plain
+        print("  opencode web request: websearch/webfetch allowed by name + Exa enabled")
+    finally:
+        server.CLI, server.BARE, server.PROFILE, server.PROVIDER = real
+        os.unlink(fake_cli.name)
+
+
+def test_web_only_tools_are_not_refused_on_the_text_path():
+    """A request whose only `tools` entry is a server-side web-search tool is
+    a web-search request, not a caller tool the CLI cannot run: no 400."""
+    import asyncio
+    seen = {}
+
+    async def fake_invoke(prompt, system, model, image_paths=None, *, web=False):
+        seen["web"] = web
+        return {"result": "found it", "usage": {}}
+
+    real = server.invoke
+    server.invoke = fake_invoke
+    try:
+        messages = [{"role": "user", "content": "search x"}]
+        for shape in ({"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+                      {"web_search_options": {}}):     # what LiteLLM makes of it
+            seen.clear()
+            asyncio.run(server._handle_chat({"model": "m", "messages": messages, **shape}))
+            assert seen == {"web": True}, (shape, seen)
+        print("  web tool / web_search_options -> text path with the CLI's search on, no 400")
+    finally:
+        server.invoke = real
+
+
 def test_codex_text_path_argv_carries_the_lockdown():
     """The text path's codex has the same shell, patch tool and code-mode
     host as the tool path's -- and before this, nothing but the missing
@@ -1965,10 +2065,17 @@ def test_opencode_config_denies_every_builtin_unless_allowed():
     """Hiding a tool (`tools: {x: false}`) does not stop OpenCode executing
     it when the model names it; the permission layer does. `allow` is the
     only way through, and a builtin named in it is also un-hidden."""
+    only_mcp = server.opencode_config(allow=("switchyard_*",))["agent"]["switchyard"]
+    assert only_mcp["permission"] == {"*": "deny", "switchyard_*": "allow"}, only_mcp
+    # With a BUILT-IN allowed, `"*": "deny"` would drop every built-in from
+    # the tool list on the pinned OpenCode (the allowed one included), so the
+    # other built-ins are denied by name instead.
     cfg = server.opencode_config(allow=("switchyard_*", "read"))
     agent = cfg["agent"]["switchyard"]
-    assert agent["permission"] == {"*": "deny", "switchyard_*": "allow",
-                                   "read": "allow"}, agent
+    assert "*" not in agent["permission"], agent["permission"]
+    assert agent["permission"] == {
+        **{t: "deny" for t in server.OPENCODE_BUILTIN_TOOLS if t != "read"},
+        "switchyard_*": "allow", "read": "allow"}, agent["permission"]
     assert cfg["permission"] == agent["permission"], cfg
     assert agent["tools"]["read"] is True, agent["tools"]
     others = {k: v for k, v in agent["tools"].items() if k != "read"}
