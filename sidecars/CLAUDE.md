@@ -18,8 +18,13 @@ images carry the full `switchyard/` package:
       - `sidecars/cli_bridge/server.py` (the cli_bridge bridge)
       - `sidecars/mcp_bridge/` (the mcp_bridge bridge, whole directory)
       - `sidecars/cli_bridge/harness/` (the harness configs both bridges need)
-      - `switchyard/__init__.py` and `switchyard/caller_env.py` only — none
-        of `models.py`, `picker.py`, `usage.py`, `hooks.py`, `oauth.py`, etc.
+      - `switchyard/__init__.py`, `switchyard/caller_env.py`, and
+        `switchyard/models.py` — `models.py` ships because the bridges
+        build `CallerEnvironmentSettings` from
+        `settings.caller_environment` in plans.yaml (issue #44 +
+        operator config); dropping it silently turns that config into
+        `None` on every request. None of `picker.py`, `usage.py`,
+        `hooks.py`, `oauth.py`, etc.
     `claude-max-sidecar` is the only service with a `build:` line in
     `docker-compose.yml`; the others reference the tag it produced.
 

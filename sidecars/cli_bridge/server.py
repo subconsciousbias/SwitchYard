@@ -96,6 +96,28 @@ except ImportError:
         _spec.loader.exec_module(_caller_env)
     else:
         _caller_env = None
+# switchyard/models.py: CallerEnvironmentSettings lives here (the typed
+# surface plans.yaml's settings.caller_environment is parsed into). Same
+# package / path-load idiom as the caller_env block above: production has
+# Dockerfile.sidecar's COPY of models.py + PYTHONPATH=/app, so the package
+# branch wins in the container; tests that load this module by file path
+# without the repo root on sys.path take the path-load branch.
+# A None here is a deploy bug: read_config() must log.error and drop the
+# caller_environment config rather than silently construct None, so the
+# regression is loud in `docker compose logs`, not a quiet half-feature.
+try:
+    import switchyard.models as _models
+except ImportError:
+    _models_path = Path(__file__).resolve().parent.parent.parent / "switchyard" / "models.py"
+    if _models_path.exists():
+        _mspec = _il.spec_from_file_location("switchyard.models", _models_path)
+        _models = _il.module_from_spec(_mspec)
+        _models.__package__ = "switchyard"
+        sys.modules.setdefault("switchyard", type(sys)("switchyard"))
+        sys.modules["switchyard.models"] = _models
+        _mspec.loader.exec_module(_models)
+    else:
+        _models = None
 
 app = FastAPI(title="switchyard-cli-bridge")
 
@@ -543,32 +565,27 @@ def read_config() -> Config:
                     or {}).get("seed_cap", 2))
         ce_raw = (raw.get("settings") or {}).get("caller_environment") or {}
         if isinstance(ce_raw, dict):
-            try:
-                from switchyard.models import CallerEnvironmentSettings
-                caller_environment = CallerEnvironmentSettings(**ce_raw)
-            except ImportError:
-                # Tests may load the sidecar modules by path without the
-                # switchyard package on sys.path. The same trick the
-                # bridges use for caller_env works here: load models.py
-                # directly so callers never have to add `switchyard/` to
-                # sys.path. Production has PYTHONPATH=/app + the package
-                # on disk, so this fallback is only a test convenience.
-                _ce_path = Path(__file__).resolve().parent.parent.parent / "switchyard" / "models.py"
-                if _ce_path.exists():
-                    _spec = _il.spec_from_file_location("switchyard.models", _ce_path)
-                    _models_mod = _il.module_from_spec(_spec)
-                    _models_mod.__package__ = "switchyard"
-                    sys.modules.setdefault("switchyard", type(sys)("switchyard"))
-                    sys.modules["switchyard.models"] = _models_mod
-                    _spec.loader.exec_module(_models_mod)
-                    from switchyard.models import CallerEnvironmentSettings
-                    caller_environment = CallerEnvironmentSettings(**ce_raw)
-                else:
-                    caller_environment = None
-            except Exception as exc:
-                log.warning("could not load CallerEnvironmentSettings from %s: %s",
-                            PLANS_PATH, exc, exc_info=True)
+            if _models is None:
+                # Loud: production has Dockerfile.sidecar's COPY of
+                # models.py + PYTHONPATH=/app, so reaching this branch
+                # means the image was built without models.py or with the
+                # PYTHONPATH=/app line dropped. Caller_environment config
+                # is being dropped on the floor, so a 429-style refusal or
+                # a permissive fallback would silently degrade; surface it.
+                log.error("caller_environment config in %s is being dropped: "
+                          "switchyard.models is not importable here. "
+                          "Dockerfile.sidecar must COPY switchyard/models.py "
+                          "to /app/switchyard/models.py and set "
+                          "PYTHONPATH=/app.",
+                          PLANS_PATH)
                 caller_environment = None
+            else:
+                try:
+                    caller_environment = _models.CallerEnvironmentSettings(**ce_raw)
+                except Exception as exc:
+                    log.error("could not load CallerEnvironmentSettings from %s: %s",
+                              PLANS_PATH, exc, exc_info=True)
+                    caller_environment = None
         plan = (raw.get("plans") or {}).get(target) or {}
         if not plan:
             log.warning("no plan %r in %s; falling back to env", target, PLANS_PATH)
@@ -1845,13 +1862,18 @@ async def _handle_chat(body: dict):
         if _caller_env is not None:
             ce_cfg = config().caller_environment
             if ce_cfg is None:
-                try:
-                    from switchyard.models import CallerEnvironmentSettings
-                    ce_cfg = CallerEnvironmentSettings()
-                except Exception as exc:
-                    log.warning("could not build default CallerEnvironmentSettings: %s",
-                                exc, exc_info=True)
-                    ce_cfg = None
+                if _models is None:
+                    log.error("no caller_environment config AND switchyard.models "
+                              "is not importable; CallerEnvironmentSettings "
+                              "default cannot be built. Dockerfile.sidecar "
+                              "must COPY switchyard/models.py.")
+                else:
+                    try:
+                        ce_cfg = _models.CallerEnvironmentSettings()
+                    except Exception as exc:
+                        log.warning("could not build default CallerEnvironmentSettings: %s",
+                                    exc, exc_info=True)
+                        ce_cfg = None
             # Downgrade `required` -> `auto` for the text path only. Done
             # via a tiny shim rather than mutating the dataclass so the
             # other consumer (mcp_bridge) still sees the operator's value.

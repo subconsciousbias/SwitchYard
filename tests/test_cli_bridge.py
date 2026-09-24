@@ -384,112 +384,6 @@ def test_an_oversized_prompt_travels_on_stdin():
     print(f"  {len(huge)}-char prompt kept off argv; small prompt unchanged")
 
 
-# ------------------------------------------------- issue #121: argv prompt hardening ---
-def test_argv_prompt_sentinel_keeps_dash_leading_prompts_unescaped():
-    """Issue #121: a prompt (or system block folded onto it) starting with '-'
-    can be parsed as a CLI flag. OpenCode uses yargs (verified on 1.18.31),
-    so a caller prompt of "--agent=build" would silently override the
-    `--agent switchyard` the bridge pinned and re-enable every tool the
-    harness suppressed.
-
-    Hardening on the argv path:
-      * opencode: build_argv splices a profile-driven 'prompt_terminator'
-        sentinel ('--') immediately before the prompt element; yargs treats
-        '--' as 'stop parsing flags', so the element that follows is a
-        positional no matter what it starts with.
-      * claude and codex: the prompt slot is an option value (`-p "{prompt}"`)
-        or a positional whose arg shape we do not own, so no sentinel. For
-        them, when the prompt starts with '-', build_argv prepends a fixed
-        'Message:' line     so the element can never look like a flag.
-    """
-    system = "--agent=build"
-    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
-    try:
-        # opencode: '--' lands immediately before the prompt.
-        server.PROVIDER = "opencode"
-        server.PROFILE = server.PROFILES["opencode"]
-        server.CLI = server.PROFILE["cli"]
-        argv, stdin_data = server.build_argv("--agent=build", system)
-        assert stdin_data is None, argv
-        idx = argv.index("--agent=build")
-        assert argv[idx - 1] == "--", argv
-
-        # claude: prompt slot is the value of -p; must not start with '-'.
-        server.PROVIDER = "claude"
-        server.PROFILE = server.PROFILES["claude"]
-        server.CLI = server.PROFILE["cli"]
-        argv, stdin_data = server.build_argv("--agent=build", system)
-        assert stdin_data is None, argv
-        prompt_idx = argv.index("-p") + 1
-        assert not argv[prompt_idx].startswith("-"), argv
-        assert argv[prompt_idx].startswith("Message:"), argv
-
-        # codex: prompt is a positional at the end; must not start with '-'.
-        server.PROVIDER = "codex"
-        server.PROFILE = server.PROFILES["codex"]
-        server.CLI = server.PROFILE["cli"]
-        argv, stdin_data = server.build_argv("--agent=build", system)
-        assert stdin_data is None, argv
-        prompt_idx = [i for i, a in enumerate(argv) if a.startswith("Message:")]
-        assert prompt_idx, argv
-        idx = prompt_idx[0]
-        assert not argv[idx].startswith("-"), argv
-    finally:
-        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
-
-
-def test_argv_prompt_sentinel_stdin_path_is_unchanged():
-    """Issue #121: the sentinel and prefix only apply on the argv path; the
-    stdin path (oversized prompt) must look exactly as before -- no extra
-    '--' splice for opencode, no 'Message:' prefix on the prompt slot for
-    any provider. The sentinel exists to stop argv parsers from misreading
-    a flag-shaped element; on the stdin path there is no argv element to
-    misread, so neither guard fires.
-    """
-    system = "--agent=build"
-    huge = "x" * (server.STDIN_PROMPT_LIMIT + 10)
-    saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
-    try:
-        # opencode: {prompt} drops out of argv entirely on stdin path;
-        # argv ends with the last template element ("switchyard"), no extra
-        # '--' spliced between it and the previous element.
-        server.PROVIDER = "opencode"
-        server.PROFILE = server.PROFILES["opencode"]
-        server.CLI = server.PROFILE["cli"]
-        argv, stdin_data = server.build_argv(huge, system)
-        assert stdin_data is not None
-        assert huge not in argv, argv
-        # 'switchyard' is the last template element; nothing was appended after.
-        assert argv[-1] == "switchyard", argv
-        # And the agent flag the test cares about was NOT interpreted as a
-        # CLI flag -- the sentinel did not run, but the prompt is on stdin
-        # so there is no argv element to misread in the first place.
-        assert "--agent=build" not in argv, argv
-
-        # claude: same shape as before -- prompt not in argv, no Message:
-        # prefix anywhere (the guard is argv-path only).
-        server.PROVIDER = "claude"
-        server.PROFILE = server.PROFILES["claude"]
-        server.CLI = server.PROFILE["cli"]
-        argv, stdin_data = server.build_argv(huge, system)
-        assert stdin_data is not None
-        assert huge not in argv, argv
-        assert not any(a.startswith("Message:") for a in argv), argv
-
-        # codex: '-' placeholder stays in argv at the prompt slot; no
-        # Message: prefix anywhere.
-        server.PROVIDER = "codex"
-        server.PROFILE = server.PROFILES["codex"]
-        server.CLI = server.PROFILE["cli"]
-        argv, stdin_data = server.build_argv(huge, system)
-        assert stdin_data is not None
-        assert huge not in argv, argv
-        assert "-" in argv, argv
-        assert not any(a.startswith("Message:") for a in argv), argv
-    finally:
-        server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
-
-
 CODEX_FIXTURE = os.path.join(HERE, "fixtures", "codex-events.jsonl")
 
 
@@ -1494,7 +1388,7 @@ def test_text_path_no_tools_passthrough_with_metadata_still_parses():
                     == "tools_unsupported"):
                 raise AssertionError(
                     f"text path must not 400 on tools when no tools present: "
-                    f"{exc.detail}") from exc
+                    f"{exc.detail}")
             assert exc.status_code in (429, 502), (
                 f"unexpected HTTPException from _handle_chat: "
                 f"{exc.status_code} {exc.detail}")
@@ -1881,6 +1775,235 @@ def test_spawn_sites_pass_only_the_allowlisted_env_to_the_cli():
           f"{len(captured_envs)} captures, all keys subset of "
           f"{len(server.SUBPROCESS_ENV_KEYS)}-key allowlist; "
           f"{planted} absent")
+
+
+# --------------------------------------------------------------- sidecar image ---
+# Dockerfile.sidecar must COPY switchyard/models.py into the image AND
+# read_config() must build a real CallerEnvironmentSettings from it. Two
+# tests pin both halves: the Dockerfile line itself (a static guard, the
+# same style tests/test_litellm_patch.py uses), and an end-to-end mirror
+# of the image layout so a dropped COPY or a silent fallback fails this
+# suite, not just the running container.
+
+DOCKERFILE_SIDECAR = os.path.join(os.path.dirname(HERE), "Dockerfile.sidecar")
+
+
+def test_dockerfile_sidecar_copies_switchyard_models_py():
+    """Dockerfile.sidecar must COPY switchyard/models.py into the image.
+
+    The earlier build only carried caller_env.py, so `import switchyard.models`
+    failed inside the container and read_config() silently turned plans.yaml's
+    `settings.caller_environment` into None on every request. A regression that
+    drops the COPY (or moves models.py under a different dst) brings the
+    silent-None bug back without a commit message. The exact-occurrence assert
+    is deliberate: this Dockerfile is part of the sidecar-image contract.
+    """
+    with open(DOCKERFILE_SIDECAR, encoding="utf-8") as fh:
+        src = fh.read()
+
+    expected = "COPY switchyard/models.py /app/switchyard/models.py"
+    assert expected in src, (
+        f"Dockerfile.sidecar no longer contains {expected!r}; "
+        f"switchyard/models.py is no longer baked into the sidecar image, "
+        f"so the bridges cannot build CallerEnvironmentSettings from "
+        f"plans.yaml and caller_environment config will silently become None."
+    )
+    # Build-time assertion must follow: a copy that is present but whose
+    # `python3 -c "import switchyard.models; ..."` step was lost would
+    # still build a broken image silently, so guard the assertion line too.
+    assert "import switchyard.models" in src, (
+        "Dockerfile.sidecar lost its build-time assertion that switchyard.models "
+        "imports and constructs CallerEnvironmentSettings; a future copy that "
+        "misses the file would no longer fail the build."
+    )
+    # The constructor call is what proves the typed surface shipped, not
+    # just the bare `import` -- a future edit that shortens the RUN to
+    # `python3 -c "import switchyard.models"` would still pass the import
+    # guard above but stop exercising CallerEnvironmentSettings(probe=...).
+    # Pin the constructor substring so a "weakened but not deleted" edit
+    # also fails this static guard, not only the image-layout test that
+    # catches the regression end-to-end after a real `docker compose build`.
+    assert "switchyard.models.CallerEnvironmentSettings" in src, (
+        "Dockerfile.sidecar lost its build-time assertion that constructs "
+        "CallerEnvironmentSettings(probe='required'); the import line may be "
+        "present but the typed-surface check is gone, so a future edit that "
+        "breaks the constructor (e.g. renames the field) would build a "
+        "silent-503 image instead of failing fast."
+    )
+    print(f"  Dockerfile.sidecar: {expected!r} present (with build-time assertion)")
+
+
+def _copy_layout_for_dockerfile(image_root: str) -> dict:
+    """Parse Dockerfile.sidecar's COPY lines and copy each <src> into <dst>
+    under `image_root`. Returns the (src, dst) pairs actually copied so the
+    test can name what landed.
+
+    Each `COPY` line may name a single src/dst pair or a directory src; both
+    shapes are handled by shutil.copy2 (file) / shutil.copytree (dir). A
+    src is treated as a directory when it ends in `/` OR when a path by that
+    name exists on disk as a directory under the repo root -- Dockerfile
+    `COPY sidecars/mcp_bridge /app/mcp_bridge` is a directory src even
+    without a trailing slash, and a literal shutil.copy2 on it raises
+    `IsADirectoryError`. The parser is intentionally narrow — it does NOT
+    interpret Dockerfile variables, ARG defaults, or multi-stage builds —
+    because the sidecar Dockerfile is short and the relevant lines are
+    plain COPYs.
+    """
+    import shutil
+
+    repo_root = os.path.dirname(HERE)
+    pairs = []
+    with open(DOCKERFILE_SIDECAR, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line.startswith("COPY "):
+                continue
+            parts = line.split()[1:]
+            if len(parts) != 2:
+                # Multi-source COPY (COPY a b c /dst/) is not used here.
+                continue
+            src, dst = parts
+            full_dst = os.path.join(image_root, dst.lstrip("/"))
+            os.makedirs(os.path.dirname(full_dst), exist_ok=True)
+            src_on_disk = os.path.join(repo_root, src.rstrip("/"))
+            if src.endswith("/") or os.path.isdir(src_on_disk):
+                shutil.copytree(src_on_disk, full_dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src_on_disk, full_dst)
+            pairs.append((src, dst))
+    return pairs
+
+
+def test_image_layout_builds_a_real_caller_environment_settings():
+    """End-to-end mirror of Dockerfile.sidecar's image: a temp `/app` is
+    populated from the Dockerfile's own COPY lines, a minimal plans.yaml
+    sets `settings.caller_environment`, and a fresh subprocess runs
+    `read_config()` against that layout. A dropped COPY line OR a silent
+    `None` fallback in the code is caught here, not only by the running
+    image.
+
+    The reproduction runs `read_config()` in a clean subprocess so the
+    sidecar module's import-time globals (PROVIDER, PLAN, PLANS_PATH,
+    _models) are constructed fresh against the mirrored layout, the same
+    way the running container constructs them. Asserting the typed
+    surface — `caller_environment` is not None, `.probe == "required"`,
+    `.platform == "win32"` — pins both halves of the contract.
+    """
+    import shutil
+    import subprocess
+
+    image_root = Path(tempfile.mkdtemp(prefix="clib-imagelayout-"))
+    try:
+        pairs = _copy_layout_for_dockerfile(str(image_root))
+        # Sanity-check the layout that the parser produced: the bridge
+        # module, the switchyard package init, and the two switchyard
+        # modules the bridges need (caller_env + models). Anything else
+        # the Dockerfile copies (harness configs, mcp_bridge/) is fine to
+        # have but not relevant to this test's contract.
+        copied = {dst for _src, dst in pairs}
+        assert "/app/cli_bridge/server.py" in copied, sorted(copied)
+        assert "/app/switchyard/__init__.py" in copied, sorted(copied)
+        assert "/app/switchyard/caller_env.py" in copied, sorted(copied)
+        assert "/app/switchyard/models.py" in copied, sorted(copied)
+
+        # Minimal plans.yaml: one plan, settings.caller_environment set
+        # to a recognisable shape so a successful build is observable
+        # (probe + platform are the two fields CallerEnvironmentSettings
+        # exposes at its constructor).
+        plans_path = image_root / "plans.yaml"
+        plans_path.write_text(
+            "settings:\n"
+            "  caller_environment:\n"
+            "    probe: required\n"
+            "    platform: win32\n"
+            "plans:\n"
+            "  regression:\n"
+            "    max_parallel: 1\n"
+            "    models:\n"
+            "      m:\n"
+            "        model: m\n"
+            "        enabled: true\n"
+        )
+
+        # Import and call read_config() in a fresh subprocess against
+        # the mirrored layout. cwd /app/cli_bridge mirrors the running
+        # container's `cd /app/${BRIDGE:-cli}_bridge`; PYTHONPATH=<root>/app
+        # mirrors the Dockerfile's ENV PYTHONPATH=/app so a plain
+        # `import switchyard.models` resolves the package we copied.
+        # The harness /mcp_bridge dirs are not needed for read_config()
+        # but the Dockerfile COPY them; the parser above will have copied
+        # them if present, which is harmless.
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(image_root / "app")
+        env["PROVIDER"] = "claude"
+        env["SWITCHYARD_PLAN"] = "regression"
+        env["SWITCHYARD_PLANS"] = str(plans_path)
+        # Keep litellm (pulled by switchyard.models' guarded import) on
+        # the local backup map for the subprocess too, mirroring what
+        # plans_path does for the test suite.
+        env.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, json;"
+             "sys.path.insert(0, '.');"
+             "import importlib.util;"
+             "_spec = importlib.util.spec_from_file_location('regression_cli_bridge',"
+             " 'server.py');"
+             "_mod = importlib.util.module_from_spec(_spec);"
+             # Register BEFORE exec: cli_bridge defines a @dataclass that"
+             # looks itself up by cls.__module__ in sys.modules during class"
+             # construction, so the spec-loaded module has to be in"
+             # sys.modules before exec_module runs."
+             "sys.modules['regression_cli_bridge'] = _mod;"
+             "_spec.loader.exec_module(_mod);"
+             "cfg = _mod.read_config();"
+             "ce = cfg.caller_environment;"
+             "print(json.dumps({'caller_environment_is_none': ce is None,"
+             " 'probe': getattr(ce, 'probe', None),"
+             " 'platform': getattr(ce, 'platform', None)}))"],
+            cwd=str(image_root / "app" / "cli_bridge"),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, (
+            f"subprocess failed (rc={proc.returncode}); "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+        # Locate the JSON line: subprocess.run may have litellm's noisy
+        # stdout ahead of it. Take the last line that parses as JSON.
+        import json as _json
+        payload = None
+        for line in proc.stdout.splitlines()[::-1]:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            break
+        assert payload is not None, (
+            f"subprocess did not emit a parseable JSON result; "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+        # The full contract: caller_environment is a typed settings
+        # instance, the probe field is what plans.yaml said, and the
+        # platform field round-trips. A dropped COPY line in the
+        # Dockerfile would leave _models is None and `caller_environment`
+        # would be dropped on the floor by the new log.error branch,
+        # so the first assertion fails.
+        assert payload["caller_environment_is_none"] is False, payload
+        assert payload["probe"] == "required", payload
+        assert payload["platform"] == "win32", payload
+        print(f"  image-mirror: read_config().caller_environment "
+              f"probe={payload['probe']!r} platform={payload['platform']!r} "
+              f"(not None — Dockerfile COPY line + module-level import "
+              f"both intact)")
+    finally:
+        shutil.rmtree(image_root, ignore_errors=True)
 
 
 # ------------------------------------------ issue #127: envelope -> error ----

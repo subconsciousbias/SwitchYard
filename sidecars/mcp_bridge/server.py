@@ -509,6 +509,12 @@ def _caller_env_settings() -> Any:
     loaded successfully); otherwise returns a CallerEnvironmentSettings
     with `probe=auto` -- the field is always defined, the question is
     only what the operator set.
+
+    `_caller_env.CallerEnvironmentSettings` does NOT exist (caller_env.py
+    owns runtime resolution, not the typed settings class -- the class
+    lives in switchyard.models.py). Build the default from
+    cli_bridge._models instead, which cli_bridge loads via the same
+    package / path-load idiom this module already uses for _caller_env.
     """
     if _caller_env is None:
         return None
@@ -516,8 +522,15 @@ def _caller_env_settings() -> Any:
     settings = getattr(cfg, "caller_environment", None)
     if settings is not None:
         return settings
+    models = getattr(cli_bridge, "_models", None)
+    if models is None:
+        log.error("no caller_environment config AND switchyard.models is not "
+                  "importable via cli_bridge; CallerEnvironmentSettings default "
+                  "cannot be built. Dockerfile.sidecar must COPY "
+                  "switchyard/models.py.")
+        return None
     try:
-        return _caller_env.CallerEnvironmentSettings()
+        return models.CallerEnvironmentSettings()
     except Exception as exc:
         log.warning("could not build default CallerEnvironmentSettings: %s",
                     exc, exc_info=True)
