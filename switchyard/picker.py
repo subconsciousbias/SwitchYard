@@ -820,6 +820,27 @@ class Picker:
         # body is fully skipped, step 3's tail `_visit_ref` re-leases the
         # tail. So placement converges and nothing has to re-add the lease
         # by hand.
+        #
+        # Pacing note (issue #110): the gate is deliberately
+        # pacing-independent. It fires whether or not `policy.tail_enabled()`
+        # is true, so a tail lease taken BEFORE pacing turned the tail off
+        # un-pins the same way — pacing's tail flip does not strand an
+        # already-leased session on the disabled tail. Step 3 then refuses
+        # to re-lease the tail (it appends `{ref}(tail disabled (pacing))`
+        # and skips), so a body-full paced lane raises `LaneSaturated`
+        # with the lease already dropped by this gate's CAS. The gate
+        # intentionally does NOT consult `tail_enabled()`: doing so would
+        # narrow it to the pacing-on case only, leaving the original
+        # overflow-tail case (#95 — a session that got onto the tail
+        # because the body was full) unaddressed, and would re-introduce a
+        # second drop branch with its own race-vs-`drop_lease_if` CAS
+        # rules to keep in lock-step. The existing pacing-independent drop
+        # already covers both #95 and #110, so the right move is a
+        # regression test that locks the pacing case in — not a narrower
+        # check that re-introduces the case #312 closed. The tail stays in
+        # `reachable` (above) for the same reason — to drop the lease here,
+        # the held ref has to still be one `_affinity` recognises as
+        # in-lane.
         if self.registry.is_tail(ctx.lane, held) and not ctx.pinned:
             # Compare-and-drop the tail lease: between `held = ...`
             # (line 763) and now we have awaited at least once (the

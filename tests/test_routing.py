@@ -5842,6 +5842,169 @@ def test_overflow_lease_is_not_sticky_on_a_paid_local_tail_lane():
           f"({pinned_pick}, sticky=True)")
 
 
+def test_paced_tail_lease_is_not_sticky():
+    """Issue #110: pacing turning the tail off does not strand a live
+    tail lease.
+
+    The overflow gate at the bottom of `_affinity` is pacing-independent:
+    it fires whether or not `policy.tail_enabled()` is true, so a lease
+    taken before pacing turned the tail off un-pins the same way. Step 3
+    then refuses to re-lease the tail (it appends
+    `{ref}(tail disabled (pacing))`), so a body-full paced lane raises
+    `LaneSaturated` with the lease already dropped — no stranded tail
+    lease, no silent fallback. The pinned exemption survives pacing.
+
+    Mirrors `test_overflow_lease_is_not_sticky_on_a_paid_local_tail_lane`
+    on lane `apex` (body `claude-max/fable`, `openai/astra`;
+    tail `local-box/qwen`), with `build_with_policy()` and
+    `await picker.policy.set_pacing(True)` flipped on at the start of (a).
+    """
+    async def go():
+        reg, slots, picker, _ledger = build_with_policy()
+        lane = "apex"
+        session = "sess-paced-tail"
+        tail_ref = "local-box/qwen"
+        lease_ttl = reg.settings.lease_ttl_seconds
+
+        body_refs = [
+            m.ref for m in reg.lane_members(lane)
+            if not reg.is_tail(lane, m.ref)
+        ]
+        assert body_refs, (
+            "test needs at least one non-tail body member on "
+            f"{lane!r}; got {body_refs!r}"
+        )
+        assert reg.is_tail(lane, tail_ref), (
+            "test fixture drifted: expected tail_ref "
+            f"{tail_ref!r} on lane {lane!r}"
+        )
+
+        # (a) Prime the lease to the tail while pacing is still off,
+        # then turn pacing on. With pacing on the tail is disabled
+        # (`tail_enabled()` is False), but the overflow gate does NOT
+        # consult that flag: a tail lease drops unconditionally, the
+        # body walk re-places the session on a normal member, and the
+        # returned pick is not sticky.
+        assert not await picker.policy.pacing_enabled()
+        assert await picker.policy.tail_enabled()
+
+        await slots.set_lease(session, tail_ref, lease_ttl)
+        assert await slots.get_lease(session) == tail_ref
+
+        await picker.policy.set_pacing(True)
+        assert await picker.policy.pacing_enabled()
+        assert not await picker.policy.tail_enabled()
+
+        picked = await picker.pick(lane, session)
+        assert picked.ref in body_refs, (
+            "paced overflow pick must land on a body member, "
+            f"not {picked.ref!r} (body={body_refs!r})"
+        )
+        assert not picked.sticky, (
+            "a tail lease acquired before pacing turned the tail off "
+            "is not sticky -- the overflow gate is pacing-independent"
+        )
+        held_after_a = await slots.get_lease(session)
+        assert held_after_a == picked.ref, (
+            "lease must MOVE to the new body member, not be dropped "
+            f"or left pointing at the tail: {held_after_a!r} vs "
+            f"picked={picked.ref!r}"
+        )
+        assert held_after_a != tail_ref, held_after_a
+        await picker.release(picked.plan.key, picked.request_id, picked.ref)
+
+        # (b) Fill every body plan via slots.try_claim (same filler
+        # pattern as the non-paced overflow test). When the picker
+        # walks the body every plan is at full, the tail walk appends
+        # `{tail}(tail disabled (pacing))`, and the picker raises
+        # LaneSaturated. The overflow gate drops the tail lease on
+        # the way in, so the post-pick get_lease is falsy: pacing must
+        # not fall back to the tail.
+        filler_rids: list[str] = []
+        for ref in body_refs:
+            model = reg.model(ref)
+            plan = reg.plan_of(model)
+            for n in range(plan.max_parallel * 2):
+                rid = f"paced-filler-{ref.replace('/', '-')}-{n}"
+                if await slots.try_claim(
+                        plan.key, plan.max_parallel, rid,
+                        model.ref, model.max_parallel,
+                        lane=lane) != 1:
+                    break
+                filler_rids.append(rid)
+        assert filler_rids, "could not fill any body plan slot"
+
+        # Re-prime the lease to the tail. The picker enters _affinity
+        # with a tail lease; the overflow gate fires (drop_lease_if CAS,
+        # succeeds because the value still matches), ctx.skipped gets
+        # "{tail}(tail overflow, body walk)", and _affinity returns
+        # None. The body walk then fails on every member (full), the
+        # tail walk appends "{tail}(tail disabled (pacing))", and the
+        # picker raises LaneSaturated. The CAS already dropped the
+        # lease, so the post-pick get_lease is falsy.
+        await slots.set_lease(session, tail_ref, lease_ttl)
+        try:
+            await picker.pick(lane, session)
+        except LaneSaturated as exc:
+            refused = str(exc)
+        else:
+            raise AssertionError(
+                "a body-full paced lane must raise LaneSaturated, "
+                "not silently fall back to the tail"
+            )
+        assert "tail disabled (pacing)" in refused, (
+            f"refusal must name the pacing-off tail; got {refused!r}"
+        )
+        assert not await slots.get_lease(session), (
+            "pacing must not fall back to the tail -- the overflow "
+            "gate should have dropped the lease before the body walk "
+            "ran and failed"
+        )
+
+        # Drain the fillers so (c) starts clean. ZREM is idempotent,
+        # so calling release for every (plan, rid) pair is a no-op on
+        # plans where that rid was never claimed.
+        for ref in body_refs:
+            model = reg.model(ref)
+            plan = reg.plan_of(model)
+            for rid in filler_rids:
+                await picker.release(plan.key, rid, model.ref)
+
+        # (c) Pinned (mid-tool-loop) follow-up: the exemption in the
+        # overflow gate is `if is_tail and not ctx.pinned`. pinned=True
+        # makes the gate a no-op, the lease is honoured, and the pick
+        # lands on the tail with sticky=True. Pacing must not break
+        # this contract -- the gen_litellm precedent on which the
+        # tool-loop pin rides is the same whether the tail is enabled
+        # or not.
+        await slots.set_lease(session, tail_ref, lease_ttl)
+        pinned_pick = await picker.pick(lane, session, pinned=True)
+        assert pinned_pick.ref == tail_ref, (
+            "pinned follow-up must keep the tail lease under pacing: "
+            f"got {pinned_pick.ref!r}"
+        )
+        assert pinned_pick.sticky, (
+            "pinned follow-up on the tail must read as sticky"
+        )
+        held_after_c = await slots.get_lease(session)
+        assert held_after_c == tail_ref, held_after_c
+        await picker.release(
+            pinned_pick.plan.key, pinned_pick.request_id, pinned_pick.ref)
+
+        # Reset pacing so a later test that runs in the same Redis
+        # namespace (none today, but the helper file is module-level)
+        # sees the configured default.
+        await picker.policy.set_pacing(None)
+
+        return tail_ref, body_refs, picked.ref, refused, pinned_pick.ref
+
+    tail_ref, body_refs, body_pick, refused, pinned_pick = run(go())
+    print(f"  pacing-on tail lease {tail_ref} -> body walk placed on "
+          f"{body_pick} (body {sorted(body_refs)}); body-full + pacing -> "
+          f"LaneSaturated: {refused.split(': ', 1)[1]}; pinned exemption "
+          f"kept tail {pinned_pick} (sticky=True)")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
