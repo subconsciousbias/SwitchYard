@@ -4948,10 +4948,12 @@ def test_no_tools_fallthrough_inherits_max_tokens_enforcement_and_health_reports
     """The mcp_bridge no-tools path delegates to cli_bridge._handle_chat, so it
     inherits the per-profile max_tokens mode (issue #70). On a codex profile
     the bare request must 400 with max_tokens_unenforceable; on a claude
-    profile /health reports enforces_max_tokens=true with no reason. The
-    tool loop (handle_fresh / run_session / render_turn) is NOT exercised
-    here -- it is out of scope and unchanged: max_tokens stays ignored on
-    that path exactly as today.
+    profile /health reports enforces_max_tokens=true with no reason. The tool
+    loop (handle_fresh / run_session / render_turn) is exercised separately:
+    render_turn's final turn now runs cli_bridge.enforce_max_tokens on the
+    payload, so an overshoot on the tool path truncates with finish_reason
+    "length" the same way cli_bridge._complete does -- covered by
+    test_render_turn_final_truncates_long_answer_to_cap_with_length_finish.
     """
     from fastapi import HTTPException
     saved_provider, saved_profile = server.cli_bridge.PROVIDER, server.cli_bridge.PROFILE
@@ -6928,6 +6930,365 @@ def test_followup_duplicate_delivery_reaped_mid_turn_rebuilds_instead_of_500():
               f"{session.id[:8]}... ended")
     finally:
         restore()
+
+
+# --------------------------------- issue #70: max_tokens on the mcp_bridge tool path ---
+def test_render_turn_final_truncates_long_answer_to_cap_with_length_finish():
+    """The mcp_bridge final turn now runs cli_bridge.enforce_max_tokens the
+    same way cli_bridge._complete does (bridge-siblings rule, issue #70):
+    an assistant reply whose byte length exceeds `cap * 4` is cut on a UTF-8
+    boundary to roughly that size, finish_reason becomes "length", and the
+    usage the CLI reported is left untouched -- the caller paid for whatever
+    the CLI actually produced (issue #70's honest-bookkeeping rule). The
+    truncation site documents the tool path's no-400 contract: a CLI tool
+    loop is one conversation the router cannot spill mid-loop, so the only
+    honest outcome on an overshoot is to truncate and surface length.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-render-trunc-"))
+    try:
+        session = server.Session(
+            id=uuid.uuid4().hex, provider="claude", model="claude-sonnet-5",
+            workdir=str(workdir), max_tokens=10)
+        # 100 'x' bytes -- ceil(100 / 4) = 25 tokens, well past the cap of 10.
+        # The cut lands at 40 bytes (cap * 4) modulo a multi-byte boundary
+        # that the 100-byte ASCII string does not exercise, so the cut is
+        # byte-exact at 40 here.
+        long_text = "x" * 100
+        result = {"type": "final",
+                  "payload": {"result": long_text,
+                              "usage": {"input_tokens": 5, "output_tokens": 25,
+                                        "total_tokens": 30}}}
+        response = server.render_turn(session, result, session.model)
+        msg = response["choices"][0]["message"]
+        assert response["choices"][0]["finish_reason"] == "length", \
+            response["choices"][0]
+        # enforce_max_tokens cuts to cap * 4 = 40 bytes for pure ASCII;
+        # 100 'x' -> 40 'x' on a UTF-8 boundary, so byte-exact here.
+        assert len(msg["content"].encode("utf-8")) <= 40, \
+            (len(msg["content"]), msg["content"])
+        assert msg["content"].startswith("x" * 30), \
+            ("truncated answer should still begin with the original text",
+             msg["content"])
+        # Honest usage: the CLI reported output_tokens=25 (what it actually
+        # generated); enforce_max_tokens does NOT touch usage, and neither
+        # does to_openai when finish_reason is length -- the caller books
+        # what it paid for, not the byte-truncated text length.
+        usage = response["usage"]
+        assert usage["completion_tokens"] == 25, usage
+        assert usage["prompt_tokens"] == 5, usage
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    print(f"  render_turn final turn: 100-byte answer at cap=10 -> "
+          f"{len(msg['content'])}-byte cut, finish_reason=length, "
+          f"usage unchanged (output_tokens={usage['completion_tokens']})")
+
+
+def test_render_turn_tool_calls_turn_passes_through_byte_untouched():
+    """A mid-loop `tool_calls` turn is byte-untouched with
+    finish_reason="tool_calls" -- the cap is for the final assistant
+    answer text, not for a parked tool request. The tool_calls response
+    is hand-built by render_turn (not built by to_openai), so
+    enforce_max_tokens must NOT run on it; doing so would silently cut
+    the tool-call arguments JSON and break the call.
+    """
+    async def go():
+        workdir = Path(tempfile.mkdtemp(prefix="mcpb-render-tc-"))
+        try:
+            session = server.Session(
+                id=uuid.uuid4().hex, provider="claude", model="claude-sonnet-5",
+                workdir=str(workdir), max_tokens=1)
+            # A parked call carries a name and arguments that look like tool
+            # plumbing, not assistant text. Set up a single fake call so the
+            # tool_calls branch builds the response without raising. render_turn
+            # only reads c.id / c.name / c.arguments, so the future just needs
+            # to exist; the loop context here makes a real Future constructable.
+            call = server.ParkedCall(
+                id="call_x", name="probe",
+                arguments={"k": "v" * 1000},
+                future=asyncio.get_running_loop().create_future())
+            result = {"type": "tool_calls", "calls": [call]}
+            response = server.render_turn(session, result, session.model)
+            assert response["choices"][0]["finish_reason"] == "tool_calls", \
+                response["choices"][0]
+            # Arguments are the same JSON the tool_server.py expects to
+            # round-trip back to the CLI -- byte-untouched regardless of cap.
+            msg = response["choices"][0]["message"]
+            assert msg["content"] is None, msg
+            assert msg["tool_calls"][0]["function"]["name"] == "probe"
+            assert msg["tool_calls"][0]["function"]["arguments"] == \
+                '{"k": "' + ("v" * 1000) + '"}', msg["tool_calls"]
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        print("  render_turn tool_calls turn: arguments JSON byte-untouched "
+              "despite max_tokens=1, finish_reason=tool_calls")
+
+    asyncio.run(go())
+
+
+def test_render_turn_final_within_or_no_cap_keeps_stop_finish():
+    """Two adjacent cases: a final answer that fits the cap, and a final
+    answer where the caller never asked for one at all (session.max_tokens
+    is None). Both must land as finish_reason="stop" with the content
+    byte-identical to what the CLI produced -- enforce_max_tokens is a
+    no-op in both cases, and the unchanged-output behaviour (and any
+    caller-side caching keyed on it) is preserved (see cli_bridge
+    enforce_max_tokens docstring).
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-render-stop-"))
+    try:
+        # Within-cap: 20-byte answer at cap=10 -> 5 tokens, well under the
+        # cap, must pass through untouched.
+        session = server.Session(
+            id=uuid.uuid4().hex, provider="claude", model="claude-sonnet-5",
+            workdir=str(workdir), max_tokens=10)
+        short_text = "short answer."          # 13 bytes, 4 tokens
+        result = {"type": "final",
+                  "payload": {"result": short_text,
+                              "usage": {"input_tokens": 1, "output_tokens": 4}}}
+        response = server.render_turn(session, result, session.model)
+        assert response["choices"][0]["finish_reason"] == "stop", \
+            response["choices"][0]
+        assert response["choices"][0]["message"]["content"] == short_text, \
+            response["choices"][0]["message"]
+
+        # No cap: session.max_tokens is None, so enforce_max_tokens is a
+        # no-op and finish_reason stays "stop" regardless of length.
+        session.max_tokens = None
+        long_text = "y" * 4096
+        result2 = {"type": "final",
+                   "payload": {"result": long_text,
+                               "usage": {"input_tokens": 1, "output_tokens": 1024}}}
+        response2 = server.render_turn(session, result2, session.model)
+        assert response2["choices"][0]["finish_reason"] == "stop", \
+            response2["choices"][0]
+        assert response2["choices"][0]["message"]["content"] == long_text, \
+            "no cap must leave the answer byte-identical"
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    print("  render_turn final turn: within-cap and no-cap both -> "
+          "finish_reason=stop, content byte-identical")
+
+
+def test_render_turn_final_on_rebuilt_session_still_truncates_to_cap():
+    """A follow-up-born rebuilt session must still honour the cap on its
+    eventual final turn. The rebuild path is resume_gone_session ->
+    start_session with the same body, and start_session re-reads
+    cli_bridge.request_max_tokens(body) every time it runs -- so a Session
+    built from the rebuild path carries the same max_tokens value a fresh
+    Session would. This test pins both halves end-to-end: (a) the real
+    start_session wiring (body -> Session.max_tokens) for both the
+    max_tokens spelling and LiteLLM's max_completion_tokens rename, and
+    (b) the render_turn final-turn path consuming session.max_tokens to
+    truncate an overshooting answer.
+
+    Same harness as test_error_result_releases_gate_slot_and_removes_session:
+    a stubbed run_session captures the Session that start_session actually
+    constructed, which is the only way to pin the production wiring rather
+    than the request_max_tokens primitive in isolation (the previous test
+    assigned request_max_tokens output directly and so did not exercise
+    the new Session(max_tokens=...) kwarg in start_session -- a regression
+    that drops the kwarg or breaks resume_gone_session's body passthrough
+    would have passed).
+    """
+    captured_sessions: list = []
+    FINAL_RESULT = {"type": "final",
+                    "payload": {"result": "ok", "usage": {"input_tokens": 1,
+                                                          "output_tokens": 1,
+                                                          "total_tokens": 2}}}
+
+    async def scenario():
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+        real_run = server.run_session
+
+        async def fake_run(session, argv, stdin_data=None):
+            # Capture the Session that start_session actually constructed
+            # -- its max_tokens field is set by the line this PR added.
+            captured_sessions.append(session)
+            session.resolve_final(FINAL_RESULT)
+
+        server.run_session = fake_run
+        try:
+            tools = [{"type": "function", "function": {
+                "name": "f", "description": "",
+                "parameters": {"type": "object", "properties": {}}}}]
+            # (a) Drive start_session's body -> Session.max_tokens wiring
+            # for both cap spellings the runtime ever sees. A fresh gate
+            # is bound here (same as the issue #80 regression test) so the
+            # gate acquire inside handle_fresh is uncontested.
+            body_with_cap = {"model": "m", "max_tokens": 10,
+                             "tools": tools,
+                             "messages": [{"role": "user", "content": "hi"}]}
+            await server.handle_fresh(body_with_cap, tools, None)
+
+            # LiteLLM renames max_tokens to max_completion_tokens for gpt-5
+            # names (issue #279); the same body, the same primitive.
+            body_litellm = {**body_with_cap}
+            del body_litellm["max_tokens"]
+            body_litellm["max_completion_tokens"] = 25
+            await server.handle_fresh(body_litellm, tools, None)
+        finally:
+            server.run_session = real_run
+            server.SESSIONS.clear()
+            server.SESSIONS.update(saved_sessions)
+            server.cli_bridge._gate = saved_gate
+
+    asyncio.run(scenario())
+    # Two sessions captured, one per handle_fresh call.
+    assert len(captured_sessions) == 2, len(captured_sessions)
+    session_with_cap, session_litellm = captured_sessions
+    # (a) start_session picked the cap up from each body's spelling --
+    # not from the Session default. A regression that drops the
+    # `max_tokens=cli_bridge.request_max_tokens(body)` kwarg from
+    # start_session's Session(...) constructor would land these as None.
+    assert session_with_cap.max_tokens == 10, session_with_cap.max_tokens
+    assert session_litellm.max_tokens == 25, session_litellm.max_tokens
+
+    # (b) render_turn's final-turn path consumes session.max_tokens and
+    # truncates an overshooting answer -- the end-to-end contract.
+    result = {"type": "final",
+              "payload": {"result": "z" * 100,
+                          "usage": {"input_tokens": 2, "output_tokens": 25,
+                                    "total_tokens": 27}}}
+    response = server.render_turn(session_with_cap, result, session_with_cap.model)
+    msg = response["choices"][0]["message"]
+    assert response["choices"][0]["finish_reason"] == "length", \
+        response["choices"][0]
+    assert len(msg["content"].encode("utf-8")) <= 40, \
+        ("start_session-built Session final turn must truncate to cap*4 bytes",
+         len(msg["content"]))
+    assert msg["content"].startswith("z" * 30), msg["content"]
+    print(f"  start_session-built Session: max_tokens={session_with_cap.max_tokens}, "
+          f"max_completion_tokens variant={session_litellm.max_tokens}; "
+          f"cap=10 truncates 100-byte answer to {len(msg['content'])} bytes, "
+          f"finish_reason=length")
+
+
+def test_continue_followup_refreshes_session_max_tokens_from_per_turn_body():
+    """The live follow-up path must refresh session.max_tokens from the
+    per-turn body, mirroring what start_session already does on the rebuild
+    path. Without this refresh, a session that stays alive across turns uses
+    the stale cap from the first request -- exactly the failure #133
+    describes for a Claude Code / OpenCode tool loop that sends max_tokens
+    on every turn.
+
+    Three cases pinned (each via a fresh parked session and a real
+    _continue_followup call, with await_turn and new_turn stubbed the same
+    way test_followup_error_result_does_not_leak does):
+
+      (a) follow-up ADDS a cap (None -> 10) -- render_turn would have
+          landed as 'stop' on an unbounded answer without the refresh;
+      (b) follow-up CHANGES the cap (10 -> 25) -- render_turn would have
+          kept truncating to 10 instead of 25;
+      (c) follow-up DROPS the cap (10 -> None) -- render_turn would have
+          kept truncating to 10 instead of letting the answer be unbounded.
+
+    All three must leave session.max_tokens == the per-turn body's
+    request_max_tokens by the time _continue_followup returns, so the
+    subsequent render_turn sees the per-turn policy.
+    """
+    FINAL = {"type": "final",
+             "payload": {"result": "ok", "usage": {"input_tokens": 1,
+                                                   "output_tokens": 1,
+                                                   "total_tokens": 2}}}
+    bodies_and_initial = [
+        # (a) follow-up adds a cap
+        ({"model": "m", "max_tokens": 10,
+          "messages": [{"role": "tool", "tool_call_id": "t1",
+                        "content": "ok"}]}, None),
+        # (b) follow-up changes the cap
+        ({"model": "m", "max_tokens": 25,
+          "messages": [{"role": "tool", "tool_call_id": "t1",
+                        "content": "ok"}]}, 10),
+        # (c) follow-up drops the cap
+        ({"model": "m",
+          "messages": [{"role": "tool", "tool_call_id": "t1",
+                        "content": "ok"}]}, 10),
+    ]
+
+    async def scenario():
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+        real_new_turn = server.Session.new_turn
+        real_await_turn = server.await_turn
+
+        async def fast_await_turn(sess, request):
+            return FINAL
+        server.await_turn = fast_await_turn
+
+        observed: list = []
+        try:
+            for body, initial_max in bodies_and_initial:
+                # Hand-build a parked session identical to the issue #80
+                # regression's setup: real new_turn() so the initial
+                # turn_future resolves to tool_calls via register_tool_call's
+                # _flush. Override new_turn on the class BEFORE calling
+                # _continue_followup so the await on new_turn inside it
+                # returns an already-resolved future (run_session is never
+                # started in this scenario -- without the override the
+                # await on new_turn would hang).
+                session = _new_session()
+                session.new_turn()
+                parked = asyncio.create_task(
+                    server.register_tool_call(session.id, "echo", {"text": "x"}))
+                await asyncio.sleep(0)
+                turn = await session.turn_future
+                assert turn["type"] == "tool_calls", turn
+                call = turn["calls"][0]
+                session.awaiting_followup = True
+                session.holds_slot = False
+                # Pre-load the session's stored max_tokens with the FIRST
+                # request's value (None in case (a), 10 in cases (b)/(c))
+                # so the refresh line is what changes it, not start_session.
+                session.max_tokens = initial_max
+
+                def resolved_new_turn(self):
+                    f = asyncio.get_event_loop().create_future()
+                    f.set_result(FINAL)
+                    self.turn_future = f
+                    return f
+                server.Session.new_turn = resolved_new_turn
+
+                # Replace the synthetic tool_msg's call_id with the real one
+                # minted by register_tool_call.
+                followup_body = {**body}
+                followup_body["messages"] = [
+                    {"role": "tool", "tool_call_id": call.id,
+                     "content": "ok"}]
+                await server._continue_followup(
+                    followup_body, session.id,
+                    followup_body["messages"], None)
+                observed.append((session.id, session.max_tokens,
+                                 call.id))
+                # Drain the parked coroutine so its outcome is observed.
+                await parked
+                server.SESSIONS.pop(session.id, None)
+                # Restore real new_turn so the next iteration's parked-
+                # session setup uses the real one.
+                server.Session.new_turn = real_new_turn
+        finally:
+            server.Session.new_turn = real_new_turn
+            server.await_turn = real_await_turn
+            server.SESSIONS.clear()
+            server.SESSIONS.update(saved_sessions)
+            server.cli_bridge._gate = saved_gate
+        return observed
+
+    observed = asyncio.run(scenario())
+    # (a) None -> 10
+    assert observed[0][1] == 10, observed[0]
+    # (b) 10 -> 25
+    assert observed[1][1] == 25, observed[1]
+    # (c) 10 -> None
+    assert observed[2][1] is None, observed[2]
+    print("  live follow-up refresh: None->10, 10->25, 10->None all wired "
+          "(session.max_tokens now follows the per-turn body)")
 
 
 if __name__ == "__main__":

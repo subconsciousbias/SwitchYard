@@ -405,6 +405,15 @@ class Session:
     # `display == "omitted"` end to end, the same way cli_bridge's _complete
     # does (bridge-siblings rule).
     thinking: dict | None = None
+    # Issue #70: the caller's output cap (any of max_tokens /
+    # max_completion_tokens / max_output_tokens, per cli_bridge.request_max_tokens),
+    # captured at session start so render_turn's final turn can run
+    # cli_bridge.enforce_max_tokens the same way cli_bridge._complete does on
+    # the text path (bridge-siblings rule). None when the caller did not ask
+    # for a cap; rebuilds (resume_gone_session -> start_session) re-derive it
+    # from the same body, so a follow-up-born session still enforces whatever
+    # cap the latest request carried.
+    max_tokens: int | None = None
     _flush_handle: object = None
 
     def touch(self) -> None:
@@ -2020,7 +2029,19 @@ def render_turn(session: Session, result: dict, requested_model: str | None) -> 
         # final-turn must honour the same contract -- the policy is what the
         # caller asked for, regardless of which bridge served the turn.
         display = (session.thinking or {}).get("display")
-        response = cli_bridge.to_openai(result["payload"], requested_model or session.model,
+        # Issue #70: enforce the caller's output cap on the final answer --
+        # the same pairing cli_bridge._complete uses (cli_bridge/server.py:
+        # enforce_max_tokens(payload, request_max_tokens(body)) immediately
+        # before to_openai(...)). The tool path never 400s on the cap: a CLI
+        # tool loop is one conversation the router cannot spill mid-loop, and
+        # the only honest outcome when the model overshoots is to truncate
+        # and surface finish_reason="length" so the caller can recover
+        # (issue #279). The tool_calls branch above is byte-untouched -- the
+        # cap applies to the final answer text, not to a parked tool request.
+        final_payload, finish = cli_bridge.enforce_max_tokens(
+            result["payload"], session.max_tokens)
+        response = cli_bridge.to_openai(final_payload, requested_model or session.model,
+                                        finish_reason=finish,
                                         reasoning_display=display)
         # On the final turn, the OpenAI-shaped sum the CLI's payload carries
         # is what should be billed; the last-call context replaces
@@ -2339,11 +2360,17 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     web = cli_bridge.wants_web_search(body)
     effort = cli_bridge.request_effort(body)
     thinking = cli_bridge.request_thinking(body)
+    # Issue #70: stash the caller's output cap on the Session so render_turn's
+    # final turn can run cli_bridge.enforce_max_tokens the same way
+    # cli_bridge._complete does on the text path. resume_gone_session -> this
+    # function re-derives it from the same body, so a follow-up-born rebuilt
+    # session still truncates the eventual final answer.
+    max_tokens = cli_bridge.request_max_tokens(body)
     session = Session(id=session_id, provider=PROVIDER, model=model,
                       workdir=str(workdir), holds_slot=True,
                       spawn_dir=str(spawn_dir),
                       spawn_env=session_env(env, workdir, spawn_dir, web=web),
-                      thinking=thinking)
+                      thinking=thinking, max_tokens=max_tokens)
     # Inject the env block (system) and the first-turn reminder (prompt).
     # Both are pure functions of (prompt, system, env, first_turn) so a
     # rebuild of the same request produces the same CLI argv.
@@ -2707,6 +2734,18 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
     # stays True, `resolved_recently` is untouched, and the gateway's retry
     # walks the same follow-up path against the same live session.
     await unpark_session(session)
+    # Issue #70: refresh the caller's output cap on the live follow-up path.
+    # start_session reads max_tokens from the body when it constructs the
+    # Session; rebuilds (resume_gone_session -> start_session) re-derive it
+    # from the follow-up body, so a follow-up-born rebuilt session already
+    # honours whatever cap the latest request carried. The live path must
+    # do the same -- Claude Code / OpenCode send a cap on every turn, so
+    # per #133 the per-turn body is the authoritative per-turn policy, and
+    # a follow-up that DROPS the cap must also be respected (reassign
+    # unconditionally; None -> enforce_max_tokens no-op). Without this a
+    # follow-up turn that adds or changes the cap silently used the stale
+    # value from the first request.
+    session.max_tokens = cli_bridge.request_max_tokens(body)
     resolved = 0
     for m in tool_msgs:
         call = session.pending.pop(m["tool_call_id"], None)
@@ -2936,11 +2975,13 @@ async def health() -> JSONResponse:
                  # issue #264: the startup self-check's verdict (selfcheck.py).
                  "host_mirror": dict(HOST_MIRROR, mode=HOST_MIRROR_MODE)
                  if HOST_MIRROR_MODE != "off" else {"mode": "off"},
-                 # Profile-driven (mirrors cli_bridge /health). The MCP path's
-                 # tool loop ignores max_tokens regardless (see handle_fresh /
-                 # render_turn), so this field is reported but only the
-                 # no-tools fall-through actually applies it -- a CLI tool
-                 # request is not the contract the cap was designed for.
+                 # Profile-driven (mirrors cli_bridge /health). The cap now
+                 # applies to the final answer on the tool path too --
+                 # render_turn runs cli_bridge.enforce_max_tokens on the final
+                 # payload the same way cli_bridge._complete does, so an
+                 # overshoot lands as finish_reason="length" instead of an
+                 # unbounded assistant reply (issue #70). The shape of this
+                 # field is unchanged; only the tool path's compliance has.
                  "enforces_max_tokens": bool(cli_bridge.PROFILE.get("enforce_max_tokens"))}
     if not health_doc["enforces_max_tokens"]:
         reason = cli_bridge.PROFILE.get("enforce_max_tokens_reason")
