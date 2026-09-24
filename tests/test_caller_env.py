@@ -682,6 +682,10 @@ def test_render_first_turn_reminder_unknown_uses_own_wording():
     reminder = caller_env.render_first_turn_reminder(env)
     assert "caller environment unknown" in reminder
     assert "do not assume the relay container is the caller machine" in reminder
+    # Issue #256: a headless relay has no one to answer a question, so the
+    # reminder must not tell the model to ask one.
+    assert "ask if needed" not in reminder
+    assert "instead of asking" in reminder
     print(f"  reminder unknown: {reminder[:60]}...")
 
 
@@ -698,6 +702,119 @@ def test_render_functions_are_pure_no_environment_substitution():
     assert "/app/" not in reminder
     print("  render functions are pure (no host-env leakage)")
 
+
+
+# ---------------------------------- issue #187: real caller prompt formats ---
+CLAUDE_CODE_ENV_SECTION = (
+    "You are Claude Code.\n\n# Environment\n"
+    "You have been invoked in the following environment: \n"
+    " - Primary working directory: /Users/me/Documents/GitHub/proj\n"
+    " - Is a git repository: true\n"
+    " - Platform: darwin\n"
+    " - Shell: zsh\n"
+    " - OS Version: Darwin 27.0.0\n")
+
+OPENCODE_ENV_BLOCK = (
+    "You are opencode.\n"
+    "Here is some useful information about the environment you are running in:\n"
+    "<env>\n"
+    "  Working directory: /home/oranode/orca/workspaces/SwitchYard/x\n"
+    "  Workspace root folder: /home/oranode/orca/workspaces/SwitchYard\n"
+    "  Is directory a git repo: yes\n"
+    "  Platform: linux\n"
+    "  Today's date: Thu Sep 24 2026\n"
+    "</env>\n")
+
+
+def test_parse_claude_code_environment_section():
+    """Claude Code's system prompt lists its environment as bulleted
+    `- Label: value` lines under `# Environment`. All three fields must
+    come through -- the old parser found none of them."""
+    env = caller_env.parse_request({"messages": [
+        {"role": "system", "content": CLAUDE_CODE_ENV_SECTION},
+        {"role": "user", "content": "hi"}]})
+    assert env is not None
+    assert env.cwd == "/Users/me/Documents/GitHub/proj", env
+    assert env.platform == "darwin", env
+    assert env.shell == "zsh", env
+    print(f"  Claude Code # Environment -> {env}")
+
+
+def test_parse_top_level_anthropic_system():
+    """On /v1/messages the gateway sees Claude Code's system prompt as the
+    top-level `system` (string or block list), not a message."""
+    for system in (CLAUDE_CODE_ENV_SECTION,
+                   [{"type": "text", "text": "preamble"},
+                    {"type": "text", "text": CLAUDE_CODE_ENV_SECTION}]):
+        env = caller_env.parse_request({
+            "system": system, "messages": [{"role": "user", "content": "hi"}]})
+        assert env is not None and env.cwd == "/Users/me/Documents/GitHub/proj", env
+    print("  top-level system (string and block list) parsed")
+
+
+def test_parse_opencode_env_block_keeps_cwd():
+    """OpenCode's `<env>` block says `Working directory:`. An earlier parser
+    matched its platform and returned before anything read the cwd, so the
+    tool path ran "in unknown" (issue #255's vacuous reminder)."""
+    env = caller_env.parse_request({"messages": [
+        {"role": "system", "content": OPENCODE_ENV_BLOCK},
+        {"role": "user", "content": "hi"}]})
+    assert env is not None
+    assert env.cwd == "/home/oranode/orca/workspaces/SwitchYard/x", env
+    assert env.platform == "linux", env
+    print(f"  OpenCode <env> -> {env}")
+
+
+def test_parsers_merge_field_by_field():
+    """One parser may know the platform and another the cwd; the result
+    carries both instead of whichever parser matched first."""
+    # The OpenCode-style parser matches `<environment>` and finds only the
+    # platform; the cwd is in a labelled line only a later parser reads.
+    text = ("<environment>\n  <platform>windows</platform>\n</environment>\n"
+            "Working directory: C:/Users/me/proj\nShell: pwsh\n")
+    env = caller_env.parse_request({"messages": [{"role": "system", "content": text}]})
+    assert (env.cwd, env.platform, env.shell) == ("C:/Users/me/proj", "windows", "pwsh"), env
+    print(f"  merged: {env}")
+
+
+def test_real_paths_containing_app_are_not_relay_paths():
+    """Relay paths are the relay's own directories, matched as prefixes.
+    A substring match on "/app/" discarded real caller paths."""
+    for real in ("/home/u/myapp/app/src", "/Users/me/app/web", "/srv/app/x"):
+        assert not caller_env._is_relay_path(real), real
+    for relay in ("/app/mcp_bridge", "/app/cli_bridge/x", "/tmp/mcpb-1234-ab",
+                  "/tmp/sy-cli-xyz", "/tmp/switchyard-relay/a"):
+        assert caller_env._is_relay_path(relay), relay
+    env = caller_env.parse_request({"messages": [{"role": "system", "content":
+        "# Environment\n - Primary working directory: /Users/me/app/web\n"}]})
+    assert env is not None and env.cwd == "/Users/me/app/web", env
+    print("  /app/ inside a real path kept; relay prefixes still rejected")
+
+
+def test_relay_cwd_from_one_parser_is_rescued_by_a_later_one():
+    """The merge strips a relay-looking cwd per parser and keeps going, so a
+    later parser can still supply the caller's real cwd. Previously the
+    first parser won outright and its stripped cwd was final."""
+    text = ("<environment>\n  <working_directory>/app/mcp_bridge</working_directory>\n"
+            "  <platform>linux</platform>\n</environment>\n"
+            "<environment_context>\n  <cwd>/home/u/proj</cwd>\n  <shell>zsh</shell>\n"
+            "</environment_context>\n")
+    env = caller_env.parse_request({"messages": [{"role": "system", "content": text}]})
+    assert (env.cwd, env.platform, env.shell) == ("/home/u/proj", "linux", "zsh"), env
+    print(f"  relay cwd stripped, real cwd rescued: {env}")
+def test_parse_git_flag_from_claude_code_and_opencode():
+    """The caller's prompt says whether its cwd is a repository; the relay's
+    mirror of that directory is `git init`ed to match."""
+    cc = caller_env.parse_request({"messages": [
+        {"role": "system", "content": CLAUDE_CODE_ENV_SECTION}]})
+    oc = caller_env.parse_request({"messages": [
+        {"role": "system", "content": OPENCODE_ENV_BLOCK}]})
+    no = caller_env.parse_request({"messages": [{"role": "system", "content":
+        "<env>\nWorking directory: /x\nIs directory a git repo: no\n</env>"}]})
+    bare = caller_env.parse_request({"messages": [{"role": "system", "content":
+        "# Environment\n - Primary working directory: /x\n"}]})
+    assert (cc.git, oc.git, no.git, bare.git) == (True, True, False, None)
+    print("  git flag: true / yes / no / absent")
 
 if __name__ == "__main__":
     import _runner

@@ -599,8 +599,8 @@ Image blocks used to be flattened away by the sidecars: a screenshot came
 back as a confident near-white hex (e.g. `#EDF6EC` for a magenta swatch --
 the model answering from its prior over what such a screenshot "usually"
 shows). The fix stages the bytes to disk and tells each CLI how to carry
-them: `claude -p` gets `--add-dir` + an explicit `Read` allowlist (and Read
-is no longer in its bare-mode disallowed-tools list), `codex exec` gets a
+them: `claude -p` gets `--add-dir` + an explicit `Read` allowlist (and
+`--tools Read`, so Read is the only built-in that exists), `codex exec` gets a
 repeatable `-i FILE`, and `opencode run` gets a repeatable `-f FILE`. None
 of the CLIs accept raw base64 in the prompt, which is why staging is the
 shape they all share.
@@ -652,14 +652,14 @@ docker compose exec -T opencode-go-sidecar opencode run --format json \
 
 docker compose exec -T claude-max-sidecar claude -p --output-format json \
   --model opus --max-turns 4 \
-  --disallowed-tools 'Bash,Edit,Write,Glob,Grep,WebFetch,WebSearch,NotebookEdit' \
+  --tools Read --strict-mcp-config --setting-sources '' --permission-prompts none \
   --add-dir /tmp/magenta-stage --allowed-tools 'Read(/tmp/magenta-stage/**)' \
   'The image is saved as /tmp/magenta-stage/01.png. Read it with your Read tool and reply with only its hex colour.'
 ```
 
 **Expect** a magenta-family hex from each. The Claude one proves the
-`bare_args_images` list is the one in use: Read is unrestricted and the
-disallowed list does not contain it.
+`bare_args_images` list is the one in use: Read is the only built-in, and
+the `--allowed-tools Read(<dir>/**)` rule is what lets it reach the file.
 
 ## 5. Behaviour tests
 

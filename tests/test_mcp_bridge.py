@@ -44,6 +44,10 @@ sys.path.insert(0, HERE)
 
 os.environ["PROVIDER"] = "claude"
 os.environ.setdefault("SWITCHYARD_PLAN", "claude-max")
+# These tests drive handle_tool_request directly, with fake sessions; the
+# startup self-check that gates it (selfcheck.py) has its own tests in
+# tests/test_selfcheck.py.
+os.environ["MCP_HOST_MIRROR_CHECK"] = "off"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from plans_path import plans_path  # noqa: E402
 
@@ -55,6 +59,9 @@ os.environ.setdefault("SIDECAR_PORT", "8081")
 from _modules import load  # noqa: E402
 
 server = load("mcp_bridge_server", os.path.join(MCP_BRIDGE_DIR, "server.py"))
+# The env var above only takes effect if this module loads the bridge first;
+# another test module may already have, so pin the mode on the module too.
+server.HOST_MIRROR_MODE = "off"
 
 TOOL_SERVER = os.path.join(MCP_BRIDGE_DIR, "tool_server.py")
 
@@ -91,6 +98,118 @@ def test_translate_tools_openai_to_mcp():
     }
     assert mcp_tools[1]["name"] == "no_wrapper"
     print(f"  {len(mcp_tools)}/3 tools translated (one malformed entry dropped)")
+
+
+def test_fit_tool_surface_splits_long_descriptions_for_claude():
+    """Claude Code cuts an MCP tool description at 2048 characters. A
+    longer caller description keeps its head on the tool and moves the
+    remainder into the system prompt -- nothing lost, nothing sent twice."""
+    saved = (server.PROVIDER, server.PROFILE)
+    try:
+        server.PROVIDER, server.PROFILE = "claude", server.MCP_PROFILES["claude"]
+        head = "Runs a shell command.\n" + ("h" * 1500) + "\n"
+        tail = "TAIL-" + ("t" * 3000)
+        tools = [{"name": "Bash", "description": head + tail, "inputSchema": {}},
+                 {"name": "Read", "description": "short", "inputSchema": {}}]
+        fitted, system = server.fit_tool_surface(tools, "CALLER", {})
+        bash = fitted[0]["description"]
+        assert len(bash) < 2048, len(bash)
+        assert bash.startswith("Runs a shell command."), bash[:40]
+        assert "Tool reference: mcp__switchyard__Bash" in bash, bash[-120:]
+        assert fitted[1]["description"] == "short"
+        assert system.startswith("CALLER\n\n"), system[:40]
+        assert "### Tool reference: mcp__switchyard__Bash" in system
+        assert tail in system and head not in system, "remainder only, once"
+        print("  claude: long description split, remainder in system prompt")
+    finally:
+        server.PROVIDER, server.PROFILE = saved
+
+
+def test_fit_tool_surface_leaves_other_clis_descriptions_whole():
+    """OpenCode and codex keep a 5000-character description intact
+    (verified on the pinned CLIs): no split there."""
+    saved = (server.PROVIDER, server.PROFILE)
+    try:
+        for provider in ("opencode", "codex"):
+            server.PROVIDER, server.PROFILE = provider, server.MCP_PROFILES[provider]
+            desc = "d" * 5000
+            fitted, system = server.fit_tool_surface(
+                [{"name": "bash", "description": desc, "inputSchema": {}}], None, {})
+            assert fitted[0]["description"] == desc, provider
+            assert "Tool reference" not in (system or ""), provider
+        print("  opencode / codex: descriptions untouched")
+    finally:
+        server.PROVIDER, server.PROFILE = saved
+
+
+def test_fit_tool_surface_maps_names_and_states_tool_choice():
+    """The caller's prompt names its tools bare; the CLI exposes them with
+    a prefix, so one line maps the two. tool_choice has no CLI flag and
+    becomes an explicit (advisory) instruction."""
+    saved = (server.PROVIDER, server.PROFILE)
+    tools = [{"name": "Bash", "description": "x", "inputSchema": {}}]
+    try:
+        server.PROVIDER, server.PROFILE = "claude", server.MCP_PROFILES["claude"]
+        _, system = server.fit_tool_surface(tools, None, {})
+        assert "`Bash` is `mcp__switchyard__Bash`" in system, system
+        _, system = server.fit_tool_surface(tools, None, {"tool_choice": "none"})
+        assert "do not call any tool" in system, system
+        _, system = server.fit_tool_surface(tools, None, {"tool_choice": "required"})
+        assert "must call at least one tool" in system, system
+        _, system = server.fit_tool_surface(
+            tools, None, {"tool_choice": {"type": "function", "function": {"name": "Bash"}}})
+        assert "must call the tool `mcp__switchyard__Bash`" in system, system
+        server.PROVIDER, server.PROFILE = "opencode", server.MCP_PROFILES["opencode"]
+        _, system = server.fit_tool_surface(tools, None, {})
+        assert "`Bash` is `switchyard_Bash`" in system, system
+        server.PROVIDER, server.PROFILE = "codex", server.MCP_PROFILES["codex"]
+        _, system = server.fit_tool_surface(tools, None, {})
+        assert system is None, system          # codex keeps bare names
+        print("  name mapping per CLI; tool_choice none/required/named stated")
+    finally:
+        server.PROVIDER, server.PROFILE = saved
+
+
+def test_translate_tools_logs_what_it_drops():
+    """A server-side tool (web search) or a malformed entry has no
+    caller-side executor; it is dropped, but never silently."""
+    import logging
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    server.log.addHandler(handler)
+    try:
+        out = server.translate_tools([
+            {"type": "function", "function": {"name": "ok", "parameters": {}}},
+            {"type": "web_search_preview"}])
+    finally:
+        server.log.removeHandler(handler)
+    assert [t["name"] for t in out] == ["ok"], out
+    assert any("web_search_preview" in r.getMessage() for r in records), \
+        [r.getMessage() for r in records]
+    print("  dropped non-function tool is logged")
+
+
+def test_opencode_session_config_carries_the_caller_system_prompt():
+    """The agent's `prompt:` replaces OpenCode's own ~9.5K base prompt;
+    the caller's system prompt belongs there, not folded into the user
+    turn beneath it."""
+    import shutil
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-oc-prompt-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    saved = (server.PROVIDER, server.PROFILE)
+    try:
+        server.PROVIDER, server.PROFILE = "opencode", server.MCP_PROFILES["opencode"]
+        argv, _ = server.build_argv("do the thing", "CALLER SYSTEM", "m",
+                                    workdir, "sess", tools_path, "")
+        cfg = json.loads((workdir / "opencode.json").read_text())
+        assert cfg["agent"]["switchyard"]["prompt"] == "CALLER SYSTEM", cfg
+        assert argv[-1] == "do the thing", argv
+        print("  opencode: caller system prompt -> agent prompt, user turn untouched")
+    finally:
+        server.PROVIDER, server.PROFILE = saved
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def test_call_id_round_trips_the_session_id():
@@ -165,6 +284,148 @@ def test_followup_correlates_by_tool_call_id_and_resumes_the_model():
     assert response["choices"][0]["message"]["content"] == "done: hi back"
     assert tool_result["content"][0]["text"] == "hi back"
     print(f"  follow-up correlated by tool_call_id -> {response['choices'][0]['message']['content']!r}")
+
+
+class _JsonRequest:
+    """The two things chat() and the follow-up path read from a Request."""
+
+    def __init__(self, body: dict):
+        self._body = body
+
+    async def json(self) -> dict:
+        return self._body
+
+    async def is_disconnected(self) -> bool:
+        return False
+
+
+ECHO_TOOLS = [{"type": "function", "function": {
+    "name": "echo", "description": "echo",
+    "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}}}]
+
+
+def test_followup_without_tools_resumes_the_parked_session():
+    """Issue #260: OpenAI-compatible clients may send `tools` on the first
+    turn only. A follow-up that answers one of OUR tool calls must still
+    reach the parked session -- not the text path, which would start a
+    fresh tool-less CLI while the parked one waits for a result forever."""
+    async def scenario():
+        session = _new_session()
+        server.remember_tools(session.id, ECHO_TOOLS)
+        session.new_turn()
+        parked = asyncio.create_task(
+            server.register_tool_call(session.id, "echo", {"text": "ping"}))
+        turn = await session.turn_future
+        call = turn["calls"][0]
+        body = {"model": "m", "messages": [   # no "tools" key at all
+            {"role": "user", "content": "echo ping"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": call.id, "type": "function",
+                              "function": {"name": "echo", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": call.id, "content": "got ping"},
+        ]}
+        real_text_path = server.cli_bridge._handle_chat
+
+        async def text_path(_body):
+            raise AssertionError("tool follow-up was routed to the text path")
+        server.cli_bridge._handle_chat = text_path
+        try:
+            followup = asyncio.create_task(server.chat(_JsonRequest(body)))
+            await asyncio.sleep(0.05)
+            session.resolve_final({"type": "final", "payload": {"result": "done"}})
+            response = await followup
+        finally:
+            server.cli_bridge._handle_chat = real_text_path
+        result = await parked
+        _drop(session)
+        return response, result
+
+    response, result = asyncio.run(scenario())
+    assert result["content"][0]["text"] == "got ping", result
+    assert response["choices"][0]["message"]["content"] == "done", response
+    print("  tool-less follow-up delivered 'got ping' to the parked session")
+
+
+def test_streamed_followup_without_tools_resumes_the_parked_session():
+    """The #260 follow-up as a streaming request: chat() rehydrates the
+    body's tools and must still frame the parked session's answer as SSE."""
+    from fastapi.responses import StreamingResponse
+
+    async def scenario():
+        session = _new_session()
+        server.remember_tools(session.id, ECHO_TOOLS)
+        session.new_turn()
+        parked = asyncio.create_task(
+            server.register_tool_call(session.id, "echo", {"text": "ping"}))
+        turn = await session.turn_future
+        call = turn["calls"][0]
+        body = {"model": "m", "stream": True, "messages": [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": call.id, "type": "function",
+                              "function": {"name": "echo", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": call.id, "content": "got ping"},
+        ]}
+        followup = asyncio.create_task(server.chat(_JsonRequest(body)))
+        await asyncio.sleep(0.05)
+        session.resolve_final({"type": "final", "payload": {"result": "streamed done"}})
+        response = await followup
+        chunks = [c if isinstance(c, str) else c.decode()
+                  async for c in response.body_iterator]
+        result = await parked
+        _drop(session)
+        return response, "".join(chunks), result
+
+    response, stream, result = asyncio.run(scenario())
+    assert isinstance(response, StreamingResponse), type(response)
+    assert result["content"][0]["text"] == "got ping", result
+    assert "streamed done" in stream and "data: [DONE]" in stream, stream[-200:]
+    print("  streamed tool-less follow-up resumed the parked session as SSE")
+
+
+def test_tool_less_request_without_our_call_ids_stays_on_the_text_path():
+    """Only a follow-up answering a call we minted is rerouted: a plain chat,
+    or a tool message whose id we never issued, is the text path's."""
+    seen = []
+
+    async def text_path(body):
+        seen.append(body)
+        return {"text": True}
+
+    real = server.cli_bridge._handle_chat
+    server.cli_bridge._handle_chat = text_path
+    try:
+        plain = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        foreign = {"model": "m", "messages": [
+            {"role": "tool", "tool_call_id": "call_notours_1", "content": "x"}]}
+        assert asyncio.run(server.chat(_JsonRequest(plain))) == {"text": True}
+        assert asyncio.run(server.chat(_JsonRequest(foreign))) == {"text": True}
+    finally:
+        server.cli_bridge._handle_chat = real
+    assert len(seen) == 2 and all("tools" not in b for b in seen), seen
+    print("  plain chat and foreign tool ids still take the text path")
+
+
+def test_remembered_tools_cover_probe_ids_and_are_bounded():
+    """A caller-env probe answer can come back without `tools` too; the
+    probe's call id maps to the tools of the request that minted it. The
+    map is bounded so a long-lived sidecar does not grow without limit."""
+    saved_limit = server.REMEMBERED_TOOLS_LIMIT
+    saved_entries = dict(server.REMEMBERED_TOOLS)
+    try:
+        probe_id = "switchyard_env_deadbeef"
+        server.remember_tools(probe_id, ECHO_TOOLS)
+        body = {"messages": [{"role": "tool", "tool_call_id": probe_id, "content": "cwd=/x"}]}
+        assert server.remembered_tools_for(body) == ECHO_TOOLS
+        server.REMEMBERED_TOOLS.clear()
+        server.REMEMBERED_TOOLS_LIMIT = 3
+        for i in range(5):
+            server.remember_tools(f"k{i}", ECHO_TOOLS)
+        assert list(server.REMEMBERED_TOOLS) == ["k2", "k3", "k4"], list(server.REMEMBERED_TOOLS)
+    finally:
+        server.REMEMBERED_TOOLS_LIMIT = saved_limit
+        server.REMEMBERED_TOOLS.clear()
+        server.REMEMBERED_TOOLS.update(saved_entries)
+    print("  probe ids remembered; map bounded, oldest evicted first")
 
 
 def test_followup_with_unknown_session_is_rebuilt():
@@ -1342,18 +1603,22 @@ def test_argv_path_protects_dash_leading_prompts_for_all_providers_and_stdin_pat
         server.PROVIDER = "opencode"
         server.PROFILE = server.MCP_PROFILES["opencode"]
 
-        # Argv path with a system that begins with `-`: the effective_prompt
-        # is the folded text (`"<system>\\n\\n<prompt>"`), and the element
-        # immediately before it in argv must be the `--` sentinel.
+        # Argv path with a system that begins with `-`: the system prompt
+        # now lives in the agent's `prompt:` (write_opencode_dir), never in
+        # argv, and the prompt element is still preceded by the sentinel.
         argv, stdin_data = server.build_argv(
             "build", "--agent=build", "m", workdir, "sess", tools_path, "")
         assert stdin_data is None, "argv path must not feed stdin"
-        # The sentinel must be present, and the element immediately after it
-        # must be the folded effective_prompt -- exactly what puts
-        # `--agent=build` in argv as a string the parser cannot consume.
         assert "--" in argv, argv
         assert argv.index("--") == len(argv) - 2, argv
-        assert argv[-1] == "--agent=build\n\nbuild", argv
+        assert argv[-1] == "build", argv
+        assert "--agent=build" not in argv, argv
+        cfg = json.loads((workdir / "opencode.json").read_text())
+        assert cfg["agent"]["switchyard"]["prompt"] == "--agent=build", cfg
+        # A prompt that itself leads with `-` is what the sentinel guards.
+        argv, _ = server.build_argv(
+            "--agent=build", None, "m", workdir, "sess", tools_path, "")
+        assert argv[-2:] == ["--", "--agent=build"], argv
 
         # A short prompt with no system still picks up the same sentinel.
         argv, stdin_data = server.build_argv(
@@ -2772,9 +3037,8 @@ def test_mcp_build_argv_passes_images_through_claude_profile():
     Read(<imgdir>/**). Without these flags the staged files are
     unreachable to the CLI's harness, and the model never sees them.
 
-    Images also lift Read out of --disallowed-tools: Claude Code concatenates
-    repeated flag values, so leaving Read in the disallowed list would
-    silently block the model from Reading the staged file (the bug fix in
+    Images also make Read the one built-in that exists (`--tools Read`);
+    without it the model could not Read the staged file (the bug fix in
     PR #32 review). The MCP-tools --allowed-tools allowlist survives in
     either path.
     """
@@ -2809,26 +3073,25 @@ def test_mcp_build_argv_passes_images_through_claude_profile():
         # still be substituted into argv even when an image request also
         # appends its own Read(...) entry.
         assert any("mcp__switchyard__get_weather" in a for a in argv), argv
-        # Read is OUT of --disallowed-tools in the image variant. The
-        # value of the flag lives at argv[idx + 1]; split on "," to assert
-        # the list itself, since the order is not contractual.
-        idx = argv.index("--disallowed-tools")
-        disallowed = argv[idx + 1]
-        for tool in disallowed.split(","):
-            assert tool != "Read", (disallowed, tool)
+        # Read is the only built-in in the image variant.
+        assert argv[argv.index("--tools") + 1] == "Read", argv
+        assert "--disallowed-tools" not in argv, argv
         assert stdin_data is None
         print(f"  mcp_bridge claude build_argv(image) -> --add-dir={img_dir}, "
-              f"--allowed-tools={allowed_pairs[0]}, Read dropped from "
-              f"--disallowed-tools, mcp__switchyard__get_weather still present")
+              f"--allowed-tools={allowed_pairs[0]}, --tools Read, "
+              f"mcp__switchyard__get_weather still present")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def test_mcp_build_argv_keeps_full_disallowed_list_when_no_image():
-    """Regression guard for the non-image path: Read stays in
-    --disallowed-tools when the request carries no image. The fix that
-    lifted Read for image sessions must not regress text-only sessions,
-    which still need Read (and Bash/Edit/Write/etc.) blocked.
+def test_mcp_build_argv_allows_no_builtin_tools_when_no_image():
+    """Without images the claude MCP session gets NO built-in tools
+    (`--tools ""`): the model's tool list is exactly the caller's bridged
+    mcp__switchyard__* tools. A denylist missed Agent/Skill/ToolSearch/
+    AskUserQuestion and any built-in a CLI release adds (issues #195, #256,
+    #264); an empty allowlist cannot. The shared cli_bridge.CLAUDE_LOCKDOWN
+    rides along: only --mcp-config's servers, no login-dir settings, no
+    permission prompts.
     """
     import shutil
     workdir = Path(tempfile.mkdtemp(prefix="mcpb-argv-noimg-"))
@@ -2837,22 +3100,53 @@ def test_mcp_build_argv_keeps_full_disallowed_list_when_no_image():
     try:
         argv, stdin_data = server.build_argv("just text", None, "m", workdir,
                                               "sess", tools_path, "")
-        idx = argv.index("--disallowed-tools")
-        disallowed = argv[idx + 1]
-        # The original full list is preserved: Read, Bash, Edit, Write, Glob,
-        # Grep, WebFetch, WebSearch, NotebookEdit -- nine names. The exact
-        # ordering matches MCP_PROFILES["claude"]["disallowed_tools_default"];
-        # asserted as a sorted set so a future re-order in the profile does
-        # not silently fail this guard.
-        assert sorted(disallowed.split(",")) == sorted(
-            "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit".split(",")
-        ), disallowed
+        assert argv[argv.index("--tools") + 1] == "", argv
+        assert "--disallowed-tools" not in argv, argv
+        lockdown = list(server.cli_bridge.CLAUDE_LOCKDOWN)
+        i = argv.index(lockdown[0])
+        assert argv[i:i + len(lockdown)] == lockdown, argv
         # And the MCP-tools allowlist is still wired up.
         assert "--allowed-tools" in argv, argv
+        assert "--mcp-config" in argv, argv
         assert stdin_data is None
-        print("  mcp_bridge claude build_argv(text-only) -> "
-              "--disallowed-tools includes Read; original 9 names preserved")
+        print("  mcp_bridge claude build_argv(text-only) -> --tools '' + lockdown")
     finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_codex_mcp_build_argv_appends_the_lockdown():
+    """Issue #255: on the pinned codex the caller's bridged tools were hidden
+    inside the code-mode `exec` host while codex's own shell was advertised.
+    The MCP argv must carry the shared cli_bridge lockdown -- every tool
+    feature disabled, the prompt sections off, and the locked-down model
+    catalog -- whatever the request looks like."""
+    import shutil
+    saved = (server.PROVIDER, server.PROFILE)
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-codex-argv-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    try:
+        server.PROVIDER = "codex"
+        server.PROFILE = server.MCP_PROFILES["codex"]
+        argv, _ = server.build_argv("hi", "CALLER SYSTEM", "gpt-5.6-terra",
+                                    workdir, "sess", tools_path, "")
+        for feature in ("shell_tool", "unified_exec", "multi_agent", "code_mode_host"):
+            i = argv.index(feature)
+            assert argv[i - 1] == "--disable", (feature, argv)
+        for override in ("include_environment_context=false",
+                         "skills.include_instructions=false",
+                         "tools.experimental_request_user_input.enabled=false"):
+            assert argv[argv.index(override) - 1] == "-c", (override, argv)
+        catalog = [el for el in argv if el.startswith("model_catalog_json=")]
+        assert len(catalog) == 1, argv
+        path = catalog[0].split("=", 1)[1].strip('"')
+        data = json.loads(Path(path).read_text())
+        assert not any("tool_mode" in m for m in data["models"]), data
+        instr = argv.index(f"model_instructions_file={workdir / 'instructions.md'}")
+        assert instr < argv.index("--disable"), argv
+        print("  codex MCP argv: bypass + lockdown + locked-down catalog")
+    finally:
+        server.PROVIDER, server.PROFILE = saved
         shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -2877,7 +3171,34 @@ def test_write_opencode_dir_enables_read_when_images_passed():
         # Other tools stay disabled.
         for tool in ("bash", "edit", "write", "grep", "glob"):
             assert cfg["agent"]["switchyard"]["tools"][tool] is False, tool
+        assert cfg["agent"]["switchyard"]["permission"]["read"] == "allow", cfg
         print("  write_opencode_dir(images=True) -> read enabled, others stay disabled")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_write_opencode_dir_denies_builtins_at_the_permission_layer():
+    """`tools: {bash: false}` only hides bash; OpenCode 1.18.31 still runs it
+    when the model names it. The session config must deny everything at the
+    permission layer except the bridged `switchyard_*` tools, and must be
+    the shared cli_bridge.opencode_config lockdown (bridge-siblings rule)
+    plus the MCP server -- nothing else."""
+    import shutil
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-op-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    try:
+        server.write_opencode_dir(workdir, "sess", tools_path, images=False)
+        cfg = json.loads((workdir / "opencode.json").read_text())
+        agent = cfg["agent"]["switchyard"]
+        assert agent["permission"] == {"*": "deny", "switchyard_*": "allow"}, agent
+        assert cfg["permission"] == agent["permission"], cfg
+        assert cfg["agent"]["title"] == {"disable": True}, cfg
+        assert not any(agent["tools"].values()), agent["tools"]
+        mcp = cfg.pop("mcp")
+        assert mcp["switchyard"]["environment"]["SWITCHYARD_SESSION_ID"] == "sess", mcp
+        assert cfg == server.cli_bridge.opencode_config(allow=("switchyard_*",)), cfg
+        print("  write_opencode_dir: * deny, switchyard_* allow, title call off")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -3437,6 +3758,53 @@ def test_metadata_source_config_is_relabeled_to_request():
         server.RESOLVED_PROBES.update(saved_resolved)
 
 
+def test_probe_still_fires_when_only_the_platform_is_known():
+    """Issue #187: a platform-only env (a `fallback_platform` stamp, a
+    prompt naming only the OS) used to count as known and skip the probe,
+    so the cwd stayed unknown for the whole session. The probe fires unless
+    the cwd is known."""
+    saved = (dict(server.FAILED_PROBES), dict(server.RESOLVED_PROBES),
+             server._caller_env_settings, server.cli_bridge.config)
+
+    class _Cfg:
+        caller_environment = type("CE", (), {"probe": "auto"})()
+
+    tools = [{"type": "function", "function": {
+        "name": "Bash", "description": "",
+        "parameters": {"type": "object",
+                       "properties": {"command": {"type": "string"}},
+                       "required": ["command"]}}}]
+    try:
+        server.FAILED_PROBES.clear()
+        server.RESOLVED_PROBES.clear()
+        server.cli_bridge.config = lambda: _Cfg()
+        platform_only = {"model": "m", "tools": tools,
+                         "metadata": {"switchyard": {"caller_env": {
+                             "platform": "darwin", "source": "request"}}},
+                         "messages": [{"role": "user", "content": "probe me"}]}
+        async def probe(body):
+            future = server._maybe_probe(body, tools)
+            return await future if future is not None else None
+
+        response = asyncio.run(probe(platform_only))
+        assert response is not None, "platform-only env must still probe"
+        call = response["choices"][0]["message"]["tool_calls"][0]
+        assert call["function"]["name"] == "Bash", call
+        server.FAILED_PROBES.clear()
+        server.RESOLVED_PROBES.clear()
+        with_cwd = dict(platform_only, messages=[{"role": "user", "content": "other"}],
+                        metadata={"switchyard": {"caller_env": {
+                            "platform": "darwin", "cwd": "/Users/x", "source": "request"}}})
+        assert asyncio.run(probe(with_cwd)) is None
+        print("  platform-only env probes; env with a cwd does not")
+    finally:
+        server.FAILED_PROBES.clear()
+        server.FAILED_PROBES.update(saved[0])
+        server.RESOLVED_PROBES.clear()
+        server.RESOLVED_PROBES.update(saved[1])
+        server._caller_env_settings, server.cli_bridge.config = saved[2], saved[3]
+
+
 def test_metadata_source_host_is_relabeled_to_request():
     """Round-2 should-fix: `source=host` is also plans.yaml-derived
     (the `fallback_platform` branch of `resolve()` produces it), so a
@@ -3696,10 +4064,11 @@ def _write_inner_transcript(session: "server.Session", root: Path,
     order; `last_call_usage` scans the file in reverse so the LAST assistant
     in the list is what callers see.
     """
-    sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(session.workdir))
+    sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(session.spawn_dir or session.workdir))
     target = root / sanitized
     target.mkdir(parents=True, exist_ok=True)
-    path = target / "transcript.jsonl"
+    # build_argv pins the name with --session-id (see claude_session_uuid).
+    path = target / f"{server.claude_session_uuid(session.id)}.jsonl"
     with path.open("w") as fh:
         for i, usage in enumerate(calls):
             fh.write(json.dumps({"type": "user", "message": {"role": "user",
@@ -3708,6 +4077,185 @@ def _write_inner_transcript(session: "server.Session", root: Path,
                                  "message": {"role": "assistant",
                                              "content": f"a{i}",
                                              "usage": usage}}) + "\n")
+
+
+def test_sessions_sharing_a_mirrored_cwd_read_their_own_transcript():
+    """Two sessions for the same caller cwd run in the same mirror
+    directory, so Claude files both transcripts in one project dir. Each
+    session must read its own (pinned by --session-id), never the newest."""
+    saved = server.cli_bridge.CLAUDE_PROJECTS
+    tmp = Path(tempfile.mkdtemp(prefix="mcpb-projects-shared-"))
+    usage_a = {"input_tokens": 11, "output_tokens": 1,
+               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    usage_b = {"input_tokens": 99, "output_tokens": 9,
+               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    a, b = _new_session(), _new_session()
+    try:
+        a.spawn_dir = b.spawn_dir = "/Users/me/proj"
+        _write_inner_transcript(a, tmp, [usage_a])
+        _write_inner_transcript(b, tmp, [usage_b])   # newer file, other session
+        server.cli_bridge.CLAUDE_PROJECTS = tmp
+        assert server.last_call_usage(a)["input_tokens"] == 11
+        assert server.last_call_usage(b)["input_tokens"] == 99
+        print("  shared mirror dir: each session reads its own pinned transcript")
+    finally:
+        server.cli_bridge.CLAUDE_PROJECTS = saved
+        _drop(a)
+        _drop(b)
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class _MirrorSandbox:
+    """Point the mirror machinery at a temp root with a fresh registry."""
+
+    def __enter__(self):
+        import tempfile as _tf
+        self.root = Path(_tf.mkdtemp(prefix="mcpb-mirror-root-"))
+        self.saved = (server.MIRROR_ROOTS, server.MIRROR_DENY, server.MIRROR_LIMIT,
+                      server.MIRROR_MANIFEST, dict(server.MIRROR_USERS),
+                      dict(server.MIRROR_CREATED))
+        server.MIRROR_ROOTS = (f"{self.root}/",)
+        server.MIRROR_DENY = (f"{self.root}/node",)
+        server.MIRROR_MANIFEST = self.root / "manifest.json"
+        server.MIRROR_USERS.clear()
+        server.MIRROR_CREATED.clear()
+        return self
+
+    def env(self, cwd, **kw):
+        return server._caller_env.CallerEnvironment(cwd=cwd, source="request", **kw)
+
+    def __exit__(self, *exc):
+        import shutil
+        (server.MIRROR_ROOTS, server.MIRROR_DENY, server.MIRROR_LIMIT,
+         server.MIRROR_MANIFEST, users, created) = self.saved
+        server.MIRROR_USERS.clear()
+        server.MIRROR_USERS.update(users)
+        server.MIRROR_CREATED.clear()
+        server.MIRROR_CREATED.update(created)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+def test_mirror_is_created_only_for_safe_caller_paths():
+    """The CLI runs in a directory at the caller's own cwd path so its
+    environment block agrees with the caller (issue #264). Only plain
+    absolute POSIX paths under the image's mirror roots qualify: never the
+    relay's own dirs, the credential dirs under /home/node, a Windows path
+    or anything with `..`."""
+    with _MirrorSandbox() as box:
+        made = server.acquire_mirror(box.env(f"{box.root}/me/proj"), "s1")
+        assert made == box.root / "me" / "proj" and made.is_dir(), made
+        assert not (made / ".git").exists()
+        repo = server.acquire_mirror(box.env(f"{box.root}/me/repo", git=True), "s2")
+        assert (repo / ".git").is_dir(), repo
+        assert list(made.iterdir()) == [], "nothing may be written into a mirror"
+        for refused in (None, "relative/path", "C:\\Users\\me", f"{box.root}/me/../x",
+                        f"{box.root}/node/.claude", "/tmp/elsewhere", "/app/mcp_bridge"):
+            assert server.acquire_mirror(box.env(refused), "s3") is None, refused
+        assert server.acquire_mirror(None, "s4") is None
+        print("  mirror: caller path recreated (git init on request); unsafe paths refused")
+
+
+def test_mirror_is_removed_with_its_last_session_and_only_what_was_created():
+    """Review of #273: a caller-supplied path must not leave directories and
+    repos behind. Each mirror is reference-counted; the last session to end
+    removes what the relay created -- the dir, the ancestors it made, the
+    .git it initialised -- and nothing that existed before."""
+    with _MirrorSandbox() as box:
+        (box.root / "pre").mkdir()                    # existed before any mirror
+        path = f"{box.root}/pre/me/proj"
+        a = server.acquire_mirror(box.env(path, git=True), "a")
+        b = server.acquire_mirror(box.env(path, git=True), "b")
+        assert a == b and (a / ".git").is_dir()
+        server.release_mirror(path, "a")
+        assert a.is_dir(), "removed while another session still runs in it"
+        server.release_mirror(path, "b")
+        assert not (box.root / "pre" / "me").exists(), list((box.root / "pre").iterdir())
+        assert (box.root / "pre").is_dir(), "removed a directory the relay did not create"
+        assert server.MIRROR_USERS == {} and server.MIRROR_CREATED == {}
+        print("  mirror removed with its last session; pre-existing ancestors kept")
+
+
+def test_nested_mirrors_never_remove_a_live_one():
+    """/x/me/proj is released while /x/me is still a live mirror: removal
+    walks up through the ancestors it created but stops at a live mirror."""
+    with _MirrorSandbox() as box:
+        inner = server.acquire_mirror(box.env(f"{box.root}/me/proj"), "inner")
+        outer = server.acquire_mirror(box.env(f"{box.root}/me"), "outer")
+        server.release_mirror(str(inner), "inner")
+        assert not inner.exists() and outer.is_dir(), "a live mirror was removed"
+        server.release_mirror(str(outer), "outer")
+        print("  nested mirrors: releasing the inner one keeps the live outer one")
+
+
+def test_mirror_count_is_bounded():
+    with _MirrorSandbox() as box:
+        server.MIRROR_LIMIT = 2
+        assert server.acquire_mirror(box.env(f"{box.root}/a"), "1") is not None
+        assert server.acquire_mirror(box.env(f"{box.root}/b"), "2") is not None
+        assert server.acquire_mirror(box.env(f"{box.root}/c"), "3") is None
+        assert server.acquire_mirror(box.env(f"{box.root}/a"), "4") is not None, \
+            "joining an existing mirror is not a new one"
+        assert not (box.root / "c").exists()
+        print("  mirrors capped at MIRROR_LIMIT; joining an existing one still allowed")
+
+
+def test_startup_sweeps_mirrors_a_crash_left_behind():
+    with _MirrorSandbox() as box:
+        leftover = server.acquire_mirror(box.env(f"{box.root}/crash/proj", git=True), "gone")
+        assert json.loads(server.MIRROR_MANIFEST.read_text())
+        server.MIRROR_USERS.clear()                     # the process died
+        server.MIRROR_CREATED.clear()
+        server.sweep_mirrors()
+        assert not leftover.exists() and not (box.root / "crash").exists()
+        print("  startup sweep removed a crashed process's mirror")
+
+
+def test_end_session_reclaims_the_mirror():
+    """Every teardown path (final answer, reaper, supersede) goes through
+    end_session, which must release the session's mirror."""
+    with _MirrorSandbox() as box:
+        session = _new_session()
+        mirror = server.acquire_mirror(box.env(f"{box.root}/me/proj"), session.id)
+        session.spawn_dir = str(mirror)
+        asyncio.run(server.end_session(session))
+        assert not mirror.exists() and not (box.root / "me").exists()
+        print("  end_session released and removed the session's mirror")
+
+
+def test_session_env_and_argv_follow_the_mirror():
+    """OpenCode's --dir is the mirror and its per-session config rides
+    OPENCODE_CONFIG (the mirror is shared); Claude gets the caller's SHELL
+    and a --session-id. Every added key is on the allowlist."""
+    import shutil
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-mirror-wd-"))
+    mirror = Path("/Users/me/proj")
+    env = server._caller_env.CallerEnvironment(cwd=str(mirror), shell="zsh",
+                                               source="request")
+    saved = (server.PROVIDER, server.PROFILE)
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    try:
+        server.PROVIDER, server.PROFILE = "opencode", server.MCP_PROFILES["opencode"]
+        extra = server.session_env(env, workdir, mirror)
+        assert extra == {"OPENCODE_CONFIG": str(workdir / "opencode.json")}, extra
+        assert server.session_env(env, workdir, workdir) == {}
+        argv, _ = server.build_argv("hi", None, "m", workdir, "sess", tools_path, "",
+                                    spawn_dir=mirror)
+        assert argv[argv.index("--dir") + 1] == str(mirror), argv
+        assert (workdir / "opencode.json").exists()
+
+        server.PROVIDER, server.PROFILE = "claude", server.MCP_PROFILES["claude"]
+        assert server.session_env(env, workdir, mirror) == {"SHELL": "/bin/zsh"}
+        sid = uuid.uuid4().hex
+        argv, _ = server.build_argv("hi", None, "m", workdir, sid, tools_path, "")
+        assert argv[argv.index("--session-id") + 1] == str(uuid.UUID(sid)), argv
+        allowed = set(server.cli_bridge.SUBPROCESS_ENV_KEYS)
+        assert {"OPENCODE_CONFIG", "SHELL"} <= allowed
+        print("  opencode --dir=<mirror> + OPENCODE_CONFIG; claude SHELL + --session-id")
+    finally:
+        server.PROVIDER, server.PROFILE = saved
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def test_final_turn_reports_last_call_context_size_and_bills_the_sum():
@@ -4050,85 +4598,33 @@ def test_run_session_attempt_passes_only_the_allowlisted_env_to_the_cli():
 
 
 def test_codex_mcp_profile_argv_carries_disable_overrides_after_bypass():
-    """The codex profile in MCP_PROFILES is the only surface on the MCP path
-    that runs a CLI with its OWN shell-and-search tools still enabled. The
-    fix (issue #116) has to land three pieces at once:
+    """The codex MCP profile runs a CLI whose own tools act on the sidecar.
 
       1. --dangerously-bypass-approvals-and-sandbox KEPT. Without it codex
          refuses an MCP tool call ("MCP tool call requires approval").
-      2. `-c` overrides added: `sandbox_mode="read-only"` neutralises the
-         built-in shell, `tools.web_search=false` strips web search. Both
-         MUST sit in argv AFTER the bypass flag so the overrides win.
-      3. Every `mcp_servers.switchyard.*` line KEPT -- parking an MCP tool
+      2. NO `sandbox_mode=` override. It was here on the theory that it
+         neutralised the built-in shell; against the pinned 0.155.1 it does
+         not (issue #255), and a flag that looks protective but is not is
+         worse than none. The shell is removed by the lockdown build_argv
+         appends instead (test_codex_mcp_build_argv_appends_the_lockdown).
+      3. `tools.web_search=false` kept, after the bypass flag.
+      4. Every `mcp_servers.switchyard.*` line KEPT -- parking an MCP tool
          call is the whole point of this bridge.
-
-    SCOPE OF THIS TEST: argv shape only -- it asserts that argv contains
-    the three pieces above, in the right order, with the expected config
-    key spellings. It deliberately does NOT assert:
-
-      * That `sandbox_mode=` and `tools.web_search=` are still recognised
-        config keys on the pinned codex line. A rename upstream (e.g.
-        `sandbox.policy=` or `tools.search=`) would no-op the override
-        while keeping this test green on a literal startswith match -- the
-        issue #116 attack surface would silently reopen. That gap is owned
-        by the runtime probe described in
-        `sidecars/mcp_bridge/server.py:271-280` (operator-visible fallback
-        + a `scripts/smoke.py` no-network probe should be the next step;
-        it cannot live here because the offline suite must not depend on
-        the codex binary).
-      * That the `-c` overrides win over `--dangerously-bypass-approvals-and-sandbox`.
-        That depends on codex argv-order config merge, which is
-        implementation-defined. The PR hedges this in the same comment;
-        the test name + this paragraph make the limit explicit.
-
-    In short: this test is the trip-wire against argv drift, not against
-    a future codex version changing its config-key namespace. Both are
-    real risks, but only the former belongs in an offline test.
     """
     profile = server.MCP_PROFILES["codex"]
     argv = profile["argv"]
 
-    # The bypass flag has to stay: codex refuses an MCP tool call otherwise.
     assert "--dangerously-bypass-approvals-and-sandbox" in argv, \
         f"--dangerously-bypass-approvals-and-sandbox missing from argv: {argv}"
-
-    # Both tool-disable overrides have to be in argv, AFTER the bypass flag
-    # (so they win). Find their indices and check ordering.
+    assert not any(isinstance(el, str) and el.startswith("sandbox_mode=")
+                   for el in argv), argv
     bypass_idx = argv.index("--dangerously-bypass-approvals-and-sandbox")
-    sandbox_c_idx = None
-    web_search_c_idx = None
-    for i, element in enumerate(argv):
-        if element.startswith("-c") and i + 1 < len(argv) \
-                and argv[i + 1].startswith("sandbox_mode="):
-            sandbox_c_idx = i
-        if element.startswith("-c") and i + 1 < len(argv) \
-                and argv[i + 1].startswith("tools.web_search="):
-            web_search_c_idx = i
-
-    assert sandbox_c_idx is not None, \
-        f"sandbox_mode -c override missing from codex argv: {argv}"
-    assert web_search_c_idx is not None, \
-        f"tools.web_search -c override missing from codex argv: {argv}"
-    assert bypass_idx < sandbox_c_idx, \
-        f"bypass flag must precede -c override (bypass at {bypass_idx}, " \
-        f"sandbox at {sandbox_c_idx}): {argv}"
-    assert bypass_idx < web_search_c_idx, \
-        f"bypass flag must precede -c override (bypass at {bypass_idx}, " \
-        f"web_search at {web_search_c_idx}): {argv}"
-
-    # sandbox_mode must be restrictive (read-only or workspace-write), not
-    # back to danger-full-access which is what the bypass flag wanted.
-    # We only need the value, not the position, so plain iteration (the
-    # earlier ordering loop above does need the index and uses it).
-    sandbox_value = None
-    for element in argv:
-        if element.startswith("sandbox_mode="):
-            sandbox_value = element.split("=", 1)[1].strip('"').strip("'")
-            break
-    assert sandbox_value in ("read-only", "workspace-write"), \
-        f"sandbox_mode override must restrict shell, got {sandbox_value!r}: {argv}"
-    assert sandbox_value != "danger-full-access", \
-        f"sandbox_mode override is the default the bypass wanted, not a restriction: {argv}"
+    web_search_c_idx = next(
+        (i for i, el in enumerate(argv)
+         if el == "-c" and i + 1 < len(argv)
+         and argv[i + 1].startswith("tools.web_search=")), None)
+    assert web_search_c_idx is not None, argv
+    assert bypass_idx < web_search_c_idx, argv
 
     # All four mcp_servers.switchyard.* lines still there. Parking an MCP
     # tool call is the bridge's whole purpose -- a regression that drops
@@ -4146,8 +4642,8 @@ def test_codex_mcp_profile_argv_carries_disable_overrides_after_bypass():
         "mcp_servers.switchyard.env",
     }, f"missing/wrong mcp_servers.switchyard.* keys: {keys}"
 
-    print(f"  codex argv: bypass flag kept; sandbox_mode={sandbox_value!r} "
-          f"and tools.web_search override sit AFTER it; "
+    print(f"  codex argv: bypass flag kept, no sandbox_mode override, "
+          f"tools.web_search override AFTER it; "
           f"{len(mcp_fragments)} mcp_servers.switchyard.* keys intact")
 
 

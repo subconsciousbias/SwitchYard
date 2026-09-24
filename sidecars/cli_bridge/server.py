@@ -64,8 +64,10 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 import uuid
@@ -183,7 +185,63 @@ SUBPROCESS_ENV_KEYS = (
     "USER", "LOGNAME", "SHELL", "TMPDIR",
     "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
     "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+    # Never inherited from the sidecar in practice: mcp_bridge sets it per
+    # session to that session's own config when OpenCode runs in a mirror of
+    # the caller's cwd (mcp_bridge.session_env). Listed so the allowlist
+    # stays the one canonical set of keys a CLI can receive.
+    "OPENCODE_CONFIG",
 )
+
+
+# --------------------------------------------------- opencode lockdown ---
+# OpenCode's built-in tools. `agent.tools: {name: false}` only HIDES a tool
+# from the model's tool list: verified on the pinned 1.18.31, a model that
+# names `bash` anyway still has it executed, in the sidecar, as `node`. The
+# `permission` block is what actually refuses the call ("Model tried to call
+# unavailable tool"), and a refusal there does not end the run. So every
+# OpenCode config the bridges write carries both, and the deny is `*` --
+# a built-in added by a future OpenCode is refused before anyone lists it.
+OPENCODE_BUILTIN_TOOLS = (
+    "bash", "edit", "write", "read", "grep", "glob", "list", "patch",
+    "todowrite", "todoread", "webfetch", "websearch", "task", "multiedit",
+    "skill",
+)
+
+
+def opencode_config(allow: tuple[str, ...] = (), prompt: str | None = None) -> dict:
+    """The OpenCode project config both bridges run under.
+
+    `allow` names permission patterns to let through: mcp_bridge passes
+    `switchyard_*` (its bridged tools) and, for image sessions, `read`.
+    Everything else is denied at the permission layer and hidden from the
+    tool list. `agent.title.disable` stops the extra title-generation model
+    call OpenCode otherwise makes on every run -- a paid request whose
+    output nobody reads. sidecars/cli_bridge/harness/opencode.json is this
+    function's output for `allow=()`; tests hold the two in step.
+
+    `prompt`, the caller's system prompt, becomes the agent's `prompt:`,
+    which REPLACES OpenCode's own base prompt (thousands of tokens of "You
+    are opencode..." for most models) rather than sitting underneath the
+    caller's instructions in the user turn (issue #264). Both bridges pass
+    it: bridge-siblings rule.
+    """
+    permission = {"*": "deny", **{pattern: "allow" for pattern in allow}}
+    config = {
+        "$schema": "https://opencode.ai/config.json",
+        "permission": permission,
+        "agent": {
+            "switchyard": {
+                "description": "Plain completion relay for Switchyard",
+                "mode": "primary",
+                "tools": {tool: tool in allow for tool in OPENCODE_BUILTIN_TOOLS},
+                "permission": permission,
+            },
+            "title": {"disable": True},
+        },
+    }
+    if prompt:
+        config["agent"]["switchyard"]["prompt"] = prompt
+    return config
 
 
 def subprocess_env() -> dict:
@@ -198,6 +256,28 @@ def subprocess_env() -> dict:
     return {k: os.environ[k] for k in SUBPROCESS_ENV_KEYS if k in os.environ}
 
 
+# ------------------------------------------------ claude tool lockdown ---
+# Claude Code's built-ins are removed by ALLOWLIST (`--tools ""`, or
+# `--tools Read` for an image request), never by a --disallowed-tools
+# denylist: a denylist has to name every built-in and silently misses each
+# one a CLI release adds -- which is how Agent/Task/Skill/ToolSearch
+# (issue #195) and AskUserQuestion (issue #256) stayed live. Verified on the
+# pinned 2.1.278 against a fake model: with `--tools ""` the tool list is
+# empty (or only the bridged mcp__switchyard__* tools), and a model that
+# names Bash/Read/Agent/AskUserQuestion anyway gets "No such tool available".
+#
+# The rest of the lockdown, shared by both bridges (bridge-siblings rule):
+#   --strict-mcp-config          only MCP servers from --mcp-config; no
+#                                connectors attached to the logged-in account
+#   --setting-sources ""         no user/project settings: the login dir's
+#                                CLAUDE.md, hooks and skills stay out of the
+#                                prompt (OAuth still reads .credentials.json)
+#   --permission-prompts none    anything that would prompt is denied -- there
+#                                is no human on a headless sidecar to answer
+CLAUDE_LOCKDOWN = ("--strict-mcp-config", "--setting-sources", "",
+                   "--permission-prompts", "none")
+
+
 # ------------------------------------------------------------------ images ---
 # flatten() used to drop every non-text content block, so a request with a
 # screenshot was accepted, answered confidently, and wrong -- `#EDF6EC` for a
@@ -207,8 +287,8 @@ def subprocess_env() -> dict:
 # CLI actually can (verified against the installed versions):
 #   claude 2.1.278 `-p`   -- no image flag; stage to disk and let the model
 #                            Read() the files (--add-dir + an allowed-tools
-#                            Read rule; and Read must NOT also be in
-#                            --disallowed-tools, which bare mode used to list).
+#                            Read rule; the image variant's `--tools Read`
+#                            is what makes Read exist at all).
 #   codex 0.153.4 `exec`  -- native `-i FILE`, repeatable.
 #   opencode 1.18.32 `run`-- native `-f FILE(s)`, repeatable.
 # Any image block that cannot be carried that way -- a plain http(s) URL, a
@@ -383,15 +463,15 @@ PROFILES: dict[str, dict] = {
         "system_file_args_replace": ["--system-prompt-file", "{path}"],
         # Strip the inner harness's own tools: they would act on the sidecar's
         # container, not the caller's workspace, and the caller never sees them.
-        "bare_args": ["--max-turns", "1", "--disallowed-tools",
-                      "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,NotebookEdit"],
+        # `--tools ""` is an allowlist of zero built-ins (see CLAUDE_LOCKDOWN).
+        "bare_args": ["--max-turns", "1", "--tools", "", *CLAUDE_LOCKDOWN],
         # Image requests need Read for the staged files (see image_note) and
         # more than one turn -- reading the image and then answering is two
         # agentic turns, and --max-turns 1 would kill the answer with
-        # error_max_turns. Every other tool stays stripped.
-        "bare_args_images": ["--max-turns", "4", "--disallowed-tools",
-                             "Bash,Edit,Write,Glob,Grep,WebFetch,WebSearch,"
-                             "NotebookEdit"],
+        # error_max_turns. Read is the only built-in, and build_argv's
+        # `--allowed-tools Read(<imgdir>/**)` is the only path it may use:
+        # any other Read would prompt, and --permission-prompts none denies it.
+        "bare_args_images": ["--max-turns", "4", "--tools", "Read", *CLAUDE_LOCKDOWN],
         # Only valid alongside --system-prompt. Drops the CLI's dynamically
         # injected sections (working directory, git state, environment), which
         # are pure noise when the caller supplies its own prompt — and which the
@@ -414,15 +494,16 @@ PROFILES: dict[str, dict] = {
     "opencode": {
         "cli": os.environ.get("OPENCODE_CLI", "opencode"),
         "model": os.environ.get("OPENCODE_MODEL", "xai/grok-4.6"),
-        # --agent switchyard selects the minimal agent in harness/opencode.json:
-        # every tool disabled and NO prompt field. Measured on a trivial call,
-        # 7,239 -> 423 tokens, a 94% cut — the difference between a subscription
-        # being usable for volume and not.
+        # --agent switchyard selects the minimal agent opencode_config() writes
+        # into the spawn directory (harness/opencode.json is the same config):
+        # every tool hidden and denied. Measured on a trivial call, 7,239 -> 423
+        # tokens, a 94% cut — the difference between a subscription being
+        # usable for volume and not.
         #
-        # The agent deliberately has no `prompt:`. Carrying a one-line prompt cost
-        # 582 tokens against 423 without it, for identical answers, and it was
-        # redundant anyway: the caller's system prompt is folded into the message,
-        # so it governs. (`--pure` changes nothing; no plugins are installed.)
+        # The caller's system prompt becomes the agent's `prompt:`, which
+        # replaces OpenCode's base prompt (issue #264) instead of being folded
+        # into the user turn beneath it; with no caller system prompt the
+        # agent has none. (`--pure` changes nothing; no plugins are installed.)
         "args": os.environ.get(
             "OPENCODE_ARGS",
             "run --model {model} --format json --agent switchyard {prompt}").split(),
@@ -457,6 +538,7 @@ PROFILES: dict[str, dict] = {
         # pure cost. The agent's `tools:` config is where the token cut comes
         # from. The caller's prompt is folded into the message; see fold_system.
         "system_args": [],
+        "system_via_agent_prompt": True,
         "parser": "events_json",
         "default_retry_after": 3600,
         "enforce_max_tokens": True,
@@ -819,6 +901,129 @@ def resolve_model(requested: str | None) -> tuple[str, str | None]:
                        f"({sorted(cfg.models)}); ran {cfg.model} instead")
 
 
+# ------------------------------------------------- codex tool lockdown ---
+# Codex's own tools act on the sidecar, never on the caller, and the caller
+# never sees them run. Verified on the pinned 0.155.1 against a fake model
+# (issue #264): `-c sandbox_mode="read-only"` does NOT neutralise the shell --
+# the prompt still reads `sandbox_mode` is `danger-full-access` under the
+# bypass flag -- and the current catalog entries (gpt-5.6-*, gpt-6-*) run in
+# `tool_mode: code_mode_only`, where every tool, the caller's bridged MCP
+# tools included, is a hidden nested tool inside a JavaScript `exec` host
+# while `exec_command` (the shell) is advertised. That is issue #255: the
+# model never saw `switchyard_bash`.
+#
+# The lockdown, applied on both bridges (bridge-siblings rule):
+#   * `--disable <feature>` for every feature that adds a tool or prompt
+#     section. An unknown name is a hard error (exit 1), so a CLI upgrade
+#     that renames one fails loudly instead of quietly reopening a tool.
+#   * `-c include_*=false` etc. drops the environment/permissions/
+#     collaboration/apps/skills sections and the question tool, and
+#     `project_doc_max_bytes=0` stops AGENTS.md discovery in the relay dir.
+#   * `-c model_catalog_json=<file>`: the CLI's own catalog (`codex debug
+#     models`) with the code-mode, multi-agent, apply_patch and web-search
+#     fields removed, so tools are plain top-level functions again.
+# Result, verified: the model sees the caller's prompt and the caller's
+# tools (plus codex's three read-only MCP-resource helpers), and a forced
+# exec_command / apply_patch call is refused ("unsupported call").
+CODEX_DISABLED_FEATURES = (
+    "shell_tool", "unified_exec", "shell_snapshot", "multi_agent", "goals",
+    "apps", "plugins", "remote_plugin", "browser_use", "in_app_browser",
+    "computer_use", "image_generation", "view_image", "skill_search",
+    "skill_mcp_dependency_install", "tool_suggest", "sleep_tool",
+    "code_mode_host", "hooks", "memories", "personality",
+    "workspace_dependencies",
+)
+CODEX_CONFIG_OVERRIDES = (
+    "include_environment_context=false",
+    "include_permissions_instructions=false",
+    "include_collaboration_mode_instructions=false",
+    "include_apps_instructions=false",
+    "skills.include_instructions=false",
+    "tools.experimental_request_user_input.enabled=false",
+    "project_doc_max_bytes=0",
+)
+# Catalog fields that put a model into code mode / multi-agent mode or give it
+# the built-in patch and web-search tools.
+CODEX_CATALOG_DROP = ("tool_mode", "multi_agent_version",
+                      "apply_patch_tool_type", "web_search_tool_type")
+CODEX_CATALOG_PATH = Path(os.environ.get(
+    "CODEX_CATALOG_PATH",
+    os.path.join(tempfile.gettempdir(), "switchyard-codex-catalog.json")))
+_codex_catalog_ready = False
+# Serialises generate-and-publish: two concurrent first requests must not both
+# write and rename the catalog (the loser's rename used to 502 the request).
+_codex_catalog_lock = threading.Lock()
+
+
+def patch_codex_catalog(catalog: dict) -> dict:
+    """`codex debug models` output with every tool-adding field removed."""
+    models = catalog["models"] if isinstance(catalog, dict) else catalog
+    for model in models:
+        for key in CODEX_CATALOG_DROP:
+            model.pop(key, None)
+        model["supports_search_tool"] = False
+        model["experimental_supported_tools"] = []
+    return catalog
+
+
+def codex_catalog_path() -> Path:
+    """Write the locked-down catalog once per process and return its path.
+
+    Fails closed: if the catalog cannot be built, codex would run with code
+    mode and its own tools, so the request is refused with a 502 (the router
+    cools the plan) rather than served on an unlocked CLI.
+    """
+    global _codex_catalog_ready
+    if _codex_catalog_ready and CODEX_CATALOG_PATH.exists():
+        return CODEX_CATALOG_PATH
+    with _codex_catalog_lock:
+        # Re-check under the lock: a concurrent first request may have just
+        # published it.
+        if _codex_catalog_ready and CODEX_CATALOG_PATH.exists():
+            return CODEX_CATALOG_PATH
+        tmp_name = None
+        try:
+            done = subprocess.run(
+                [PROFILES["codex"]["cli"], "debug", "models"],
+                capture_output=True, text=True, timeout=60,
+                env=subprocess_env(), cwd=tempfile.gettempdir())
+            if done.returncode != 0:
+                raise RuntimeError(f"exit {done.returncode}: {done.stderr[:300]}")
+            catalog = patch_codex_catalog(json.loads(done.stdout))
+            # A unique temp file beside the target, then an atomic replace:
+            # a reader never sees a half-written catalog.
+            with tempfile.NamedTemporaryFile(
+                    "w", dir=CODEX_CATALOG_PATH.parent, prefix=".codex-catalog-",
+                    suffix=".tmp", delete=False) as fh:
+                tmp_name = fh.name
+                fh.write(json.dumps(catalog))
+            os.replace(tmp_name, CODEX_CATALOG_PATH)
+            tmp_name = None
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError,
+                subprocess.SubprocessError) as exc:
+            log.error("codex tool lockdown unavailable: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"codex tool lockdown unavailable: {exc}") from exc
+        finally:
+            if tmp_name:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_name)
+        _codex_catalog_ready = True
+    return CODEX_CATALOG_PATH
+
+
+def codex_lockdown_args() -> list[str]:
+    """The argv fragment that strips codex down to the caller's tools."""
+    argv: list[str] = []
+    for feature in CODEX_DISABLED_FEATURES:
+        argv += ["--disable", feature]
+    for override in CODEX_CONFIG_OVERRIDES:
+        argv += ["-c", override]
+    argv += ["-c", f'model_catalog_json="{codex_catalog_path()}"']
+    return argv
+
+
 def build_argv(prompt: str, system: str | None,
                model: str | None = None,
                image_paths: list[Path] | None = None) -> tuple[list[str], str | None]:
@@ -899,6 +1104,11 @@ def build_argv(prompt: str, system: str | None,
         else:   # opencode: `-f FILE(s)` attaches to the message
             for path in image_paths:
                 argv += ["-f", str(path)]
+
+    if PROVIDER == "codex":
+        # The text path's codex has the same shell, patch tool and code-mode
+        # host as the tool path's; see CODEX_DISABLED_FEATURES.
+        argv += codex_lockdown_args()
 
     return argv + EXTRA_ARGS, (prompt if use_stdin else None)
 
@@ -1163,6 +1373,10 @@ def fold_system(prompt: str, system: str | None) -> tuple[str, str | None]:
     if PROFILE.get("instructions_arg"):
         # Handled by instructions_file(), which overrides rather than appends.
         return prompt, system
+    if PROFILE.get("system_via_agent_prompt"):
+        # OpenCode: _run_cli_attempt writes it as the agent's `prompt:`,
+        # which replaces the CLI's base prompt (opencode_config).
+        return prompt, system
     key = ("system_args_replace" if SYSTEM_MODE == "replace"
            and PROFILE.get("system_args_replace") else "system_args")
     if system and not PROFILE.get(key):
@@ -1290,6 +1504,15 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
     # the bottom of this function (success AND failure paths).
     spawn_cwd = Path(tempfile.mkdtemp(prefix="sy-cli-"))
     try:
+        # OpenCode reads its project config from the working directory, so
+        # the `switchyard` agent has to live HERE. Spawning in a fresh temp
+        # dir without it made `--agent switchyard` fall back to OpenCode's
+        # `build` agent -- every built-in tool, `permission: * allow`, full
+        # base prompt. Inside the try: a failed write is a spawn that never
+        # happened, cleaned up and classified by the OSError handler below.
+        if PROVIDER == "opencode":
+            (spawn_cwd / "opencode.json").write_text(
+                json.dumps(opencode_config(prompt=system)))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE if stdin_data is not None

@@ -12,7 +12,16 @@ from __future__ import annotations
 import conftest  # noqa: F401  (socket guard)
 
 import importlib.util
+import os
 import sys
+
+# The bridges generate codex's locked-down model catalog by running
+# `codex debug models` (cli_bridge.codex_catalog_path). There is no codex
+# binary offline, so point every bridge loaded in a test at a fake that
+# answers exactly that command. Set before any bridge is loaded: the codex
+# profile reads CODEX_CLI at import.
+os.environ["CODEX_CLI"] = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "fixtures", "fake_codex.py")
 
 
 def load(name: str, path: str):

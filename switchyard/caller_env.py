@@ -80,15 +80,19 @@ PROBE_COMMAND = (
 # environment, not the caller's -- the inner CLI in /app/mcp_bridge will
 # happily tell us so on its own. Reject any value that names the relay
 # process's own filesystem.
-_RELAY_PATH_HINTS = ("/app/", "/tmp/switchyard-relay/", "/tmp/mcpb-",
-                     "/tmp/sy-cli-", "/app/mcp_bridge", "/app/cli_bridge")
+#
+# Matched as PREFIXES of the relay's own directories (issue #187): a
+# substring match on "/app/" threw away real caller paths such as
+# /home/u/myapp/app/src or /Users/me/app/web.
+_RELAY_PATH_PREFIXES = ("/app/mcp_bridge", "/app/cli_bridge", "/tmp/mcpb-",
+                        "/tmp/sy-cli-", "/tmp/switchyard-relay/")
 
 
 def _is_relay_path(value: str | None) -> bool:
     if not value:
         return False
     v = value.replace("\\", "/")
-    return any(hint in v for hint in _RELAY_PATH_HINTS)
+    return any(v.startswith(prefix) for prefix in _RELAY_PATH_PREFIXES)
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,10 @@ class CallerEnvironment:
     platform: str | None = None
     shell: str | None = None
     source: str = "unknown"   # config | request | probe | host | unknown
+    # Whether the caller's cwd is a git repository, when its prompt says so.
+    # Only used to make the relay's mirror of that directory agree
+    # (mcp_bridge.mirror_dir_for); None means nobody said.
+    git: bool | None = None
 
     @classmethod
     def unknown(cls) -> "CallerEnvironment":
@@ -224,7 +232,10 @@ def _label_value(text: str, *labels: str) -> str | None:
 
     Two syntaxes are accepted, on a single line:
 
-      `label: value` or `label = value`      (yaml / labelled-line style)
+      `label: value` or `label = value`      (yaml / labelled-line style,
+                                              optionally a `- ` / `* ` list
+                                              item, as Claude Code's
+                                              `# Environment` section is)
       `<label>value</label>`                 (xml-tag style, used by codex
                                               and OpenCode)
 
@@ -233,7 +244,8 @@ def _label_value(text: str, *labels: str) -> str | None:
     if not text:
         return None
     for label in labels:
-        labelled = re.compile(rf"(?im)^\s*{re.escape(label)}\s*[:=]\s*(.+?)\s*$")
+        labelled = re.compile(
+            rf"(?im)^\s*(?:[-*]\s+)?{re.escape(label)}\s*[:=]\s*(.+?)\s*$")
         m = labelled.search(text)
         if m:
             return m.group(1).strip().strip('"').strip("'")
@@ -295,20 +307,33 @@ def _parse_codex_env(text: str) -> CallerEnvironment | None:
 
 
 def _parse_anthropic_system(text: str) -> CallerEnvironment | None:
-    """Anthropic-protocol requests sometimes carry an `<env>` block, and
-    their own Claude Code SDK may surface a `<runtime>` block. Either of
-    these is fair game as a passive source.
+    """Anthropic-protocol requests carry their environment in the system
+    prompt: an `<env>` block (older Claude Code, and OpenCode's prompt), a
+    `<runtime>` block, or Claude Code's `# Environment` section of bulleted
+    lines. All are fair game as a passive source.
 
-    Example:
+    Examples:
         <env>
           cwd=C:\\Users\\someone\\proj
           shell=PowerShell
           platform=Windows
         </env>
+
+        <env>
+          Working directory: /home/user/project
+          Platform: linux
+        </env>
+
+        # Environment
+         - Primary working directory: /Users/me/project
+         - Platform: darwin
+         - Shell: zsh
     """
-    if "<env" not in text and "<runtime" not in text:
+    if ("<env" not in text and "<runtime" not in text
+            and "# Environment" not in text):
         return None
-    cwd = _label_value(text, "cwd", "working_directory", "directory")
+    cwd = _label_value(text, "cwd", "working_directory", "primary working directory",
+                       "working directory", "directory")
     platform = _label_value(text, "platform", "os")
     shell = _label_value(text, "shell")
     if cwd is None and platform is None and shell is None:
@@ -329,7 +354,8 @@ def _parse_generic_env_section(text: str) -> CallerEnvironment | None:
     """
     if not text:
         return None
-    cwd = _label_value(text, "cwd", "working_directory", "working directory")
+    cwd = _label_value(text, "cwd", "working_directory", "primary working directory",
+                       "working directory")
     platform = _label_value(text, "platform", "os")
     shell = _label_value(text, "shell")
     if cwd is None and platform is None and shell is None:
@@ -340,10 +366,15 @@ def _parse_generic_env_section(text: str) -> CallerEnvironment | None:
 def parse_request(data: dict[str, Any]) -> CallerEnvironment | None:
     """Best-effort passive parse of an OpenAI-shaped request body.
 
-    Walks the first system message and the first user message, then tries
-    each known parser in turn. Returns the first non-None result. Any
-    parsed value that names the relay is dropped (the inner CLI sees its
-    own filesystem; that is the bug we are avoiding).
+    Reads the top-level `system` (an Anthropic-shaped body, which is what
+    the gateway sees for Claude Code's /v1/messages) plus the first two
+    messages (system + first user turn), then runs every known parser and
+    merges the results FIELD BY FIELD: each of cwd / platform / shell comes
+    from the first parser that found it. Returning the first parser that
+    found anything lost Claude Code's cwd whenever an earlier parser matched
+    only its platform (issue #187). Any parsed cwd that names the relay is
+    dropped (the inner CLI sees its own filesystem; that is the bug we are
+    avoiding).
     """
     if not isinstance(data, dict):
         return None
@@ -351,6 +382,9 @@ def parse_request(data: dict[str, Any]) -> CallerEnvironment | None:
     if not isinstance(messages, list):
         return None
     blocks: list[str] = []
+    top_system = _blocks_text(data.get("system"))
+    if top_system:
+        blocks.append(top_system)
     for msg in messages[:2]:                # system + first user turn
         if not isinstance(msg, dict):
             continue
@@ -360,18 +394,37 @@ def parse_request(data: dict[str, Any]) -> CallerEnvironment | None:
     if not blocks:
         return None
     text = "\n".join(blocks)
+    fields: dict[str, str | None] = {"cwd": None, "platform": None, "shell": None}
     for parser in (_parse_opencode_env, _parse_codex_env,
                    _parse_anthropic_system, _parse_generic_env_section):
         env = parser(text)
         if env is None:
             continue
-        # Strip relay-looking values. A request that names a relay path
-        # is telling us the relay's environment, not the caller's, and
-        # the inner CLI already gave us that -- the bug is using it.
-        if _is_relay_path(env.cwd):
-            env = CallerEnvironment(cwd=None, platform=env.platform,
-                                    shell=env.shell, source=env.source)
-        return env
+        for name in fields:
+            value = getattr(env, name)
+            # Strip relay-looking values. A request that names a relay path
+            # is telling us the relay's environment, not the caller's, and
+            # the inner CLI already gave us that -- the bug is using it.
+            if name == "cwd" and _is_relay_path(value):
+                value = None
+            if fields[name] is None and value:
+                fields[name] = value
+    if not any(fields.values()):
+        return None
+    return CallerEnvironment(source="request", git=_parse_git_flag(text), **fields)
+
+
+def _parse_git_flag(text: str) -> bool | None:
+    """Claude Code's `Is a git repository: true`, OpenCode's
+    `Is directory a git repo: yes`. None when neither is present."""
+    value = _label_value(text, "is a git repository", "is directory a git repo")
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value in ("true", "yes"):
+        return True
+    if value in ("false", "no"):
+        return False
     return None
 
 
@@ -591,7 +644,8 @@ def render_first_turn_reminder(env: CallerEnvironment) -> str:
     on this exact turn.
 
     Unknown-env wording is explicit: the model is told not to assume the
-    relay container is the caller machine, and to ask if needed. The
+    relay container is the caller machine, and to state its assumptions
+    instead of asking -- a headless relay has no one to ask (issue #256). The
     Linux / /app wording matches the OWNER's template verbatim so a
     model that has seen it before recognises it as authoritative.
     """
@@ -604,7 +658,9 @@ def render_first_turn_reminder(env: CallerEnvironment) -> str:
         )
     return (
         "[SwitchYard: caller environment unknown -- do not assume the "
-        "relay container is the caller machine; ask if needed.]"
+        "relay container is the caller machine; your tools run on the "
+        "caller, so use them to find out, and state any assumption you "
+        "make instead of asking.]"
     )
 
 

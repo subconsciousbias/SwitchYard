@@ -75,7 +75,14 @@ Knobs read by the running bridges (all read once at import time):
     `MCP_DISCONNECT_POLL_SECONDS`, `MCP_PARKED_GRACE_SECONDS`,
     `MCP_RESUME_WAIT_SECONDS`, `MCP_REBUILD_LOST`, `MCP_PREEMPTED_MEMORY`,
     `MCP_RECLAIM_POLL_SECONDS`, `MCP_PROCESS_TIMEOUT_SECONDS`,
-    `MCP_BATCH_WINDOW_SECONDS`, `LOG_TEXT_LOST` — mcp_bridge knobs.
+    `MCP_BATCH_WINDOW_SECONDS`, `MCP_REMEMBERED_TOOLS_LIMIT`, `LOG_TEXT_LOST`
+    — mcp_bridge knobs.
+
+The tool path runs each inner CLI in a mirror of the caller's cwd
+(`mcp_bridge.acquire_mirror`, issue #264). `MCP_MIRROR_LIMIT` caps how many
+distinct mirrors exist at once (default 64; past it a session keeps its
+workdir) and `MCP_MIRROR_MANIFEST` is where created mirrors are recorded so
+startup can sweep what a crash left behind.
 
 `SWITCHYARD_PLAN` (or its legacy alias `SWITCHYARD_SUBSCRIPTION`) names the
 plan this process fronts. One process per subscription: sharing a process

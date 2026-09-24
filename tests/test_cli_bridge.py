@@ -548,29 +548,26 @@ def test_multibyte_prompts_are_measured_in_bytes_not_characters():
     print(f"  {n}-char CJK prompt ({len(huge.encode('utf-8'))} bytes) kept off argv")
 
 
-def test_an_oversized_system_prompt_folds_into_the_stdin_prompt():
-    """OpenCode has no system-prompt flag, so an oversized system block has
-    nowhere to live but the prompt itself -- and the prompt rides stdin.
-
-    fold_system prepends the caller's system to the prompt when the active
-    profile has no system_args key; once both are over STDIN_PROMPT_LIMIT,
-    build_argv must still recognise that and put the combined text on stdin
-    rather than trying to fit it as one argv element (issue #29).
-    """
+def test_an_oversized_system_prompt_never_reaches_opencode_argv():
+    """OpenCode takes the caller's system prompt as the agent's `prompt:` in
+    the spawn dir's opencode.json (issue #264), so an oversized system block
+    is neither folded into the user turn nor put on argv (issue #29): the
+    user prompt stays as small as it was and rides argv."""
     huge_system = "s" * (server.STDIN_PROMPT_LIMIT + 10)
-    # Drive the same path run_cli does for opencode: fold_system prepends the
-    # caller's system text into the prompt and clears it, then build_argv
-    # sees the now-oversized prompt and routes it to stdin.
-    folded_prompt, folded_system = server.fold_system("small", huge_system)
-    argv, stdin_data = server.build_argv(folded_prompt, folded_system)
-    assert stdin_data is not None, "oversized prompt+system must ride stdin"
-    assert stdin_data.startswith(huge_system), \
-        (stdin_data[:40], "...", stdin_data[-40:])
-    # No element of argv may be the system text itself.
-    assert all(huge_system != element for element in argv), argv
-    # The plain prompt also isn't an element (it was folded into stdin).
-    assert "small" not in argv, argv
-    print(f"  {len(huge_system)}-char system prompt folded into {len(stdin_data)}-char stdin payload")
+    saved = (server.PROVIDER, server.PROFILE)
+    try:
+        server.PROVIDER, server.PROFILE = "opencode", server.PROFILES["opencode"]
+        prompt, system = server.fold_system("small", huge_system)
+        assert (prompt, system) == ("small", huge_system)
+        argv, stdin_data = server.build_argv(prompt, system)
+        assert stdin_data is None, "a small user prompt stays on argv"
+        assert all(huge_system not in element for element in argv), "system on argv"
+        assert argv[-1] == "small", argv
+        cfg = server.opencode_config(prompt=system)
+        assert cfg["agent"]["switchyard"]["prompt"] == huge_system
+        print(f"  {len(huge_system)}-char system prompt -> agent prompt, argv untouched")
+    finally:
+        server.PROVIDER, server.PROFILE = saved
 
 
 def test_a_real_spawn_delivers_an_oversized_prompt_on_stdin():
@@ -838,6 +835,130 @@ def test_stage_or_fail_cleans_up_on_unexpected_failure():
     raise AssertionError("expected OSError from the simulated write_bytes failure")
 
 
+def test_patch_codex_catalog_strips_code_mode_and_builtin_tools():
+    """The catalog fields that put a codex model into code mode, multi-agent
+    mode, or hand it the apply_patch / web-search tools are removed; every
+    other field (context window, reasoning levels...) is left alone."""
+    catalog = {"models": [
+        {"slug": "a", "tool_mode": "code_mode_only", "multi_agent_version": "v2",
+         "apply_patch_tool_type": "freeform", "web_search_tool_type": "text",
+         "supports_search_tool": True, "experimental_supported_tools": ["clock"],
+         "context_window": 272000},
+        {"slug": "b", "context_window": 1}]}
+    out = server.patch_codex_catalog(catalog)
+    for model in out["models"]:
+        for key in server.CODEX_CATALOG_DROP:
+            assert key not in model, (key, model)
+        assert model["supports_search_tool"] is False, model
+        assert model["experimental_supported_tools"] == [], model
+    assert out["models"][0]["context_window"] == 272000, out
+    print("  patch_codex_catalog: code mode / agents / patch / search removed")
+
+
+def test_codex_catalog_is_generated_from_the_cli_and_cached():
+    """codex_catalog_path runs `<codex> debug models` (tests: the fake in
+    tests/fixtures/fake_codex.py), writes the patched catalog, and reuses it
+    for the rest of the process."""
+    import shutil
+    tmp = Path(tempfile.mkdtemp(prefix="clib-codexcat-"))
+    saved = (server.CODEX_CATALOG_PATH, server._codex_catalog_ready)
+    try:
+        server.CODEX_CATALOG_PATH = tmp / "catalog.json"
+        server._codex_catalog_ready = False
+        path = server.codex_catalog_path()
+        data = json.loads(path.read_text())
+        slugs = [m["slug"] for m in data["models"]]
+        assert slugs == ["gpt-5.6-terra", "gpt-5.5"], slugs
+        assert "tool_mode" not in data["models"][0], data
+        mtime = path.stat().st_mtime_ns
+        assert server.codex_catalog_path() == path
+        assert path.stat().st_mtime_ns == mtime, "regenerated instead of cached"
+        print("  codex catalog generated once from `codex debug models`, then cached")
+    finally:
+        server.CODEX_CATALOG_PATH, server._codex_catalog_ready = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_concurrent_first_codex_requests_share_one_catalog():
+    """Review of #270: two first requests racing through catalog generation
+    must both get the catalog; the loser of a shared temp-file rename used
+    to 502 a perfectly valid request."""
+    import shutil
+    import threading
+    tmp = Path(tempfile.mkdtemp(prefix="clib-codexcat-race-"))
+    saved = (server.CODEX_CATALOG_PATH, server._codex_catalog_ready)
+    results, errors = [], []
+
+    def first_request():
+        try:
+            results.append(server.codex_catalog_path())
+        except Exception as exc:    # noqa: BLE001 -- any failure is the bug
+            errors.append(exc)
+
+    try:
+        server.CODEX_CATALOG_PATH = tmp / "catalog.json"
+        server._codex_catalog_ready = False
+        threads = [threading.Thread(target=first_request) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+        assert results == [tmp / "catalog.json"] * 8, results
+        assert [p.name for p in tmp.iterdir()] == ["catalog.json"], list(tmp.iterdir())
+        print("  8 concurrent first requests -> one catalog, no errors, no temp leftovers")
+    finally:
+        server.CODEX_CATALOG_PATH, server._codex_catalog_ready = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_codex_catalog_failure_refuses_with_502():
+    """Without the catalog, codex runs in code mode with its own shell. The
+    request must be refused (502, so the router cools the plan), never
+    served on an unlocked CLI."""
+    import shutil
+    from fastapi import HTTPException
+    tmp = Path(tempfile.mkdtemp(prefix="clib-codexcat-bad-"))
+    saved = (server.CODEX_CATALOG_PATH, server._codex_catalog_ready,
+             server.PROFILES["codex"]["cli"])
+    try:
+        server.CODEX_CATALOG_PATH = tmp / "catalog.json"
+        server._codex_catalog_ready = False
+        server.PROFILES["codex"]["cli"] = str(tmp / "no-such-codex")
+        try:
+            server.codex_lockdown_args()
+            raise AssertionError("expected HTTPException")
+        except HTTPException as exc:
+            assert exc.status_code == 502, exc.detail
+            assert "lockdown unavailable" in str(exc.detail), exc.detail
+        assert not server.CODEX_CATALOG_PATH.exists()
+        print("  codex catalog failure -> 502, no argv built")
+    finally:
+        (server.CODEX_CATALOG_PATH, server._codex_catalog_ready,
+         server.PROFILES["codex"]["cli"]) = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_codex_text_path_argv_carries_the_lockdown():
+    """The text path's codex has the same shell, patch tool and code-mode
+    host as the tool path's -- and before this, nothing but the missing
+    `tools` field stood between them and the model."""
+    saved = (server.PROVIDER, server.PROFILE, server.CLI)
+    try:
+        server.PROVIDER = "codex"
+        server.PROFILE = server.PROFILES["codex"]
+        server.CLI = server.PROFILE["cli"]
+        argv, _ = server.build_argv("hi", None, None)
+        disabled = [argv[i + 1] for i, el in enumerate(argv) if el == "--disable"]
+        assert list(server.CODEX_DISABLED_FEATURES) == disabled, disabled
+        for override in server.CODEX_CONFIG_OVERRIDES:
+            assert argv[argv.index(override) - 1] == "-c", (override, argv)
+        assert any(el.startswith("model_catalog_json=") for el in argv), argv
+        print("  codex text-path argv carries the full lockdown")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved
+
+
 def test_codex_argv_carries_one_minus_i_per_image():
     """codex takes images via repeatable `-i FILE`. Every staged file must
     appear on argv with its own flag, in order, so the CLI receives the
@@ -894,9 +1015,9 @@ def test_opencode_argv_carries_one_minus_f_per_image():
 def test_claude_argv_uses_add_dir_and_allows_read_for_images():
     """Claude Code has no image flag; the staged files must be reachable via
     Read. `--add-dir <imgdir>` adds the directory and `--allowed-tools
-    Read(<imgdir>/**)` lifts Read out of the bare-mode disallowed-tools
-    list. Read must NOT also be in --disallowed-tools (the bare list does
-    include it, so the image variant's bare_args_images is the one used).
+    Read(<imgdir>/**)` pre-approves it for the staged files only. The image
+    variant's bare_args_images is the one used: `--tools Read` makes Read
+    the only built-in that exists (the plain variant has `--tools ""`).
     """
     import shutil
     saved_provider, saved_profile, saved_cli = server.PROVIDER, server.PROFILE, server.CLI
@@ -916,17 +1037,44 @@ def test_claude_argv_uses_add_dir_and_allows_read_for_images():
         assert "--allowed-tools" in argv, argv
         allowed = argv[argv.index("--allowed-tools") + 1]
         assert allowed.startswith("Read(") and allowed.endswith("/**)"), allowed
-        # The image variant's bare_args_images is in argv: max-turns 4, no
-        # Read in the disallowed list.
+        # The image variant's bare_args_images is in argv: max-turns 4 and
+        # Read as the only built-in.
         assert "4" in argv, argv
-        idx = argv.index("--disallowed-tools")
-        disallowed = argv[idx + 1]
-        for tool in disallowed.split(","):
-            assert tool != "Read", (disallowed, tool)
+        assert argv[argv.index("--tools") + 1] == "Read", argv
+        assert "--disallowed-tools" not in argv, argv
         print(f"  claude argv: --add-dir={img.parent}, --allowed-tools={allowed}")
     finally:
         server.PROVIDER, server.PROFILE, server.CLI = saved_provider, saved_profile, saved_cli
         shutil.rmtree(img_dir, ignore_errors=True)
+
+
+def test_claude_text_path_allows_no_builtin_tools():
+    """The text path's --max-turns 1 turn ends in error_max_turns -> a paid
+    502 whenever the model calls ANY tool (issue #195: Agent, ToolSearch,
+    Skill; issue #256: AskUserQuestion). A denylist has to name every
+    built-in and misses the next one a CLI release adds, so the bare args
+    are an allowlist of zero (`--tools ""`) plus the shared lockdown:
+    no account MCP connectors, no login-dir settings/CLAUDE.md/hooks, and
+    no permission prompt anyone would have to answer."""
+    saved = (server.PROVIDER, server.PROFILE, server.CLI, server.BARE)
+    try:
+        server.PROVIDER = "claude"
+        server.PROFILE = server.PROFILES["claude"]
+        server.CLI = server.PROFILE["cli"]
+        server.BARE = True
+        argv, _ = server.build_argv("hi", None, None)
+        assert argv[argv.index("--tools") + 1] == "", argv
+        assert "--disallowed-tools" not in argv, argv
+        assert argv[argv.index("--max-turns") + 1] == "1", argv
+        assert "--strict-mcp-config" in argv, argv
+        assert argv[argv.index("--setting-sources") + 1] == "", argv
+        assert argv[argv.index("--permission-prompts") + 1] == "none", argv
+        assert tuple(server.CLAUDE_LOCKDOWN) == (
+            "--strict-mcp-config", "--setting-sources", "",
+            "--permission-prompts", "none"), server.CLAUDE_LOCKDOWN
+        print("  claude text path: --tools '' + strict MCP + no settings + no prompts")
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI, server.BARE = saved
 
 
 def test_no_image_blocks_means_image_note_is_empty():
@@ -1671,6 +1819,145 @@ def test_health_reports_max_tokens_mode():
 
     print("  opencode health -> enforces_max_tokens=True (no reason); "
           "codex health -> False, reason='no-truncation-flag'")
+
+
+def test_opencode_text_path_spawn_dir_carries_the_locked_down_agent():
+    """OpenCode reads its project config from the working directory. The
+    text path spawns in a fresh `sy-cli-*` temp dir (issue #44), so unless
+    the bridge writes the config THERE, `--agent switchyard` is not found
+    and OpenCode falls back to its `build` agent: every built-in tool,
+    `permission: * allow`. A fake CLI reports the opencode.json it finds in
+    its own cwd; the assert is that the spawned process saw the lockdown.
+    """
+    import asyncio
+    fake_cli = tempfile.NamedTemporaryFile(
+        "w", suffix=".py", prefix="clib-ocfg-", delete=False)
+    fake_cli.write(
+        "import json, os\n"
+        "cfg = open('opencode.json').read() if os.path.exists('opencode.json') else 'MISSING'\n"
+        "print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': cfg}}))\n"
+        "print(json.dumps({'type': 'step_finish', 'part': "
+        "    {'type': 'step-finish', "
+        "     'tokens': {'input': 1, 'output': 1, 'reasoning': 0}}}))\n")
+    fake_cli.close()
+    # Pin the opencode profile outright: another test module may have loaded
+    # this bridge under a different PROVIDER in the same process.
+    real = (server.CLI, server.BARE, server.PROFILE, server.PROVIDER)
+    try:
+        server.CLI = sys.executable
+        server.BARE = False
+        server.PROVIDER = "opencode"
+        server.PROFILE = dict(server.PROFILES["opencode"], args=[fake_cli.name])
+        payload = asyncio.run(server.run_cli("hi", None, "m"))
+        assert payload["result"] != "MISSING", "no opencode.json in the spawn dir"
+        cfg = json.loads(payload["result"])
+        assert cfg == server.opencode_config(), cfg
+        agent = cfg["agent"]["switchyard"]
+        assert agent["permission"] == {"*": "deny"}, agent
+        assert cfg["permission"] == {"*": "deny"}, cfg
+        assert not any(agent["tools"].values()), agent["tools"]
+        assert cfg["agent"]["title"] == {"disable": True}, cfg
+        print("  text-path spawn dir carries the switchyard agent, all built-ins denied")
+    finally:
+        server.CLI, server.BARE, server.PROFILE, server.PROVIDER = real
+        os.unlink(fake_cli.name)
+
+
+def test_opencode_spawn_dir_config_write_failure_is_cleaned_up_and_502():
+    """Writing the spawn dir's opencode.json can fail (full disk, a temp
+    dir made unwritable). That must go through the same path as a failed
+    spawn: the `sy-cli-*` dir is removed, not orphaned, and the caller
+    gets a 502 so the router cools the plan -- not an unclassified 500."""
+    import asyncio
+    from fastapi import HTTPException
+    tmp_root = tempfile.mkdtemp(prefix="clib-ocfg-fail-")
+    real = (server.PROVIDER, server.PROFILE, server.opencode_config,
+            tempfile.tempdir)
+
+    def broken_config(allow=(), prompt=None):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    try:
+        server.PROVIDER = "opencode"
+        server.PROFILE = server.PROFILES["opencode"]
+        server.opencode_config = broken_config
+        tempfile.tempdir = tmp_root
+        try:
+            asyncio.run(server.run_cli("hi", None, "m"))
+            raise AssertionError("expected HTTPException")
+        except HTTPException as exc:
+            assert exc.status_code == 502, exc.detail
+            assert "could not be spawned" in str(exc.detail), exc.detail
+        leftovers = [n for n in os.listdir(tmp_root) if n.startswith("sy-cli-")]
+        assert leftovers == [], leftovers
+        print("  opencode.json write failure -> 502, sy-cli-* dir removed")
+    finally:
+        (server.PROVIDER, server.PROFILE, server.opencode_config,
+         tempfile.tempdir) = real
+        import shutil
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def test_opencode_text_path_carries_the_system_prompt_as_the_agent_prompt():
+    """Bridge-siblings with mcp_bridge.write_opencode_dir (review of #274):
+    on the text path too, the caller's system prompt is the agent's
+    `prompt:` -- replacing OpenCode's base prompt -- and is not folded into
+    the user turn."""
+    import asyncio
+    fake_cli = tempfile.NamedTemporaryFile(
+        "w", suffix=".py", prefix="clib-ocprompt-", delete=False)
+    fake_cli.write(
+        "import json, sys\n"
+        "cfg = json.load(open('opencode.json'))\n"
+        "out = {'prompt': cfg['agent']['switchyard'].get('prompt'), 'argv_tail': sys.argv[-1]}\n"
+        "print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': json.dumps(out)}}))\n"
+        "print(json.dumps({'type': 'step_finish', 'part': "
+        "    {'type': 'step-finish', "
+        "     'tokens': {'input': 1, 'output': 1, 'reasoning': 0}}}))\n")
+    fake_cli.close()
+    real = (server.CLI, server.BARE, server.PROFILE, server.PROVIDER)
+    try:
+        server.CLI = sys.executable
+        server.BARE = False
+        server.PROVIDER = "opencode"
+        server.PROFILE = dict(server.PROFILES["opencode"],
+                              args=[fake_cli.name, "{prompt}"])
+        payload = asyncio.run(server.run_cli("the user turn", "CALLER SYSTEM", "m"))
+        seen = json.loads(payload["result"])
+        assert seen["prompt"] == "CALLER SYSTEM", seen
+        assert seen["argv_tail"] == "the user turn", seen
+        print("  opencode text path: system -> agent prompt, user turn unfolded")
+    finally:
+        server.CLI, server.BARE, server.PROFILE, server.PROVIDER = real
+        os.unlink(fake_cli.name)
+
+
+def test_opencode_harness_file_matches_opencode_config():
+    """harness/opencode.json ships in the image (Dockerfile.sidecar) and is
+    what a manual `opencode run` from /app picks up. It must be exactly the
+    config the bridge writes, or the two drift and one of them is the
+    unlocked one."""
+    harness = Path(server.__file__).resolve().parent / "harness" / "opencode.json"
+    assert json.loads(harness.read_text()) == server.opencode_config(), \
+        "regenerate sidecars/cli_bridge/harness/opencode.json from opencode_config()"
+    print("  harness/opencode.json == opencode_config()")
+
+
+def test_opencode_config_denies_every_builtin_unless_allowed():
+    """Hiding a tool (`tools: {x: false}`) does not stop OpenCode executing
+    it when the model names it; the permission layer does. `allow` is the
+    only way through, and a builtin named in it is also un-hidden."""
+    cfg = server.opencode_config(allow=("switchyard_*", "read"))
+    agent = cfg["agent"]["switchyard"]
+    assert agent["permission"] == {"*": "deny", "switchyard_*": "allow",
+                                   "read": "allow"}, agent
+    assert cfg["permission"] == agent["permission"], cfg
+    assert agent["tools"]["read"] is True, agent["tools"]
+    others = {k: v for k, v in agent["tools"].items() if k != "read"}
+    assert others and not any(others.values()), others
+    for tool in ("bash", "skill", "task", "webfetch"):
+        assert tool in agent["tools"], tool
+    print("  opencode_config: * deny, allow-list only, builtins hidden")
 
 
 def test_spawn_sites_pass_only_the_allowlisted_env_to_the_cli():

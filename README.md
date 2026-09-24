@@ -737,7 +737,7 @@ Each CLI offers a different lever, all now applied:
 
 | CLI | Mechanism | Prompt tokens, trivial call |
 |---|---|---|
-| `claude -p` | `--system-prompt` (true replace), `--disallowed-tools`, `--exclude-dynamic-system-prompt-sections` | **2** |
+| `claude -p` | `--system-prompt` (true replace), `--tools ""` (no built-ins), `--strict-mcp-config`, `--setting-sources ""`, `--exclude-dynamic-system-prompt-sections` | **2** |
 | `opencode run` | `--agent switchyard` — a custom agent (`harness/opencode.json`) with every tool disabled and no prompt of its own | 7,239 → **445** |
 | `codex exec` | `-c model_instructions_file=<path>` replaces the compiled-in base instructions | 14,255 → **9,768** |
 

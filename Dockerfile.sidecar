@@ -47,9 +47,11 @@ COPY sidecars/mcp_bridge /app/mcp_bridge
 COPY switchyard/__init__.py /app/switchyard/__init__.py
 COPY switchyard/caller_env.py /app/switchyard/caller_env.py
 COPY switchyard/models.py /app/switchyard/models.py
-# Minimal harness configs. opencode.json is read as the project config from the
-# working directory and defines the `switchyard` agent (one-line prompt, every
-# tool disabled); codex-instructions.md is the default base-instruction override.
+# Minimal harness configs. opencode.json defines the `switchyard` agent (every
+# built-in tool hidden AND denied at the permission layer); the bridges write
+# the same config (cli_bridge.opencode_config) into each spawn directory,
+# because OpenCode reads its project config from the working directory.
+# codex-instructions.md is the default base-instruction override.
 # Together these are what makes a subscription viable for volume: they cut the
 # CLI's own prompt from thousands of tokens per call to hundreds.
 COPY sidecars/cli_bridge/harness /app/harness
@@ -76,6 +78,17 @@ RUN cd /app && python3 -c "import switchyard.models; assert switchyard.models.Ca
 # the four dirs in node-owned and the mounts land on a writable path.
 RUN mkdir -p /home/node/.local/state /home/node/.local/share /home/node/.config /home/node/.cache \
     && chown -R node:node /home/node/.local /home/node/.config /home/node/.cache
+
+# Roots the tool path may recreate the caller's working directory under
+# (mcp_bridge.MIRROR_ROOTS). Claude Code and OpenCode report their own cwd,
+# git state and shell to the model in a block no flag removes on a
+# subscription login; running them in an empty directory at the caller's own
+# path makes that block agree with the caller instead of contradicting it
+# (issue #264). Sticky + world-writable so the unprivileged `node` user can
+# create the path, and nobody can remove another's; /home/node itself keeps
+# its owner and is excluded by MIRROR_DENY.
+RUN mkdir -p /Users /workspace /workspaces /srv /mnt /projects /code /data \
+    && chmod 1777 /Users /home /workspace /workspaces /srv /mnt /projects /code /data
 
 # The container runs as root, so $HOME is /root — but the host credential
 # directories are mounted under /home/node. Claude and Codex are pinned by
