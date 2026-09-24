@@ -5600,6 +5600,89 @@ def test_check_result_envelope_helper_classifies_four_payload_shapes():
           " / limit-text-only")
 
 
+# ----------------------------------------- MCP_WORKDIR_ROOT (issue #294) -----
+def test_new_workdir_lives_sunder_root_with_full_session_id():
+    """new_workdir puts the session dir directly under MCP_WORKDIR_ROOT,
+    names the dir with the full session uuid, gives distinct ids distinct
+    dirs, and lets cleanup_workdir's rmtree remove exactly that session
+    dir -- the root must stay. /relay is the production default; the
+    test points MCP_WORKDIR_ROOT at a temp dir so no /relay exists."""
+    import shutil
+    saved = server.MCP_WORKDIR_ROOT
+    test_root: Path | None = None
+    try:
+        test_root = Path(tempfile.mkdtemp(prefix="mcpb-wdroot-"))
+        server.MCP_WORKDIR_ROOT = test_root
+        a_id, b_id = uuid.uuid4().hex, uuid.uuid4().hex
+        a = server.new_workdir(a_id)
+        b = server.new_workdir(b_id)
+        assert a == server.MCP_WORKDIR_ROOT / a_id, a
+        assert b == server.MCP_WORKDIR_ROOT / b_id, b
+        assert a != b, "distinct session ids must produce distinct dirs"
+        assert a.is_dir() and b.is_dir()
+        # The full uuid is the dirname, not a truncated prefix; this is
+        # what makes cleanup_workdir's rmtree remove exactly one session.
+        assert a.name == a_id and b.name == b_id
+        server.cleanup_workdir(a)
+        assert not a.exists(), a
+        # cleanup_workdir must not have touched the root itself.
+        assert server.MCP_WORKDIR_ROOT.is_dir(), server.MCP_WORKDIR_ROOT
+        # The other session is untouched by the first cleanup.
+        assert b.is_dir(), b
+        print("  new_workdir: <root>/<full_session_id>; cleanup removes one, root stays")
+    finally:
+        server.MCP_WORKDIR_ROOT = saved
+        # Remove the test-created temp root, NOT the saved production root
+        # (default /relay): on a host without /relay rmtree is a silent no-op,
+        # but inside the sidecar image it would silently wipe every
+        # session dir beneath /relay. The test owns only test_root.
+        if test_root is not None:
+            shutil.rmtree(test_root, ignore_errors=True)
+
+
+def test_new_workdir_falls_back_when_root_is_uncreatable():
+    """When MCP_WORKDIR_ROOT cannot accept a mkdir (an image without /relay,
+    a read-only env, an existing file in the way), new_workdir logs a
+    warning and falls back to a mcpb- prefixed tempfile.mkdtemp dir
+    rather than raising. This keeps the relay alive in any host environment."""
+    saved_root = server.MCP_WORKDIR_ROOT
+    try:
+        # An existing file at the root path makes mkdir(parents=True) raise
+        # NotADirectoryError on Linux; any OSError is enough to trigger the
+        # fallback (the function's broad except catches them all).
+        blocker = Path(tempfile.mkdtemp(prefix="mcpb-block-")) / "notadir"
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_text("not a directory")
+        server.MCP_WORKDIR_ROOT = blocker
+        captured: list[str] = []
+        import logging as _lg
+        class _Capture(_lg.Handler):
+            def emit(self, record):
+                captured.append(record.getMessage())
+        cap = _Capture()
+        cap.setLevel(_lg.WARNING)
+        server.log.addHandler(cap)
+        try:
+            sid = uuid.uuid4().hex
+            wd = server.new_workdir(sid)
+        finally:
+            server.log.removeHandler(cap)
+        assert any("falling back to tempfile" in m for m in captured), captured
+        assert wd.is_dir()
+        assert wd.name.startswith(f"mcpb-{sid[:8]}-"), wd
+        # The fallback dir is sibling to the blocker, not under it: nothing
+        # in the caller-visible workdir path was written inside the root.
+        assert blocker not in wd.parents and wd != blocker, wd
+        shutil.rmtree(wd.parent if wd.parent == blocker.parent else wd,
+                      ignore_errors=True)
+        # Clean up the temp blocker hierarchy.
+        import shutil as _sh
+        _sh.rmtree(blocker.parent, ignore_errors=True)
+        print("  new_workdir: OSError -> tempfile.mkdtemp fallback, no raise, warning logged")
+    finally:
+        server.MCP_WORKDIR_ROOT = saved_root
+
+
 # -------------------------------------------- issue #292: MCP + reasoning ---
 def test_mcp_bridge_build_argv_passes_thinking_to_cli_bridge():
     """mcp_bridge's build_argv must thread the thinking policy into the

@@ -77,6 +77,7 @@ Knobs read by the running bridges (all read once at import time):
     `MCP_RESUME_WAIT_SECONDS`, `MCP_REBUILD_LOST`, `MCP_PREEMPTED_MEMORY`,
     `MCP_RECLAIM_POLL_SECONDS`, `MCP_PROCESS_TIMEOUT_SECONDS`,
     `MCP_BATCH_WINDOW_SECONDS`, `MCP_REMEMBERED_TOOLS_LIMIT`,
+    `MCP_WORKDIR_ROOT`,
     `LOG_TEXT_LOST` — mcp_bridge knobs.
   - `MCP_PDF_PAGE_LIMIT`, `MCP_PDF_RENDER_DPI` — the PDF render
     (`cli_bridge.render_pdf`, poppler): pages rendered and their DPI, for a
@@ -88,6 +89,18 @@ The tool path runs each inner CLI in a mirror of the caller's cwd
 distinct mirrors exist at once (default 64; past it a session keeps its
 workdir) and `MCP_MIRROR_MANIFEST` is where created mirrors are recorded so
 startup can sweep what a crash left behind.
+
+Each session's workdir lands at `/relay/<session_id>` (issue #294), where
+`/relay` is created by `Dockerfile.sidecar` as sticky + world-writable like
+the mirror roots — the unprivileged `node` user can `mkdir` under it, and
+`cleanup_workdir`'s `rmtree` removes exactly the session dir, never the
+root. `MCP_WORKDIR_ROOT` overrides the default (`/relay`) when an image or
+env lacks the dir; `new_workdir` falls back to the original
+`tempfile.mkdtemp(prefix="mcpb-<id8>-")` rather than failing. None of this
+touches the `mirror_target`/`MIRROR_ROOTS`/`MIRROR_DENY` path; the relay's
+own paths (`/app`, `/relay/<session_id>`, `/tmp/sy-cli-*`) are named in
+`render_first_turn_reminder`'s "trust the relay env" warning so the model
+does not mistake them for the caller's filesystem.
 
 `SWITCHYARD_PLAN` (or its legacy alias `SWITCHYARD_SUBSCRIPTION`) names the
 plan this process fronts. One process per subscription: sharing a process

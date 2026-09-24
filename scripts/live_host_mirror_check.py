@@ -74,7 +74,7 @@ CALLER_TOOLS = [BASH, READ, GH]
 HOST_ID = "uid=501(caller) gid=20(staff)"
 LISTING = "README.md\npyproject.toml\nsrc\n"
 README = "# Caller Project Marker\nThis README exists only on the caller.\n"
-RELAY_PATH = re.compile(r"/tmp/|/app/|/home/node|sy-cli-|mcpb-")
+RELAY_PATH = re.compile(r"/tmp/|/app/|/home/node|/relay/|sy-cli-|mcpb-")
 
 def post(body):
     req = urllib.request.Request(URL, data=json.dumps(body).encode(),

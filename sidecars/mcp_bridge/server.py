@@ -1046,6 +1046,29 @@ def cleanup_workdir(workdir: Path) -> None:
     shutil.rmtree(workdir, ignore_errors=True)
 
 
+def new_workdir(session_id: str) -> Path:
+    """Create the per-session directory beneath MCP_WORKDIR_ROOT.
+
+    The dirname is the full session uuid, so distinct sessions get distinct
+    dirs and cleanup_workdir's rmtree removes exactly one session -- it
+    never reaches the root, and the root stays across every session in the
+    lifetime of the container (issue #294). On an image or env without
+    /relay (a test fixture, a deployment that mounts the root read-only),
+    mkdir raises OSError; we log a warning and fall back to the original
+    tempfile.mkdtemp(prefix=f"mcpb-{session_id[:8]}-") so the relay still
+    has somewhere to run, with no behavioural change to anything that
+    touches a workdir.
+    """
+    target = MCP_WORKDIR_ROOT / session_id
+    try:
+        target.mkdir(parents=True)
+    except OSError as exc:
+        log.warning("could not create workdir under %s (%s); falling back to tempfile",
+                    MCP_WORKDIR_ROOT, exc)
+        return Path(tempfile.mkdtemp(prefix=f"mcpb-{session_id[:8]}-"))
+    return target
+
+
 def write_claude_mcp_config(workdir: Path, session_id: str, tools_path: Path) -> Path:
     cfg = {
         "mcpServers": {
@@ -2030,6 +2053,14 @@ MIRROR_MANIFEST = Path(os.environ.get(
     "MCP_MIRROR_MANIFEST", os.path.join(tempfile.gettempdir(), "switchyard-mirrors.json")))
 MIRROR_USERS: dict[str, set] = {}      # mirror path -> ids of live sessions in it
 MIRROR_CREATED: dict[str, dict] = {}   # mirror path -> {"top": first dir we made, "git": bool}
+# Relay-only root for per-session directories (issue #294). The session
+# workdir sits beneath it as <root>/<session_id> so cleanup_workdir's rmtree
+# removes the session dir but never the root. Dockerfile.sidecar makes /relay
+# sticky + world-writable (compose runs as `user: node`), the same shape the
+# mirror roots have; a custom env or a test environment without that dir
+# falls back to a tempfile.mkdtemp mcpb-<id8>- prefixed dir so the relay
+# still has somewhere to run.
+MCP_WORKDIR_ROOT = Path(os.environ.get("MCP_WORKDIR_ROOT", "/relay"))
 
 
 def _save_mirror_manifest() -> None:
@@ -2192,7 +2223,7 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     again -- the rebuild is a new first turn by construction.
     """
     session_id = uuid.uuid4().hex
-    workdir = Path(tempfile.mkdtemp(prefix=f"mcpb-{session_id[:8]}-"))
+    workdir = new_workdir(session_id)
     # The slot was acquired by the caller before getting here; the session owns
     # it from now on, and gives it back when it parks or ends.
     spawn_dir = acquire_mirror(env, session_id) or workdir

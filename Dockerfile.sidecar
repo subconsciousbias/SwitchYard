@@ -91,8 +91,12 @@ RUN mkdir -p /home/node/.local/state /home/node/.local/share /home/node/.config 
 # (issue #264). Sticky + world-writable so the unprivileged `node` user can
 # create the path, and nobody can remove another's; /home/node itself keeps
 # its owner and is excluded by MIRROR_DENY.
-RUN mkdir -p /Users /workspace /workspaces /srv /mnt /projects /code /data \
-    && chmod 1777 /Users /home /workspace /workspaces /srv /mnt /projects /code /data
+# /relay is the workdir root for mcp_bridge sessions (issue #294): each
+# session lands at /relay/<session_id> with the same sticky + world-writable
+# permissions, so the unprivileged `node` user can mkdir there and
+# cleanup_workdir's rmtree never reaches the root.
+RUN mkdir -p /Users /workspace /workspaces /srv /mnt /projects /code /data /relay \
+    && chmod 1777 /Users /home /workspace /workspaces /srv /mnt /projects /code /data /relay
 
 # The container runs as root, so $HOME is /root — but the host credential
 # directories are mounted under /home/node. Claude and Codex are pinned by

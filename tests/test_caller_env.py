@@ -671,6 +671,12 @@ def test_render_first_turn_reminder_known():
     assert "[SwitchYard: tools execute on Windows in C:\\src\\proj" in reminder
     assert "/app" in reminder            # relay path warning is part of the line
     assert "must not be used for tool paths" in reminder
+    # Issue #294: the relay now also has /relay/<session_id> workdirs and
+    # /tmp/sy-cli-* spawned CLIs. The reminder names all three relay-only
+    # shapes so the model does not mistake any of them for the caller's
+    # filesystem.
+    assert "/relay" in reminder
+    assert "/tmp" in reminder
     print(f"  reminder known: {reminder[:60]}...")
 
 
@@ -782,8 +788,10 @@ def test_real_paths_containing_app_are_not_relay_paths():
     A substring match on "/app/" discarded real caller paths."""
     for real in ("/home/u/myapp/app/src", "/Users/me/app/web", "/srv/app/x"):
         assert not caller_env._is_relay_path(real), real
-    for relay in ("/app/mcp_bridge", "/app/cli_bridge/x", "/tmp/mcpb-1234-ab",
-                  "/tmp/sy-cli-xyz", "/tmp/switchyard-relay/a"):
+    for relay in ("/app/mcp_bridge", "/app/cli_bridge/x",
+                  # issue #294: unmirrored sessions now live at /relay/<session_id>
+                  ("/relay/" + "0" * 32),
+                  "/tmp/mcpb-1234-ab", "/tmp/sy-cli-xyz", "/tmp/switchyard-relay/a"):
         assert caller_env._is_relay_path(relay), relay
     env = caller_env.parse_request({"messages": [{"role": "system", "content":
         "# Environment\n - Primary working directory: /Users/me/app/web\n"}]})

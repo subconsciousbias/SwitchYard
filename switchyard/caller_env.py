@@ -109,8 +109,8 @@ PROBE_COMMANDS = {"posix": PROBE_COMMAND, "powershell": PROBE_COMMAND_POWERSHELL
 # Matched as PREFIXES of the relay's own directories (issue #187): a
 # substring match on "/app/" threw away real caller paths such as
 # /home/u/myapp/app/src or /Users/me/app/web.
-_RELAY_PATH_PREFIXES = ("/app/mcp_bridge", "/app/cli_bridge", "/tmp/mcpb-",
-                        "/tmp/sy-cli-", "/tmp/switchyard-relay/")
+_RELAY_PATH_PREFIXES = ("/app/mcp_bridge", "/app/cli_bridge", "/relay/",
+                        "/tmp/mcpb-", "/tmp/sy-cli-", "/tmp/switchyard-relay/")
 
 
 def _is_relay_path(value: str | None) -> bool:
@@ -768,16 +768,23 @@ def render_first_turn_reminder(env: CallerEnvironment) -> str:
 
     Unknown-env wording is explicit: the model is told not to assume the
     relay container is the caller machine, and to state its assumptions
-    instead of asking -- a headless relay has no one to ask (issue #256). The
-    Linux / /app wording matches the OWNER's template verbatim so a
-    model that has seen it before recognises it as authoritative.
+    instead of asking -- a headless relay has no one to ask (issue #256).
+    The known-env line keeps the OWNER-template anchor -- "/app/..." as
+    one example of a relay path -- so a model that has seen the prior
+    line still recognises it as authoritative; the /relay and /tmp
+    additions (issue #294) are a deliberate extension -- they name the
+    two other shapes a relay CLI now reports (the per-session workdir
+    lives at /relay/<session_id>, cli_bridge's spawned CLI cwd is
+    /tmp/sy-cli-*) so the model's "trust the relay env" mistake does
+    not reappear with a different root.
     """
     if env.platform or env.cwd:
         return (
             f"[SwitchYard: tools execute on {env.platform or 'unknown'}"
-            f" in {env.cwd or 'unknown'}. Any Linux /app/... environment"
-            " reported by the relay CLI refers only to the relay container"
-            " and must not be used for tool paths.]"
+            f" in {env.cwd or 'unknown'}. Any Linux environment the "
+            "relay CLI reports for itself (like /app/..., /relay/..., or "
+            "/tmp/...) describes only the relay container and must not "
+            "be used for tool paths.]"
         )
     return (
         "[SwitchYard: caller environment unknown -- do not assume the "
