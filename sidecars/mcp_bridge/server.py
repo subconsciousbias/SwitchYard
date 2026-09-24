@@ -70,7 +70,7 @@ from pathlib import Path
 log = logging.getLogger("mcp_bridge")
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI(title="switchyard-mcp-bridge")
 
@@ -2799,7 +2799,7 @@ async def handle_tool_request(body: dict, tools: list[dict],
 
 
 @app.get("/health")
-async def health() -> dict:
+async def health() -> JSONResponse:
     cfg = cli_bridge.config()
     health_doc = {"ok": cfg.source == "config", "provider": PROVIDER, "supports_tools": True,
                  # All three MCP_PROFILES carry images via the same per-profile
@@ -2827,7 +2827,7 @@ async def health() -> dict:
         reason = cli_bridge.PROFILE.get("enforce_max_tokens_reason")
         if reason:
             health_doc["enforces_max_tokens_reason"] = reason
-    return health_doc
+    return JSONResponse(health_doc, status_code=200 if health_doc["ok"] else 503)
 
 
 @app.get("/usage")

@@ -182,10 +182,12 @@ def test_health_is_dishonest_never_ok_true_without_a_working_grant():
     originals = _install_fake_oauth(authorised=False)
     try:
         client = TestClient(server.app)
-        health = client.get("/health").json()
+        resp = client.get("/health")
+        health = resp.json()
+        assert resp.status_code == 503, (resp.status_code, health)
         assert health["ok"] is False, health
         assert health["authorised"] is False
-        print(f"  unauthorised xai: ok={health['ok']}")
+        print(f"  unauthorised xai: status={resp.status_code} ok={health['ok']}")
     finally:
         _restore_oauth(originals)
 
@@ -195,11 +197,13 @@ def test_health_is_ok_for_xai_once_authorised():
     originals = _install_fake_oauth(authorised=True)
     try:
         client = TestClient(server.app)
-        health = client.get("/health").json()
+        resp = client.get("/health")
+        health = resp.json()
+        assert resp.status_code == 200, (resp.status_code, health)
         assert health["ok"] is True, health
         assert health["upstream_base"] == "https://api.x.ai/v1"
         assert health["supports_chat_completions"] is True
-        print(f"  authorised xai: {health}")
+        print(f"  authorised xai: status={resp.status_code} {health}")
     finally:
         _restore_oauth(originals)
 
@@ -211,12 +215,14 @@ def test_health_is_never_ok_for_openai_regardless_of_grant():
     originals = _install_fake_oauth(authorised=True, account="acct-1")
     try:
         client = TestClient(server.app)
-        health = client.get("/health").json()
+        resp = client.get("/health")
+        health = resp.json()
+        assert resp.status_code == 503, (resp.status_code, health)
         assert health["ok"] is False, health
         assert health["authorised"] is True   # the grant itself is fine
         assert health["supports_chat_completions"] is False
-        print(f"  authorised-but-unsupported openai: ok={health['ok']} "
-              f"authorised={health['authorised']}")
+        print(f"  authorised-but-unsupported openai: status={resp.status_code} "
+              f"ok={health['ok']} authorised={health['authorised']}")
     finally:
         _restore_oauth(originals)
         server.PROVIDER = "xai"

@@ -371,7 +371,7 @@ async def messages(request: Request):
 
 
 @app.get("/health")
-async def health() -> dict:
+async def health() -> JSONResponse:
     spec = PROVIDERS.get(PROVIDER)
     st = oauth.status(PROVIDER)
     supports_chat = bool(spec and spec.chat_completions_path)
@@ -379,7 +379,7 @@ async def health() -> dict:
     # whenever this process cannot actually serve a request right now, not
     # merely whenever something is technically running.
     ok = bool(spec) and bool(st.get("authorised")) and supports_chat
-    return {
+    doc = {
         "ok": ok,
         "provider": PROVIDER,
         "authorised": st.get("authorised", False),
@@ -390,3 +390,4 @@ async def health() -> dict:
         "supports_chat_completions": supports_chat,
         "supports_messages": bool(spec and spec.messages_path),
     }
+    return JSONResponse(doc, status_code=200 if ok else 503)

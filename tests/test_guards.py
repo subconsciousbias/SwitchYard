@@ -937,6 +937,68 @@ def test_compose_portal_environment_covers_every_probe_header_env_var():
           f"{sorted(needed)}")
 
 
+# Test (g): portal healthcheck on /healthz ------------------------------
+#
+# Issue: portal had no `healthcheck:` block in docker-compose.yml, so a
+# Redis outage left its container reporting healthy while every probe
+# inside was failing. apply.sh's svc_ready already curls /healthz
+# (the route at switchyard/portal/app.py:952 that pings Redis), so
+# this is the compose-side mirror of that contract. Without the test,
+# the blind spot can silently return the next time someone edits the
+# compose file.
+
+
+def test_compose_portal_healthcheck_references_healthz():
+    with open(os.path.join(ROOT, "docker-compose.yml")) as fh:
+        compose_text = fh.read()
+    import yaml
+    compose = yaml.safe_load(compose_text) or {}
+    healthcheck = ((compose.get("services") or {})
+                   .get("portal", {}).get("healthcheck"))
+    assert isinstance(healthcheck, dict), (
+        "docker-compose.yml services.portal must declare a `healthcheck:` "
+        "block (same shape as the gateway's); the absence of one is the "
+        "exact blind spot the issue names."
+    )
+    test = healthcheck.get("test")
+    assert test, (
+        "services.portal.healthcheck must declare a `test:` command; "
+        f"got healthcheck={healthcheck!r}"
+    )
+    # Compose renders `test` as either a string ("CMD-SHELL ...") or a
+    # list whose last element is the shell string. Cover both shapes so
+    # the assertion stays valid if someone reformats the block.
+    if isinstance(test, list):
+        cmd = " ".join(str(part) for part in test)
+    else:
+        cmd = str(test)
+    # Tighten from "any URL containing `/healthz`" to the exact literal
+    # the issue expects. The path alone doesn't catch a host/port typo
+    # (`localhost:4002/healthz`, `portal.local/healthz`); the whole point
+    # of the healthcheck is to probe the portal on its published port.
+    assert "http://localhost:4001/healthz" in cmd, (
+        "services.portal.healthcheck.test must probe "
+        "`http://localhost:4001/healthz` (the route that pings Redis and "
+        "returns 503 when Redis is down); got command: " + repr(cmd)
+    )
+    # Same shape as the gateway's: timings must be present so the probe
+    # is actually exercised, not declared in a no-op form. Assert the
+    # literal values too -- presence of the keys still passes if a
+    # copy of the gateway block has one number edited, which would not
+    # change whether the probe runs but would silently drift from the
+    # cadence the issue documents.
+    expected_timings = {"interval": "15s", "timeout": "5s",
+                        "retries": 5, "start_period": "40s"}
+    for key, want in expected_timings.items():
+        got = healthcheck.get(key)
+        assert got == want, (
+            f"services.portal.healthcheck.{key} must equal {want!r} "
+            "(matching the gateway's portal-healthcheck cadence); "
+            f"got {got!r} in healthcheck={healthcheck!r}"
+        )
+    print("  services.portal.healthcheck probes http://localhost:4001/healthz with gateway-shape timings")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

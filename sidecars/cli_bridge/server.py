@@ -79,7 +79,7 @@ import jsonschema
 log = logging.getLogger("cli_bridge")
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # switchyard/caller_env.py: per-request resolution of the caller's tool-
 # execution environment (issue #44). Same import strategy as the mcp_bridge:
@@ -2990,7 +2990,7 @@ async def usage() -> dict:
 
 
 @app.get("/health")
-async def health() -> dict:
+async def health() -> JSONResponse:
     cfg = config()
     health_doc = {"ok": cfg.source == "config", "provider": PROVIDER,
                   "config_source": cfg.source, "supports_tools": False,
@@ -3015,7 +3015,7 @@ async def health() -> dict:
         reason = PROFILE.get("enforce_max_tokens_reason")
         if reason:
             health_doc["enforces_max_tokens_reason"] = reason
-    return health_doc
+    return JSONResponse(health_doc, status_code=200 if health_doc["ok"] else 503)
 
 
 @app.get("/v1/models")

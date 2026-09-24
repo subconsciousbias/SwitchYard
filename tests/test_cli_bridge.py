@@ -2313,7 +2313,8 @@ def test_health_reports_max_tokens_mode():
     try:
         server.PROVIDER = "opencode"
         server.PROFILE = server.PROFILES["opencode"]
-        h_open = asyncio.run(server.health())
+        h_open_resp = asyncio.run(server.health())
+        h_open = json.loads(h_open_resp.body)
         assert h_open["enforces_max_tokens"] is True, h_open
         assert "enforces_max_tokens_reason" not in h_open, h_open
 
@@ -2322,13 +2323,67 @@ def test_health_reports_max_tokens_mode():
         # request, which always carry a cap).
         server.PROVIDER = "codex"
         server.PROFILE = server.PROFILES["codex"]
-        h_codex = asyncio.run(server.health())
+        h_codex_resp = asyncio.run(server.health())
+        h_codex = json.loads(h_codex_resp.body)
         assert h_codex["enforces_max_tokens"] is True, h_codex
         assert "enforces_max_tokens_reason" not in h_codex, h_codex
     finally:
         server.PROVIDER, server.PROFILE = saved_provider, saved_profile
 
     print("  opencode and codex health -> enforces_max_tokens=True (no reason)")
+
+
+# ----------------------------------------------------- /health status codes ---
+def test_health_returns_200_with_ok_true_when_config_source_is_config():
+    """Happy path: a sidecar that successfully read plans.yaml returns
+    200 + ok=true. The compose healthcheck and `scripts/health_idle.py`
+    only see a 2xx response on this side, so this is the contract that
+    must hold whenever the sidecar is actually ready to serve.
+    """
+    from fastapi.testclient import TestClient
+    mod, old = _load_server_with_plans(PLANS)
+    try:
+        client = TestClient(mod.app)
+        resp = client.get("/health")
+        body = resp.json()
+        assert resp.status_code == 200, (resp.status_code, body)
+        assert body["ok"] is True, body
+        assert body["config_source"] == "config", body
+        assert body["provider"] == "claude", body
+    finally:
+        _restore_env_and_reload(old)
+    print("  /health: config_source=config -> 200 + ok=true")
+
+
+def test_health_returns_503_with_ok_false_on_cold_start_fallback():
+    """The cold-start fallback (unknown SWITCHYARD_PLAN, _config reset to None)
+    must surface as 503 + ok=false, not a misleading 200. The compose
+    healthcheck maps 503 to "this sidecar is unhealthy", which is exactly
+    what /health should be saying when it cannot resolve the plan it was
+    started for -- a 200 here would have routed traffic into the void.
+    """
+    from fastapi.testclient import TestClient
+    import _modules
+    saved = dict(os.environ)
+    os.environ.update({"PROVIDER": "claude", "SWITCHYARD_PLAN": "no-such-plan",
+                       "SWITCHYARD_PLANS": PLANS})
+    for key in ("SIDECAR_CONCURRENCY", "CLAUDE_MODEL", "CODEX_MODEL", "OPENCODE_MODEL"):
+        os.environ.pop(key, None)
+    try:
+        mod = _modules.reload(server)
+        mod._config = None
+        mod._config_at = 0.0
+        mod._config_mtime = None
+        client = TestClient(mod.app)
+        resp = client.get("/health")
+        body = resp.json()
+        assert resp.status_code == 503, (resp.status_code, body)
+        assert body["ok"] is False, body
+        assert body["config_source"] == "fallback", body
+        assert body["provider"] == "claude", body
+    finally:
+        _restore_env_and_reload(saved)
+    print("  /health: cold-start fallback (unknown plan) -> 503 + ok=false, config_source=fallback")
 
 
 def test_opencode_text_path_spawn_dir_carries_the_locked_down_agent():

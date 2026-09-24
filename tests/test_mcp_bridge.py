@@ -4847,7 +4847,9 @@ def test_no_tools_fallthrough_inherits_max_tokens_enforcement_and_health_reports
         server.cli_bridge.PROVIDER = "claude"
         server.cli_bridge.PROFILE = server.cli_bridge.PROFILES["claude"]
         server.PROVIDER = "claude"
-        h = asyncio.run(server.health())
+        h_resp = asyncio.run(server.health())
+        h = json.loads(h_resp.body)
+        assert h_resp.status_code == 200, (h_resp.status_code, h)
         assert h["enforces_max_tokens"] is True, h
         assert "enforces_max_tokens_reason" not in h, h
     finally:
@@ -4857,6 +4859,73 @@ def test_no_tools_fallthrough_inherits_max_tokens_enforcement_and_health_reports
 
     print("  mcp no-tools fall-through: unenforceable lane -> 400 max_tokens_unenforceable; "
           "claude /health -> enforces_max_tokens=True")
+
+
+# ----------------------------------------------------- /health status codes ---
+def test_health_returns_200_with_ok_true_when_config_source_is_config():
+    """Happy path: an mcp_bridge with a real plans.yaml-backed config returns
+    200 + ok=true. The compose healthcheck and `scripts/health_idle.py` only
+    see a 2xx response on this side, so this is the contract that must hold
+    whenever the bridge is actually ready to serve a tool loop.
+    """
+    from fastapi.testclient import TestClient
+    saved_cfg = server.cli_bridge._config
+    saved_cfg_at = server.cli_bridge._config_at
+    saved_cfg_mtime = server.cli_bridge._config_mtime
+    server.cli_bridge._config = None
+    server.cli_bridge._config_at = 0.0
+    server.cli_bridge._config_mtime = None
+    try:
+        client = TestClient(server.app)
+        resp = client.get("/health")
+        body = resp.json()
+        assert resp.status_code == 200, (resp.status_code, body)
+        assert body["ok"] is True, body
+        assert body["config_source"] == "config", body
+        assert body["provider"] == "claude", body
+    finally:
+        server.cli_bridge._config = saved_cfg
+        server.cli_bridge._config_at = saved_cfg_at
+        server.cli_bridge._config_mtime = saved_cfg_mtime
+    print("  mcp /health: config_source=config -> 200 + ok=true")
+
+
+def test_health_returns_503_with_ok_false_on_cold_start_fallback():
+    """The cold-start fallback (unknown SWITCHYARD_PLAN, _config reset to
+    None) must surface as 503 + ok=false. The mcp_bridge health doc is
+    built from cli_bridge.config(), so resetting cli_bridge's _config and
+    pointing it at a plan that does not exist drives the same `fallback`
+    source that the bridge's cold-start path takes -- and the response
+    code must match the body's `ok: false`, otherwise the compose
+    healthcheck would happily route traffic into a sidecar that just
+    told us it cannot resolve its own plan.
+    """
+    from fastapi.testclient import TestClient
+    saved_env = dict(os.environ)
+    saved_cfg = server.cli_bridge._config
+    saved_cfg_at = server.cli_bridge._config_at
+    saved_cfg_mtime = server.cli_bridge._config_mtime
+    saved_plan = server.cli_bridge.PLAN
+    os.environ["SWITCHYARD_PLAN"] = "no-such-plan"
+    server.cli_bridge.PLAN = "no-such-plan"
+    server.cli_bridge._config = None
+    server.cli_bridge._config_at = 0.0
+    server.cli_bridge._config_mtime = None
+    try:
+        client = TestClient(server.app)
+        resp = client.get("/health")
+        body = resp.json()
+        assert resp.status_code == 503, (resp.status_code, body)
+        assert body["ok"] is False, body
+        assert body["config_source"] == "fallback", body
+    finally:
+        server.cli_bridge._config = saved_cfg
+        server.cli_bridge._config_at = saved_cfg_at
+        server.cli_bridge._config_mtime = saved_cfg_mtime
+        server.cli_bridge.PLAN = saved_plan
+        os.environ.clear()
+        os.environ.update(saved_env)
+    print("  mcp /health: cold-start fallback (unknown plan) -> 503 + ok=false, config_source=fallback")
 
 
 # ----------------------------------------- last-call context vs billed sum -----

@@ -133,10 +133,26 @@ def check_plugin_loaded() -> None:
 
 def check_sidecar_health() -> None:
     for svc, port in SIDECARS.items():
+        # /health returns 503 when ok=false (cold-start fallback, missing
+        # plan, ...). `urlopen` raises HTTPError in that case, so catch it
+        # and emit the body so the check below can still name the real
+        # reason -- an empty FAIL is what hid the regression until it
+        # shipped to production.
+        #
+        # The inner script uses real newlines instead of `;` separators
+        # because Python's `try:` clause does not survive a trailing
+        # semicolon on the same line: `try:  ... ; except: ...` is a
+        # SyntaxError. `python3 -c` accepts a multi-line string fine, so
+        # we just keep each clause on its own line.
         raw = compose("exec", "-T", svc, "python3", "-c",
-                      f"import json,urllib.request;"
-                      f"print(json.dumps(json.load(urllib.request.urlopen("
-                      f"'http://localhost:{port}/health'))))")
+                      "import json,urllib.request,urllib.error\n"
+                      "try:\n"
+                      f"    print(json.dumps(json.load(urllib.request.urlopen(\n"
+                      f"        'http://localhost:{port}/health'))))\n"
+                      "except urllib.error.HTTPError as e:\n"
+                      "    body = e.read()\n"
+                      "    d = json.loads(body) if body else {'__status__': e.code}\n"
+                      "    print(json.dumps(d))")
         try:
             d = json.loads(raw)
         except ValueError:
@@ -146,9 +162,11 @@ def check_sidecar_health() -> None:
         # what both return, or this passes for the wrong reason on a bridged
         # sidecar and prints "plan=None" while claiming success.
         ok = d.get("ok") and d.get("config_source") == "config"
-        check(f"{svc} reads its plan from config", ok,
-              f"plan={d.get('plan') or d.get('provider')} "
-              f"models={d.get('models')} conc={d.get('concurrency')}")
+        detail = (f"plan={d.get('plan') or d.get('provider')} "
+                  f"models={d.get('models')} conc={d.get('concurrency')}")
+        if not ok:
+            detail = f"{detail}; config_source={d.get('config_source')!r}"
+        check(f"{svc} reads its plan from config", ok, detail)
 
 
 def check_cli_starts_as_node() -> None:
@@ -199,10 +217,19 @@ def check_token_proxy_health() -> None:
     otherwise fail every request in its lane.
     """
     for svc, port in TOKEN_PROXIES.items():
+        # Same 503-then-HTTPError handling as check_sidecar_health: when ok is
+        # false the proxy answers 503 with the doc as the body. Read it so the
+        # "run: python3 -m switchyard.oauth login xai" message survives instead
+        # of collapsing into an empty FAIL.
         raw = compose("exec", "-T", svc, "python3", "-c",
-                      f"import json,urllib.request;"
-                      f"print(json.dumps(json.load(urllib.request.urlopen("
-                      f"'http://localhost:{port}/health'))))")
+                      "import json,urllib.request,urllib.error\n"
+                      "try:\n"
+                      f"    print(json.dumps(json.load(urllib.request.urlopen(\n"
+                      f"        'http://localhost:{port}/health'))))\n"
+                      "except urllib.error.HTTPError as e:\n"
+                      "    body = e.read()\n"
+                      "    d = json.loads(body) if body else {'__status__': e.code}\n"
+                      "    print(json.dumps(d))")
         try:
             d = json.loads(raw)
         except ValueError:
