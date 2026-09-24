@@ -266,6 +266,28 @@ def test_web_only_request_to_the_mcp_bridge_takes_the_text_path():
     print("  web-only request -> text path (which runs the CLI's own search)")
 
 
+def test_tool_path_argv_carries_the_effort_and_env_rides_the_carrier():
+    """The session's CLI gets the caller's effort, and the gateway's
+    caller_env stamp is read from `switchyard` (extra_body): LiteLLM never
+    forwards `metadata` to the sidecar."""
+    import shutil
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-effort-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    saved = (server.PROVIDER, server.PROFILE)
+    try:
+        server.PROVIDER, server.PROFILE = "claude", server.MCP_PROFILES["claude"]
+        argv, _ = server.build_argv("q", None, "m", workdir, "s", tools_path, "x", effort="max")
+        assert argv[argv.index("--effort") + 1] == "max", argv
+    finally:
+        server.PROVIDER, server.PROFILE = saved
+        shutil.rmtree(workdir, ignore_errors=True)
+    env = server._resolve_env({"switchyard": {"caller_env": {
+        "cwd": "/Users/x/p", "platform": "darwin", "source": "request"}}})
+    assert env is not None and env.cwd == "/Users/x/p", env
+    print("  tool path: --effort carried; caller_env read from the extra_body carrier")
+
+
 def test_call_id_round_trips_the_session_id():
     session = _new_session()
     call_id = session.mint_call_id()
@@ -4072,10 +4094,13 @@ def test_no_tools_fallthrough_inherits_max_tokens_enforcement_and_health_reports
     from fastapi import HTTPException
     saved_provider, saved_profile = server.cli_bridge.PROVIDER, server.cli_bridge.PROFILE
     try:
-        # codex -> 400 max_tokens_unenforceable on the no-tools fall-through.
-        server.cli_bridge.PROVIDER = "codex"
-        server.cli_bridge.PROFILE = server.cli_bridge.PROFILES["codex"]
-        server.PROVIDER = "codex"
+        # An unenforceable lane -> 400 max_tokens_unenforceable on the
+        # no-tools fall-through (no shipped profile is one any more; codex
+        # enforces since the tool lockdown).
+        server.cli_bridge.PROVIDER = "opencode"
+        server.cli_bridge.PROFILE = dict(server.cli_bridge.PROFILES["opencode"],
+                                         enforce_max_tokens=False)
+        server.PROVIDER = "opencode"
 
         async def go_codex():
             try:
@@ -4103,7 +4128,7 @@ def test_no_tools_fallthrough_inherits_max_tokens_enforcement_and_health_reports
             saved_provider, saved_profile
         server.PROVIDER = saved_provider
 
-    print("  mcp no-tools fall-through: codex profile -> 400 max_tokens_unenforceable; "
+    print("  mcp no-tools fall-through: unenforceable lane -> 400 max_tokens_unenforceable; "
           "claude /health -> enforces_max_tokens=True")
 
 

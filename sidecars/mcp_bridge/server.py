@@ -577,7 +577,12 @@ def _resolve_env(body: dict, *, known: Any = None) -> Any:
         return known
     if _caller_env is None:
         return None
-    meta = (((body or {}).get("metadata") or {}).get("switchyard") or {}).get("caller_env")
+    # The gateway's stamp rides `extra_body.switchyard` (it arrives as the
+    # body's `switchyard` key): LiteLLM never forwards `metadata`. The
+    # metadata spelling stays for a caller that reaches the sidecar directly.
+    carried = (body or {}).get("switchyard") if isinstance((body or {}).get("switchyard"), dict) else {}
+    meta = carried.get("caller_env") or \
+        (((body or {}).get("metadata") or {}).get("switchyard") or {}).get("caller_env")
     # NEVER trust a wire-stamped `source=config`: the only path that
     # produces source=config is the operator's plans.yaml settings.
     # Values still flow through at the request tier. See
@@ -957,7 +962,7 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
                 allowed_tools: str,
                 image_paths: list | None = None,
                 spawn_dir: Path | None = None,
-                web: bool = False) -> tuple[list[str], str | None]:
+                web: bool = False, effort: str | None = None) -> tuple[list[str], str | None]:
     """Build the CLI argv, plus the prompt to feed it on stdin (or None).
 
     Returns a pair so an oversized prompt can travel on stdin instead of argv
@@ -1086,6 +1091,7 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
             for path in image_paths:
                 argv += ["-f", str(path)]
 
+    argv += cli_bridge.effort_args(effort)
     if PROVIDER == "claude":
         # Pin the transcript's file name to this session. Claude files it
         # under a directory named after the cwd, and with the cwd mirrored
@@ -2009,6 +2015,7 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     # Server-side web search the caller asked for (cli_bridge.wants_web_search)
     # is served by this CLI's own provider-side search, for this session only.
     web = cli_bridge.wants_web_search(body)
+    effort = cli_bridge.request_effort(body)
     session = Session(id=session_id, provider=PROVIDER, model=model,
                       workdir=str(workdir), holds_slot=True,
                       spawn_dir=str(spawn_dir),
@@ -2028,7 +2035,7 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
         allowed = ",".join(PROFILE["tool_qualifier"](t["name"]) for t in mcp_tools)
         argv, stdin_data = build_argv(prompt, system, model, workdir, session_id,
                                       tools_path, allowed, image_paths,
-                                      spawn_dir=spawn_dir, web=web)
+                                      spawn_dir=spawn_dir, web=web, effort=effort)
     except Exception as exc:
         log.warning("start_session failed to build argv: %s", exc, exc_info=True)
         await cli_bridge._gate.release()

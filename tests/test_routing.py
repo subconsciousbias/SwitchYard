@@ -417,6 +417,32 @@ def test_a_lane_with_one_tool_capable_member_routes_to_it():
     print(f"  judge with only {picked}'s plan tool-capable routed a tool-using request there")
 
 
+def test_cli_sidecar_requests_carry_effort_and_caller_env_in_extra_body():
+    """For a CLI-backed plan the gateway moves the reasoning effort out of the
+    parameters LiteLLM interprets -- with tools, an effort sent gpt-5.4+ model
+    names (the codex plans) to a /responses endpoint no sidecar serves -- and
+    carries it, with the caller_env stamp (LiteLLM never forwards metadata),
+    in extra_body.switchyard."""
+    from switchyard.hooks import carry_to_cli_sidecar
+    chat = {"reasoning_effort": "high", "extra_body": {"keep": 1}}
+    carry_to_cli_sidecar(chat, {"cwd": "/Users/x/p", "source": "request"})
+    assert "reasoning_effort" not in chat, chat
+    assert chat["extra_body"] == {"keep": 1, "switchyard": {
+        "reasoning_effort": "high", "caller_env": {"cwd": "/Users/x/p", "source": "request"}}}, chat
+    anthropic = {"output_config": {"effort": "max", "format": {"type": "json_schema"}}}
+    carry_to_cli_sidecar(anthropic, None)
+    assert anthropic["output_config"] == {"format": {"type": "json_schema"}}, anthropic
+    assert anthropic["extra_body"]["switchyard"] == {"reasoning_effort": "max"}, anthropic
+    responses = {"reasoning": {"effort": "low"}}
+    carry_to_cli_sidecar(responses, None)
+    assert "reasoning" not in responses and \
+        responses["extra_body"]["switchyard"]["reasoning_effort"] == "low", responses
+    plain = {"messages": []}
+    carry_to_cli_sidecar(plain, None)
+    assert plain == {"messages": []}, "nothing to carry -> request untouched"
+    print("  CLI plan: effort + caller_env moved into extra_body.switchyard")
+
+
 def test_cli_blocklist_drops_blocked_tools_and_passes_the_rest():
     """The per-CLI tool blocklist filters native tools out of `data["tools"]`
     before the picker ever sees them, matching case-insensitively against

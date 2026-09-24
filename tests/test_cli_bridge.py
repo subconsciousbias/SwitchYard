@@ -1039,7 +1039,7 @@ def test_web_only_tools_are_not_refused_on_the_text_path():
     import asyncio
     seen = {}
 
-    async def fake_invoke(prompt, system, model, image_paths=None, *, web=False):
+    async def fake_invoke(prompt, system, model, image_paths=None, *, web=False, effort=None):
         seen["web"] = web
         return {"result": "found it", "usage": {}}
 
@@ -1055,6 +1055,51 @@ def test_web_only_tools_are_not_refused_on_the_text_path():
         print("  web tool / web_search_options -> text path with the CLI's search on, no 400")
     finally:
         server.invoke = real
+
+
+def test_request_effort_reads_every_carrier():
+    """OpenAI chat, Responses, Anthropic, and the gateway's carrier."""
+    assert server.request_effort({"reasoning_effort": "High"}) == "high"
+    assert server.request_effort({"reasoning": {"effort": "low"}}) == "low"
+    assert server.request_effort({"output_config": {"effort": "max"}}) == "max"
+    assert server.request_effort({"switchyard": {"reasoning_effort": "xhigh"}}) == "xhigh"
+    assert server.request_effort({}) is None
+    print("  effort read from reasoning_effort / reasoning / output_config / switchyard")
+
+
+def test_effort_maps_to_each_clis_own_switch():
+    """claude --effort, codex model_reasoning_effort, opencode --variant; an
+    unknown level adds nothing rather than breaking the request."""
+    saved = server.PROVIDER
+    try:
+        server.PROVIDER = "claude"
+        assert server.effort_args("high") == ["--effort", "high"]
+        assert server.effort_args("minimal") == ["--effort", "low"]
+        assert server.effort_args("ultra") == ["--effort", "max"]
+        assert server.effort_args("bogus") == [] and server.effort_args(None) == []
+        server.PROVIDER = "codex"
+        assert server.effort_args("xhigh") == ["-c", 'model_reasoning_effort="xhigh"']
+        assert server.effort_args("none") == ["-c", 'model_reasoning_effort="low"']
+        server.PROVIDER = "opencode"
+        assert server.effort_args("high") == ["--variant", "high"]
+        assert server.effort_args("xhigh") == ["--variant", "max"]
+        print("  effort -> claude --effort / codex model_reasoning_effort / opencode --variant")
+    finally:
+        server.PROVIDER = saved
+
+
+def test_text_path_argv_carries_the_effort():
+    saved = (server.PROVIDER, server.PROFILE, server.CLI)
+    try:
+        server.PROVIDER, server.PROFILE = "claude", server.PROFILES["claude"]
+        server.CLI = server.PROFILE["cli"]
+        argv, _ = server.build_argv("hi", None, None, effort="high")
+        assert argv[argv.index("--effort") + 1] == "high", argv
+        argv, _ = server.build_argv("hi", None, None)
+        assert "--effort" not in argv, argv
+    finally:
+        server.PROVIDER, server.PROFILE, server.CLI = saved
+    print("  text-path argv carries --effort only when the caller asked")
 
 
 def test_codex_text_path_argv_carries_the_lockdown():
@@ -1825,93 +1870,47 @@ def test_max_tokens_truncated_with_length_reason():
 
 
 def test_unenforceable_max_tokens_returns_400():
-    """A codex-backed request with max_tokens must 400 with the contract
-    detail -- and the same request WITHOUT max_tokens must still 502 from
-    the CLI spawn guard (proving omission is unchanged).
-
-    The save/restore of server.PROVIDER/PROFILE/CLI follows the convention
-    set by test_text_path_no_tools_passthrough_with_metadata_still_parses
-    and the text_path_argv tests above.
-    """
+    """A lane that cannot honour an output cap refuses it with the #70
+    contract detail -- under every spelling of the cap (max_completion_tokens
+    is what LiteLLM sends for gpt-5 names, issue #133). No shipped profile
+    is such a lane any more (codex enforces since the tool lockdown), so the
+    refusal is driven through a synthetic one."""
     import asyncio
     from fastapi import HTTPException
-    saved_provider, saved_profile, saved_cli = \
-        server.PROVIDER, server.PROFILE, server.CLI
+    saved = (server.PROVIDER, server.PROFILE, server.CLI)
     try:
-        server.PROVIDER = "codex"
-        server.PROFILE = server.PROFILES["codex"]
-        server.CLI = server.PROFILE["cli"]
-        # Sentinel CLI that does not exist on disk: any spawn attempt would
-        # 502 (FileNotFoundError -> spawn-failed 502). That's the second
-        # branch's expected outcome.
+        server.PROVIDER = "opencode"
+        server.PROFILE = dict(server.PROFILES["opencode"], enforce_max_tokens=False,
+                              enforce_max_tokens_reason="test-lane")
         server.CLI = "/no/such/cli-binary-for-issue70"
-
-        async def go_with():
-            try:
-                await server._handle_chat({
-                    "model": "m", "max_tokens": 100,
-                    "messages": [{"role": "user", "content": "hi"}]})
-            except HTTPException as exc:
-                return exc.status_code, exc.detail
-
-        status, detail = asyncio.run(go_with())
-        assert status == 400, (status, detail)
-        assert detail["error"]["message"] == "max_tokens is not enforceable on this lane", \
-            detail
-        assert detail["error"]["type"] == "max_tokens_unenforceable", detail
-
-        async def go_without():
-            try:
-                await server._handle_chat({
-                    "model": "m",
-                    "messages": [{"role": "user", "content": "hi"}]})
-            except HTTPException as exc:
-                return exc.status_code, exc.detail
-
-        status2, _detail2 = asyncio.run(go_without())
-        assert status2 == 502, status2
-        print("  codex + max_tokens -> 400 max_tokens_unenforceable; "
-              "codex without max_tokens -> 502 (omission unchanged)")
-
-        # Ordering: a codex request carrying both tools AND max_tokens must
-        # surface the more specific max_tokens_unenforceable, not the generic
-        # tools_unsupported. The refusal block sits BEFORE the tools check so
-        # the caller gets the reason it can act on. (Reviewer finding on #87.)
-        async def go_both():
-            try:
-                await server._handle_chat({
-                    "model": "m", "max_tokens": 100,
-                    "tools": [{"type": "function",
-                               "function": {"name": "x",
-                                            "parameters": {"type": "object",
-                                                           "properties": {}}}}],
-                    "messages": [{"role": "user", "content": "hi"}]})
-            except HTTPException as exc:
-                return exc.status_code, exc.detail
-
-        status3, detail3 = asyncio.run(go_both())
-        assert status3 == 400, (status3, detail3)
-        assert detail3["error"]["type"] == "max_tokens_unenforceable", \
-            "max_tokens refusal must precede the tools check " \
-            "(more specific reason wins): " + repr(detail3)
-        print("  codex + tools + max_tokens -> 400 max_tokens_unenforceable "
-              "(specific refusal beats generic tools_unsupported)")
+        for spelling in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            async def go(key=spelling):
+                try:
+                    await server._handle_chat({
+                        "model": "m", key: 100,
+                        "messages": [{"role": "user", "content": "hi"}]})
+                except HTTPException as exc:
+                    return exc.status_code, exc.detail
+            status, detail = asyncio.run(go())
+            assert status == 400, (spelling, status, detail)
+            assert detail["error"]["type"] == "max_tokens_unenforceable", detail
+            assert detail["error"]["reason"] == "test-lane", detail
+        print("  unenforceable lane: 400 under max_tokens / max_completion_tokens / max_output_tokens")
     finally:
-        server.PROVIDER, server.PROFILE, server.CLI = \
-            saved_provider, saved_profile, saved_cli
+        server.PROVIDER, server.PROFILE, server.CLI = saved
 
 
-def test_fold_max_tokens_is_gone():
-    """The fold-into-prompt shim is removed entirely: no shim, no deprecation,
-    no warn-and-ignore. /health reports the real mode now (see next test)."""
-    assert not hasattr(server, "fold_max_tokens"), \
-        "fold_max_tokens must be removed, not kept as a shim"
-    print("  fold_max_tokens is gone (no shim, no deprecation)")
+def test_request_max_tokens_reads_every_spelling():
+    assert server.request_max_tokens({"max_tokens": 5}) == 5
+    assert server.request_max_tokens({"max_completion_tokens": 7}) == 7
+    assert server.request_max_tokens({"max_output_tokens": 9}) == 9
+    assert server.request_max_tokens({"max_tokens": 0}) is None
+    assert server.request_max_tokens({}) is None
+    print("  output cap read from max_tokens / max_completion_tokens / max_output_tokens")
 
 
 def test_health_reports_max_tokens_mode():
-    """opencode profile -> enforces_max_tokens=True with no reason key;
-    codex profile -> False, reason 'no-truncation-flag'.
+    """opencode and codex profiles -> enforces_max_tokens=True, no reason key.
 
     Same shape both bridges report; /health's callers can branch on the
     field and (when false) inspect the reason to tell a future streaming-
@@ -1926,17 +1925,18 @@ def test_health_reports_max_tokens_mode():
         assert h_open["enforces_max_tokens"] is True, h_open
         assert "enforces_max_tokens_reason" not in h_open, h_open
 
+        # Codex enforces post-hoc since the tool lockdown left its text path
+        # a single answer (refusing rejected every Claude Code / OpenCode
+        # request, which always carry a cap).
         server.PROVIDER = "codex"
         server.PROFILE = server.PROFILES["codex"]
         h_codex = asyncio.run(server.health())
-        assert h_codex["enforces_max_tokens"] is False, h_codex
-        assert h_codex["enforces_max_tokens_reason"] == "no-truncation-flag", \
-            h_codex
+        assert h_codex["enforces_max_tokens"] is True, h_codex
+        assert "enforces_max_tokens_reason" not in h_codex, h_codex
     finally:
         server.PROVIDER, server.PROFILE = saved_provider, saved_profile
 
-    print("  opencode health -> enforces_max_tokens=True (no reason); "
-          "codex health -> False, reason='no-truncation-flag'")
+    print("  opencode and codex health -> enforces_max_tokens=True (no reason)")
 
 
 def test_opencode_text_path_spawn_dir_carries_the_locked_down_agent():

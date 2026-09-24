@@ -284,6 +284,53 @@ def wants_web_search(body: dict) -> bool:
         is_web_search_tool(tool) for tool in body.get("tools") or [])
 
 
+# -------------------------------------------- effort and output cap ---
+# The caller's reasoning effort, in any of the shapes it reaches a sidecar:
+# `reasoning_effort` (OpenAI chat), `reasoning.effort` (Responses),
+# `output_config.effort` (Anthropic), or `switchyard.reasoning_effort` -- the
+# gateway moves it there for CLI plans (switchyard.hooks.carry_to_cli_sidecar),
+# because left in place it made LiteLLM send codex tool turns to a Responses
+# endpoint no sidecar serves. Each CLI gets it through its own switch.
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+OPENCODE_VARIANTS = ("minimal", "low", "medium", "high", "max")
+
+
+def request_effort(body: dict) -> str | None:
+    carried = body.get("switchyard") if isinstance(body.get("switchyard"), dict) else {}
+    reasoning = body.get("reasoning") if isinstance(body.get("reasoning"), dict) else {}
+    output_config = body.get("output_config") if isinstance(body.get("output_config"), dict) else {}
+    effort = (body.get("reasoning_effort") or carried.get("reasoning_effort")
+              or reasoning.get("effort") or output_config.get("effort"))
+    return str(effort).strip().lower() if effort else None
+
+
+def effort_args(effort: str | None) -> list[str]:
+    """The CLI flag for `effort`, or nothing when this CLI has no such level
+    (an unknown level must never break the request)."""
+    if not effort:
+        return []
+    if PROVIDER == "claude":
+        level = {"none": "low", "minimal": "low", "ultra": "max"}.get(effort, effort)
+        return ["--effort", level] if level in CLAUDE_EFFORTS else []
+    if PROVIDER == "codex":
+        level = {"none": "low", "minimal": "low"}.get(effort, effort)
+        return ["-c", f'model_reasoning_effort="{level}"'] if level in CODEX_EFFORTS else []
+    level = {"none": "minimal", "xhigh": "max", "ultra": "max"}.get(effort, effort)
+    return ["--variant", level] if level in OPENCODE_VARIANTS else []
+
+
+def request_max_tokens(body: dict) -> int | None:
+    """The caller's output cap under any of its spellings. LiteLLM renames
+    max_tokens to max_completion_tokens for gpt-5 names (issue #133), and a
+    Responses-shaped body says max_output_tokens."""
+    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        value = body.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
 def subprocess_env() -> dict:
     """A minimal env dict for spawning a vendor CLI subprocess.
 
@@ -611,13 +658,14 @@ PROFILES: dict[str, dict] = {
         "system_args": [],
         "parser": "codex_jsonl",
         "default_retry_after": 3600,
-        # codex exec runs its own multi-turn agent loop; truncating its
-        # narration mid-stream is not an honest token cap (the model is
-        # still mid-episode and will continue to charge tokens to refill
-        # the cut). The right behaviour for an unenforceable cap is to
-        # refuse with 400, not fake a "length" finish.
-        "enforce_max_tokens": False,
-        "enforce_max_tokens_reason": "no-truncation-flag",
+        # Issue #70 refused max_tokens here because codex exec ran its own
+        # multi-turn agent loop, and truncating narration mid-episode is not
+        # an honest cap. The tool lockdown (codex_lockdown_args, issue #264)
+        # removed every codex tool: the text path is one answer, so the same
+        # post-hoc truncation claude and opencode use is an honest cap now.
+        # Refusing it rejected every Claude Code / OpenCode request, all of
+        # which carry a max_tokens.
+        "enforce_max_tokens": True,
     },
 }
 
@@ -822,13 +870,14 @@ _warmup_lock = asyncio.Lock()
 
 
 async def invoke(prompt: str, system: str | None, model: str | None,
-                image_paths: list[Path] | None = None, *, web: bool = False) -> dict:
+                image_paths: list[Path] | None = None, *, web: bool = False,
+                effort: str | None = None) -> dict:
     if _warm.is_set():
-        return await run_cli(prompt, system, model, image_paths, web=web)
+        return await run_cli(prompt, system, model, image_paths, web=web, effort=effort)
     async with _warmup_lock:
         if _warm.is_set():                     # someone warmed it while we waited
-            return await run_cli(prompt, system, model, image_paths, web=web)
-        payload = await run_cli(prompt, system, model, image_paths, web=web)
+            return await run_cli(prompt, system, model, image_paths, web=web, effort=effort)
+        payload = await run_cli(prompt, system, model, image_paths, web=web, effort=effort)
         _warm.set()
         log.info("%s: first call succeeded, releasing full concurrency", PROVIDER)
         return payload
@@ -1093,7 +1142,7 @@ def claude_web_args(argv: list[str]) -> list[str]:
 def build_argv(prompt: str, system: str | None,
                model: str | None = None,
                image_paths: list[Path] | None = None,
-               *, web: bool = False) -> tuple[list[str], str | None]:
+               *, web: bool = False, effort: str | None = None) -> tuple[list[str], str | None]:
     """Build the CLI argv, plus the prompt to feed it on stdin (or None).
 
     Returns a pair so an oversized prompt can travel on stdin instead of argv
@@ -1179,6 +1228,7 @@ def build_argv(prompt: str, system: str | None,
         # host as the tool path's; see CODEX_DISABLED_FEATURES.
         argv += codex_lockdown_args(web=web)
 
+    argv += effort_args(effort)
     return argv + EXTRA_ARGS, (prompt if use_stdin else None)
 
 
@@ -1503,7 +1553,8 @@ def system_prompt_file(system: str | None):
 
 
 async def run_cli(prompt: str, system: str | None, model: str | None = None,
-                image_paths: list[Path] | None = None, *, web: bool = False) -> dict:
+                image_paths: list[Path] | None = None, *, web: bool = False,
+                effort: str | None = None) -> dict:
     prompt, system = fold_system(prompt, system)
     with instructions_file(system) as (extra_args, system):
         with system_prompt_file(system) as (sys_args, system):
@@ -1512,12 +1563,13 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None,
             # and the matching replace_extra_args one — the file path now
             # carries the same content, with the same extras appended above.
             return await _run_cli(prompt, system, model, extra_args + sys_args,
-                                  image_paths, web=web)
+                                  image_paths, web=web, effort=effort)
 
 
 async def _run_cli(prompt: str, system: str | None, model: str | None,
                    extra_args: list,
-                   image_paths: list[Path] | None = None, *, web: bool = False) -> dict:
+                   image_paths: list[Path] | None = None, *, web: bool = False,
+                   effort: str | None = None) -> dict:
     """Spawn the CLI, parse its output, and surface errors as HTTPExceptions.
 
     Issue #64: opencode-ai@1.18.31 occasionally emits a step_finish with
@@ -1530,11 +1582,11 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
     """
     try:
         return await _run_cli_attempt(prompt, system, model, extra_args,
-                                      image_paths, web=web)
+                                      image_paths, web=web, effort=effort)
     except CliNoTextError as exc:
         try:
             payload = await _run_cli_attempt(prompt, system, model, extra_args,
-                                              image_paths, web=web)
+                                              image_paths, web=web, effort=effort)
         except CliNoTextError as exc2:
             combined = _sum_usage(dict(exc.usage), exc2.usage)
             raise HTTPException(
@@ -1551,7 +1603,7 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
 async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
                            extra_args: list,
                            image_paths: list[Path] | None = None, *,
-                           web: bool = False) -> dict:
+                           web: bool = False, effort: str | None = None) -> dict:
     """One end-to-end spawn+parse+post-parse check, without the no-text retry.
 
     Raises HTTPException for terminal errors (spawn failure, timeout, auth,
@@ -1560,7 +1612,8 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
     find charged usage; that signals the retriable no-text-with-usage shape
     to _run_cli, which then performs exactly one in-process retry.
     """
-    cmd, stdin_data = build_argv(prompt, system, model, image_paths, web=web)
+    cmd, stdin_data = build_argv(prompt, system, model, image_paths, web=web,
+                                 effort=effort)
     cmd = cmd + list(extra_args)
     spawn_env = subprocess_env()
     if web and PROVIDER == "opencode":
@@ -2096,8 +2149,7 @@ async def _handle_chat(body: dict):
     # generic tools-unsupported 400. Placement also guarantees the 400 is
     # raised before any stage_or_fail / flatten / gate / spawn, so no SSE
     # header is ever sent for a request we already know to refuse.
-    if body.get("max_tokens") and body["max_tokens"] > 0 \
-            and not PROFILE.get("enforce_max_tokens", True):
+    if request_max_tokens(body) and not PROFILE.get("enforce_max_tokens", True):
         raise HTTPException(
             status_code=400,
             detail={"error": {
@@ -2225,11 +2277,12 @@ async def _handle_chat(body: dict):
                                 detail=f"sidecar at capacity ({limit})",
                                 headers={"Retry-After": "5"})
         try:
-            payload = await invoke(prompt, system, model, image_paths or None, web=web)
+            payload = await invoke(prompt, system, model, image_paths or None, web=web,
+                                   effort=request_effort(body))
         finally:
             await _gate.release()
         payload, finish_reason = enforce_max_tokens(
-            payload, body.get("max_tokens"))
+            payload, request_max_tokens(body))
         result = to_openai(payload, model, finish_reason=finish_reason)
     finally:
         # Image dir is owned here; the workdir on the mcp_bridge path is owned

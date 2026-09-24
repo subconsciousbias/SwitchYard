@@ -108,6 +108,49 @@ UNLOGGED_CALL_TYPES = frozenset({"anthropic_messages", "aanthropic_messages"})
 _TERMINATED = "_terminated"
 
 
+# -------------------------------------------- what a CLI sidecar must receive ---
+# Two things a CLI-backed plan needs never arrived through LiteLLM (issue #264,
+# measured against the pinned LiteLLM 1.101.0 with a loopback capture):
+#
+#   * `metadata` is not forwarded to the provider at all, so the caller_env
+#     stamp above never reached the sidecar;
+#   * a reasoning effort is forwarded to claude/opencode sidecars and then
+#     ignored, and for gpt-5.4+ model names (the codex plans) function tools
+#     plus an effort make LiteLLM switch to its Responses-API bridge --
+#     POST {api_base}/responses, which no sidecar serves: every OpenCode tool
+#     turn (it always sends reasoning_effort) and every Claude Code tool turn
+#     with output_config.effort 404'd on codex.
+#
+# `extra_body` IS forwarded verbatim. So for a CLI-backed plan the effort is
+# taken out of the parameters LiteLLM interprets and carried, with the
+# caller_env stamp, in `extra_body.switchyard`; the bridges map the effort to
+# the CLI's own switch (claude --effort, codex model_reasoning_effort,
+# opencode --variant). API plans are untouched.
+def carry_to_cli_sidecar(data: dict, caller_env_stamp: dict | None) -> None:
+    effort = data.pop("reasoning_effort", None)
+    reasoning = data.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        effort = effort or reasoning.get("effort")
+        data.pop("reasoning", None)
+    output_config = data.get("output_config")
+    if isinstance(output_config, dict) and "effort" in output_config:
+        effort = effort or output_config.get("effort")
+        rest = {k: v for k, v in output_config.items() if k != "effort"}
+        if rest:
+            data["output_config"] = rest
+        else:
+            data.pop("output_config", None)
+    extra = dict(data.get("extra_body") or {})
+    carried = dict(extra.get("switchyard") or {})
+    if effort:
+        carried["reasoning_effort"] = effort
+    if caller_env_stamp:
+        carried["caller_env"] = caller_env_stamp
+    if carried:
+        extra["switchyard"] = carried
+        data["extra_body"] = extra
+
+
 class SwitchyardHandler(CustomLogger):
     def __init__(self) -> None:
         self.registry = models.load()
@@ -418,6 +461,8 @@ class SwitchyardHandler(CustomLogger):
             }
         except Exception:                       # never fail the request over a label
             log.debug("caller_env resolution skipped for this request", exc_info=True)
+        if pick.plan.is_cli_backed:
+            carry_to_cli_sidecar(data, meta[META_KEY].get("caller_env"))
         log.info(
             "lane=%s -> %s [%s]%s%s%s%s",
             lane, pick.model.ref, _reason_with_group(pick),
