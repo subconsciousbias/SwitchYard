@@ -494,6 +494,63 @@ CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 OPENCODE_VARIANTS = ("minimal", "low", "medium", "high", "max")
 
+# Issue #292: explicit request/display policy, lifted onto the carrier by
+# `carry_to_cli_sidecar`. The CLI's thinking mode is only enabled when the
+# caller asked for it -- `reasoning_effort` (already mapped above) or
+# `thinking.type` in {enabled, adaptive}, never for `disabled` -- and the
+# display policy (`display: omitted`) suppresses the assistant's visible
+# content while preserving the accumulated reasoning on the response, so the
+# adapter path (LiteLLM -> chat / Messages / Responses) sees both halves
+# and can adapt the one the caller wanted.
+THINKING_DISPLAY_VALUES = ("summarized", "full", "omitted")
+THINKING_REQUESTED_TYPES = ("enabled", "adaptive")
+
+
+def request_thinking(body: dict) -> dict | None:
+    """The caller's reasoning-request/display policy.
+
+    Reads from `switchyard.thinking` (the carrier the gateway writes) first,
+    then falls back to a top-level `thinking` (Claude Code's spelling) when
+    the request arrived from a non-routed caller. An OpenAI `reasoning`
+    field that carries only a `display` marker (the gateway already popped
+    the effort-typed reason but kept the display marker on the body) is
+    also accepted; the sidecar sees the display policy without re-deriving
+    the effort. Returns a normalised dict carrying only the fields a CLI
+    sidecar acts on -- `type` (the enable signal) and `display` (the
+    visibility policy). Returns None when no policy was requested; an
+    explicit `thinking.type == "disabled"` is also passed through as `None`
+    to match the "off unless asked" rule.
+    """
+    def _from(d: dict | None) -> dict | None:
+        if not isinstance(d, dict):
+            return None
+        kind = d.get("type")
+        display = d.get("display")
+        if kind == "disabled":
+            return None
+        if not kind and not display:
+            return None
+        out: dict = {}
+        if kind in THINKING_REQUESTED_TYPES:
+            out["type"] = kind
+        if display in THINKING_DISPLAY_VALUES:
+            out["display"] = display
+        return out or None
+
+    def _from_reasoning(carrier_body: dict) -> dict | None:
+        prior = carrier_body.get("reasoning")
+        if isinstance(prior, dict):
+            display = prior.get("display")
+            if isinstance(display, str) and display in THINKING_DISPLAY_VALUES:
+                return {"display": display}
+        return None
+
+    carried = body.get("switchyard") if isinstance(body.get("switchyard"), dict) else {}
+    return (_from(carried.get("thinking"))
+            or _from(body.get("thinking"))
+            or _from_reasoning(carried)
+            or _from_reasoning(body))
+
 
 def request_effort(body: dict) -> str | None:
     carried = body.get("switchyard") if isinstance(body.get("switchyard"), dict) else {}
@@ -517,6 +574,81 @@ def effort_args(effort: str | None) -> list[str]:
         return ["-c", f'model_reasoning_effort="{level}"'] if level in CODEX_EFFORTS else []
     level = {"none": "minimal", "xhigh": "max", "ultra": "max"}.get(effort, effort)
     return ["--variant", level] if level in OPENCODE_VARIANTS else []
+
+
+def thinking_display(body: dict) -> str | None:
+    """The caller's `thinking.display` policy -- `summarized`, `full`, or
+    `omitted`. `omitted` means the caller wants only the reasoning, not the
+    assistant text; the CLI's argv still runs with the reasoning enabled, the
+    final answer's `result` is left empty (or matches the reasoning so the
+    gateway's `text`-only consumers see *something*), and the adapter path
+    gets a separate `reasoning_content` to render.
+    """
+    policy = request_thinking(body) or {}
+    return policy.get("display")
+
+
+def thinking_args(thinking: dict | None) -> list[str]:
+    """The argv fragment that turns this CLI's reasoning on.
+
+    Only added when the caller actually asked for it -- any policy other than
+    the explicit `enabled`/`adaptive` request leaves reasoning off, so the
+    CLI's default cost / latency shape is preserved. Unknown / missing policy
+    returns `[]` rather than breaking the request.
+    """
+    if not thinking or "type" not in thinking:
+        return []
+    if PROVIDER == "claude":
+        # claude stream-json already surfaces assistant reasoning through the
+        # `assistant` event's content blocks; no CLI flag is required -- it is
+        # the model's own behaviour at a given effort level. (Keeping the
+        # switch explicit nonetheless is the contract callers asked for.)
+        return []
+    if PROVIDER == "codex":
+        # codex has no per-call "thinking on/off" beyond the effort override
+        # the effort branch already added; reasoning shown via the
+        # `reasoning` item the parser already extracts.
+        return []
+    # opencode: --variant <low|medium|high|max|minimal> doubles as the
+    # reasoning level; effort_args() above has already mapped the caller's
+    # effort to that family. No extra flags are required to enable it, so
+    # nothing further goes here.
+    return []
+
+
+def reasoning_event(opencode_part: dict, claude_message_content: list,
+                    codex_item: dict) -> str | None:
+    """Extract the reasoning text from one CLI event.
+
+    Three shapes, all verified against real output (issue #292):
+
+      OpenCode (`part.type == "reasoning"`):
+        {"type":"reasoning","part":{"type":"reasoning","text":"..."}}
+      Claude (assistant message content block):
+        {"type":"thinking","thinking":"..."}
+      Codex (`item.type == "reasoning"`):
+        {"type":"item.completed","item":{"type":"reasoning","text":"..."}}
+
+    Returns the text or None for anything else.
+    """
+    if opencode_part and isinstance(opencode_part, dict):
+        kind = opencode_part.get("type")
+        if kind == "reasoning":
+            text = opencode_part.get("text")
+            return text if isinstance(text, str) else None
+    if claude_message_content and isinstance(claude_message_content, list):
+        for block in claude_message_content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in ("thinking", "redacted_thinking"):
+                text = block.get("thinking")
+                if isinstance(text, str):
+                    return text
+    if codex_item and isinstance(codex_item, dict):
+        if codex_item.get("type") == "reasoning":
+            text = codex_item.get("text")
+            return text if isinstance(text, str) else None
+    return None
 
 
 def request_max_tokens(body: dict) -> int | None:
@@ -1231,15 +1363,17 @@ _warmup_lock = asyncio.Lock()
 async def invoke(prompt: str, system: str | None, model: str | None,
                 image_paths: list[Path] | None = None,
                 fmt: dict | None = None, *, web: bool = False,
-                effort: str | None = None) -> dict:
+                effort: str | None = None,
+                thinking: dict | None = None) -> dict:
     if _warm.is_set():
-        return await run_cli(prompt, system, model, image_paths, fmt, web=web, effort=effort)
+        return await run_cli(prompt, system, model, image_paths, fmt, web=web,
+                             effort=effort, thinking=thinking)
     async with _warmup_lock:
         if _warm.is_set():                     # someone warmed it while we waited
             return await run_cli(prompt, system, model, image_paths, fmt,
-                                 web=web, effort=effort)
+                                 web=web, effort=effort, thinking=thinking)
         payload = await run_cli(prompt, system, model, image_paths, fmt,
-                                web=web, effort=effort)
+                                web=web, effort=effort, thinking=thinking)
         _warm.set()
         log.info("%s: first call succeeded, releasing full concurrency", PROVIDER)
         return payload
@@ -1504,7 +1638,8 @@ def claude_web_args(argv: list[str]) -> list[str]:
 def build_argv(prompt: str, system: str | None,
                model: str | None = None,
                image_paths: list[Path] | None = None,
-               *, web: bool = False, effort: str | None = None) -> tuple[list[str], str | None]:
+               *, web: bool = False, effort: str | None = None,
+               thinking: dict | None = None) -> tuple[list[str], str | None]:
     """Build the CLI argv, plus the prompt to feed it on stdin (or None).
 
     Returns a pair so an oversized prompt can travel on stdin instead of argv
@@ -1517,6 +1652,12 @@ def build_argv(prompt: str, system: str | None,
     carries them by its own mechanism. No CLI gets them as prompt text: a
     base64 blob in the prompt would blow past MAX_ARG_STRLEN and the model
     cannot read raw bytes anyway.
+
+    `thinking` (issue #292) carries the explicit request/display policy. It
+    is only consulted when a request/display policy is present -- a request
+    with no policy gets nothing on the argv, leaving reasoning off by
+    default. OpenCode already takes the caller's effort via `effort_args`;
+    claude and codex stream reasoning through their existing event channels.
     """
     model = model or config().model
     image_paths = image_paths or []
@@ -1588,6 +1729,7 @@ def build_argv(prompt: str, system: str | None,
         argv += codex_lockdown_args(web=web)
 
     argv += effort_args(effort)
+    argv += thinking_args(thinking)
     if PROVIDER == "claude" and image_paths:
         # Media ride inline on stdin as stream-json, with the prompt.
         return claude_stream_argv(argv) + EXTRA_ARGS, claude_media_stdin(prompt, image_paths)
@@ -1673,105 +1815,196 @@ def format_no_text_detail(provider: str, usage: dict) -> str:
             f"completion_tokens={int(u.get('output_tokens', 0))})")
 
 
+def _parse_claude_json(stdout: str) -> dict:
+    """Parse a Claude CLI stdout, which is either `claude --output-format json`
+    (one JSON object) or `claude --output-format stream-json` (one event per
+    line). Returns the result object -- a dict that already looks like the
+    OpenAI-shape the rest of the pipeline consumes (with `result`, `usage`,
+    `is_error`, ...). Reasoning text the assistant emitted on prior events is
+    collected onto a `reasoning` field so `to_openai` can lift it onto
+    `message.reasoning_content`. Returns the dict, or raises JSONDecodeError
+    when the stream-json form has no `result` event to anchor on.
+    """
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        # --output-format stream-json (one event per line): reasoning block
+        # content lands on preceding assistant events, gather those first,
+        # then return the trailing result event with the reasoning field
+        # attached.
+        reasoning_parts: list[str] = []
+        for evt in iter_json_objects(stdout):
+            if evt.get("type") != "assistant":
+                continue
+            content = (evt.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in ("thinking", "redacted_thinking"):
+                    text = block.get("thinking")
+                    if isinstance(text, str):
+                        reasoning_parts.append(text)
+        for evt in reversed(list(iter_json_objects(stdout))):
+            if evt.get("type") == "result":
+                if reasoning_parts:
+                    evt = dict(evt)
+                    evt["reasoning"] = "".join(reasoning_parts)
+                return evt
+        raise
+    # --output-format json (single object): reasoning text lives in
+    # `parsed["content"]` as `thinking` / `redacted_thinking` blocks, the same
+    # shape the stream-json assistant events carry. Walk the result's content
+    # so the buffered path matches the stream-json contract.
+    if isinstance(parsed, dict):
+        content = parsed.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in ("thinking", "redacted_thinking"):
+                    text = block.get("thinking")
+                    if isinstance(text, str):
+                        parts.append(text)
+            if parts and "reasoning" not in parsed:
+                parsed = {**parsed, "reasoning": "".join(parts)}
+    return parsed
+
+
+def _parse_events_json(stdout: str) -> dict:
+    """Parse `opencode --format json` (events_json) and `codex exec --json`
+    (codex_jsonl) stdout. Both write one JSON object per line; the two wire
+    shapes differ only in what they wrap each piece under -- `part` for
+    OpenCode, `item` for Codex. So they share a loop here rather than
+    duplicating half the parser twice. Returns the standard
+    `{result, usage, reasoning?}` dict the rest of the pipeline consumes;
+    raises `CliNoTextError` when the stream had billable output but no text
+    event (issue #64), or `JSONDecodeError` for a clean zero-text stream.
+    """
+    # Two different event shapes, both verified against real output.
+    #
+    # OpenCode nests everything under `part`:
+    #   {"type":"text","part":{"type":"text","text":"OK"}}
+    #   {"type":"reasoning","part":{"type":"reasoning","text":"..."}}
+    #   {"type":"step_finish","part":{"type":"step-finish",
+    #      "tokens":{"input":6194,"output":18,"reasoning":0,
+    #                "cache":{"read":1280}}}}
+    #
+    # Codex uses `item` plus a top-level usage object:
+    #   {"type":"item.completed","item":{"type":"agent_message","text":"OK"}}
+    #   {"type":"item.completed","item":{"type":"reasoning","text":"..."}}
+    #   {"type":"turn.completed","usage":{"input_tokens":14159,
+    #      "cached_input_tokens":12160,"output_tokens":7,
+    #      "reasoning_output_tokens":0}}
+    #
+    # Reasoning tokens are counted into output because they are billed, but
+    # reasoning *text* is never part of the answer.
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    usage: dict = {}
+
+    def add(field: str, value) -> None:
+        usage[field] = usage.get(field, 0) + _int(value)
+
+    for evt in iter_json_objects(stdout):
+        part = evt.get("part") if isinstance(evt.get("part"), dict) else {}
+        item = evt.get("item") if isinstance(evt.get("item"), dict) else {}
+
+        # --- OpenCode ------------------------------------------------
+        if part.get("type") == "text" and isinstance(part.get("text"), str):
+            text_parts.append(part["text"])
+        if part.get("type") == "reasoning":
+            rtext = reasoning_event(part, None, None)
+            if rtext:
+                reasoning_parts.append(rtext)
+        tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else None
+        if tokens:
+            cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+            add("input_tokens", tokens.get("input"))
+            add("output_tokens", tokens.get("output"))
+            add("output_tokens", tokens.get("reasoning"))
+            add("cache_read_tokens", cache.get("read"))
+        if isinstance(part.get("cost"), (int, float)):
+            # The provider's notional API cost. Recorded for visibility only:
+            # on a prepaid subscription the marginal cost of a request is zero.
+            usage["provider_cost"] = usage.get("provider_cost", 0.0) + float(part["cost"])
+
+        # --- Codex ---------------------------------------------------
+        if item.get("type") in ("agent_message", "message") and isinstance(item.get("text"), str):
+            text_parts.append(item["text"])
+        if item.get("type") == "reasoning":
+            rtext = reasoning_event(None, None, item)
+            if rtext:
+                reasoning_parts.append(rtext)
+        top = evt.get("usage") if isinstance(evt.get("usage"), dict) else None
+        if top:
+            add("input_tokens", top.get("input_tokens") or top.get("prompt_tokens"))
+            add("output_tokens", top.get("output_tokens") or top.get("completion_tokens"))
+            add("output_tokens", top.get("reasoning_output_tokens"))
+            add("cache_read_tokens", top.get("cached_input_tokens"))
+
+        # --- generic fallbacks for shapes neither of the above covers --
+        if not part and not item:
+            msg = evt.get("message") or evt.get("text") or evt.get("delta")
+            if isinstance(msg, dict):
+                msg = msg.get("content") or msg.get("text")
+            if isinstance(msg, list):
+                msg = "".join(str(b.get("text", "")) for b in msg
+                              if isinstance(b, dict))
+            if isinstance(msg, str) and msg.strip() and evt.get("type") in (
+                    None, "message", "assistant", "agent_message",
+                    "response.output_text.delta"):
+                text_parts.append(msg)
+            # Fallback for a reasoning item the generic path is asked
+            # about (a future CLI may emit ``{"type":"reasoning","text":"..."}``
+            # without the part/item wrapper). Walk the event for any
+            # reason-shaped payload so the contract stays "every reasoning
+            # text the CLI said flows onto reasoning_content".
+            rtext = reasoning_event(evt.get("reasoning") if isinstance(evt.get("reasoning"), dict) else {},
+                                    None, None)
+            if rtext:
+                reasoning_parts.append(rtext)
+
+    if not text_parts:
+        # Issue #64: opencode-ai@1.18.31 sometimes emits a step_finish with
+        # nonzero output tokens but no text event. The provider bills those
+        # tokens regardless, so the parse failure must carry the usage —
+        # not discard it as the original JSONDecodeError did. A zero-usage
+        # no-text stream stays on the old path (no retry, original message).
+        if _int(usage.get("input_tokens")) or _int(usage.get("output_tokens")) \
+                or (isinstance(usage.get("provider_cost"), (int, float))
+                    and float(usage["provider_cost"]) > 0):
+            raise CliNoTextError(usage)
+        raise json.JSONDecodeError("no assistant text in CLI output", stdout, 0)
+    out: dict = {"result": "".join(text_parts), "usage": usage}
+    reasoning_text = "".join(reasoning_parts)
+    if reasoning_text:
+        out["reasoning"] = reasoning_text
+    return out
+
+
 def parse_output(stdout: str, kind: str | None = None) -> dict:
-    """Normalise a CLI's output into {result, usage}.
+    """Normalise a CLI's output into {result, reasoning, usage}.
 
     `kind` defaults to this process's own PROFILE, but mcp_bridge calls this
     with its own provider's parser kind explicitly — the event shapes
     ("claude_json", "events_json", "codex_jsonl") are the same regardless of
     which sidecar is asking, so there is no reason to duplicate this parser.
+
+    Issue #292: reasoning text is collected separately from the answer so the
+    adapter path can lift it into `reasoning_content` for chat / Messages /
+    Responses callers. `result` stays as the assistant's answer text only;
+    `reasoning` (when present) is the accumulated chain-of-thought. Both are
+    stringy, both can be empty, and the absence of `reasoning` is itself the
+    "omitted" signal in the OpenAI chat-completion shape.
     """
     kind = kind or PROFILE["parser"]
-
     if kind == "claude_json":
-        try:
-            return json.loads(stdout)
-        except json.JSONDecodeError:
-            # --output-format stream-json (media requests): one event per line;
-            # the final `result` event has the same shape as the json output.
-            for evt in reversed(list(iter_json_objects(stdout))):
-                if evt.get("type") == "result":
-                    return evt
-            raise
-
+        return _parse_claude_json(stdout)
     if kind in ("events_json", "codex_jsonl"):
-        # Two different event shapes, both verified against real output.
-        #
-        # OpenCode nests everything under `part`:
-        #   {"type":"text","part":{"type":"text","text":"OK"}}
-        #   {"type":"step_finish","part":{"type":"step-finish",
-        #      "tokens":{"input":6194,"output":18,"reasoning":0,
-        #                "cache":{"read":1280}}}}
-        #
-        # Codex uses `item` plus a top-level usage object:
-        #   {"type":"item.completed","item":{"type":"agent_message","text":"OK"}}
-        #   {"type":"turn.completed","usage":{"input_tokens":14159,
-        #      "cached_input_tokens":12160,"output_tokens":7,
-        #      "reasoning_output_tokens":0}}
-        #
-        # Reasoning tokens are counted into output because they are billed, but
-        # reasoning *text* is never part of the answer.
-        text_parts: list[str] = []
-        usage: dict = {}
-
-        def add(field: str, value) -> None:
-            usage[field] = usage.get(field, 0) + _int(value)
-
-        for evt in iter_json_objects(stdout):
-            part = evt.get("part") if isinstance(evt.get("part"), dict) else {}
-            item = evt.get("item") if isinstance(evt.get("item"), dict) else {}
-
-            # --- OpenCode ------------------------------------------------
-            if part.get("type") == "text" and isinstance(part.get("text"), str):
-                text_parts.append(part["text"])
-            tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else None
-            if tokens:
-                cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
-                add("input_tokens", tokens.get("input"))
-                add("output_tokens", tokens.get("output"))
-                add("output_tokens", tokens.get("reasoning"))
-                add("cache_read_tokens", cache.get("read"))
-            if isinstance(part.get("cost"), (int, float)):
-                # The provider's notional API cost. Recorded for visibility only:
-                # on a prepaid subscription the marginal cost of a request is zero.
-                usage["provider_cost"] = usage.get("provider_cost", 0.0) + float(part["cost"])
-
-            # --- Codex ---------------------------------------------------
-            if item.get("type") in ("agent_message", "message") and isinstance(item.get("text"), str):
-                text_parts.append(item["text"])
-            top = evt.get("usage") if isinstance(evt.get("usage"), dict) else None
-            if top:
-                add("input_tokens", top.get("input_tokens") or top.get("prompt_tokens"))
-                add("output_tokens", top.get("output_tokens") or top.get("completion_tokens"))
-                add("output_tokens", top.get("reasoning_output_tokens"))
-                add("cache_read_tokens", top.get("cached_input_tokens"))
-
-            # --- generic fallbacks for shapes neither of the above covers --
-            if not part and not item:
-                msg = evt.get("message") or evt.get("text") or evt.get("delta")
-                if isinstance(msg, dict):
-                    msg = msg.get("content") or msg.get("text")
-                if isinstance(msg, list):
-                    msg = "".join(str(b.get("text", "")) for b in msg
-                                  if isinstance(b, dict))
-                if isinstance(msg, str) and msg.strip() and evt.get("type") in (
-                        None, "message", "assistant", "agent_message",
-                        "response.output_text.delta"):
-                    text_parts.append(msg)
-
-        if not text_parts:
-            # Issue #64: opencode-ai@1.18.31 sometimes emits a step_finish with
-            # nonzero output tokens but no text event. The provider bills those
-            # tokens regardless, so the parse failure must carry the usage —
-            # not discard it as the original JSONDecodeError did. A zero-usage
-            # no-text stream stays on the old path (no retry, original message).
-            if _int(usage.get("input_tokens")) or _int(usage.get("output_tokens")) \
-                    or (isinstance(usage.get("provider_cost"), (int, float))
-                        and float(usage["provider_cost"]) > 0):
-                raise CliNoTextError(usage)
-            raise json.JSONDecodeError("no assistant text in CLI output", stdout, 0)
-        return {"result": "".join(text_parts), "usage": usage}
-
+        return _parse_events_json(stdout)
     return {"result": stdout.strip()}
 
 
@@ -2114,7 +2347,8 @@ def system_prompt_file(system: str | None):
 async def run_cli(prompt: str, system: str | None, model: str | None = None,
                 image_paths: list[Path] | None = None,
                 fmt: dict | None = None, *, web: bool = False,
-                effort: str | None = None) -> dict:
+                effort: str | None = None,
+                thinking: dict | None = None) -> dict:
     prompt, system = fold_system(prompt, system)
     with instructions_file(system) as (extra_args, system), \
             system_prompt_file(system) as (sys_args, system), \
@@ -2125,13 +2359,14 @@ async def run_cli(prompt: str, system: str | None, model: str | None = None,
         # carries the same content, with the same extras appended above.
         return await _run_cli(prompt, system, model,
                               extra_args + sys_args + fmt_args, image_paths,
-                              web=web, effort=effort)
+                              web=web, effort=effort, thinking=thinking)
 
 
 async def _run_cli(prompt: str, system: str | None, model: str | None,
                    extra_args: list,
                    image_paths: list[Path] | None = None, *, web: bool = False,
-                   effort: str | None = None) -> dict:
+                   effort: str | None = None,
+                   thinking: dict | None = None) -> dict:
     """Spawn the CLI, parse its output, and surface errors as HTTPExceptions.
 
     Issue #64: opencode-ai@1.18.31 occasionally emits a step_finish with
@@ -2144,11 +2379,13 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
     """
     try:
         return await _run_cli_attempt(prompt, system, model, extra_args,
-                                      image_paths, web=web, effort=effort)
+                                      image_paths, web=web, effort=effort,
+                                      thinking=thinking)
     except CliNoTextError as exc:
         try:
             payload = await _run_cli_attempt(prompt, system, model, extra_args,
-                                              image_paths, web=web, effort=effort)
+                                              image_paths, web=web, effort=effort,
+                                              thinking=thinking)
         except CliNoTextError as exc2:
             combined = _sum_usage(dict(exc.usage), exc2.usage)
             raise HTTPException(
@@ -2165,7 +2402,8 @@ async def _run_cli(prompt: str, system: str | None, model: str | None,
 async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
                            extra_args: list,
                            image_paths: list[Path] | None = None, *,
-                           web: bool = False, effort: str | None = None) -> dict:
+                           web: bool = False, effort: str | None = None,
+                           thinking: dict | None = None) -> dict:
     """One end-to-end spawn+parse+post-parse check, without the no-text retry.
 
     Raises HTTPException for terminal errors (spawn failure, timeout, auth,
@@ -2175,7 +2413,7 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
     to _run_cli, which then performs exactly one in-process retry.
     """
     cmd, stdin_data = build_argv(prompt, system, model, image_paths, web=web,
-                                 effort=effort)
+                                 effort=effort, thinking=thinking)
     cmd = cmd + list(extra_args)
     spawn_env = subprocess_env()
     if web and PROVIDER == "opencode":
@@ -2426,7 +2664,23 @@ def _limit_error(blob: str, default_retry_after: int | None = None) -> HTTPExcep
     )
 
 
-def to_openai(payload: dict, model: str, finish_reason: str = "stop") -> dict:
+def to_openai(payload: dict, model: str, finish_reason: str = "stop",
+              reasoning_display: str | None = None) -> dict:
+    """Render a CLI's completed payload as an OpenAI chat-completion response.
+
+    Issue #292: the reasoning text the parser extracted (`payload["reasoning"]`)
+    rides onto `choices[0].message.reasoning_content`, leaving `content` for the
+    assistant's visible answer alone. `reasoning_content` is only emitted
+    when the parser found reasoning text; its absence on a regular turn is
+    itself the "no reasoning requested" signal, which is what LiteLLM and
+    Anthropic-protocol adapters use to omit the field on the wire.
+
+    `reasoning_display="omitted"` means the caller asked for the assistant
+    text NOT to be rendered -- the reasoning IS returned, on
+    `reasoning_content`, and `content` is left empty so a `text`-only consumer
+    (a downstream chat client that ignores the field) sees nothing rather
+    than the duplicated answer.
+    """
     usage = payload.get("usage") or {}
     input_tokens = int(usage.get("input_tokens", 0) or 0)
     output_tokens = int(usage.get("output_tokens", 0) or 0)
@@ -2462,6 +2716,14 @@ def to_openai(payload: dict, model: str, finish_reason: str = "stop") -> dict:
         # correct. Both are emitted even when zero so the shape is stable.
         out_usage["prompt_tokens_details"] = {"cached_tokens": cache_read}
         out_usage["cache_creation_input_tokens"] = cache_creation
+    message: dict = {"role": "assistant"}
+    if reasoning_display == "omitted":
+        message["content"] = ""
+    else:
+        message["content"] = payload.get("result", "")
+    reasoning_text = payload.get("reasoning")
+    if isinstance(reasoning_text, str) and reasoning_text:
+        message["reasoning_content"] = reasoning_text
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
         "object": "chat.completion",
@@ -2469,7 +2731,7 @@ def to_openai(payload: dict, model: str, finish_reason: str = "stop") -> dict:
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": payload.get("result", "")},
+            "message": message,
             "finish_reason": finish_reason,
         }],
         "usage": out_usage,
@@ -2583,6 +2845,13 @@ async def sse_from_completion(result: dict, model: str):
     Tool calls are carried too. Without them a tool-using client streaming
     against a bridged plan sees an empty message and no finish_reason it
     recognises.
+
+    Issue #292: a reasoning-enabled turn emits two deltas in order —
+    `reasoning_content` first, then `content` — because the chat-completion
+    streaming schema deltas the two fields on the same `choices[0]` and
+    clients expect them in the same order on the wire. The terminal chunk
+    carries the same fields as one frame so a client that reads `delta`
+    rather than accumulating gets both halves.
     """
     choices = result.get("choices") or [{}]
     base = {"id": result.get("id"), "object": "chat.completion.chunk",
@@ -2591,6 +2860,12 @@ async def sse_from_completion(result: dict, model: str):
     for choice in choices:
         message = choice.get("message") or {}
         first = {"role": "assistant"}
+        reasoning_text = message.get("reasoning_content")
+        if reasoning_text:
+            # Reasoning first; the wire layout matches what LiteLLM emits for a
+            # native reasoning turn on the chat-completion delta path, and
+            # what's documented for the `reasoning_content` OpenAI extension.
+            first["reasoning_content"] = reasoning_text
         if message.get("content"):
             first["content"] = message["content"]
         if message.get("tool_calls"):
@@ -2866,19 +3141,26 @@ async def _complete(body: dict) -> dict:
         limit = config().concurrency
         if not await _gate.acquire(limit):
             # Never queue: SwitchYard needs to hear "full" immediately so it can
-            # spill to the next plan in the lane instead of blocking a worker.
+            # spill to the next plan in the lane instead of holding a worker open.
             raise HTTPException(status_code=429,
                                 detail=f"sidecar at capacity ({limit})",
                                 headers={"Retry-After": "5"})
+        thinking_policy = request_thinking(body)
         try:
             payload = await invoke(prompt, system, model, image_paths or None,
                                    fmt if native else None, web=web,
-                                   effort=request_effort(body))
+                                   effort=request_effort(body),
+                                   thinking=thinking_policy)
         finally:
             await _gate.release()
         payload, finish_reason = enforce_max_tokens(
             payload, request_max_tokens(body))
-        result = to_openai(payload, model, finish_reason=finish_reason)
+        # `display` rides on the same policy we just read into `thinking_policy`
+        # -- resolve it once here rather than calling `thinking_display(body)`,
+        # which would re-walk every spelling of the carrier.
+        display = (thinking_policy or {}).get("display")
+        result = to_openai(payload, model, finish_reason=finish_reason,
+                           reasoning_display=display)
     finally:
         # Image dir is owned here; the workdir on the mcp_bridge path is owned
         # by the session and outlives the request, so this only cleans up

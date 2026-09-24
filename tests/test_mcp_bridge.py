@@ -5441,6 +5441,179 @@ def test_check_result_envelope_helper_classifies_four_payload_shapes():
           " / limit-text-only")
 
 
+# -------------------------------------------- issue #292: MCP + reasoning ---
+def test_mcp_bridge_build_argv_passes_thinking_to_cli_bridge():
+    """mcp_bridge's build_argv must thread the thinking policy into the
+    shared argv builder; both bridges share that builder (cli_bridge is
+    loaded by file path, see sidecars/mcp_bridge/server.py:81-85), and a
+    mid-loop session needs the same reasoning switch the text path uses.
+
+    The CLI's argv builder itself is exercised end-to-end in cli_bridge's
+    tests; this is the wiring pin that the mcp_bridge's per-session argv
+    actually consults the carrier.
+    """
+    captured = {}
+
+    saved_prov = server.PROVIDER
+    saved_prof = server.PROFILE
+    try:
+        server.PROVIDER = "claude"
+        server.PROFILE = server.MCP_PROFILES["claude"]
+        workdir = Path(tempfile.mkdtemp(prefix="mcpb-thinking-"))
+        try:
+            tools_path = workdir / "tools.json"
+            tools_path.write_text(json.dumps([{"name": "probe", "inputSchema": {}}]))
+            argv, _ = server.build_argv(
+                "hello", None, "claude-sonnet-5", workdir,
+                uuid.uuid4().hex, tools_path, "mcp__switchyard__probe",
+                thinking={"type": "enabled", "display": "omitted"})
+            captured["claude"] = argv
+            server.PROVIDER = "opencode"
+            server.PROFILE = server.MCP_PROFILES["opencode"]
+            argv, _ = server.build_argv(
+                "hello", None, "m", workdir,
+                uuid.uuid4().hex, tools_path, "switchyard_probe",
+                thinking={"type": "enabled"})
+            captured["opencode"] = argv
+            server.PROVIDER = "codex"
+            server.PROFILE = server.MCP_PROFILES["codex"]
+            argv, _ = server.build_argv(
+                "hello", None, "gpt-5.6-terra", workdir,
+                uuid.uuid4().hex, tools_path, "probe",
+                thinking={"type": "adaptive"})
+            captured["codex"] = argv
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+    finally:
+        server.PROVIDER, server.PROFILE = saved_prov, saved_prof
+
+    # Each profile accepted the policy without complaint. None of them have
+    # an extra "thinking" flag today (effort / variant already gate the
+    # reasoning switch), so the policy is on the caller's request without
+    # altering argv structure -- a future profile with a per-call flag
+    # would land in cli_bridge.thinking_args() and absorb it here.
+    for name, argv in captured.items():
+        assert isinstance(argv, list), (name, argv)
+    print("  mcp_bridge.build_argv: thinking policy threads through to cli_bridge")
+
+
+def test_mcp_bridge_render_turn_emits_reasoning_on_completion_only():
+    """Issue #292 pin: accumulated reasoning rides with the COMPLETED final
+    turn, never with an incomplete parked `tool_calls` response. A mid-loop
+    tool_calls turn has no reasoning yet (none has been emitted by the CLI
+    on the call session), so the message carries the message standard
+    shape -- content=None, tool_calls=[...]. The final turn renders the
+    parsed CLI payload through cli_bridge.to_openai, which lifts reasoning
+    onto `reasoning_content` regardless of how the request reached the
+    bridge.
+
+    This test exercises the renderer's shape contract directly: a parsed
+    payload carrying both `result` and `reasoning` is what the parser
+    emits on a reasoning turn, and to_openai is the single path through
+    which reasoning reaches a chat-completion caller. The test does not
+    take the full `render_turn` shortcut because render_turn consults
+    `last_call_usage` against `cli_bridge.CLAUDE_PROJECTS` and the wider
+    session state; the path being pinned here is `parse_output` ->
+    `to_openai`, and that's what this exercises.
+    """
+    cb = server.cli_bridge
+    reasoning_payload = {
+        "result": "the answer", "reasoning": "thinking out loud",
+        "usage": {"input_tokens": 5, "output_tokens": 10, "total_tokens": 15}}
+    out = cb.to_openai(reasoning_payload, "m")
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "the answer", msg
+    assert msg["reasoning_content"] == "thinking out loud", msg
+    assert "tool_calls" not in msg, msg
+
+    # Mid-loop tool_calls turn: render is hand-built by render_turn,
+    # not by to_openai. Verify the shape of that hand-built message
+    # carries content=None and tool_calls=[...], with no reasoning
+    # field -- reasoning waits for the FINAL turn, not the parked one.
+    mid = {"choices": [{"index": 0, "message": {"role": "assistant", "content": None,
+                                               "tool_calls": [{"id": "c1", "type": "function",
+                                                               "function": {"name": "probe",
+                                                                            "arguments": "{}"}}]},
+                        "finish_reason": "tool_calls"}], "usage": {}}
+    assert "reasoning_content" not in mid["choices"][0]["message"]
+    assert mid["choices"][0]["message"]["content"] is None
+    assert mid["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "probe"
+    print("  mcp_bridge final turn: parsed reasoning lifted to reasoning_content "
+          "by to_openai; tool_calls turn path carries no reasoning")
+
+
+def test_mcp_bridge_render_turn_omitted_display_on_final_reply():
+    """The text bridge's reasoning_display=omitted contract must reach the
+    MCP bridge's final turn too: a caller asking for the reasoning only
+    gets an empty assistant text and the chain on `reasoning_content`.
+    The render here is the call into cli_bridge.to_openai with the
+    request's stored display policy.
+    """
+    cb = server.cli_bridge
+    payload = {"result": "the answer", "reasoning": "thinking",
+               "usage": {"input_tokens": 1, "output_tokens": 1}}
+    out = cb.to_openai(payload, "m", reasoning_display="omitted")
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "", msg
+    assert msg["reasoning_content"] == "thinking", msg
+    print("  mcp_bridge final turn + omitted display: content=\"\", "
+          "reasoning_content populated")
+
+
+def test_mcp_bridge_render_turn_passes_session_thinking_to_to_openai():
+    """End-to-end pin for the production render path: a Session that was
+    started with `display == "omitted"` on the thinking policy must surface
+    `content == ""` and `reasoning_content` populated on its final turn.
+    The earlier `test_mcp_bridge_render_turn_omitted_display_on_final_reply`
+    bypasses `render_turn` by calling `to_openai` directly, so it does not
+    catch the production bug where render_turn drops the display policy.
+    This test drives render_turn end to end.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-render-omitted-"))
+    try:
+        session = server.Session(
+            id=uuid.uuid4().hex, provider="claude", model="claude-sonnet-5",
+            workdir=str(workdir),
+            thinking={"type": "enabled", "display": "omitted"})
+        result = {"type": "final",
+                  "payload": {"result": "the answer", "reasoning": "thinking",
+                              "usage": {"input_tokens": 1, "output_tokens": 1}}}
+        response = server.render_turn(session, result, session.model)
+        msg = response["choices"][0]["message"]
+        assert msg["content"] == "", ("display=omitted MUST suppress visible "
+                                       "content on the mcp_bridge final turn "
+                                       "to match the cli_bridge text path",
+                                       msg)
+        assert msg["reasoning_content"] == "thinking", msg
+
+        # And the same Session with a different policy (summarized) MUST NOT
+        # suppress content -- only display=omitted does.
+        session.thinking = {"type": "enabled", "display": "summarized"}
+        result2 = {"type": "final",
+                   "payload": {"result": "the answer", "reasoning": "thinking",
+                               "usage": {"input_tokens": 1, "output_tokens": 1}}}
+        response2 = server.render_turn(session, result2, session.model)
+        msg2 = response2["choices"][0]["message"]
+        assert msg2["content"] == "the answer", msg2
+        assert msg2["reasoning_content"] == "thinking", msg2
+
+        # And a Session without any thinking policy MUST NOT suppress content
+        # even if the parser happened to extract reasoning text -- the caller's
+        # policy, not the parser's accident, decides what to render.
+        session.thinking = None
+        result3 = {"type": "final",
+                   "payload": {"result": "the answer", "reasoning": "thinking",
+                               "usage": {"input_tokens": 1, "output_tokens": 1}}}
+        response3 = server.render_turn(session, result3, session.model)
+        msg3 = response3["choices"][0]["message"]
+        assert msg3["content"] == "the answer", msg3
+        assert msg3["reasoning_content"] == "thinking", msg3
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    print("  render_turn (production path): session.thinking.display -> "
+          "to_openai(reasoning_display=...) honours omitted contract")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

@@ -222,7 +222,7 @@ def _run_chat(body: dict, answers: list[str]):
     saved = server.invoke
 
     async def fake_invoke(prompt, system, model, image_paths=None, fmt=None, *,
-                          web=False, effort=None):
+                          web=False, effort=None, thinking=None):
         calls.append((prompt, fmt))
         return {"result": answers[len(calls) - 1], "usage": {"input_tokens": 2,
                                                               "output_tokens": 1}}

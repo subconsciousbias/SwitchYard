@@ -199,6 +199,44 @@ def test_codex_output_schema_reaches_the_api_as_strict_json_schema():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_codex_reasoning_event_parsed_separately_from_answer():
+    """Codex reports reasoning as a `reasoning` item on the same event stream
+    the agent_message item lives on, with usage flags `reasoning_output_tokens`
+    on the turn.completed usage object. The parser collects the chain onto
+    `payload.reasoning` (separate from `result`) and rolls the reasoning
+    output tokens into output_tokens (already there) -- the two have to live
+    on different keys so to_openai can lift reasoning onto a separate
+    message field without paying the user's bill twice.
+    """
+    cb = server.cli_bridge
+    stream = "\n".join([
+        json.dumps({"type": "item.completed",
+                    "item": {"type": "reasoning", "text": "thinking step"}}),
+        json.dumps({"type": "item.completed",
+                    "item": {"type": "agent_message", "text": "the answer"}}),
+        json.dumps({"type": "turn.completed",
+                    "usage": {"input_tokens": 4, "output_tokens": 2,
+                              "reasoning_output_tokens": 8}}),
+    ])
+    parsed = cb.parse_output(stream, "codex_jsonl")
+    assert parsed["result"] == "the answer", parsed
+    assert parsed.get("reasoning") == "thinking step", parsed
+    # Reasoning tokens stay rolled into output_tokens (the parser's contract),
+    # so the ledger books the full billed output.
+    assert parsed["usage"]["output_tokens"] == 10, parsed["usage"]
+
+    # to_openai lifts the reasoning onto a separate field; the result stays
+    # on `content`. This is the only path the adapter uses to surface the
+    # chain of thought on a codex turn -- downstream codex never sees the
+    # raw item.
+    out = cb.to_openai(parsed, "gpt-5.6-terra")
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "the answer", msg
+    assert msg["reasoning_content"] == "thinking step", msg
+    print("  codex: reasoning item -> separate `reasoning` field; tokens "
+          "rolled into output; reasoning_content lifted by to_openai")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

@@ -1040,7 +1040,7 @@ def test_web_only_tools_are_not_refused_on_the_text_path():
     seen = {}
 
     async def fake_invoke(prompt, system, model, image_paths=None, fmt=None, *,
-                          web=False, effort=None):
+                          web=False, effort=None, thinking=None):
         seen["web"] = web
         return {"result": "found it", "usage": {}}
 
@@ -1310,7 +1310,7 @@ def _run_pdf_chat(provider: str, **extra) -> dict:
     seen: dict = {}
 
     async def fake_invoke(prompt, system, model, image_paths=None, fmt=None, *,
-                          web=False, effort=None):
+                          web=False, effort=None, thinking=None):
         paths = list(image_paths or [])
         argv, stdin_data = server.build_argv(prompt, system, model, image_paths=paths)
         seen.update(prompt=prompt, paths=paths, argv=argv, stdin=stdin_data, fmt=fmt,
@@ -1511,6 +1511,39 @@ def test_claude_json_parser_reads_stream_json_result():
     else:
         raise AssertionError("garbage parsed")
     print("  claude_json parser: stream-json result event accepted")
+
+
+def test_claude_json_buffered_collects_reasoning_from_content_blocks():
+    """`claude --output-format json` (a single JSON object, not stream-json) has
+    any reasoning blocks nested in `content[]` of the result, exactly the same
+    shape the stream-json assistant events carry. The parser walks that list
+    so a buffered single-object form gives the same `reasoning` field the
+    stream-json form collects on its own loop. Before the fix both branches of
+    the conditional returned the parsed object unchanged.
+    """
+    single = json.dumps({"type": "result", "result": "the answer",
+                         "content": [
+                             {"type": "thinking", "thinking": "first "},
+                             {"type": "text", "text": "the answer"},
+                             {"type": "redacted_thinking", "thinking": "redacted"},
+                         ],
+                         "is_error": False,
+                         "usage": {"input_tokens": 4, "output_tokens": 5}})
+    out = server.parse_output(single, "claude_json")
+    assert out["result"] == "the answer", out
+    assert out["reasoning"] == "first redacted", out
+    assert out["type"] == "result", out
+
+    # No thinking block -> no `reasoning` key (same absence-on-reasoning contract
+    # the events_json path enforces).
+    plain_single = json.dumps({"type": "result", "result": "hi",
+                               "is_error": False,
+                               "usage": {"input_tokens": 1, "output_tokens": 1}})
+    out2 = server.parse_output(plain_single, "claude_json")
+    assert "reasoning" not in out2, out2
+    assert out2["result"] == "hi", out2
+    print("  claude_json buffered: thinking blocks collected onto `reasoning`, "
+          "absent when the model emitted none")
 
 
 def test_claude_text_path_allows_no_builtin_tools():
@@ -2804,6 +2837,271 @@ def test_exit_zero_envelope_error_is_classified_via_http_surface():
     finally:
         server.CLI, server.BARE, server.PROFILE["args"], server.PROFILE["parser"] = \
             real_cli, real_bare, real_args, real_parser
+
+
+# -------------------------------------------- issue #292: reasoning propagation ---
+def test_request_thinking_reads_every_carrier_and_shape():
+    """The reasoning-request/display policy reaches the bridges under several
+    spellings:
+        * `extra_body.switchyard.thinking` (the gateway's carrier, set by
+          hooks.py:carry_to_cli_sidecar for CLI plans)
+        * top-level `thinking` (a non-routed caller, or any Anthropic-shape
+          request the gateway lifted onto the carrier but a test hits directly)
+        * OpenAI's `reasoning` with only a `display` field (when the gateway
+          already popped the effort-typed reason but kept the display marker
+          on the carrier).
+    A `thinking.type` value of `disabled` is treated as no policy at all (the
+    user's explicit "off" -- not something to be lifted). Unknown
+    `type`/`display` values are dropped silently so a future schema bump
+    cannot silently disable reasoning on the sidecar.
+    """
+    assert server.request_thinking({"switchyard": {"thinking": {"type": "enabled"}}}) \
+        == {"type": "enabled"}
+    assert server.request_thinking({"switchyard": {"thinking": {"type": "adaptive",
+                                                                 "display": "full"}}}) \
+        == {"type": "adaptive", "display": "full"}
+    assert server.request_thinking({"thinking": {"type": "enabled",
+                                                  "display": "summarized"}}) \
+        == {"type": "enabled", "display": "summarized"}
+    assert server.request_thinking({"switchyard": {"thinking": {"type": "disabled"}}}) \
+        is None, "disabled is off-by-explicit-choice; never lifted"
+    assert server.request_thinking({"switchyard": {"thinking": {"type": "unknown"}}}) \
+        is None, "unknown type does not silently keep reasoning on"
+    assert server.request_thinking({"switchyard": {"thinking": {"display": "omitted"}}}) \
+        == {"display": "omitted"}, "display alone is a valid policy (no type)"
+    assert server.request_thinking({}) is None
+    # Provider hint: display policy lives on a different key in some shapes.
+    assert server.request_thinking({"reasoning": {"display": "omitted"}}) \
+        == {"display": "omitted"}
+    print("  reasoning policy read from extra_body.switchyard.thinking, "
+          "thinking, and reasoning.display (disabled -> off, unknown -> off)")
+
+
+def test_thinking_args_only_added_when_a_policy_was_requested():
+    """The CLI's reasoning mode is only turned on when the caller asked; a
+    request with no policy gets nothing on the argv. Each profile gates on
+    `type in ("enabled", "adaptive")` -- not on a display value alone, which
+    is a presentation choice, not an enablement signal.
+    """
+    # No policy -> no argv fragment, on every profile.
+    for prov, prof in (("claude", server.PROFILES["claude"]),
+                       ("codex", server.PROFILES["codex"]),
+                       ("opencode", server.PROFILES["opencode"])):
+        saved = (server.PROVIDER, server.PROFILE, server.CLI)
+        try:
+            server.PROVIDER, server.PROFILE, server.CLI = prov, prof, prof["cli"]
+            assert server.thinking_args(None) == [], prov
+            assert server.thinking_args({}) == [], prov
+            # A display-only policy is NOT an enable signal.
+            assert server.thinking_args({"display": "omitted"}) == [], prov
+            # An explicit enable signal -> each profile's argv-builder
+            # already covers reasoning via effort_args(); thinking_args adds
+            # nothing extra because (a) claude/codex have no per-call
+            # reasoning switch beyond the effort override, and (b) opencode
+            # gates reasoning behind `--variant`, already handled. A future
+            # profile that needs an explicit switch will land here.
+            assert server.thinking_args({"type": "enabled"}) == [], prov
+            assert server.thinking_args({"type": "adaptive"}) == [], prov
+        finally:
+            server.PROVIDER, server.PROFILE, server.CLI = saved
+    print("  thinking_args: no policy -> nothing; display-only -> nothing; "
+          "enabled/adaptive -> empty (effort already gates reasoning)")
+
+
+def test_parse_output_separates_reasoning_from_answer_for_three_clis():
+    """OpenCode's `part.type == "reasoning"` events collect into a separate
+    `reasoning` field; so do Claude's `thinking` content blocks and Codex's
+    `item.type == "reasoning"` items. The assistant text and the chain of
+    thought are both kept (issue #292): a downstream adapter lifts the
+    reasoning onto `reasoning_content` rather than burying it inside the
+    answer the user reads.
+    """
+    opencode_stream = "\n".join([
+        json.dumps({"type": "reasoning", "part": {"type": "reasoning",
+                                                   "text": "let me think"}}),
+        json.dumps({"type": "reasoning", "part": {"type": "reasoning",
+                                                   "text": "step two"}}),
+        json.dumps({"type": "text", "part": {"type": "text", "text": "answer"}}),
+        json.dumps({"type": "step_finish", "part": {
+            "type": "step-finish",
+            "tokens": {"input": 10, "output": 5, "reasoning": 15}}}),
+    ])
+    out = server.parse_output(opencode_stream)
+    assert out["result"] == "answer", out
+    assert out["reasoning"] == "let me thinkstep two", out
+    assert out["usage"]["output_tokens"] == 20, out["usage"]
+
+    codex_stream = "\n".join([
+        json.dumps({"type": "item.completed",
+                    "item": {"type": "reasoning", "text": "thinking..."}}),
+        json.dumps({"type": "item.completed",
+                    "item": {"type": "agent_message", "text": "ok"}}),
+        json.dumps({"type": "turn.completed",
+                    "usage": {"input_tokens": 4, "output_tokens": 3,
+                              "reasoning_output_tokens": 12}}),
+    ])
+    out = server.parse_output(codex_stream, "codex_jsonl")
+    assert out["result"] == "ok", out
+    assert out["reasoning"] == "thinking...", out
+    assert out["usage"]["output_tokens"] == 15, out["usage"]
+
+    claude_stream_json = "\n".join(json.dumps(e) for e in [
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "why"},
+            {"type": "text", "text": "answer"},
+        ]}},
+        {"type": "result", "subtype": "success", "is_error": False,
+         "result": "answer", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+    out = server.parse_output(claude_stream_json, "claude_json")
+    assert out["result"] == "answer", out
+    assert out["reasoning"] == "why", out
+    print("  three CLIs: reasoning text on `payload.reasoning`, answer stays on `result`")
+
+
+def test_parse_output_omits_reasoning_when_the_cli_emitted_none():
+    """A regular answer carries no reasoning: the `reasoning` key is absent,
+    not present-but-empty. LiteLLM and downstream consumers should treat its
+    absence as the "no reasoning requested/returned" signal -- an empty string
+    would coerce to a falsy value in many clients and confuse the
+    omitted-display contract.
+    """
+    plain = "\n".join([
+        json.dumps({"type": "text", "part": {"type": "text", "text": "hi"}}),
+        json.dumps({"type": "step_finish", "part": {
+            "type": "step-finish",
+            "tokens": {"input": 1, "output": 1, "reasoning": 0}}}),
+    ])
+    out = server.parse_output(plain)
+    assert "reasoning" not in out, out
+    assert out["result"] == "hi"
+    print("  parse_output: no reasoning emitted -> reasoning key absent (not empty)")
+
+
+def test_to_openai_emits_reasoning_content_when_present():
+    """The OpenAI chat-completion message gains a `reasoning_content` field
+    on any turn the parser separated reasoning from answer. The field is
+    omitted on turns without reasoning, exactly the absence-shape LiteLLM's
+    Messages/Responses adapters pass through as "no reasoning requested"."""
+    payload = {"result": "answer", "reasoning": "chain of thought",
+               "usage": {"input_tokens": 5, "output_tokens": 10, "total_tokens": 15}}
+    out = server.to_openai(payload, "m")
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "answer", msg
+    assert msg["reasoning_content"] == "chain of thought", msg
+
+    no_reasoning = {"result": "answer",
+                    "usage": {"input_tokens": 5, "output_tokens": 10, "total_tokens": 15}}
+    out2 = server.to_openai(no_reasoning, "m")
+    assert "reasoning_content" not in out2["choices"][0]["message"], out2
+    print("  to_openai: reasoning_content present iff reasoning present, "
+          "absent otherwise")
+
+
+def test_to_openai_omitted_display_suppresses_visible_content():
+    """`thinking.display == "omitted"` means the caller wants the
+    reasoning ONLY -- the assistant's visible text is suppressed. The
+    reasoning is preserved on `reasoning_content` so an adapter can render
+    it; a downstream `text`-only consumer sees an empty `content` rather
+    than the duplicated answer. The shape stays stable: the message has
+    both fields, one empty, one filled, so adapter paths don't have to
+    branch on presence.
+    """
+    payload = {"result": "the answer", "reasoning": "the chain",
+               "usage": {"input_tokens": 1, "output_tokens": 1}}
+    out = server.to_openai(payload, "m", reasoning_display="omitted")
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "", msg
+    assert msg["reasoning_content"] == "the chain", msg
+
+    # Other display values don't suppress content.
+    out2 = server.to_openai(payload, "m", reasoning_display="full")
+    assert out2["choices"][0]["message"]["content"] == "the answer", out2
+    print("  to_openai: display=omitted -> content=\"\"; display=full -> content=result")
+
+
+def test_sse_from_completion_emits_reasoning_before_content():
+    """An OpenAI chat-completion stream that carries reasoning has it on
+    `choices[0].delta.reasoning_content` BEFORE `choices[0].delta.content`,
+    matching the documented order on the wire for streams of native
+    reasoning models. Reasoning-only turns get the field, content-only turns
+    do not -- an empty first delta is never emitted on a regular turn.
+    """
+    import asyncio as _asyncio
+    payload = {"id": "x", "object": "chat.completion", "created": 0, "model": "m",
+               "choices": [{"index": 0, "finish_reason": "stop",
+                            "message": {"role": "assistant",
+                                         "content": "answer",
+                                         "reasoning_content": "chain"}}],
+               "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+    frames = []
+    async def collect():
+        async for frame in server.sse_from_completion(payload, "m"):
+            frames.append(frame)
+    _asyncio.run(collect())
+    assert len(frames) == 3, frames
+    first_delta = json.loads(frames[0][len("data: "):])["choices"][0]["delta"]
+    keys = list(first_delta.keys())
+    r_idx = keys.index("reasoning_content")
+    c_idx = keys.index("content")
+    assert r_idx < c_idx, ("reasoning_content before content", keys)
+    assert first_delta["reasoning_content"] == "chain"
+    assert first_delta["content"] == "answer"
+
+    # A no-reasoning payload: stream has no reasoning_content delta.
+    plain = {"id": "x", "object": "chat.completion", "created": 0, "model": "m",
+             "choices": [{"index": 0, "finish_reason": "stop",
+                          "message": {"role": "assistant", "content": "answer"}}],
+             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+    frames2 = []
+    async def collect2():
+        async for frame in server.sse_from_completion(plain, "m"):
+            frames2.append(frame)
+    _asyncio.run(collect2())
+    delta2 = json.loads(frames2[0][len("data: "):])["choices"][0]["delta"]
+    assert "reasoning_content" not in delta2, delta2
+    print("  SSE: reasoning_content emitted before content when present; "
+          "absent on regular turns")
+
+
+def test_thinking_display_omitted_means_text_path_result_is_empty():
+    """End-to-end on the text path: a request carrying the omitted-display
+    policy produces a response whose `message.content` is empty and whose
+    `message.reasoning_content` carries the chain. The round-trip is the
+    whole contract -- an empty `content` with no `reasoning_content` would
+    be a silent drop.
+    """
+    import asyncio as _asyncio
+    captured = {}
+
+    async def fake_invoke(prompt, system, model, image_paths=None, fmt=None, *,
+                          web=False, effort=None, thinking=None):
+        captured["thinking"] = thinking
+        return {"result": "the answer", "reasoning": "the chain",
+                "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+    real_invoke = server.invoke
+    server.invoke = fake_invoke
+    saved = (server.PROVIDER, server.PROFILE, server.CLI)
+    try:
+        server.PROVIDER, server.PROFILE, server.CLI = ("claude", server.PROFILES["claude"],
+                                                      server.PROFILES["claude"]["cli"])
+        body = {"model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "switchyard": {"thinking": {"type": "enabled",
+                                             "display": "omitted"}}}
+        result = _asyncio.run(server._handle_chat(body))
+    finally:
+        server.invoke = real_invoke
+        server.PROVIDER, server.PROFILE, server.CLI = saved
+
+    # The carrier reaches invoke, not just the response layer.
+    assert captured.get("thinking") == {"type": "enabled", "display": "omitted"}, captured
+    msg = result["choices"][0]["message"]
+    assert msg["content"] == "", msg
+    assert msg["reasoning_content"] == "the chain", msg
+    print("  end-to-end: switchyard.thinking.type=enabled + display=omitted -> "
+          "content=\"\", reasoning_content populated")
 
 
 if __name__ == "__main__":

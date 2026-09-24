@@ -429,6 +429,79 @@ def test_cli_sidecar_requests_carry_effort_and_caller_env_in_extra_body():
     print("  CLI plan: effort + caller_env moved into extra_body.switchyard")
 
 
+def test_cli_sidecar_requests_carry_thinking_policy_in_extra_body():
+    """Issue #292: a `thinking` object travels onto `extra_body.switchyard`
+    as a typed policy -- type (enable signal) + display (visibility
+    policy). Each shape the caller can use reaches the sidecar under a
+    single key, so the CLI's argv builder has the full picture and the
+    adapter path stays deterministic on the carrier.
+    """
+    from switchyard.hooks import carry_to_cli_sidecar
+
+    # Anthropic Claude Code shape: thinking is a top-level object.
+    anthropic = {"thinking": {"type": "enabled", "display": "summarized"},
+                "extra_body": {"keep": 1}}
+    carry_to_cli_sidecar(anthropic, None)
+    assert "thinking" not in anthropic, anthropic
+    assert anthropic["extra_body"] == {"keep": 1, "switchyard": {
+        "thinking": {"type": "enabled", "display": "summarized"}}}, anthropic
+
+    # Anthropic shape with budget_tokens and an unknown field: only the
+    # fields the sidecar acts on make it onto the carrier (extra dropped).
+    budgeted = {"thinking": {"type": "adaptive", "display": "full",
+                             "budget_tokens": 2048, "extra": "x"}}
+    carry_to_cli_sidecar(budgeted, None)
+    assert "extra_body" in budgeted, budgeted
+    assert "extra" not in budgeted["extra_body"]["switchyard"]["thinking"], budgeted
+    assert budgeted["extra_body"]["switchyard"]["thinking"]["type"] == "adaptive"
+    assert budgeted["extra_body"]["switchyard"]["thinking"]["display"] == "full"
+
+    # An OpenAI `reasoning.display`-only request still lifts the policy.
+    display_only = {"reasoning": {"display": "omitted"}}
+    carry_to_cli_sidecar(display_only, None)
+    assert display_only["extra_body"]["switchyard"]["thinking"] == \
+        {"display": "omitted"}, display_only
+
+    # Disabled thinking is dropped -- the request reaches the sidecar with
+    # NO reasoning policy, which is what "off by default" looks like.
+    disabled = {"thinking": {"type": "disabled", "display": "summarized"}}
+    carry_to_cli_sidecar(disabled, None)
+    assert disabled == {}, "disabled -> no policy on the carrier"
+
+    # A combined request: effort from `reasoning_effort`, policy from
+    # `thinking.display` -- both ride together.
+    combined = {"reasoning_effort": "high",
+                "thinking": {"type": "enabled", "display": "omitted"},
+                "caller_env_stamp": {"cwd": "/p", "source": "request"}}
+    carry_to_cli_sidecar(combined, {"cwd": "/p", "source": "request"})
+    assert combined["extra_body"]["switchyard"] == {
+        "reasoning_effort": "high",
+        "thinking": {"type": "enabled", "display": "omitted"},
+        "caller_env": {"cwd": "/p", "source": "request"},
+    }, combined
+    print("  CLI plan: thinking policy + display moved into extra_body.switchyard")
+
+
+def test_cli_sidecar_carry_does_not_destroy_request_when_no_policy():
+    """A request carrying nothing to carry must round-trip the body untouched,
+    including any pre-existing extra_body. The new thinking-policy lift must
+    not turn a no-op request into one whose extra_body now exists with only
+    an empty switchyard key.
+    """
+    from switchyard.hooks import carry_to_cli_sidecar
+    body = {"messages": [], "extra_body": {"keep": 1}}
+    carry_to_cli_sidecar(body, None)
+    assert body == {"messages": [], "extra_body": {"keep": 1}}, body
+
+    # A request with effort but no thinking: effort alone should not pull a
+    # thinking key onto the carrier.
+    effort_only = {"reasoning_effort": "high"}
+    carry_to_cli_sidecar(effort_only, None)
+    assert "thinking" not in effort_only.get("extra_body", {}).get("switchyard", {}), \
+        effort_only
+    print("  carry_to_cli_sidecar: no policy -> no thinking key; pre-existing extra_body untouched")
+
+
 def test_cli_blocklist_drops_blocked_tools_and_passes_the_rest():
     """The per-CLI tool blocklist filters native tools out of `data["tools"]`
     before the picker ever sees them, matching case-insensitively against

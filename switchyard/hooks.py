@@ -126,6 +126,18 @@ _TERMINATED = "_terminated"
 # caller_env stamp, in `extra_body.switchyard`; the bridges map the effort to
 # the CLI's own switch (claude --effort, codex model_reasoning_effort,
 # opencode --variant). API plans are untouched.
+#
+# Issue #292: the explicit reasoning-request / display policy travels here
+# too. A Claude Code caller says `thinking: {type: enabled, display: ...}`
+# (or `thinking: {type: adaptive}` on adaptive models), and the bridges map
+# that to the CLI's own thinking switch -- claude's `--include-partial-messages`
+# + the agent's reasoning event channel, codex's `--reasoning-effort` override,
+# opencode's `--variant` family. The display policy (`thinking.display`)
+# names whether the assistant text is rendered alongside the reasoning or
+# only the reasoning is shown (`omitted`); the bridges honour that by
+# suppressing the visible content when "omitted" is requested, while
+# preserving the reasoning itself on the payload's `reasoning_content` so
+# the gateway/LiteLLM can adapt it for chat / Messages / Responses callers.
 def carry_to_cli_sidecar(data: dict, caller_env_stamp: dict | None) -> None:
     effort = data.pop("reasoning_effort", None)
     reasoning = data.get("reasoning")
@@ -140,10 +152,41 @@ def carry_to_cli_sidecar(data: dict, caller_env_stamp: dict | None) -> None:
             data["output_config"] = rest
         else:
             data.pop("output_config", None)
+    # Issue #292: lift `thinking` (Anthropic shape) onto the carrier.
+    # `thinking.type` is the enable signal (enabled/adaptive/disabled);
+    # `thinking.display` is the visibility policy (summarized/full/omitted).
+    # Neither is interpreted by LiteLLM on a CLI plan, but both go to the
+    # sidecar in `extra_body.switchyard.thinking` so each CLI's argv builder
+    # can switch the model's reasoning on AND pick the right rendering.
+    # An explicit `thinking.type == "disabled"` is the user's "off, do not
+    # lift" choice; we drop the entire policy in that case so the sidecar's
+    # `thinking` key never carries a disabled marker it would have to
+    # second-guess.
+    #
+    # The whitelist also carries `budget_tokens` (Anthropic's thinking-budget
+    # spelling for adaptive models) and `enabled` (a future Anthropic field).
+    # Today the sidecar reads only `type` and `display` -- the other two ride
+    # the carrier anyway so a future reader does not need a gateway-side
+    # change to act on them.
+    thinking: dict | None = None
+    raw_thinking = data.pop("thinking", None) if isinstance(data.get("thinking"), dict) else None
+    if isinstance(raw_thinking, dict) and raw_thinking.get("type") != "disabled":
+        thinking = {k: v for k, v in raw_thinking.items()
+                    if k in ("type", "display", "budget_tokens", "enabled")}
+    if thinking is None:
+        # OpenAI shape spelled `reasoning` -- we already popped one above if
+        # it carried `effort`. A second one with `display` only is still
+        # possible; lift those keys too so the sidecar has the full picture.
+        prior = data.get("reasoning")
+        if isinstance(prior, dict) and "display" in prior:
+            thinking = {"display": prior["display"]}
     extra = dict(data.get("extra_body") or {})
     carried = dict(extra.get("switchyard") or {})
     if effort:
         carried["reasoning_effort"] = effort
+    if thinking:
+        # Normalise: a caller that only sent `display` keeps just that key.
+        carried["thinking"] = thinking
     if caller_env_stamp:
         carried["caller_env"] = caller_env_stamp
     if carried:

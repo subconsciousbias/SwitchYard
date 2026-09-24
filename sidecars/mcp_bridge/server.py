@@ -355,6 +355,14 @@ class Session:
     # retrying because the previous response never arrived, not asking for a
     # new turn. None until the first render.
     last_response: dict | None = None
+    # Issue #292: the caller's reasoning-request/display policy, lifted onto
+    # extra_body.switchyard.thinking by carry_to_cli_sidecar. Stashed here
+    # when start_session built the argv, so render_turn's final-turn path can
+    # pass the display policy to cli_bridge.to_openai -- a parked tool_calls
+    # turn carries no reasoning to render, but the final turn must honour
+    # `display == "omitted"` end to end, the same way cli_bridge's _complete
+    # does (bridge-siblings rule).
+    thinking: dict | None = None
     _flush_handle: object = None
 
     def touch(self) -> None:
@@ -1098,7 +1106,8 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
                 allowed_tools: str,
                 image_paths: list | None = None,
                 spawn_dir: Path | None = None,
-                web: bool = False, effort: str | None = None) -> tuple[list[str], str | None]:
+                web: bool = False, effort: str | None = None,
+                thinking: dict | None = None) -> tuple[list[str], str | None]:
     """Build the CLI argv, plus the prompt to feed it on stdin (or None).
 
     Returns a pair so an oversized prompt can travel on stdin instead of argv
@@ -1226,6 +1235,7 @@ def build_argv(prompt: str, system: str | None, model: str, workdir: Path,
                 argv += ["-f", str(path)]
 
     argv += cli_bridge.effort_args(effort)
+    argv += cli_bridge.thinking_args(thinking)
     if PROVIDER == "claude":
         # Pin the transcript's file name to this session. Claude files it
         # under a directory named after the cwd, and with the cwd mirrored
@@ -1863,7 +1873,14 @@ def render_turn(session: Session, result: dict, requested_model: str | None) -> 
         # one to its transcript before exiting this turn.
         return _with_context_usage(response, session, {})
     if result["type"] == "final":
-        response = cli_bridge.to_openai(result["payload"], requested_model or session.model)
+        # Issue #292: the cli_bridge text path passes `reasoning_display` to
+        # to_openai so a request with `thinking.display == "omitted"` lands
+        # as `content == ""` and `reasoning_content` set. The mcp_bridge
+        # final-turn must honour the same contract -- the policy is what the
+        # caller asked for, regardless of which bridge served the turn.
+        display = (session.thinking or {}).get("display")
+        response = cli_bridge.to_openai(result["payload"], requested_model or session.model,
+                                        reasoning_display=display)
         # On the final turn, the OpenAI-shaped sum the CLI's payload carries
         # is what should be billed; the last-call context replaces
         # `prompt_tokens` so the caller sees a context meter, not the run total.
@@ -2172,10 +2189,12 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     # is served by this CLI's own provider-side search, for this session only.
     web = cli_bridge.wants_web_search(body)
     effort = cli_bridge.request_effort(body)
+    thinking = cli_bridge.request_thinking(body)
     session = Session(id=session_id, provider=PROVIDER, model=model,
                       workdir=str(workdir), holds_slot=True,
                       spawn_dir=str(spawn_dir),
-                      spawn_env=session_env(env, workdir, spawn_dir, web=web))
+                      spawn_env=session_env(env, workdir, spawn_dir, web=web),
+                      thinking=thinking)
     # Inject the env block (system) and the first-turn reminder (prompt).
     # Both are pure functions of (prompt, system, env, first_turn) so a
     # rebuild of the same request produces the same CLI argv.
@@ -2191,7 +2210,8 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
         allowed = ",".join(PROFILE["tool_qualifier"](t["name"]) for t in mcp_tools)
         argv, stdin_data = build_argv(prompt, system, model, workdir, session_id,
                                       tools_path, allowed, image_paths,
-                                      spawn_dir=spawn_dir, web=web, effort=effort)
+                                      spawn_dir=spawn_dir, web=web, effort=effort,
+                                      thinking=thinking)
     except Exception as exc:
         log.warning("start_session failed to build argv: %s", exc, exc_info=True)
         await cli_bridge._gate.release()

@@ -87,6 +87,16 @@ def text_of(resp):
         return "".join(b.get("text", "") for b in resp["content"] if isinstance(b, dict))
     return str(resp)
 
+
+def reasoning_of(resp):
+    """The chain of thought off a chat-completion response, when the request
+    asked for reasoning to be returned alongside the answer. Returns the
+    trimmed string or "" when no reasoning was carried."""
+    if isinstance(resp, dict) and "choices" in resp:
+        return (resp["choices"][0]["message"].get("reasoning_content") or "").strip()
+    return ""
+
+
 def refused(status):
     return status >= 400
 
@@ -277,6 +287,72 @@ def _responses_tool_call(r):
     calls = [o for o in r.get("output", []) if o.get("type") == "function_call"]
     return calls[0] if calls else None
 
+
+def reasoning_visible_chat(m):
+    """Visible-reasoning contract on chat-completion: the caller's
+    `extra_body.switchyard.thinking` policy reached the sidecar and the
+    reasoning round-tripped on `message.reasoning_content`. Anything but a
+    200 carrying reasoning is a degradation (silent drop or never asked)."""
+    s, r = chat(m, [{"role": "user", "content": "Reply with exactly the word: pong"}],
+                max_tokens=32000, reasoning_effort="medium",
+                extra_body={"switchyard": {"thinking": {"type": "enabled",
+                                                        "display": "summarized"}}})
+    t = text_of(r) if s == 200 else r
+    rc = reasoning_of(r) if s == 200 else ""
+    ok = s == 200 and "pong" in t.lower() and bool(rc)
+    return verdict(s, ok, f"reasoning={len(rc)} chars; text={t[:60]!r}" if s == 200 else r)
+
+
+def reasoning_visible_messages(m):
+    """Visible-reasoning contract on the Messages protocol: the caller's
+    `thinking.type=enabled, display=summarized` reaches the sidecar and the
+    result carries the chain of thought (LiteLLM adapts `reasoning_content`
+    into a thinking block on the response)."""
+    s, r = messages_api(m, [{"role": "user", "content": "Reply with exactly the word: pong"}],
+                        max_tokens=64000,
+                        thinking={"type": "enabled", "display": "summarized"},
+                        output_config={"effort": "medium"})
+    t = text_of(r) if s == 200 else r
+    if not isinstance(r, dict) or s != 200:
+        return verdict(s, False, r)
+    blocks = r.get("content") or []
+    has_thinking = any(isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
+                       for b in blocks)
+    return verdict(s, "pong" in t.lower() and has_thinking,
+                   f"thinking_block={has_thinking}; text={t[:60]!r}")
+
+
+def reasoning_omitted_chat(m):
+    """`thinking.display=omitted` means the assistant's visible text is
+    suppressed -- only the chain of thought is returned. A 200 that
+    *also* carries visible text is a degradation (the omitted contract is
+    what made the caller ask for reasoning-only)."""
+    s, r = chat(m, [{"role": "user", "content": "Reply with exactly the word: pong"}],
+                max_tokens=32000, reasoning_effort="medium",
+                extra_body={"switchyard": {"thinking": {"type": "enabled",
+                                                        "display": "omitted"}}})
+    if not isinstance(r, dict) or s != 200:
+        return verdict(s, False, r)
+    t = text_of(r)
+    rc = reasoning_of(r)
+    ok = (not t.strip()) and bool(rc)
+    return verdict(s, ok, f"text={t[:60]!r}; reasoning={len(rc)} chars")
+
+
+def reasoning_not_requested_has_no_field(m):
+    """Omitted-thinking contract -- a regular request (no thinking on the
+    carrier) must NOT carry a `reasoning_content` field. A field that
+    shows up means the reasoning was always on, which is the silent
+    degradation we are guarding against."""
+    s, r = chat(m, [{"role": "user", "content": "Reply with exactly the word: pong"}],
+                max_tokens=32000, reasoning_effort="medium")
+    if not isinstance(r, dict) or s != 200:
+        return verdict(s, False, r)
+    msg = r["choices"][0]["message"]
+    ok = "pong" in msg.get("content", "").lower() and "reasoning_content" not in msg
+    return verdict(s, ok, f"keys={sorted(msg)}; text={msg.get('content', '')[:60]!r}")
+
+
 def responses_standard_tools(m):
     # The Responses API as an OpenAI SDK sends it: top-level function tools.
     s, r = http("/v1/responses", {"model": m, "reasoning": {"effort": "medium"},
@@ -305,7 +381,9 @@ def responses_codex_client_shape(m):
                    f"call {call.get('name') if call else None}; output types "
                    f"{[o.get('type') for o in r.get('output', [])] if isinstance(r, dict) else ''}" if s == 200 else r)
 
-ALL = [text_chat, text_messages, tool_loop_chat, tool_loop_messages, max_tokens_cap, image_input,
+ALL = [text_chat, text_messages, reasoning_visible_chat, reasoning_visible_messages,
+       reasoning_omitted_chat, reasoning_not_requested_has_no_field,
+       tool_loop_chat, tool_loop_messages, max_tokens_cap, image_input,
        image_in_tool_result, pdf_in_tool_result, web_search_requested, web_search_messages,
        web_fetch_messages, structured_output, n_choices,
        stop_sequence, streamed_tool_call, unsupported_server_tool,

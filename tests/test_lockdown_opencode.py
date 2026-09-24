@@ -135,6 +135,41 @@ def test_opencode_tool_path_offers_only_the_callers_tools():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_opencode_reasoning_event_reaches_the_parser_separately():
+    """Lockdown: an opencode event stream with both a `reasoning` event and
+    a text event must be parsed so the assistant's reasoning lives on its
+    own field (`reasoning`) and the text on the result. The parser returns
+    a dict with both keys intact, so to_openai lifts `reasoning_content`
+    without losing either half.
+    """
+    cb = server.cli_bridge
+    stream = "\n".join([
+        json.dumps({"type": "step_start", "part": {"type": "step-start"}}),
+        json.dumps({"type": "reasoning", "part": {"type": "reasoning",
+                                                   "text": "the chain of thought"}}),
+        json.dumps({"type": "reasoning", "part": {"type": "reasoning",
+                                                   "text": " continues"}}),
+        json.dumps({"type": "text", "part": {"type": "text", "text": "the answer"}}),
+        json.dumps({"type": "step_finish", "part": {
+            "type": "step-finish",
+            "tokens": {"input": 4, "output": 6, "reasoning": 12}}}),
+    ])
+    parsed = cb.parse_output(stream, "events_json")
+    assert parsed["result"] == "the answer", parsed
+    assert parsed["reasoning"] == "the chain of thought continues", parsed
+
+    # to_openai lifts the reasoning onto a separate field; the answer text
+    # stays on `content`. The split survives the OpenAI envelope, which is
+    # what makes LiteLLM's Messages/Responses adapters able to render the
+    # chain of thought without re-deriving it from the answer.
+    out = cb.to_openai(parsed, "m")
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "the answer", msg
+    assert msg["reasoning_content"] == "the chain of thought continues", msg
+    print("  opencode: reasoning event + text event -> separate result + "
+          "reasoning_content fields")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

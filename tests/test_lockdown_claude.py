@@ -430,6 +430,39 @@ def test_claude_json_schema_with_inline_media():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_claude_stream_json_reasoning_blocks_collect_separately():
+    """Claude Code's stream-json events include assistant messages whose
+    content blocks carry a `thinking` part separate from the user-facing
+    text. The bridge must accumulate every thinking block onto a separate
+    `reasoning` field so `to_openai` can lift it onto `reasoning_content`,
+    rather than letting it leak into the assistant's answer the way the
+    legacy parser did (issue #292).
+    """
+    cb = server.cli_bridge
+    stream = "\n".join(json.dumps(e) for e in [
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "why"}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": " more"}]}},
+        {"type": "result", "subtype": "success", "is_error": False,
+         "result": "the answer",
+         "usage": {"input_tokens": 5, "output_tokens": 7}},
+    ])
+    parsed = cb.parse_output(stream, "claude_json")
+    assert parsed["result"] == "the answer", parsed
+    assert parsed.get("reasoning") == "why more", parsed
+
+    # to_openai lifts the reasoning onto a separate message field. The
+    # split is what keeps a Messages-protocol client (`/v1/messages`) and a
+    # chat-completions client from seeing different shapes on the same turn.
+    out = cb.to_openai(parsed, "claude-sonnet-5")
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "the answer", msg
+    assert msg["reasoning_content"] == "why more", msg
+    print("  claude stream-json: every thinking block collected on `reasoning`; "
+          "to_openai lifts it onto reasoning_content")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
