@@ -335,7 +335,13 @@ def test_fresh_tool_session_attaches_a_prompt_pdf_as_page_images():
                 assert attached == [str(p) for p in paths], (provider, argv)
                 assert [Path(p).name for p in attached] == ["page-1.png", "page-2.png"]
                 sent = stdin if stdin is not None else "\n".join(argv)
-                assert "EXTRACTED TEXT" in sent and "[2 image(s) attached" in sent, sent
+                assert "EXTRACTED TEXT" in sent, sent
+                assert "[2 attachment(s) follow this text, in order -- look at " in sent, sent
+                # The path-free note must not leak the relay dir or any
+                # staged file path (issue #296).
+                assert "swimg-" not in prompt, prompt
+                assert "swimg-" not in (stdin or ""), stdin
+                assert not any(str(p) in prompt for p in paths), prompt
             finally:
                 shutil.rmtree(img_dir, ignore_errors=True)
         print("  tool path: prompt PDF -> page PNGs on codex -i / opencode -f + text")

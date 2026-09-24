@@ -1277,9 +1277,11 @@ def test_claude_media_with_web_and_effort_compose():
 
 def test_claude_media_markers_name_no_relay_path():
     """The in-prompt placeholder for a staged block must not carry the relay
-    path on claude (the bytes are inline); codex/opencode keep the path since
-    it is the file they attach."""
+    path on any provider: claude attaches the bytes inline, codex via -i and
+    opencode via -f (issue #296). The staged dir's path is noise the model
+    could hand to one of the caller's tools."""
     import shutil
+    from _modules import FakePoppler
     saved = server.PROVIDER
     msgs = lambda: [{"role": "user", "content": [  # noqa: E731
         {"type": "text", "text": "what colour?"},
@@ -1289,9 +1291,11 @@ def test_claude_media_markers_name_no_relay_path():
             "file_data": "data:application/pdf;base64," + base64.b64encode(b"%PDF-1.4").decode()}}]}]
     dirs = []
     try:
+        # claude: a PDF stays a single document block (sent inline via
+        # claude_media_stdin). claude uses no poppler.
         server.PROVIDER = "claude"
         m = msgs()
-        d = Path(tempfile.mkdtemp(prefix="cli-marker-"))
+        d = Path(tempfile.mkdtemp(prefix="cli-marker-claude-"))
         dirs.append(d)
         paths = server.stage_images(m, d)
         texts = [b["text"] for b in m[0]["content"]]
@@ -1300,14 +1304,35 @@ def test_claude_media_markers_name_no_relay_path():
         assert [p.suffix for p in paths] == [".png", ".pdf"], paths
         assert "attachment(s) follow" in server.image_note(paths)
         assert str(d) not in server.image_note(paths)
-        server.PROVIDER = "codex"
-        m = msgs()[:1]
-        m[0]["content"] = m[0]["content"][:2]
-        d = Path(tempfile.mkdtemp(prefix="cli-marker-"))
-        dirs.append(d)
-        paths = server.stage_images(m, d)
-        assert m[0]["content"][1]["text"] == f"[image 1: {paths[0]}]", m
-        print("  markers: claude 'attached', codex keeps its -i path")
+
+        # codex and opencode: a PDF is expanded to its pages + extracted text
+        # (they can't take a PDF directly), and the page paths attach via -i /
+        # -f. The marker carries the count, never the path.
+        for provider in ("codex", "opencode"):
+            with FakePoppler():
+                server.PROVIDER = provider
+                m = msgs()
+                d = Path(tempfile.mkdtemp(prefix=f"cli-marker-{provider}-"))
+                dirs.append(d)
+                paths = server.stage_images(m, d)
+            texts = [b["text"] for b in m[0]["content"]]
+            assert texts[1] == "[image 1: attached]", (provider, texts)
+            # PDF marker names the count of attached pages but no path.
+            assert texts[2].startswith("[document 2: PDF, 2 page(s) attached as images"), \
+                (provider, texts[2])
+            assert [p.suffix for p in paths] == [".png", ".png", ".png"], (provider, paths)
+            assert "attachment(s) follow" in server.image_note(paths), provider
+            assert str(d) not in server.image_note(paths), (provider, server.image_note(paths))
+            # The whole prompt must never name the staged dir or any
+            # individual file inside it: a model that did so could pass the
+            # path to a caller Read tool (issue #296).
+            prompt = texts[0]
+            for marker in texts[1:]:
+                prompt += "\n" + marker
+            prompt += server.image_note(paths)
+            assert str(d) not in prompt, (provider, prompt)
+            assert not any(str(p) in prompt for p in paths), (provider, prompt)
+        print("  markers: every provider says 'attached', no relay path in the prompt")
     finally:
         server.PROVIDER = saved
         for d in dirs:
@@ -1363,10 +1388,14 @@ def test_pdf_prompt_keeps_the_response_format_on_codex_and_opencode():
             seen = _run_pdf_chat(provider, response_format={"type": "json_object"})
         prompt = seen["prompt"]
         assert "EXTRACTED TEXT" in prompt, prompt
-        assert prompt.index("[3 image(s) attached to this prompt:") \
+        assert prompt.index("[3 attachment(s) follow this text, in order -- look at ") \
             < prompt.index("Respond with only a single JSON object"), prompt
         assert seen["fmt"] is None, seen["fmt"]
         assert len(seen["paths"]) == 3, seen["paths"]
+        # The path-free image note must not leak the relay dir or any staged
+        # file path (issue #296).
+        assert "swimg-" not in prompt, prompt
+        assert not any(str(p) in prompt for p in seen["paths"]), prompt
     strict = {"type": "json_schema", "json_schema": {
         "name": "s", "strict": True, "schema": {
             "type": "object", "properties": {"a": {"type": "string"}},
@@ -1375,6 +1404,7 @@ def test_pdf_prompt_keeps_the_response_format_on_codex_and_opencode():
         seen = _run_pdf_chat("codex", response_format=strict)
     assert seen["fmt"] and seen["fmt"]["strict"], seen["fmt"]
     assert "EXTRACTED TEXT" in seen["prompt"] and "JSON Schema" not in seen["prompt"], seen
+    assert "swimg-" not in seen["prompt"], seen["prompt"]
     # opencode never enforces a schema itself: the strict schema rides the
     # prompt as an instruction (with the schema dump), after the image note.
     with FakePoppler():
@@ -1385,8 +1415,9 @@ def test_pdf_prompt_keeps_the_response_format_on_codex_and_opencode():
     instruction = ("Respond with only a JSON value that validates against this JSON "
                    "Schema: no prose before or after it, no code fences.\n"
                    + json.dumps(strict["json_schema"]["schema"]))
-    assert prompt.index("[3 image(s) attached to this prompt:") \
+    assert prompt.index("[3 attachment(s) follow this text, in order -- look at ") \
         < prompt.index(instruction), prompt
+    assert "swimg-" not in prompt, prompt
     print("  PDF prompt + response_format: text, page note and schema all survive")
 
 
@@ -1407,12 +1438,16 @@ def test_pdf_prompt_on_codex_and_opencode_is_text_plus_page_images():
         assert attached == [str(p) for p in paths], (provider, seen["argv"])
         assert not any(a.endswith(".pdf") for a in seen["argv"]), seen["argv"]
         prompt = seen["prompt"]
-        assert "[document 1: PDF, 2 page(s) attached as images:" in prompt, prompt
+        assert "[document 1: PDF, 2 page(s) attached as images" in prompt, prompt
         assert "extracted text follows]\nEXTRACTED TEXT" in prompt, prompt
         # the text sits where the PDF was: between the two caller texts
         assert prompt.index("summarise") < prompt.index("EXTRACTED TEXT") \
             < prompt.index("and this:") < prompt.index("[image 2:"), prompt
-        assert "[3 image(s) attached to this prompt:" in prompt, prompt
+        assert "[3 attachment(s) follow this text, in order -- look at " in prompt, prompt
+        # The path-free note must not leak the relay dir or any staged file
+        # path (issue #296).
+        assert "swimg-" not in prompt, prompt
+        assert not any(str(p) in prompt for p in paths), prompt
     print("  PDF prompt: codex -i / opencode -f get page PNGs, text inline, no 400")
 
 

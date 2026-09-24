@@ -15,6 +15,7 @@ it and makes a skip a failure (tests/_pinned_clis.py).
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -35,7 +36,7 @@ os.environ.setdefault("SIDECAR_PORT", "8081")
 
 import _fake_model  # noqa: E402
 import _pinned_clis  # noqa: E402
-from _modules import load  # noqa: E402
+from _modules import FakePoppler, load  # noqa: E402
 
 server = load("mcp_bridge_server",
               os.path.join(os.path.dirname(HERE), "sidecars", "mcp_bridge", "server.py"))
@@ -197,6 +198,204 @@ def test_codex_output_schema_reaches_the_api_as_strict_json_schema():
     finally:
         cb.PROVIDER, cb.PROFILE, cb.CLI = saved
         shutil.rmtree(root, ignore_errors=True)
+
+
+def _codex_bridge_text(body: dict) -> str:
+    """The text the bridge wrote into the codex request body, stripped of
+    the `<image name="..." path="...">` blocks codex 0.155.1 wraps each
+    `-i` arg with on the wire. The bridge does not control codex's wire
+    format; what the bridge owns is the user-text content, which the change
+    in this PR makes path-free (issue #296).
+
+    Codex 0.155.1's Responses-API wire shape puts top-level items of
+    `type: "message"` (and `additional_tools` for tools) on `body["input"]`,
+    with `input_text` blocks nested inside `item["content"]`. Descend one
+    level for message items; keep the `<image ...>` filter on each text
+    block (codex wraps each `-i` arg in its own wire-format wrapper that
+    names the staged file path -- that is codex's, not the bridge's)."""
+    items = body.get("input") if isinstance(body.get("input"), list) else []
+    parts: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        blocks = item.get("content")
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "input_text":
+                continue
+            text = block.get("text") or ""
+            if not isinstance(text, str):
+                text = json.dumps(text)
+            # Codex's own wire format around each `-i` arg is an
+            # `<image name=... path=...>` input_text block -- the bridge
+            # never emits that shape.
+            if text.lstrip().startswith("<image "):
+                continue
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _stage_for_lockdown(stage: Path, provider: str) -> tuple[str, list[Path]]:
+    """Drive the cli_bridge the way `_handle_chat` does for a media call:
+    build messages carrying the test's PNG + PDF, run stage_images (the
+    bridge writes `[image N: attached]` markers, expands the PDF via
+    poppler on codex/opencode), flatten the messages into a prompt, and
+    append image_note. The caller passes the returned prompt + paths to
+    build_argv so the request codex/opencode actually emits carries the
+    path-free markers + trailing note this PR's change is supposed to
+    deliver.
+
+    Both server.PROVIDER (mcp_bridge) and server.cli_bridge.PROVIDER
+    (cli_bridge -- stage_images / _expand_pdf read this one) are flipped
+    to `provider` so stage_images takes the right branch for the PDF
+    (expansion on codex/opencode; single document block on claude). The
+    test's `saved` tuple restores cb.PROVIDER on the way out. The caller
+    must already be inside a FakePoppler() block when this runs on
+    codex/opencode."""
+    server.PROVIDER = provider
+    server.cli_bridge.PROVIDER = provider
+    img_dir = stage / "img"
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "what is attached?"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                      "data": base64.b64encode(PNG_MAGENTA).decode()}},
+        {"type": "file", "file": {"file_data":
+            "data:application/pdf;base64," + base64.b64encode(PDF_MIN).decode()}},
+    ]}]
+    paths = server.cli_bridge.stage_images(messages, img_dir)
+    prompt, _ = server.cli_bridge.flatten(messages)
+    prompt += server.cli_bridge.image_note(paths)
+    return prompt, paths
+
+
+def test_codex_media_reach_the_model_not_relay_paths():
+    """The bridge's image and PDF markers reach the pinned codex as `-i`
+    attaches, the bridge's own prompt text is path-free (the change in
+    this PR), and the caller's tool (only) is what the model can call on
+    the tool path (issue #296).
+
+    Codex 0.155.1 wraps every `-i` arg in its own `<image name="..."
+    path="...">` block on the wire, so the request body the model API sees
+    does name the relay dir inside codex's wrapper -- but the bridge's
+    own prompt text (the chat content the bridge wrote, stripped of
+    codex's wire-format wrappers) does not. The lockdown tests assert
+    only what the bridge owns.
+
+    The bridge is driven through `stage_images` + `flatten` +
+    `image_note` (the same chain `_handle_chat` runs) so the prompt
+    really does carry the path-free `[image N: attached]` markers and
+    the `[N attachment(s) follow this text...]` trailing note this PR
+    delivers."""
+    try:
+        codex = _pinned_clis.require("codex")
+    except _pinned_clis.Skip as why:
+        print(f"  skipped: {why}")
+        return
+    cb = server.cli_bridge
+    root = Path(tempfile.mkdtemp(prefix="lockdown-codex-media-"))
+    _fake_login(root)
+    stage = root / "swimg-test" / "img"
+    stage.mkdir(parents=True)
+    (stage / "01.png").write_bytes(PNG_MAGENTA)
+    (stage / "02.pdf").write_bytes(PDF_MIN)
+    media = [stage / "01.png", stage / "02.pdf"]
+    saved = (cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE, server.PROVIDER, server.PROFILE)
+    try:
+        # Text path: the bridge hands codex `-i` per file; the prompt is the
+        # usual flattened chat + image_note (path-free since #296).
+        with FakePoppler(), _RealCodex(codex, root):
+            server.PROVIDER = "codex"
+            cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE = ("codex", cb.PROFILES["codex"], codex, True)
+            prompt, staged = _stage_for_lockdown(stage, "codex")
+            argv, _ = cb.build_argv(prompt, None, MODEL, image_paths=staged)
+            assert "-i" in argv, argv
+            attached = [argv[i + 1] for i, a in enumerate(argv) if a == "-i"]
+            assert attached == [str(p) for p in staged], argv
+            with _fake_model.FakeModel([]) as fake:
+                done = _run(argv, fake, root, root)
+        assert done.returncode == 0, done.stderr[-500:]
+        # Text path offers zero tools.
+        assert all(not _fake_model.advertised_tools(r["body"]) for r in fake.requests), \
+            [_fake_model.advertised_tools(r["body"]) for r in fake.requests]
+        # The bridge's own prompt text is path-free: the prompt +
+        # image_note reach the model with no relay dir or staged file path
+        # (codex's own `<image name=... path=...>` wrappers around each
+        # `-i` arg are filtered out -- they're codex's wire format, not the
+        # bridge's, and they are unchanged by this PR).
+        text = _codex_bridge_text(fake.requests[-1]["body"])
+        assert "what is attached?" in text, text
+        assert "attachment(s) follow this text" in text, text
+        assert "[image 1: attached]" in text, text
+        assert "[document 2: PDF," in text, text
+        assert str(stage) not in text, text
+        for p in media:
+            assert str(p) not in text, (p, text)
+
+        # Tool path: same attachment, plus the caller's MCP tool only.
+        with FakePoppler(), _RealCodex(codex, root):
+            server.PROVIDER = "codex"
+            cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE = ("codex", cb.PROFILES["codex"], codex, True)
+            prompt, staged = _stage_for_lockdown(stage, "codex")
+            server.PROFILE = dict(server.MCP_PROFILES["codex"], cli=codex)
+            workdir = root / "session"
+            workdir.mkdir()
+            tools_path = workdir / "tools.json"
+            tools_path.write_text(json.dumps([PROBE]))
+            argv, _ = server.build_argv(prompt, "CALLER SYSTEM PROMPT", MODEL,
+                                        workdir, uuid.uuid4().hex, tools_path,
+                                        "mcp__switchyard__probe", staged)
+            assert "-i" in argv, argv
+            attached = [argv[i + 1] for i, a in enumerate(argv) if a == "-i"]
+            assert attached == [str(p) for p in staged], argv
+            with _fake_model.FakeModel([{"tool": "exec_command",
+                                          "input": {"cmd": "touch /tmp/native"}}]) as fake:
+                done = _run(argv, fake, root, workdir)
+        assert done.returncode == 0, done.stderr[-500:]
+        # Caller tool only (plus the three read-only MCP-resource helpers);
+        # exec_command still refused -- the same codex_lockdown_args() argv
+        # is applied whether or not image_paths is set, so the lockdown
+        # holds with media attached too.
+        offered = set()
+        for req in fake.tool_requests():
+            offered |= set(_fake_model.advertised_tools(req["body"]))
+        assert "mcp__switchyard__probe" in offered, offered
+        assert offered - HELPERS == {"mcp__switchyard__probe"}, sorted(offered)
+        text = _fake_model.request_text(fake.requests[-1]["body"])
+        assert "unsupported call: exec_command" in text, text[-600:]
+        bridge_text = _codex_bridge_text(fake.requests[-1]["body"])
+        assert "what is attached?" in bridge_text, bridge_text
+        assert "attachment(s) follow this text" in bridge_text, bridge_text
+        assert "[image 1: attached]" in bridge_text, bridge_text
+        assert "[document 2: PDF," in bridge_text, bridge_text
+        assert str(stage) not in bridge_text, bridge_text
+        for p in media:
+            assert str(p) not in bridge_text, (p, bridge_text)
+        print(f"  codex {_pinned_clis.installed_version('codex')}: image + PDF ride -i "
+              "on both paths; bridge text path-free; caller tool only; "
+              "exec_command still refused")
+    finally:
+        cb.PROVIDER, cb.PROFILE, cb.CLI, cb.BARE, server.PROVIDER, server.PROFILE = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# 1x1 magenta PNG and a minimal one-page PDF: what the media test sends.
+PNG_MAGENTA = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c63f8cf1f7f060006000300013fe46dabe90000000049454e44ae426082")
+PDF_MIN = (b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+           b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+           b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 72 72]>>endobj\n"
+           b"trailer<</Root 1 0 R>>\n%%EOF\n")
+
+
+def _fake_login(root: Path) -> Path:
+    """Codex needs only CODEX_HOME; a tiny placeholder keeps tests fast."""
+    home = root / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    return home
 
 
 def test_codex_reasoning_event_parsed_separately_from_answer():

@@ -859,16 +859,20 @@ def _expand_pdf(pdf: Path, n: int) -> tuple[str, list[Path]]:
 
     The marker carries the extracted text in the PDF's place in the prompt;
     the pages are attached with the CLI's image flag. Nothing usable ->
-    ImageUnsupportedError, a 400, never a PDF dropped unseen."""
+    ImageUnsupportedError, a 400, never a PDF dropped unseen.
+
+    The marker names the count of attached pages but NOT their paths: every
+    CLI now attaches media through its own mechanism (-i on codex, -f on
+    opencode, inline on claude), so the path is noise the model could hand
+    to the caller's Read tool (issue #296)."""
     try:
         text, pages = render_pdf(pdf, pdf.parent / f"{pdf.stem}-pages")
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         raise ImageUnsupportedError(
             f"{PROVIDER} cannot take a PDF in the prompt, and document {n} "
             f"could not be rendered to text or page images here: {exc}") from exc
-    shown = (f"{pdf_pages_note(len(pages))} attached as images: "
-             f"{', '.join(str(p) for p in pages)}" if pages
-             else pdf_pages_note(0))
+    shown = (f"{pdf_pages_note(len(pages))} attached as images"
+             if pages else pdf_pages_note(0))
     told = "extracted text follows" if text else "no text could be extracted"
     return f"[document {n}: PDF, {shown}; {told}]\n{text}".rstrip(), pages
 
@@ -877,15 +881,19 @@ def stage_images(messages: list[dict], img_dir: Path) -> list[Path]:
     """Decode every image content block into `img_dir`, in place.
 
     Each image block is replaced with a text block carrying
-    `[image N: <path>]`, so the text collapser keeps a pointer instead of
-    nothing, and the model can be told where the bytes are. Works on user
-    messages, system, and `tool` messages alike -- the rebuild path in
-    mcp_bridge relies on the last of those. Blocks that cannot be decoded
-    raise ImageUnsupportedError rather than vanishing.
+    `[image N: attached]`, so the text collapser keeps a pointer instead of
+    nothing, and the model is told bytes are coming without naming a path.
+    Works on user messages, system, and `tool` messages alike -- the rebuild
+    path in mcp_bridge relies on the last of those. Blocks that cannot be
+    decoded raise ImageUnsupportedError rather than vanishing.
 
     On codex/opencode a PDF is expanded (_expand_pdf): its marker carries the
     extracted text and the returned paths are its page PNGs, not the PDF.
-    """
+
+    No relay path appears in the marker on any provider: every CLI attaches
+    media through its own mechanism (claude: inline via claude_media_stdin;
+    codex: -i on argv; opencode: -f on argv), and a path in front of the
+    model is something a caller's tool could Read (issue #296)."""
     staged: list[Path] = []
     blocks = 0
     for m in messages:
@@ -905,11 +913,7 @@ def stage_images(messages: list[dict], img_dir: Path) -> list[Path]:
                     continue
                 staged.append(path)
                 kind = "document" if path.suffix == ".pdf" else "image"
-                # Claude gets the bytes inline (claude_media_stdin), so its
-                # marker must not name a relay path the model could hand to
-                # one of the caller's tools.
-                where = "attached" if PROVIDER == "claude" else str(path)
-                replaced.append({"type": "text", "text": f"[{kind} {n}: {where}]"})
+                replaced.append({"type": "text", "text": f"[{kind} {n}: attached]"})
             else:
                 replaced.append(block)
         m["content"] = replaced
@@ -919,11 +923,12 @@ def stage_images(messages: list[dict], img_dir: Path) -> list[Path]:
 def image_note(paths: list[Path]) -> str:
     """The line appended to the prompt that makes the model look instead of
     guess. Without it the path markers were just decoration: the model answered
-    from its prior about what such a screenshot usually shows."""
-    if PROVIDER in ("codex", "opencode"):
-        return (f"\n\n[{len(paths)} image(s) attached to this prompt: "
-                f"{', '.join(str(p) for p in paths)}]")
-    # claude: the media ride inline in the same message (claude_media_stdin).
+    from its prior about what such a screenshot usually shows.
+
+    Wording is provider-agnostic on purpose: every CLI attaches the media
+    itself (claude inline, codex -i, opencode -f), so the prompt needs no
+    per-CLI shape and -- more importantly -- names no path the model could
+    hand to one of the caller's tools (issue #296)."""
     return (f"\n\n[{len(paths)} attachment(s) follow this text, in order -- look at "
             "them before answering; do not guess at their contents.]")
 
