@@ -12,6 +12,7 @@ from .models import Group, Model, Plan, Registry
 from .policy import CapacityPolicy
 from .slots import SlotTable
 from .usage import (
+    drain_risk,
     family_partitioned_order,
     perishable_score,
     reported_is_current,
@@ -48,6 +49,9 @@ class Pick:
     # for the implicit perishable sugar we synthesise a Group so the log line
     # stays uniform.
     picked_group: Group | None = None
+    # Set when the pick came from a member the drain rule promoted ahead of
+    # its configured position -- see `Picker._drain_first`.
+    drain_reason: str = ""
 
     @property
     def ref(self) -> str:
@@ -212,16 +216,12 @@ class Picker:
     # implicit wrap happens here, not in the parser, so flat configs parse
     # unchanged.
     #
-    # Flat `fill` lanes additionally receive a drain-urgency sort: a member
-    # whose plan expires within `drain_within_days` is promoted ahead of
-    # members on plans that are not expiring, soonest death first. The key
-    # matches `Registry.lane_members()` (see models.py:594-598), and the
-    # sort is stable, so a lane with nothing expiring keeps config order
-    # bit-for-bit. Flat `perishable` lanes are NOT re-sorted here (the
-    # implicit sugar wrap already owns the ordering via its score hash),
-    # and any body that contains an explicit group is NOT re-sorted here
-    # either -- group strategies (round_robin / weighted / perishable /
-    # lowest_utilization) own their own member ordering.
+    # Flat `fill` lanes additionally get the drain rule, applied at pick time
+    # by `_drain_first` because it reads live quota state. Flat `perishable`
+    # lanes are NOT re-sorted (the implicit sugar wrap already owns the
+    # ordering via its score hash), and any body that contains an explicit
+    # group is NOT re-sorted either -- group strategies (round_robin /
+    # weighted / perishable / lowest_utilization) own their own ordering.
     def _effective_body(self, lane: str) -> tuple[list[Any], Group | None]:
         lane_cfg = self.registry.lanes.get(lane)
         if lane_cfg is None:
@@ -242,18 +242,48 @@ class Picker:
                 gid=_group_id(lane, "perishable", _member_refs_of(nodes)),
             )
             return [implicit], implicit
-        if not has_groups and lane_cfg.strategy == "fill":
-            window = self.registry.settings.drain_within_days
-
-            def urgency(ref: str) -> tuple[int, int]:
-                model = self.registry.model(ref)
-                if model is None:
-                    return (1, 0)
-                days = self.registry.plan_of(model).days_left
-                return (0, days) if (days is not None and days <= window) else (1, 0)
-
-            nodes = sorted(nodes, key=urgency)
         return nodes, None
+
+    async def _drain_first(self, lane: str,
+                           body: list[Any]) -> tuple[list[Any], dict[str, str]]:
+        """Promote members whose plan will expire with quota left unspent.
+
+        Only a flat `fill` body is reordered (see `_effective_body`). A member
+        moves to the front only when `usage.drain_risk` says its plan dies
+        inside the quota window in force AND that window is behind its pace
+        line; promoted members go soonest-death first, and everything else
+        keeps its configured order. Returns the body and, per promoted ref,
+        the reason (for the log line and the board's chip).
+
+        `capacity()` calls this too, with the lane's flat ref list, so the
+        board lists members in the order the picker walks them. The group
+        check therefore reads the lane's parsed nodes, not `body`.
+        """
+        lane_cfg = self.registry.lanes.get(lane)
+        if (self.policy is None or lane_cfg is None
+                or lane_cfg.strategy != "fill"
+                or any(isinstance(n, Group)
+                       for n in self.registry.lane_nodes().get(lane, []))):
+            return body, {}
+        reasons: dict[str, str] = {}
+        by_plan: dict[str, str | None] = {}
+        for ref in body:
+            model = self.registry.model(ref)
+            if model is None:
+                continue
+            plan = self.registry.plan_of(model)
+            if plan.expires is None or plan.expired:
+                continue
+            if plan.key not in by_plan:
+                by_plan[plan.key] = await drain_risk(self.policy.ledger, plan)
+            if by_plan[plan.key]:
+                reasons[ref] = by_plan[plan.key]
+        if not reasons:
+            return body, {}
+        promoted = sorted(
+            (r for r in body if r in reasons),
+            key=lambda r: self.registry.plan_of(self.registry.model(r)).expires)
+        return promoted + [r for r in body if r not in reasons], reasons
 
     # -- recursive visit ---------------------------------------------------
     async def _visit(self, node: Any, ctx: _VisitCtx,
@@ -694,9 +724,11 @@ class Picker:
         # 2. Walk the body. Each node returns a Pick or None; first non-None
         #    wins. The body's own _visit methods handle per-member gates and
         #    group-internal ranking.
+        body, drain_reasons = await self._drain_first(lane, body)
         for node in body:
             pick = await self._visit(node, ctx, picked_group=implicit_group)
             if pick is not None:
+                pick.drain_reason = drain_reasons.get(pick.ref, "")
                 return pick
 
         # 3. Tail as today — flat list, same per-member gates. A tail member
@@ -885,7 +917,17 @@ class Picker:
         plan_reach: dict[str, int] = {}
         plan_total: dict[str, int] = {}
 
-        for model in self.registry.lane_members(lane):
+        # Same order the picker walks: the drain rule may promote a body
+        # member ahead of config order, and the board must show that.
+        members = self.registry.lane_members(lane)
+        body = [m for m in members if not self.registry.is_tail(lane, m.ref)]
+        by_ref = {m.ref: m for m in body}
+        drained, drain_reasons = await self._drain_first(
+            lane, [m.ref for m in body])
+        members = ([by_ref[r] for r in drained]
+                   + [m for m in members if self.registry.is_tail(lane, m.ref)])
+
+        for model in members:
             plan = self.registry.plan_of(model)
             cooled, ttl, reason = await self.slots.cooldown_state(plan.key)
             inflight = await self.slots.in_flight(plan.key)
@@ -938,6 +980,7 @@ class Picker:
                 "streak_alert": streak_alert,
                 "tail": tail,
                 "days_left": plan.days_left,
+                "drain_reason": drain_reasons.get(model.ref, ""),
                 "shares_plan_with": [m.key for m in self.registry.siblings(model)],
                 "cli_backed": plan.is_cli_backed,
             })

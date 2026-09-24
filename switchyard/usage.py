@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from redis.asyncio import Redis
 
 from .models import Plan, Quota
-from .periods import period_bounds
+from .periods import expiry_moment, period_bounds
 
 
 def _now() -> datetime:
@@ -833,6 +833,57 @@ async def window_headroom(ledger: Ledger, plan: Plan, q: Quota) -> dict:
     return {**meta, "kind": q.kind, "pct_used": _pct(consumed, limit), "limit": limit,
             "consumed": consumed, "basis": basis,
             "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
+
+
+async def drain_risk(ledger: Ledger, plan: Plan,
+                     now: datetime | None = None) -> str | None:
+    """Why an expiring plan should jump its lane order right now, or None.
+
+    An expiry date alone is not a reason: a plan with weeks left and quota
+    that resets before then loses nothing by waiting its turn, and promoting
+    it just starves the plans the operator ordered first. Two conditions,
+    judged per quota window, must both hold:
+
+      1. The plan expires before the window in force rolls over. This is its
+         last window, so whatever is left in it is lost instead of reset.
+      2. Consumption so far, extrapolated linearly to the expiry, falls short
+         of the allowance -- i.e. the window is behind its pace line. At the
+         rate normal routing is already achieving, it will not drain itself.
+
+    Usage comes from `window_headroom`, the same number the board shows. A
+    window whose usage is unknown (no allowance, no provider reading) never
+    promotes: without a number, "at risk" would be a guess. A spent window
+    has nothing left to rescue.
+    """
+    end = expiry_moment(plan.expires)
+    if end is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    for q in plan.quotas:
+        if q.kind == "unlimited":
+            continue
+        h = await window_headroom(ledger, plan, q)
+        start, rollover = period_bounds(q.period, now)
+        reset_at = h.get("reset_at")
+        if isinstance(reset_at, float) and reset_at > now.timestamp():
+            # The provider's own reset beats the calendar bucket: a weekly
+            # window that resets Thursdays is not the Monday-to-Monday week.
+            provider_rollover = datetime.fromtimestamp(reset_at, tz=timezone.utc)
+            start = provider_rollover - (rollover - start)
+            rollover = provider_rollover
+        if end > rollover:
+            continue  # the window resets before the plan dies; nothing is lost
+        pct = h.get("pct_used")
+        if pct is None or pct >= 100.0:
+            continue
+        span = (end - start).total_seconds()
+        if span <= 0:
+            continue
+        elapsed = min(1.0, max(0.0, (now - start).total_seconds() / span))
+        if pct / 100.0 < elapsed:
+            return (f"{q.label} final window {pct:.0f}% used, "
+                    f"{elapsed * 100:.0f}% elapsed")
+    return None
 
 
 def _pct(consumed: float, limit: float | None) -> float | None:

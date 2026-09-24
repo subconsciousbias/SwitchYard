@@ -220,45 +220,31 @@ def test_plan_and_model_caps_are_separate_limits():
           f"took {third.ref}")
 
 
-def test_expiring_plans_are_drained_first():
-    """Cancelled capacity is promoted ahead of plans you keep paying for.
+def test_lane_members_keeps_config_order_for_expiring_plans():
+    """An expiry date alone never reorders a lane.
 
-    The expiry is synthesised rather than read from the config: whether any
-    plan happens to be expiring is a fact about one operator's billing and one
-    day's date, and the shipped example config sets no dates at all. Building
-    one here tests the rule on any checkout, on any day.
+    `lane_members` is static config order minus dead members. Whether an
+    expiring plan should jump the queue depends on live quota state, so that
+    decision lives in the picker (`_drain_first`), not here. The expiry is
+    synthesised so the test holds on any checkout, on any day.
     """
     from dataclasses import replace
     from datetime import date, timedelta
 
     reg = models.load()
     lane = "judge"
-    members = reg.lane_members(lane)
-    # The tail is excluded: it sorts last by design whatever its expiry, so
-    # using it as the victim tests the tail rule, not the drain rule.
-    ordered = [m for m in members if not reg.is_tail(lane, m.ref)]
+    ordered = [m for m in reg.lane_members(lane) if not reg.is_tail(lane, m.ref)]
     assert len(ordered) >= 2, "need two non-tail plans to have an order at all"
 
-    # Take a plan that is NOT already first and give it a near expiry.
     victim = reg.plan_of(ordered[-1])
-    # Tomorrow, not merely "inside the window": the rule is soonest-death-first,
-    # so a victim must out-expire anything the operator's own config already
-    # has, or a real plan expiring sooner legitimately keeps the front spot and
-    # the test fails on a working system.
-    soon = date.today() + timedelta(days=1)
     plans = dict(reg.plans)
-    plans[victim.key] = replace(victim, expires=soon)
-    drained = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+    plans[victim.key] = replace(victim, expires=date.today() + timedelta(days=1))
+    expiring = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
 
-    order = [m for m in drained.lane_members(lane)
-             if not drained.is_tail(lane, m.ref)]
-    days = [drained.plan_of(m).days_left for m in order]
-    assert order[0].plan_key == victim.key, list(zip((m.ref for m in order), days, strict=True))
-    # And every plan with no end date sorts after it.
-    keeping = [i for i, d in enumerate(days) if d is None]
-    assert not keeping or min(keeping) > 0, list(zip((m.ref for m in order), days, strict=True))
-    print(f"  {victim.key} expiring in {days[0]}d jumps to the front: "
-          + " -> ".join(m.ref for m in order))
+    after = [m.ref for m in expiring.lane_members(lane)
+             if not expiring.is_tail(lane, m.ref)]
+    assert after == [m.ref for m in ordered], after
+    print(f"  {victim.key} expiring tomorrow keeps its place: " + " -> ".join(after))
 
 
 def test_models_on_one_plan_share_its_connection_limit():
@@ -5102,69 +5088,96 @@ def test_lease_on_expired_plan_is_dropped_and_replaced():
           f"sticky={first_sticky}; fresh session also -> {second_ref}")
 
 
-def test_plan_within_drain_window_tried_first_in_flat_lane():
-    """Flat `fill` lanes promote a soonest-death-first member to the front
-    of the order via the urgency sort in `_effective_body`. With nothing
-    expiring, the sort is stable so config order is preserved bit-for-bit.
-    """
+def _drain_case(expires_in_days: int, reset_in_hours: float | None,
+                pct_used: float | None, board: bool = False):
+    """One pick on a flat fill lane [openai/sol, claude-max/opus], where
+    claude-max expires `expires_in_days` from today and its weekly window
+    resets `reset_in_hours` from now with `pct_used` reported. Returns the
+    picked ref and its drain reason -- or, with `board`, the capacity board's
+    body rows as (ref, drain_reason) in display order."""
     from dataclasses import replace
     from datetime import date, timedelta
+
+    from switchyard.policy import CapacityPolicy
 
     reg = models.load()
     redis = FakeRedis()
     slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
-    from switchyard.policy import CapacityPolicy
-    policy = CapacityPolicy(redis, reg.settings, Ledger(redis))
-
-    # Two distinct plans; B's plan expires tomorrow (well inside the
-    # default 21-day drain window). Without the sort, A leads; with the
-    # sort, B jumps ahead.
+    ledger = Ledger(redis)
+    policy = CapacityPolicy(redis, reg.settings, ledger)
     plans = dict(reg.plans)
     plans["claude-max"] = replace(
-        plans["claude-max"],
-        expires=date.today() + timedelta(days=1))
-    soon = models.Registry(
-        settings=reg.settings, plans=plans, lanes=reg.lanes)
-    soon_lane = _build_lane(soon, slots,
-                            key="drain-soon",
-                            order=["claude-max/opus", "openai/sol"],
-                            tail=[], strategy="fill")
-    soon_picker = Picker(soon_lane, slots, policy)
-
-    # Stability leg: same lane shape, neither plan expires. The sort key
-    # has no (0, days) elements, so every entry lands at (1, 0) and the
-    # stable sort keeps config order verbatim.
-    none = models.Registry(settings=reg.settings, plans=reg.plans,
-                           lanes=reg.lanes)
-    none_lane = _build_lane(none, slots,
-                            key="drain-stable",
-                            order=["claude-max/opus", "openai/sol"],
-                            tail=[], strategy="fill")
-    none_picker = Picker(none_lane, slots, policy)
+        plans["claude-max"], expires=date.today() + timedelta(days=expires_in_days))
+    base = models.Registry(settings=reg.settings, plans=plans, lanes=reg.lanes)
+    lane_reg = _build_lane(base, slots, key="drain-lane",
+                           order=["openai/sol", "claude-max/opus"],
+                           tail=[], strategy="fill")
+    picker = Picker(lane_reg, slots, policy)
 
     async def go():
-        first = await soon_picker.pick("drain-soon", None)
-        await soon_picker.release(
-            first.plan.key, first.request_id, first.ref)
-        first_stable = await none_picker.pick("drain-stable", None)
-        await none_picker.release(
-            first_stable.plan.key, first_stable.request_id, first_stable.ref)
-        # Stability: every ref collapses to (1, 0) when no expiry, so the
-        # stable sort must preserve config order verbatim. Inspected
-        # directly on `_effective_body` (the picker never reaches the
-        # second member on a fresh session here because cap=1 on the
-        # first member suffices; the body order is the property the test
-        # pins).
-        stable_body = none_picker._effective_body("drain-stable")[0]
-        return first.ref, first_stable.ref, stable_body
+        if pct_used is not None:
+            await ledger.note_reported_percent(
+                "claude-max", pct_used,
+                time.time() + reset_in_hours * 3600 if reset_in_hours else None,
+                window="weekly")
+        if board:
+            cap = await picker.capacity("drain-lane")
+            return [(r["ref"], r["drain_reason"]) for r in cap["plans"]
+                    if not r["tail"]]
+        pick = await picker.pick("drain-lane", None)
+        await picker.release(pick.plan.key, pick.request_id, pick.ref)
+        return pick.ref, pick.drain_reason
 
-    drain_ref, stable_a, stable_body = run(go())
-    assert drain_ref == "claude-max/opus", drain_ref
-    assert stable_a == "claude-max/opus", stable_a
-    assert stable_body == ["claude-max/opus", "openai/sol"], stable_body
-    print(f"  drain window: B (claude-max, 1d left) jumped ahead of "
-          f"openai/sol; stable sort preserved config order: "
-          f"{stable_body}")
+    return run(go())
+
+
+def test_expiry_outside_current_window_keeps_config_order():
+    """The weekly window resets in a day; the plan lives for three more.
+    Whatever is left this week resets rather than being lost, so however far
+    behind pace it is, the plan waits its turn."""
+    ref, why = _drain_case(expires_in_days=3, reset_in_hours=24, pct_used=0.0)
+    assert ref == "openai/sol" and not why, (ref, why)
+    print(f"  expiry after the weekly reset: {ref} (config order)")
+
+
+def test_expiry_inside_window_and_behind_pace_is_promoted():
+    """Expiry falls before the weekly reset, so this is the last window; the
+    window started ~5 days ago and is only 10% used, far behind the ~75%
+    elapsed. Left in config order it would expire with quota unspent."""
+    ref, why = _drain_case(expires_in_days=1, reset_in_hours=72, pct_used=10.0)
+    assert ref == "claude-max/opus", (ref, why)
+    assert why.startswith("weekly final window 10% used"), why
+    print(f"  last window, behind pace: {ref} drain=({why})")
+
+
+def test_expiry_inside_window_but_on_pace_keeps_config_order():
+    """Same last window, but 95% used: normal routing is already draining it,
+    so promoting it would only starve the plans ordered first."""
+    ref, why = _drain_case(expires_in_days=1, reset_in_hours=72, pct_used=95.0)
+    assert ref == "openai/sol" and not why, (ref, why)
+    print(f"  last window, on pace: {ref} (config order)")
+
+
+def test_capacity_board_lists_drain_promoted_member_first():
+    """Portal parity: the board lists lane members in the order the picker
+    walks them, so a promoted member is shown first with its reason, and an
+    unpromoted lane is shown in config order with no reason."""
+    rows = _drain_case(expires_in_days=1, reset_in_hours=72, pct_used=10.0,
+                       board=True)
+    assert [r for r, _ in rows] == ["claude-max/opus", "openai/sol"], rows
+    assert rows[0][1].startswith("weekly final window") and not rows[1][1], rows
+    rows = _drain_case(expires_in_days=1, reset_in_hours=72, pct_used=95.0,
+                       board=True)
+    assert rows == [("openai/sol", ""), ("claude-max/opus", "")], rows
+    print("  board order matches pick order, promoted row carries its reason")
+
+
+def test_expiry_with_unknown_usage_keeps_config_order():
+    """No provider reading and no allowance: the window's usage is unknown,
+    and an unknown is not evidence of risk."""
+    ref, why = _drain_case(expires_in_days=1, reset_in_hours=None, pct_used=None)
+    assert ref == "openai/sol" and not why, (ref, why)
+    print(f"  usage unknown: {ref} (config order)")
 
 
 def test_disabled_plan_with_enabled_model_never_picked():

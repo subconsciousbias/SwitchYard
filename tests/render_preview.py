@@ -84,6 +84,10 @@ def fixture(reg):
                 "draining": i == 1,
                 "drain_ttl": 720 if i == 1 else 0,
                 "tail": reg.is_tail(key, model.ref), "days_left": plan.days_left,
+                # Drain-rule promotion chip on row 4, a row with no other
+                # gate lit, so the preview shows it rendering on its own.
+                "drain_reason": ("weekly final window 10% used, 75% elapsed"
+                                 if i == 4 else ""),
                 "shares_plan_with": [m.key for m in reg.siblings(model)],
                 "cli_backed": plan.is_cli_backed,
                 "quota": {"pct_used": 100 if i == 1 else 4, "window": "weekly"},

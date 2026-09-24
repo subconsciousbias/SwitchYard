@@ -60,7 +60,7 @@
 
 <footer>
   Sessions stick to a provider for {{ settings.lease_ttl_seconds // 60 }} min of inactivity ·
-  plans expiring within {{ settings.drain_within_days }} days are promoted to the front of their lane ·
+  a plan that expires inside its current quota window and is behind pace is promoted to the front of its lane ·
   quota exhaustion removes a plan's slots for {{ settings.default_cooldown_seconds // 60 }} min unless the
   provider tells us its reset time.
 </footer>

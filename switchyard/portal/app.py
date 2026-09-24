@@ -27,6 +27,7 @@ from ..slots import SlotTable
 from ..periods import windows_remaining
 from ..usage import (
     Ledger,
+    drain_risk,
     family_partitioned_order,
     headroom,
     model_effective_cost_per_mtok,
@@ -865,8 +866,14 @@ async def collect_plans() -> list[dict]:
             alerting.append(f"{hr['pct_used']:.0f}% of quota used")
         if plan.alert_burn_rate_per_hour and burn["cost_per_hour"] >= plan.alert_burn_rate_per_hour:
             alerting.append(f"burning ${burn['cost_per_hour']:.2f}/hr")
-        if plan.days_left is not None and 0 <= plan.days_left <= 21:
-            alerting.append(f"expires in {plan.days_left}d — drain it")
+        if (plan.days_left is not None
+                and 0 <= plan.days_left <= reg.settings.drain_within_days):
+            # "drain it" only when the picker's drain rule would act: the
+            # plan dies inside its current window with that window behind
+            # pace. Otherwise an upcoming expiry is just a date to know.
+            risk = await drain_risk(ledger, plan)
+            alerting.append(f"expires in {plan.days_left}d — drain it ({risk})"
+                            if risk else f"expires in {plan.days_left}d")
         if cooled and reason == "quota_exhausted":
             alerting.append("out of quota")
         if cooled and reason == "auth":

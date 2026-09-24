@@ -15,7 +15,9 @@
         where the smoke.py grep `tail disabled (pacing)` matches.
      5. otherwise: in_flight / cap + a possible `cap_reason` chip if the
         cap diverged from cap_configured for an external reason (spend,
-        learning), plus a days_left tag if the plan expires soon.
+        learning), plus a days_left tag if the plan expires soon, and a
+        `drain` tag when the drain rule has promoted this row to the front
+        of its lane (its last quota window is behind pace).
 
    Each tag span is wrapped in a div so multiple chips stack vertically
    instead of fighting for horizontal space in this last column (same
@@ -60,5 +62,8 @@
   {% endif %}
   {% if p.days_left is not none and p.days_left <= 21 %}
     <div style="margin-bottom:3px"><span class="tag warn">{{ p.days_left }}d left</span></div>
+  {% endif %}
+  {% if p.drain_reason|default("") %}
+    <div style="margin-bottom:3px"><span class="tag warn" title="{{ p.drain_reason }}">drain first</span></div>
   {% endif %}
 {% endif %}

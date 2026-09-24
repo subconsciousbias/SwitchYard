@@ -434,11 +434,11 @@ curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
     "max_tokens":200}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
 ```
 
-**Expect:** a working function. **Expect in the log:**
-`lane=forge -> opencode-go` **or** `-> grok` — *not* `minimax-ultra`. That is the
-drain rule working: expiring plans go first. If you skipped OpenCode Go's
-credentials, expect `opencode-go(cooled)` in the skipped list and the pick
-falling to `grok`.
+**Expect:** a working function. **Expect in the log:** a `lane=forge -> ...`
+line naming the first member of the lane's order that has room. Expiry does not reorder this
+lane: its body is groups, which own their order, and even in a flat `fill`
+lane an expiring plan is only promoted when it is in its last quota window
+and behind pace — the log line then carries `drain=(...)` saying why.
 
 #### Oversized prompt regression (issue #29)
 
@@ -472,9 +472,10 @@ curl -s $GW/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
     "max_tokens":150}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'
 ```
 
-**Expect:** a considered answer. **Expect in the log:** `lane=judge -> openai`
-(the seat expires 2026-10-04, so it drains first), falling back to `grok` then
-`claude-max`.
+**Expect:** a considered answer. **Expect in the log:** `lane=judge -> claude-max`,
+falling back to `openai` then `glm` in config order. An expiring member only
+jumps ahead when it is in its last quota window and behind pace, and the line
+then ends with `drain=(...)` naming the window.
 
 ### 4e. `apex` — escalation
 

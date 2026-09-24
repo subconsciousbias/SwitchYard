@@ -372,16 +372,25 @@ long the final one is.
 
 ## Expiring plans get drained first
 
-Give a plan an `expires:` date and it is automatically promoted ahead of plans
-you keep paying for once it is inside `drain_within_days` (21), **soonest death
-first**, so the capacity with the least time left is drained first. Cancelled
-capacity gets used up instead of quietly rotting, and it drops out of every lane
-by itself on the expiry date. No config edit, no restart.
+Give a plan an `expires:` date and it drops out of every lane by itself on that
+date. Before then it keeps its configured place in the lane — an expiry date
+alone is not a reason to jump the queue, because quota that resets before the
+plan dies loses nothing by waiting its turn.
 
-With the example config, a `forge` lane whose plans expire in 7, 19 and 23 days
-runs the 7-day plan first, then the 19-day one, then the plans with no end date,
-and the 23-day plan promotes itself to the front once it comes inside the
-21-day window — without a config edit.
+A `fill` lane promotes an expiring plan ahead of its configured order only when
+**both** hold for one of its quota windows (5h, weekly, monthly, …):
+
+1. the plan expires before that window rolls over — it is the last window, so
+   whatever is left in it is lost rather than reset; and
+2. the window is behind its pace line — the share used is less than the share
+   of time elapsed between the window's start and the expiry, so at the rate
+   normal routing is already achieving it will not drain by itself.
+
+Promoted plans go **soonest death first**; everything else keeps config order.
+A window whose usage is unknown never promotes. The log line says why:
+`lane=judge -> opencode-go/glm-5.3-flash [...] drain=(weekly final window 20% used, 64% elapsed)`.
+`drain_within_days` (21) now only sets when the board starts flagging an
+upcoming expiry.
 
 ## The portal (`:4001`)
 

@@ -582,11 +582,13 @@ class Registry:
     def lane_members(self, lane_key: str) -> list[Model]:
         """Effective routing order for a lane.
 
-        Two rules on top of the configured order: dead members drop out (plan
-        disabled or expired, or the model disabled), and a member whose plan
-        expires within `drain_within_days` is promoted ahead of members on plans
-        that are not expiring, soonest death first, so cancelled capacity gets
-        used before it vanishes. Tail members always stay last.
+        The configured order with dead members dropped (plan disabled or
+        expired, or the model disabled). Tail members always stay last.
+
+        Expiry does NOT reorder anything here. Whether a cancelled plan should
+        jump the queue depends on live quota state -- is it in its last window,
+        and is that window behind pace? -- so the drain rule lives in the
+        picker (`Picker._drain_first`), which can read the ledger.
 
         Group structure is collapsed before filtering: a `{round_robin: [a,
         b]}` and the flat `[a, b]` produce the same effective ordering, and a
@@ -594,7 +596,6 @@ class Registry:
         weighting is the picker's job, not the body's.
         """
         refs = self.routing_order(lane_key)
-        window = self.settings.drain_within_days
 
         def live(ref_list: list[str]) -> list[Model]:
             out: list[Model] = []
@@ -607,14 +608,7 @@ class Registry:
                     out.append(model)
             return out
 
-        body = live(refs)
-
-        def urgency(model: Model) -> tuple[int, int]:
-            days = self.plans[model.plan_key].days_left
-            return (0, days) if (days is not None and days <= window) else (1, 0)
-
-        body.sort(key=urgency)
-        return body + live(self.lanes[lane_key].tail)
+        return live(refs) + live(self.lanes[lane_key].tail)
 
     def is_tail(self, lane_key: str, ref: str) -> bool:
         return ref in self.lanes[lane_key].tail

@@ -464,11 +464,12 @@ class SwitchyardHandler(CustomLogger):
         if pick.plan.is_cli_backed:
             carry_to_cli_sidecar(data, meta[META_KEY].get("caller_env"))
         log.info(
-            "lane=%s -> %s [%s]%s%s%s%s",
+            "lane=%s -> %s [%s]%s%s%s%s%s",
             lane, pick.model.ref, _reason_with_group(pick),
             " tools" if needs_tools else "",
             " images" if needs_images else "",
             " (sticky)" if pick.sticky else "",
+            f" drain=({pick.drain_reason})" if pick.drain_reason else "",
             f" skipped={','.join(pick.considered)}" if pick.considered else "",
         )
 
