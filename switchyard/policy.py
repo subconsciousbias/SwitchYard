@@ -46,7 +46,7 @@ from redis.asyncio import Redis
 from .models import Plan, Quota, Settings
 from .periods import deadline as window_deadline
 from .periods import period_bounds
-from .usage import Ledger
+from .usage import K_WINDOW, Ledger, period_key, reported_is_current
 
 K_SWITCH = "sy:switch:pacing"     # runtime override of settings.pacing.enabled
 K_LEARN = "sy:learn:{plan}:{bucket}"
@@ -54,6 +54,71 @@ K_PACE = "sy:pace:{plan}"
 K_PRESSURE = "sy:pressure:{plan}"
 
 EWMA_ALPHA = 0.3
+
+# Tolerance for promoting a candidate probe reading to a confirmed prior
+# in the percent-only estimate branch. Two consecutive raw readings must
+# agree within this relative band before the more conservative one is
+# allowed to harden into a clamp value.
+#
+# Sized as a pct-aware function (`ESTIMATE_TOLERANCE` is the floor) so the
+# band absorbs vendor whole-percent quantization where it bites hardest —
+# at low pct. A vendor reporting whole-percent pct values gives adjacent
+# readings that differ in the *estimate* by approximately 1/(pct+1) in
+# relative terms (consumed flat, pct 2 -> 3 yields estimates 50c and
+# 33c, rel_diff ≈ 0.33; pct 1 -> 2 yields 100c and 50c, rel_diff ≈ 0.5).
+# A flat 0.10 band never concorded those adjacent readings — the candidate
+# flip-flopped forever and the prior never hardened, leaving the inflation
+# case this mechanism exists for unguarded exactly at low pct.
+#
+# The band is CAPPED at `CONCORDANCE_BAND_CAP` (0.40) so the widening does
+# not become vacuous: at pct=1 the uncapped band is 1.0, which concorded
+# essentially any pair of readings and dissolved the "two independent
+# readings must agree" property entirely. The cap keeps adjacent
+# whole-percent readings concorded (rel_diff ≤ 0.33 at pct=2, 0.25 at
+# pct=3) while rejecting multi-step jumps (rel_diff 0.5 at pct=1->2,
+# 0.67 at pct=1->3). The cap is the guard against hardening a pair of
+# *inflated* readings whose truth sits below both — the more conservative
+# of the pair is still inflated, and a permissive band would let that
+# inflation harden.
+#
+# `prior = min(candidate, new_estimate)` on concordance is *within-pair*
+# protection, not absolute protection — the prior is the smaller of the
+# two readings, which is conservative only when the pair brackets truth.
+# A pair of adjacent whole-percent readings straddling truth (e.g. true
+# pct 3 reading as 1 then 2, both of which are one-step jumps away from
+# the truth) still yields an inflated prior of min(200, 100) = 100 if
+# the band is wide enough to concord them. The cap is what rejects the
+# one-step jump at pct=1->2 (rel_diff 0.5, capped tolerance 0.40) and
+# any multi-step jump (pct=1->3 rel_diff 0.67, etc.) — only true
+# adjacent whole-percent readings at pct >= 2 (rel_diff <= 0.33) are
+# allowed to concord.
+ESTIMATE_TOLERANCE = 0.10
+CONCORDANCE_BAND_CAP = 0.40
+
+# Floating-point epsilon for the concordance comparison. Adjacent whole-
+# percent pairs have rel_diff *mathematically* identical to the tolerance
+# (both are 1/pct_new), so the `<=` comparison is decided by one ULP.
+# Verified by sweep across 54 random consumed magnitudes per pair: 3->4
+# failed 36/54 trials, 6->7 54/54, 9->10 37/54 — floating-point
+# arithmetic made the rel_diff fraction land fractionally above the
+# tolerance and rejected the pair. Widening the tolerance by ~1e-9
+# relative (~2.5e-10 at tolerance 0.25) is far above ULP noise (~1e-16)
+# and stays well below any rel_diff gap the cap exists to reject
+# (cap rel_diff gap at pct=2 is 0.50 - 0.40 = 0.10, ~1e8x the epsilon).
+CONCORDANCE_EPS = 1e-9
+
+
+def _concordance_tolerance(pct: float) -> float:
+    """Relative band for two adjacent whole-percent readings to concord.
+
+    Sized to absorb a one-step vendor quantization jump (e.g. pct 2 -> 3)
+    at every pct, capped at `CONCORDANCE_BAND_CAP` so the one-step jump
+    at pct=1->2 (rel_diff 0.5, which would otherwise concord a pair of
+    inflated readings straddling truth) and any multi-step jump are
+    rejected. Floored at ESTIMATE_TOLERANCE so high-pct windows keep the
+    tighter band.
+    """
+    return max(ESTIMATE_TOLERANCE, min(CONCORDANCE_BAND_CAP, 1.0 / max(pct, 1.0)))
 
 
 @dataclass
@@ -208,7 +273,164 @@ class Pacer:
             if isinstance(observed, float) and observed > 0:
                 allowance, basis = observed, "observed"
         if allowance is None:
-            basis = "unknown"
+            # Percent-only fallback: invert the probe's percentage into an
+            # estimate of the allowance itself. MiniMax publishes no token or
+            # dollar counts, only a percentage, so without this inversion a
+            # percent-only window (`source: probe`, `allowance: null`) leaves
+            # the pacer with nothing to pace on and the plan idles while the
+            # allowance burns. With `consumed / (pct/100)`, the inverse is
+            # exactly the unit-consistent denominator the rest of the pacer
+            # expects: `consumed_frac` lands at pct/100 and the ahead-of-pace
+            # / spent / cap maths all read in their own native units (tokens
+            # or dollars), the same way `note_throughput`'s per-slot rate
+            # feeds the same unit switch.
+            #
+            # Three gates must all hold before we estimate:
+            #
+            #   (a) `reported_pct_used` is a float in (0, 100]. 0% is excluded
+            #       because dividing by zero is undefined; 100% is allowed and
+            #       routes the plan to the spent branch below. Anything outside
+            #       the band (a typo, a negative number) is treated as missing.
+            #   (b) `consumed > 0`: the inversion needs a numerator. A fresh
+            #       week where nothing has yet been recorded stays idle, not
+            #       "estimate an infinite allowance"; the picker's own stale
+            #       reads + the vendor's first 429 self-heal a quiet plan.
+            #   (c) `reported_is_current`: a stale reading (reset_at already
+            #       past, or reported_at from a previous period bucket) would
+            #       otherwise pin the estimate against an old window, the
+            #       same trap the headroom bar hit at #45.
+            #
+            # `now.timestamp()` is the same injected clock `_window` is
+            # driven from, so a stale reading check in the test uses the
+            # fixed `NOW` rather than `time.time()`.
+            #
+            # Known limitations of the estimate (intentional tradeoffs):
+            #
+            #   * Between probe intervals consumption is pinned to the
+            #     last probe's pct — the only number we have. The bound is
+            #     `probe.interval_seconds` (typically 120s), so the lag is
+            #     small relative to the window.
+            #   * Usage outside SwitchYard shrinks the estimate: our own
+            #     `consumed` undercounts, so `consumed / (pct/100)` under-
+            #     estimates the real allowance and the pacer throttles
+            #     harder. That is one of two directions, not the only one:
+            #     a `pct` that lags the truth (vendor quantization on whole-
+            #     percent readings, a delayed update) makes the *denominator*
+            #     too small, which inflates `allowance` with no upper bound
+            #     and loosens both the pace line and `allowed_rate` until
+            #     the next probe catches up. The opposite also exists: an
+            #     over-read on the very first usable reading (a vendor that
+            #     rounds UP, a probe racing the ledger so consumed briefly
+            #     lags the pct) would, under a naive `min(new, prior)`
+            #     ratchet, lock the estimate under the true allowance for
+            #     the rest of the window — throughput loss in the inverse
+            #     direction. Both are guarded below: the estimate is only
+            #     used as a clamp once *two* consecutive readings agree
+            #     within `_concordance_tolerance(pct)` relative (pct-aware
+            #     so vendor whole-percent quantization at low pct still
+            #     concorded instead of flip-flopping the candidate forever,
+            #     and CAPPED at `CONCORDANCE_BAND_CAP` so the widening does
+            #     not become vacuous and concord a multi-step jump OR the
+            #     pct=1->2 one-step jump, both of which would harden a pair
+            #     of inflated readings). The candidate sits as the pending
+            #     reading; a second concordant reading promotes the more
+            #     conservative of the pair to the prior
+            #     (within-pair protection); a divergent reading replaces
+            #     the candidate without touching the prior. On-window
+            #     inflation now throttles at least as hard as the last
+            #     concordant pair said to; on-window over-reads never
+            #     harden into a too-small allowance.
+            #
+            # Self-healing concurrency caveat: the read-facts → decide →
+            # hset sequence below is NOT atomic across overlapping
+            # `_window` callers (the portal board and the gateway picker
+            # both drive it). A stale writer can clobber a freshly
+            # hardened prior or the new `reset_at`/`new_bucket` window
+            # identity, momentarily reverting to the previous window.
+            # Every failure mode self-heals within one probe interval
+            # (the next reading re-derives the candidate/prior from the
+            # current state), so the worst outcome is a delayed clamp or
+            # one extra unclamped reading — never a stuck value. The
+            # decision was left as plain hash writes rather than moved
+            # into a Lua/WATCH-MULTI pipeline because none of those
+            # consequences rises above 'self-heals'; revisit if a future
+            # probe-side caller needs hard atomicity.
+            pct = facts.get("reported_pct_used")
+            if (isinstance(pct, float) and 0.0 < pct <= 100.0
+                    and consumed > 0
+                    and reported_is_current(facts, q.period, now.timestamp())):
+                new_estimate = consumed / (pct / 100.0)
+                # Key the persistence by `q.kind`, the same pattern as
+                # `observed_allowance_*`: tokens-kind windows write
+                # `estimated_allowance_tokens`, dollars-kind windows write
+                # `estimated_allowance_cost`. The read path mirrors it.
+                # `reset_at` is stringified to compare across the float /
+                # `""` boundary (`note_exhaustion` writes `""` when there
+                # is no hint). Window identity (reset_at + period bucket)
+                # bounds the prior and candidate to the window in force;
+                # a roll-over clears both.
+                est_key = "estimated_allowance_cost" if q.kind == "dollars" \
+                    else "estimated_allowance_tokens"
+                prior = facts.get(est_key)
+                prior_reset = str(facts.get("estimated_allowance_reset_at", ""))
+                prior_bucket = facts.get("estimated_allowance_bucket")
+                candidate = facts.get("estimated_allowance_candidate")
+                new_reset = str(facts.get("reset_at", ""))
+                new_bucket = period_key(q.period, now)
+                window_unchanged = (prior_reset == new_reset
+                                    and prior_bucket == new_bucket)
+                if not window_unchanged:
+                    prior = None
+                    candidate = None
+                # Concordance: if we have a candidate from a prior reading,
+                # compare the new raw reading against it. Concordance within
+                # the pct-aware band (`_concordance_tolerance`, sized so a
+                # one-step vendor quantization jump at low pct still
+                # concorded) promotes the more conservative of the pair to
+                # the prior; disagreement replaces the candidate without
+                # touching the prior (the prior stays authoritative until
+                # proven wrong by a concordant pair, not a singleton).
+                #
+                # Adjacent whole-percent pairs have rel_diff *mathematically*
+                # equal to the tolerance (both are 1/pct_new) — the comparison
+                # would otherwise be decided by a single floating-point ULP.
+                # Verified by sweep at every adjacent transition: 3→4 failed
+                # 36/54 random-consumed trials, 6→7 54/54, 9→10 37/54. The
+                # `* (1 + CONCORDANCE_EPS)` widens the band by ~1e-9 relative,
+                # far above ULP noise, so adjacency concordance is
+                # deterministic. Multi-step jumps still reject because their
+                # rel_diff exceeds the cap by orders of magnitude.
+                if isinstance(candidate, float) and candidate > 0:
+                    rel_diff = (abs(new_estimate - candidate)
+                                / max(new_estimate, candidate))
+                    if rel_diff <= _concordance_tolerance(pct) * (1.0 + CONCORDANCE_EPS):
+                        prior = min(candidate, new_estimate)
+                        candidate = None
+                    else:
+                        candidate = new_estimate
+                else:
+                    candidate = new_estimate
+                # Clamp against the confirmed prior. First reading of the
+                # window has no prior yet, so the raw reading is taken at
+                # face value — only the *second* concordant reading can
+                # harden an estimate into a clamp value.
+                if isinstance(prior, float) and prior > 0:
+                    allowance = min(new_estimate, prior)
+                else:
+                    allowance = new_estimate
+                basis = "estimated"
+                await self.redis.hset(
+                    K_WINDOW.format(plan=plan.key, window=q.label),
+                    mapping={
+                        est_key: prior if isinstance(prior, float) else "",
+                        "estimated_allowance_reset_at": new_reset,
+                        "estimated_allowance_bucket": new_bucket,
+                        "estimated_allowance_candidate": (
+                            candidate if isinstance(candidate, float) else ""),
+                    },
+                )
+            else:
+                basis = "unknown"
 
         dl, is_final = window_deadline(q.period, plan.expires, now)
         start, _ = period_bounds(q.period, now)

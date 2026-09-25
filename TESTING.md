@@ -829,12 +829,39 @@ curl -s -X POST "$PORTAL/admin/pacing?enabled=on" | python3 -m json.tool
 **Expect:** `{"pacing": true, ...}`, the portal banner switching to "Pacing mode
 on", and the tail (`local-box/qwen`) vanishing from the `forge` board.
 
-**Important caveat:** with `allowance: null` on every plan, pacing has nothing to
-aim at and will report *"pacing idle: no allowance known"* per plan, leaving caps
-alone. That is correct behaviour, not a bug. To see pacing actually bite, put a
-real number on one window — e.g. under `minimax-ultra`'s `monthly` window set
-`allowance: 200000000` — then `curl -X POST $PORTAL/admin/reload` and watch the
-Pacing column. Turn it back off with `?enabled=off` when you are done.
+**Important caveat:** pacing idles only when there is no fresh probe reading to
+work from. Plans whose probe publishes a percentage (`reported_pct_used`, the
+shape `minimax-ultra`, `minimax-max`, `glm`, `claude-max` and `openai` all have)
+pace on an estimate the pacer derives from the probe itself: `allowance =
+consumed / (pct / 100)`, basis `estimated`. The estimate feeds every downstream
+calculation the same way a configured allowance does — `consumed_frac` lands at
+the probe's own pct, the ahead-of-pace / spent / cap maths all read in the
+window's own unit — so a percent-only window paces the same way, refreshed at
+every probe interval (between probes, `consumed_frac` is pinned to the last
+probe's pct, since that is the only number we have). Two consecutive probe
+readings must agree within a pct-aware band (10% relative at high pct,
+widening to 1/pct relative at low pct, capped at 40% relative so a multi-
+step pct jump — which would harden a pair of inflated readings — cannot
+concord) before the estimate is allowed to harden into a clamp value (a
+"candidate" sits between them); a single divergent reading is held as the
+pending candidate without touching the prior. The result protects in both
+directions: a lagging or quantized probe cannot inflate the estimate past
+what the previous concordant pair said, AND a single early over-read cannot
+pin a too-small allowance for the rest of the window — only a concordant
+pair can harden an estimate into a prior. The cap is what bounds the
+inflation-protection at low pct: without it the band would dissolve at
+pct=1 (where 1/pct=1.0 concorded essentially any pair), and a vendor that
+stably under-reported at very low pct would harden an inflated prior for
+the rest of the window. A
+window roll-over (`reset_at` change or a new period bucket) clears both
+candidate and prior so the fresh probe is taken at face value. The plan
+still idles when the freshness gate says it should: no probe facts at all,
+a `reported_at` from a previous period bucket, a `reset_at` already in the
+past, or zero of our own consumption to invert. To see pacing bite on a plan
+with no probe and no stated allowance, set one explicitly — e.g. under
+`minimax-ultra`'s `monthly` window set `allowance: 200000000` — then
+`curl -X POST $PORTAL/admin/reload` and watch the Pacing column. Turn it
+back off with `?enabled=off` when you are done.
 
 ---
 
