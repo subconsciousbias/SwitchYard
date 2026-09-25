@@ -282,14 +282,36 @@ return 1
 # SADD, SET, EXPIRE — no window where SET exists without TTL, and no
 # caller can observe the membership without the TTL bound to it.
 #
+# Cross-plan hygiene: read the old lease value FIRST, parse its plan prefix
+# the same way `_TOUCH_LEASE` / `_DROP_LEASE` do, and SREM the session from
+# the OLD plan's reverse-index SET when the new ref's plan prefix differs.
+# Without this SREM, a session that gets re-leased onto a different plan
+# (drain migration re-pick, picker body-walk swapping lanes, hooks
+# re-leasing after a hard rejection) would leave its old plan's SET
+# holding a phantom member — the drain migrator walks `sessions_on_plan`
+# to find what to migrate, so a phantom on the old plan would be re-picked
+# forever while the session's real lease is on a different ref. A
+# same-plan re-set is idempotent: the SREM is gated on `oldplan ~= newplan`,
+# so a same-plan re-set never touches the wrong SET, and the SADD returns
+# 0 on an already-present member (the membership is unchanged).
+#
 # KEYS[1] lease key
 # KEYS[2] reverse-index key (sy:lease_plan:{plan})
-# ARGV[1] session id (for SADD)
-# ARGV[2] ref string (the value the lease holds)
+# ARGV[1] session id (for SADD / SREM)
+# ARGV[2] ref string (the value the lease holds; also source of new plan)
 # ARGV[3] ttl (lease seconds and SET EXPIRE seconds)
 # -> SADD count (newly added; 1 if first, 0 if already a member)
 _SET_LEASE = """
 -- SET_LEASE
+local v = redis.call('GET', KEYS[1])
+local oldplan
+if v then
+  oldplan = string.match(v, '^([^/]+)/')
+end
+local newplan = string.match(ARGV[2], '^([^/]+)/')
+if oldplan and newplan and oldplan ~= newplan then
+  redis.call('SREM', 'sy:lease_plan:' .. oldplan, ARGV[1])
+end
 local added = redis.call('SADD', KEYS[2], ARGV[1])
 redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
 redis.call('EXPIRE', KEYS[2], ARGV[3])
@@ -557,6 +579,22 @@ class SlotTable:
         """
         raw = await self.redis.smembers(K_LEASE_PLAN.format(plan=plan))
         return [m.decode() if isinstance(m, bytes) else m for m in raw]
+
+    async def forget_sessions_on_plan(self, plan: str,
+                                      session_ids: list[str]) -> int:
+        """SREM a list of session ids from the per-plan reverse-index SET.
+
+        Used by `switchyard/drain.py` to clean up SET members that no longer
+        have a live lease pointing at this plan (TTL fired on the lease key
+        without the matching SET entry being collected yet, or a parallel
+        turn re-leased the session onto a different plan and the SET entry
+        was carried over by an interleaving window). Returns the number of
+        members actually removed; idempotent on missing members.
+        """
+        if not session_ids:
+            return 0
+        return int(await self.redis.srem(
+            K_LEASE_PLAN.format(plan=plan), *session_ids))
 
     async def injected(self, session: str) -> bool:
         v = await self.redis.get(K_INJECTED.format(session=session))

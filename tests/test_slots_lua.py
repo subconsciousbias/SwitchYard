@@ -509,6 +509,107 @@ async def inflight_zset_ttl_under_heartbeat(r, slots):
     }
 
 
+# -------------------------------------------------------- cross-plan SREM
+# Lua-only assertion for the cross-plan reverse-index hygiene that the new
+# `_SET_LEASE` script guarantees. The fake's `_shadow_set_lease` now
+# mirrors the cross-plan SREM (issue #109 fix; see
+# `tests/fake_redis.py:_shadow_set_lease`), so the matrix test would no
+# longer diverge on a cross-plan scenario — but this Lua pin is kept as
+# the authoritative contract: it asserts the Lua source's exact behavior
+# on real Redis, which the in-memory shadow cannot reach. A regression
+# in the Lua body (e.g. someone refactors the script and loses the
+# `oldplan ~= newplan` gate) would still be caught here even if the fake
+# silently kept the old shadow behavior.
+#
+# Four properties the script must hold:
+#   (a) initial set_lease lands the session on the new plan's SET only,
+#       no SREM fires (the previous lease was absent);
+#   (b) same-plan re-set is idempotent — SADD returns 0 on an already-
+#       present member, the plan prefix is unchanged so the SREM gate is
+#       closed, both SETs are exactly as they were;
+#   (c) cross-plan re-set SREMs the session from the OLD plan's SET and
+#       SADDs to the NEW plan's SET in the same atomic script, so a
+#       `sessions_on_plan` walk on either plan returns the live picture;
+#   (d) letting the lease expire drops the SET membership too, because
+#       both keys share the same TTL — a per-SET self-healing property
+#       that holds when the SET TTL is what fires. Issue #109's natural-
+#       expiry mode (a single session's lease key fires while the SET's
+#       shared TTL keeps getting refreshed by other sessions' set_leases)
+#       is NOT covered by this contract: the SET entry of a lonely
+#       expired session persists until either (i) drain.migrate's
+#       hygiene gate SREMs it, or (ii) the same session is re-leased
+#       onto a different plan (the cross-plan SREM in (c) catches it then).
+#       `sessions_on_plan`'s "live picture — no stale keys" docstring
+#       promise is therefore drain-cycle-strong, not read-time-strong;
+#       issue #109 marks the lazy SREM in `sessions_on_plan` as
+#       "Option[al]" and both required fixes (cross-plan SREM + drain
+#       gate) are implemented in this PR.
+#
+# The `r.expire(..., 0)` trick is how the test forces expiry in a single
+# round-trip without `asyncio.sleep`: real Redis's `EXPIRE key 0`
+# deletes the key immediately, and a follow-up `r.get` sees a missing
+# key — the observable (d) relies on.
+
+async def lua_set_lease_cross_plan_srem(r, slots):
+    """Lua-only: cross-plan set_lease SREMs from the OLD plan's SET."""
+    plan_a = "cross-a"
+    plan_b = "cross-b"
+    ref_a = "cross-a/m"
+    ref_b = "cross-b/m"
+    ttl = 100
+
+    # Clean slate.
+    for k in (K_LEASE.format(session="s-cross"),
+              K_LEASE_PLAN.format(plan=plan_a),
+              K_LEASE_PLAN.format(plan=plan_b)):
+        await r.delete(k)
+
+    # (a) Initial set on plan A — fresh lease, no SREM fires.
+    await slots.set_lease("s-cross", ref_a, ttl, plan_a)
+    assert await slots.get_lease("s-cross") == ref_a, \
+        await slots.get_lease("s-cross")
+    assert sorted(await slots.sessions_on_plan(plan_a)) == ["s-cross"], \
+        await slots.sessions_on_plan(plan_a)
+    assert sorted(await slots.sessions_on_plan(plan_b)) == [], \
+        await slots.sessions_on_plan(plan_b)
+
+    # (b) Same-plan re-set — idempotent SADD, no SREM, both SETs unchanged.
+    await slots.set_lease("s-cross", ref_a, ttl, plan_a)
+    assert sorted(await slots.sessions_on_plan(plan_a)) == ["s-cross"], \
+        await slots.sessions_on_plan(plan_a)
+    assert sorted(await slots.sessions_on_plan(plan_b)) == [], \
+        await slots.sessions_on_plan(plan_b)
+
+    # (c) Cross-plan re-set — SREM from plan A, SADD to plan B in one
+    # script. `sessions_on_plan(plan_a) == []` is the property drain.migrate
+    # relies on; without the SREM the OLD plan's SET keeps the phantom.
+    await slots.set_lease("s-cross", ref_b, ttl, plan_b)
+    assert await slots.get_lease("s-cross") == ref_b, \
+        await slots.get_lease("s-cross")
+    assert sorted(await slots.sessions_on_plan(plan_a)) == [], \
+        await slots.sessions_on_plan(plan_a)
+    assert sorted(await slots.sessions_on_plan(plan_b)) == ["s-cross"], \
+        await slots.sessions_on_plan(plan_b)
+
+    # (d) Let the lease + SET expire — same TTL on both, so the SET entry
+    # drops alongside the lease key. This is the self-healing property
+    # `sessions_on_plan` depends on; without it a stale SET would live
+    # forever.
+    await r.expire(K_LEASE.format(session="s-cross"), 0)
+    await r.expire(K_LEASE_PLAN.format(plan=plan_b), 0)
+    assert await slots.get_lease("s-cross") is None, \
+        "expired lease must read as missing"
+    assert sorted(await slots.sessions_on_plan(plan_b)) == [], \
+        await slots.sessions_on_plan(plan_b)
+
+    # Cleanup.
+    for k in (K_LEASE.format(session="s-cross"),
+              K_LEASE_PLAN.format(plan=plan_a),
+              K_LEASE_PLAN.format(plan=plan_b)):
+        await r.delete(k)
+    return True
+
+
 # --------------------------------------------------------- per-test runner
 
 async def _maybe_aclose(r):
@@ -628,6 +729,47 @@ def test_107_inflight_zset_ttl():
         and outcome["touch_alive"], f"#107 regressed: {outcome}"
     print("  regression gate (#107): heartbeat kept the inflight key alive "
           "past 2*inflight_max_age; EXISTS=1, next claim refused, touch alive")
+
+
+def test_set_lease_cross_plan_srem():
+    """Cross-plan set_lease SREMs the session from the OLD plan's reverse
+    index in the same atomic script; same-plan re-set is idempotent (SADD
+    returns 0, no SREM); and the SET membership drops alongside the lease
+    when the lease TTL fires.
+
+    Closes the phantom reverse-index member drain.migrate used to walk
+    into: a session re-leased onto a different plan (drain re-pick, picker
+    body-walk swapping lanes, hooks re-leasing after a hard rejection)
+    would leave the OLD plan's SET holding the session forever, and
+    drain.migrate would re-pick that phantom every migration while the
+    real lease lived on a different ref. The new `_SET_LEASE` script
+    closes this by SREMming the OLD plan's SET when the plan prefix
+    changes, leaving the index in lock-step with `set_lease`'s caller.
+
+    Lua-only because the Lua backend is the authoritative source for the
+    cross-plan SREM contract; `_shadow_set_lease` in `tests/fake_redis.py`
+    also mirrors the behaviour (cycle-4 uplift), but the Lua pin stays as
+    the real-Redis source of truth — a regression in the Lua body that
+    loses the `oldplan ~= newplan` gate would be caught here even if the
+    fake shadow silently kept its old behaviour.
+    """
+    resolved = _skip_or_skip()
+    if resolved is None:
+        return
+    _label, factory = resolved
+
+    async def go_async():
+        r = await _make_redis(factory)
+        try:
+            slots = SlotTable(r, inflight_max_age=INFLIGHT_MAX_AGE)
+            await lua_set_lease_cross_plan_srem(r, slots)
+        finally:
+            await _maybe_aclose(r)
+
+    asyncio.run(go_async())
+    print("  set_lease cross-plan SREM: lease onto plan B clears plan A's "
+          "SET; same-plan re-set is idempotent (SADD 0, no SREM); "
+          "lease expiry drops SET membership (SET TTL bound to lease TTL)")
 
 
 # ---------------------------------------------------------------- main entry

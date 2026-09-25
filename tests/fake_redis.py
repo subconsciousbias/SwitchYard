@@ -547,13 +547,29 @@ class FakeRedis:
         return 1
 
     async def _shadow_set_lease(self, keys, args):
-        # Mirror the Lua: SADD to the SET, SET the lease with EX, EXPIRE
-        # the SET. Now that `expire` works for every key type (not just
-        # strings) the SET TTL is honored end-to-end, so the membership
-        # and its bound TTL land together — the property the real Lua
-        # script exists to guarantee.
+        # Mirror the Lua (cross-plan hygiene, issue #109): read the old
+        # lease value, parse the OLD plan prefix via `^([^/]+)/` (the same
+        # regex the Lua uses — `split` would have refreshed the wrong SET
+        # key on a bare lease value with no slash), and SREM the session
+        # from the OLD plan's reverse-index SET when the prefix differs
+        # from the NEW plan's prefix. Then SADD to the NEW SET, SET the
+        # lease with EX, EXPIRE the SET. The SREM is gated on
+        # `old ~= new`, so a same-plan re-set never touches the wrong SET
+        # and the SADD returns 0 on an already-present member.
+        #
+        # Without this SREM a fake-backend test that exercises a cross-plan
+        # set_lease (the matrix in `tests/test_drain.py`, picker body-walk
+        # re-lease paths, etc.) silently models the exact bug this PR
+        # closes — the Lua pin in `tests/test_slots_lua.py::test_set_lease_
+        # cross_plan_srem` is the only place the cross-plan SREM was being
+        # asserted, and the matrix suite was diverging from it.
         lease_key, set_key = keys
         session, ref, ttl = args
+        old = await self.get(lease_key)
+        old_plan = re.match(r"^([^/]+)/", old or "")
+        new_plan = re.match(r"^([^/]+)/", ref or "")
+        if old_plan and new_plan and old_plan.group(1) != new_plan.group(1):
+            await self.srem(f"sy:lease_plan:{old_plan.group(1)}", session)
         added = await self.sadd(set_key, session)
         await self.set(lease_key, ref, ex=int(ttl))
         await self.expire(set_key, int(ttl))

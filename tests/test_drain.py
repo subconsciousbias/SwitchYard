@@ -494,6 +494,121 @@ def test_drain_migrate_continues_past_set_lease_failure():
           f"ran for all 3) — no dirty state remains")
 
 
+def test_drain_migrate_skips_stale_reverse_index_member():
+    """A session that is still in the drained plan's reverse-index SET but
+    whose lease is gone (TTL fired) or has moved to a non-drained ref
+    (a parallel turn re-leased it elsewhere) must be SKIPPED + SREMmed
+    from the SET, not picked/migrated.
+
+    Two ways a SET entry can be stale at this point:
+
+      (a) lease TTL fired without the SET entry's matching TTL being
+          collected yet (the SET TTL equals the lease TTL, but the
+          collection is lazy on read — the next `sessions_on_plan` call
+          could observe either or both);
+      (b) a parallel turn re-leased the session onto a different plan
+          (drain migration on a sibling, picker body-walk swapping lanes,
+          hooks re-leasing after a hard rejection) and the SET entry got
+          carried over.
+
+    Picking and migrating the stale session would call `picker._visit_ref`
+    -> `set_lease` on a sibling, writing a fresh lease the session does
+    NOT own (its real lease, when present, is on a different ref). The
+    drained plan's SET would still hold the phantom, and a future
+    `drain.migrate` would re-pick the same phantom — a phantom-loop bug.
+
+    The fix: drain.migrate reads `slots.get_lease(session)` for every SET
+    member and SREMs the stale entry via `slots.forget_sessions_on_plan`,
+    printing a SKIP line to stderr. Live sessions (lease on a drained ref)
+    are migrated as before. The drained plan's SET ends empty.
+
+    The phantom SET entries are seeded directly via `redis.sadd` because
+    `set_lease`'s atomic SREM/SADD would otherwise have cleaned them up
+    — the test exercises the gate by deliberately bypassing the
+    cross-plan hygiene that the new `_SET_LEASE` script provides.
+    """
+    async def go():
+        reg, slots, picker = _build()
+        lane = "forge"
+        target = next(m for m in reg.lane_members(lane)
+                      if m.plan_key == "minimax-ultra")
+        sibling = next(m for m in reg.lane_members(lane)
+                       if m.plan_key != target.plan_key
+                       and not reg.is_tail(lane, m.ref))
+        drained_plan = target.plan_key
+        ttl = reg.settings.lease_ttl_seconds
+
+        # Live member: lease on the drained plan. Will be migrated.
+        await slots.set_lease("s-live", target.ref, ttl, drained_plan)
+
+        # Stale member #1: lease TTL fired without the SET entry being
+        # collected yet. We seed the SET directly via `redis.sadd` to
+        # simulate the lazy-collection race window.
+        await slots.redis.sadd(
+            f"sy:lease_plan:{drained_plan}", "s-ghost-1")
+
+        # Stale member #2: lease on a NON-drained ref (a parallel turn
+        # re-leased it onto `sibling` via set_lease), but the SET entry
+        # on the drained plan was carried over. We seed the phantom
+        # directly because `set_lease`'s cross-plan SREM would otherwise
+        # have cleaned it up — the test exercises the drain gate by
+        # deliberately bypassing the SET_LEASE hygiene.
+        await slots.set_lease("s-moved", sibling.ref, ttl, sibling.plan_key)
+        await slots.redis.sadd(
+            f"sy:lease_plan:{drained_plan}", "s-moved")
+
+        before_drained = sorted(await slots.sessions_on_plan(drained_plan))
+
+        count, migrated = await migrate(drained_plan, slots, picker, ttl=ttl)
+
+        after_drained = sorted(await slots.sessions_on_plan(drained_plan))
+        new_leases = {s: await slots.get_lease(s)
+                      for s in ("s-live", "s-ghost-1", "s-moved")}
+        return (before_drained, count, sorted(migrated), after_drained,
+                new_leases, target, sibling)
+
+    (before_drained, count, migrated, after_drained, new_leases,
+     target, sibling) = _run(go())
+
+    # Before migrate: 3 SET members (1 live + 2 stale).
+    assert before_drained == ["s-ghost-1", "s-live", "s-moved"], \
+        before_drained
+    # Migrate counts ONLY the live session — stale ones are skipped before
+    # the pick call, so they never enter the migration path.
+    assert count == 1, f"expected 1 migration (live only), got {count}"
+    assert migrated == ["s-live"], migrated
+    # After migrate: drained plan's SET is empty. The live was migrated
+    # off it; on FakeRedis the SREM came from `picker._affinity`'s
+    # `drop_lease` (the `_shadow_drop_lease` shadow already mirrors
+    # the `SREM sy:lease_plan:{plan}`), and on real Redis the
+    # `_SET_LEASE` cross-plan SREM is a no-op for the live session
+    # because `_affinity` already dropped the lease by then (the
+    # subsequent `_visit_ref` set_lease's old-lease GET returns nil).
+    # drain.migrate's explicit set_lease at the end is same-plan
+    # (new ref's plan == placed.plan.key), so the cross-plan SREM is
+    # closed on that call too. The stale members were SREMmed by
+    # drain.migrate's hygiene gate via `slots.forget_sessions_on_plan`.
+    assert after_drained == [], after_drained
+    # Live session: lease moved off the drained plan.
+    assert new_leases["s-live"] is not None, new_leases["s-live"]
+    assert new_leases["s-live"].split("/", 1)[0] != target.plan_key, (
+        f"live session s-live must have been migrated off {target.plan_key}; "
+        f"got {new_leases['s-live']!r}")
+    # Stale session #1: still has no lease — drain.migrate did not write one.
+    assert new_leases["s-ghost-1"] is None, (
+        f"stale s-ghost-1 had no lease before migrate and must not gain one; "
+        f"got {new_leases['s-ghost-1']!r}")
+    # Stale session #2: lease is unchanged on `sibling.ref` (drain.migrate
+    # did not touch it; the parallel turn that re-leased it owns that lease).
+    assert new_leases["s-moved"] == sibling.ref, (
+        f"stale s-moved lease must be untouched (still on the parallel "
+        f"turn's ref {sibling.ref!r}); got {new_leases['s-moved']!r}")
+    print(f"  drained {target.plan_key}: stale members (s-ghost-1, s-moved) "
+          f"SKIPPED + SREMmed by drain gate; live s-live migrated to "
+          f"{new_leases['s-live']}; after_drained={after_drained}; "
+          f"s-moved lease untouched ({new_leases['s-moved']})")
+
+
 def test_affinity_drops_lease_when_held_plan_is_draining():
     """A session whose lease is on a draining plan must NOT be honoured by
     affinity, even on a fresh request whose `ctx.exclude` does NOT name the
@@ -555,21 +670,23 @@ def test_set_lease_writes_lease_and_reverse_index_in_one_round_trip():
     The contract we pin here is the observable happy-path behaviour:
 
       (a) the lease key holds the new ref with the requested TTL,
-      (b) the SET key holds the session,
+      (b) the SET key holds the session on the NEW plan,
       (c) the script's SADD does not duplicate the membership on a
           same-session re-set (SADD returns 0 for an already-present
-          member — the atomicity shape the Lua guarantees).
+          member — the atomicity shape the Lua guarantees),
+      (d) on a cross-plan re-set the OLD plan's SET is empty after
+          the script (cross-plan SREM fired inside the same Lua), so
+          a `sessions_on_plan(old_plan)` walk returns `[]` and the
+          drain migrator finds no phantoms.
 
     The fake cannot directly simulate the partial-failure the script
-    closes (its `expire` is string-only — see the SET_LEASE shadow's
-    comment in `tests/fake_redis.py`), so the "atomicity holds across
-    network failures" property is real-Redis-only. This test pins the
-    membership and TTL contract; the cross-plan migration is the
-    responsibility of `drop_lease` (SREM on the old plan's SET, atomic),
-    not `set_lease`. In the live flow, every picker re-lease is preceded
-    by `_affinity`'s `drop_lease`, so the phantom problem the reviewer
-    raised on a hypothetical "set_lease twice without drop_lease" path
-    does not exist in the codebase.
+    closes (the SET-EXPIRE-after-SADD network drop — see the
+    `_shadow_set_lease` comment in `tests/fake_redis.py`), so the
+    "atomicity holds across network failures" property is
+    real-Redis-only. The fake does mirror the cross-plan SREM (cycle-4
+    uplift of `_shadow_set_lease`); the Lua-only pin in
+    `tests/test_slots_lua.py::test_set_lease_cross_plan_srem` is the
+    authoritative source for the real-Redis contract on (d).
     """
     async def go():
         reg, slots, _picker = _build()
@@ -589,23 +706,26 @@ def test_set_lease_writes_lease_and_reverse_index_in_one_round_trip():
         await slots.set_lease("s-reroute", "claude-max/fable", ttl, plan_a)
         on_a_again = sorted(await slots.sessions_on_plan(plan_a))
         ttl_a_again = await slots.redis.ttl("sy:lease:s-reroute")
-        # And again on a DIFFERENT plan — the SADD lands on the new SET
-        # (the script's KEYS[2] is the new plan); the old SET still holds
-        # the session because cross-plan migration is drop_lease's job,
-        # not set_lease's. We assert only that the new SET gained the
-        # session; the phantom-cleanup behaviour is exercised in the
-        # existing `test_set_touch_drop_lease_keep_lease_plan_index_in_sync`.
+        # And again on a DIFFERENT plan — the new `_SET_LEASE` script
+        # SREMs the session from the OLD plan's reverse-index SET in the
+        # same atomic script (cross-plan hygiene), then SADDs to the new
+        # SET. Asserted here on FakeRedis (the matrix backend), with the
+        # cross-plan SREM shadow mirroring the Lua body
+        # (`tests/fake_redis.py:_shadow_set_lease`); the Lua-only pin in
+        # `tests/test_slots_lua.py::test_set_lease_cross_plan_srem` is the
+        # authoritative source for the real-Redis contract.
         await slots.set_lease("s-reroute", "minimax-ultra/m3", ttl, plan_b)
+        on_a_after_cross = sorted(await slots.sessions_on_plan(plan_a))
         on_b_after = sorted(await slots.sessions_on_plan(plan_b))
         ttl_b = await slots.redis.ttl("sy:lease:s-reroute")
 
         return (lease_a, on_a, ttl_a,
                 on_a_again, ttl_a_again,
-                on_b_after, ttl_b)
+                on_a_after_cross, on_b_after, ttl_b)
 
     (lease_a, on_a, ttl_a,
      on_a_again, ttl_a_again,
-     on_b_after, ttl_b) = _run(go())
+     on_a_after_cross, on_b_after, ttl_b) = _run(go())
     assert lease_a == "claude-max/fable", lease_a
     assert on_a == ["s-reroute"], on_a
     assert ttl_a > 0, f"lease must have a TTL after set_lease, got {ttl_a}"
@@ -614,13 +734,19 @@ def test_set_lease_writes_lease_and_reverse_index_in_one_round_trip():
     assert ttl_a_again > 0, (
         f"lease TTL must persist across a same-session re-set, "
         f"got {ttl_a_again}")
-    # Cross-plan re-set: the new SET gained the session via the script.
+    # Cross-plan re-set: the new SET gained the session via the script,
+    # and the OLD plan's SET is empty (cross-plan SREM fired). Both
+    # backends honor this — FakeRedis via `_shadow_set_lease`, real
+    # Redis via the Lua body pinned in
+    # `tests/test_slots_lua.py::test_set_lease_cross_plan_srem`.
+    assert on_a_after_cross == [], on_a_after_cross
     assert on_b_after == ["s-reroute"], on_b_after
     assert ttl_b > 0, f"lease must have a fresh TTL after re-set, got {ttl_b}"
     print(f"  lease_a={lease_a!r} (ttl={ttl_a}s, A={on_a}); "
           f"re-set same session: A={on_a_again} (ttl={ttl_a_again}s, "
-          f"no duplicate); re-set to plan B: B={on_b_after} (ttl={ttl_b}s); "
-          f"SADD/SET/EXPIRE atomic, membership contract holds")
+          f"no duplicate); re-set to plan B: A={on_a_after_cross}, "
+          f"B={on_b_after} (ttl={ttl_b}s); cross-plan SREM atomic, "
+          f"membership contract holds")
 
 
 if __name__ == "__main__":

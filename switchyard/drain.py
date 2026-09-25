@@ -51,6 +51,15 @@ async def migrate(plan_key: str, slots: SlotTable, picker: Picker,
     left untouched — the caller sees the SKIP line and can decide whether
     to retry or accept the loss.
 
+    A session in `sessions_on_plan(plan)` whose lease is gone (TTL fired)
+    or whose lease has moved to a different ref since the index was last
+    maintained is treated as a stale reverse-index member: SKIP and
+    `forget_sessions_on_plan`, no pick. Picking would write a fresh lease
+    on the sibling via `_visit_ref`, leaving a phantom session on the new
+    plan's SET with no lease ever pointing at the drained plan in the
+    first place. The SET entry is the only stale state, so SREMing it
+    brings the index back to the live picture without aborting the loop.
+
     A session whose release or lease re-write fails after a successful pick
     is logged and skipped rather than aborting the loop. The two failure
     cases leave different dirty state, so the log lines and the comments
@@ -63,8 +72,21 @@ async def migrate(plan_key: str, slots: SlotTable, picker: Picker,
     `apply.sh` is taking out of service — strictly worse than the leak
     being fixed.
 
+    The reverse-index hygiene gate at the top of the loop wraps both
+    `slots.get_lease(session)` and `slots.forget_sessions_on_plan(...)`
+    in the same `try/except Exception` shape as the rest of the loop:
+    a transient Redis error logs and `continue`s, leaving the SET entry
+    in place for the next drain cycle to retry. Aborting the loop here
+    would orphan every not-yet-processed session on the plan being
+    drained — the same "strictly worse" rationale the release/set_lease
+    branches spell out.
+
     Returns (count_migrated, list_of_session_ids_migrated). The list is in
     the order sessions were processed (which is the SET iteration order).
+    Stale members skipped by the reverse-index hygiene gate are NOT
+    included in `migrated` (they were never migrated) and the call
+    returns their count in the printed SKIP lines, but the return shape
+    is unchanged so callers that pre-date this gate keep working.
     """
     registry = picker.registry
     lease_ttl = ttl if ttl is not None else registry.settings.lease_ttl_seconds
@@ -80,6 +102,52 @@ async def migrate(plan_key: str, slots: SlotTable, picker: Picker,
     sessions = await slots.sessions_on_plan(plan_key)
     migrated: list[str] = []
     for session in sessions:
+        # Reverse-index hygiene: a session in `sessions_on_plan(plan)` is
+        # expected to have a live lease whose ref belongs to this plan. Two
+        # ways it can be stale at this point: (a) the lease's TTL fired and
+        # the SET entry was collected alongside it (we are racing the SET's
+        # own TTL), or (b) a parallel turn re-leased the session onto a
+        # different plan (drain migration on a sibling, picker body-walk
+        # swapping lanes, hooks re-leasing after a hard rejection) and the
+        # SET entry got carried over. Either way, picking and migrating
+        # this session would write a fresh lease on the sibling via the
+        # picker's `_visit_ref` — a phantom: the session has no real lease
+        # on this plan to migrate. SREM the SET entry and move on; the SET
+        # is the only place the stale state lived.
+        #
+        # Both calls are wrapped in the same `try/except Exception` shape
+        # as the rest of this loop's failure paths (the lane loop catches
+        # "a Redis error, anything"; release and set_lease each have their
+        # own `except` and a "strictly worse than the leak" comment).
+        # Aborting the loop on a transient Redis error here would orphan
+        # every not-yet-processed session on the plan `apply.sh` is
+        # taking out of service — the exact outcome the other branches
+        # document as worse than the leak being fixed. On error we leave
+        # the SET entry in place; the next drain cycle (or this same call,
+        # if the operator re-runs `python -m switchyard.drain`) will retry
+        # the gate, which is the right idempotent recovery.
+        try:
+            current_lease = await slots.get_lease(session)
+        except Exception as exc:
+            print(f"{session}: reverse-index hygiene check failed "
+                  f"({type(exc).__name__}: {exc}); SET entry left in place, "
+                  f"next drain cycle will retry",
+                  file=sys.stderr)
+            continue
+        if not current_lease or current_lease not in drained_refs:
+            print(f"{session}: SKIP (stale reverse-index member on "
+                  f"{plan_key}: lease "
+                  f"{'missing' if not current_lease else repr(current_lease)}"
+                  f"); SREM from plan SET",
+                  file=sys.stderr)
+            try:
+                await slots.forget_sessions_on_plan(plan_key, [session])
+            except Exception as exc:
+                print(f"{session}: stale-member SREM failed "
+                      f"({type(exc).__name__}: {exc}); SET entry left in "
+                      f"place, next drain cycle will retry",
+                      file=sys.stderr)
+            continue
         placed = None
         for lane in relevant_lanes:
             try:
