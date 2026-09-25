@@ -2568,6 +2568,7 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
         )
     except OSError as exc:
         shutil.rmtree(spawn_cwd, ignore_errors=True)
+        _cleanup_project_dir(spawn_cwd)
         # A spawn that never happened is not a broken gateway: E2BIG is the
         # caller's request being too big for argv even after the stdin and
         # file escape hatches (issue #29 asks for 413, so a client can tell
@@ -2592,6 +2593,7 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
     except asyncio.TimeoutError:
         proc.kill()
         shutil.rmtree(spawn_cwd, ignore_errors=True)
+        _cleanup_project_dir(spawn_cwd)
         raise HTTPException(status_code=408, detail=f"{PROVIDER} cli timed out") from None
 
     stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
@@ -2659,6 +2661,7 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
     finally:
         # Reclaim the per-call cwd regardless of how the function exits.
         shutil.rmtree(spawn_cwd, ignore_errors=True)
+        _cleanup_project_dir(spawn_cwd)
 
 
 def upstream_error(stdout: str) -> tuple[int | None, str, bool | None]:
@@ -2860,6 +2863,48 @@ CLAUDE_PROJECTS = Path(os.environ.get(
 USAGE_TIMEOUT = float(os.environ.get("USAGE_TIMEOUT_SECONDS", "120"))
 
 
+def _mangled_project_name(cwd: Path) -> str:
+    """The Claude transcript-dir name for a given cwd.
+
+    The CLI mangles any non-alphanumeric character in the absolute cwd to a
+    hyphen when it picks the project dir. Same formula the mcp bridge uses
+    for its session workdir (mcp_bridge.last_call_usage), so a CLI run and
+    an mcp session that share a cwd share a project dir -- the cleanup helper
+    below has to match that name exactly, or it would delete the wrong dir.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
+def _cleanup_project_dir(spawn_cwd: Path) -> None:
+    """Best-effort: remove the Claude project dir for a per-call temp cwd.
+
+    The Claude CLI writes `<CLAUDE_PROJECTS>/<mangled spawn_cwd>/...`
+    alongside the per-call cwd that `--agent` saw as its working directory.
+    Nothing on the CLI side reclaims those dirs, so without this helper each
+    text-path spawn leaves one behind (issue #132). It is only safe to delete
+    a directory that:
+
+      * we derived from a spawn cwd this process just created via
+        ``tempfile.mkdtemp`` -- not an arbitrary operator path, and
+      * sits directly under ``CLAUDE_PROJECTS`` -- otherwise the helper is
+        not the one that owns it.
+
+    ``shutil.rmtree(..., ignore_errors=True)`` swallows the missing-dir case
+    too, so a re-entrant or partial-run teardown is harmless.
+    """
+    if PROVIDER != "claude":
+        return
+    try:
+        target = CLAUDE_PROJECTS / _mangled_project_name(spawn_cwd)
+    except (OSError, ValueError):
+        return
+    if target.parent != CLAUDE_PROJECTS:
+        return
+    if not target.exists():
+        return
+    shutil.rmtree(target, ignore_errors=True)
+
+
 def _find_usage_report(since: float) -> dict | None:
     """The newest `usageReport` written to a transcript after `since`.
 
@@ -2867,14 +2912,37 @@ def _find_usage_report(since: float) -> dict | None:
     somewhere inside the record for the command that produced it — the exact
     depth has moved between versions, so it is searched for by key rather than
     by a fixed path.
+
+    Bounded: iterates transcripts newest-first by mtime and returns on the
+    first one that contains a valid `usageReport`. The `/usage` slash
+    command produces exactly one such record per invocation, so reading more
+    than the first hit was wasted I/O -- issue #132 boards-polling path
+    spent tens of ms rglobbing before this bound landed.
+
+    Sync, blocking I/O. The async callers (``usage_report``) wrap this in
+    ``asyncio.to_thread`` so the rglob does not stall the event loop.
     """
-    newest: tuple[float, dict] | None = None
     if not CLAUDE_PROJECTS.is_dir():
         return None
-    for path in CLAUDE_PROJECTS.rglob("*.jsonl"):
+    candidates: list[tuple[float, Path]] = []
+    try:
+        for root, _dirs, files in os.walk(CLAUDE_PROJECTS):
+            for name in files:
+                if not name.endswith(".jsonl"):
+                    continue
+                p = Path(root) / name
+                try:
+                    stamp = p.stat().st_mtime
+                except OSError:
+                    continue
+                if stamp < since - 5:
+                    continue
+                candidates.append((stamp, p))
+    except OSError:
+        return None
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    for _stamp, path in candidates:
         try:
-            if path.stat().st_mtime < since - 5:
-                continue
             text = path.read_text(errors="replace")
         except OSError:
             continue
@@ -2888,10 +2956,8 @@ def _find_usage_report(since: float) -> dict | None:
             except ValueError:
                 continue
             if isinstance(found, dict) and found.get("rate_limits"):
-                stamp = path.stat().st_mtime
-                if newest is None or stamp > newest[0]:
-                    newest = (stamp, found)
-    return newest[1] if newest else None
+                return found
+    return None
 
 
 def _dig_key(node, key: str):
@@ -2912,6 +2978,45 @@ def _dig_key(node, key: str):
 
 CODEX_SESSIONS = Path(os.environ.get(
     "CODEX_SESSIONS_DIR", str(Path.home() / ".codex" / "sessions")))
+# Codex rollouts are append-only JSONL the CLI writes on every call. The
+# `rate_limits` block we mine is only as fresh as the last request, so the
+# scan is the same on a board poll and on a real /usage request -- a tiny
+# TTL cache amortises the rglob across the board's 1-Hz polling without
+# making /usage stale.
+CODEX_RATELIMITS_TTL_SECONDS = float(os.environ.get(
+    "CODEX_RATELIMITS_TTL_SECONDS", "30"))
+# Retention: rollouts older than this are deleted in the same to_thread pass
+# that scans for rate_limits, so a busy seat doesn't accumulate years of
+# JSONL. Default 48h mirrors the typical Codex weekly window plus a buffer;
+# override via env when an operator wants a tighter or looser cut.
+CODEX_ROLLOUT_RETENTION_HOURS = float(os.environ.get(
+    "CODEX_ROLLOUT_RETENTION_HOURS", "48"))
+_CODEx_RATELIMITS_CACHE: dict[str, tuple[float, dict | None]] = {}
+
+
+def _prune_codex_rollouts() -> None:
+    """Delete Codex session rollouts older than the retention window.
+
+    Failures are logged at debug and swallowed -- a transient ENOSPC /
+    EACCES on one file must not take the rate-limit scan with it, and the
+    next call will retry the file anyway.
+    """
+    if not CODEX_SESSIONS.is_dir():
+        return
+    cutoff = time.time() - CODEX_ROLLOUT_RETENTION_HOURS * 3600.0
+    try:
+        for path in CODEX_SESSIONS.rglob("*.jsonl"):
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                log.debug("codex rollout prune skipped %s: %s", path, exc)
+    except OSError as exc:
+        log.debug("codex rollout prune walk failed under %s: %s",
+                  CODEX_SESSIONS, exc)
 
 
 def _codex_rate_limits() -> dict | None:
@@ -2921,12 +3026,45 @@ def _codex_rate_limits() -> dict | None:
     to produce it — the cost is that it is only as fresh as the last request
     this sidecar made. `resets_at` says which window it describes, so a stale
     reading is still interpretable rather than silently wrong.
+
+    Sync, blocking I/O. The async callers (``usage_report``) wrap this in
+    ``asyncio.to_thread`` so the rglob does not stall the event loop. A tiny
+    TTL cache amortises the scan across board polling -- a fresh request
+    passes through, but the board's 1-Hz poll does not re-rglob on every hit.
+    Keying on ``str(CODEX_SESSIONS)`` alone keeps the cache bounded: the
+    TTL itself decides whether a hit is fresh, so including it would silently
+    leak the old entry every time an operator flips the env var (reviewer
+    finding, PR #322 cycle 2). ``CODEX_SESSIONS`` is captured at import, so
+    it does not change for the life of the process.
     """
+    key = str(CODEX_SESSIONS)
+    now = time.monotonic()
+    cached = _CODEx_RATELIMITS_CACHE.get(key)
+    if cached is not None:
+        expires, value = cached
+        if expires > now:
+            return value
+    _prune_codex_rollouts()
+    value = _scan_codex_rate_limits()
+    _CODEx_RATELIMITS_CACHE[key] = (now + CODEX_RATELIMITS_TTL_SECONDS, value)
+    return value
+
+
+def _scan_codex_rate_limits() -> dict | None:
+    """The non-cached core of `_codex_rate_limits` -- see that wrapper."""
     if not CODEX_SESSIONS.is_dir():
         return None
-    files = sorted((p for p in CODEX_SESSIONS.rglob("*.jsonl")),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    for path in files[:25]:
+    files: list[tuple[float, Path]] = []
+    try:
+        for path in CODEX_SESSIONS.rglob("*.jsonl"):
+            try:
+                files.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+    except OSError:
+        return None
+    files.sort(key=lambda pair: pair[0], reverse=True)
+    for _stamp, path in files[:25]:
         try:
             text = path.read_text(errors="replace")
         except OSError:
@@ -2942,7 +3080,7 @@ def _codex_rate_limits() -> dict | None:
                 continue
             if isinstance(found, dict) and found.get("primary"):
                 return {"rate_limits": found,
-                        "observed_at": path.stat().st_mtime}
+                        "observed_at": _stamp}
     return None
 
 
@@ -3028,7 +3166,10 @@ async def usage_report() -> dict:
                 status_code=401,
                 detail="codex cli is not logged in for this plan; "
                        "run `codex login --device-auth` in this sidecar")
-        report = _codex_rate_limits()
+        # Off-thread so the rglob + retention walk does not stall the event
+        # loop on the board's 1-Hz /usage poll. `_codex_rate_limits` itself
+        # wraps a TTL cache, so repeat calls inside the window are O(1).
+        report = await asyncio.to_thread(_codex_rate_limits)
         if report is None:
             raise HTTPException(
                 status_code=503,
@@ -3039,33 +3180,53 @@ async def usage_report() -> dict:
         raise HTTPException(status_code=501,
                             detail=f"no usage report implemented for {PROVIDER!r}")
     started = time.time()
-    proc = await asyncio.create_subprocess_exec(
-        PROFILE["cli"], "-p", "/usage",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        cwd=tempfile.gettempdir(),
-        env=subprocess_env())
+    # Spawn `claude -p /usage` in a fresh per-call temp cwd (same `sy-cli-`
+    # prefix as the text path). Without this the CLI would write its
+    # transcript to whatever the container's cwd is at the time -- usually
+    # `/app`, which is also where the live code is -- and leave a project
+    # dir behind under `~/.claude/projects/-app` on every /usage poll.
+    # The matching project dir is cleaned up after the scan returns (or
+    # raises), via `_cleanup_project_dir`. The try/finally wraps BOTH
+    # `create_subprocess_exec` and the scan: a spawn that fails
+    # (missing binary, wrong arch, renames mid-deploy) leaves a sy-cli-*
+    # cwd behind if the cleanup only followed the spawn, so the finally
+    # starts before the await (reviewer finding, PR #322 cycle 2).
+    spawn_cwd = Path(tempfile.mkdtemp(prefix="sy-cli-"))
     try:
-        _, err = await asyncio.wait_for(proc.communicate(), USAGE_TIMEOUT)
-    except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        raise HTTPException(status_code=504,
-                            detail=f"/usage did not finish within {USAGE_TIMEOUT:.0f}s") from None
-    if proc.returncode != 0:
-        raise HTTPException(
-            status_code=502,
-            detail=f"/usage exited {proc.returncode}: {err.decode(errors='replace')[:300]}")
-
-    report = _find_usage_report(started)
-    if report is None:
-        # The command ran but wrote nothing we recognise — a version change in
-        # the transcript shape is the likely cause, and saying so beats
-        # returning an empty report that reads as "no usage".
-        raise HTTPException(
-            status_code=502,
-            detail="/usage produced no usageReport in the CLI's transcripts; the "
-                   "transcript shape may have changed in this CLI version")
-    return report
+        proc = await asyncio.create_subprocess_exec(
+            PROFILE["cli"], "-p", "/usage",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            cwd=spawn_cwd,
+            env=subprocess_env())
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), USAGE_TIMEOUT)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            raise HTTPException(
+                status_code=504,
+                detail=f"/usage did not finish within {USAGE_TIMEOUT:.0f}s") from None
+        if proc.returncode != 0:
+            raise HTTPException(
+                status_code=502,
+                detail=f"/usage exited {proc.returncode}: "
+                       f"{err.decode(errors='replace')[:300]}")
+        # Scan off-thread so the rglob never stalls the event loop -- the
+        # portal's board polls /usage at ~1 Hz, and a transcript tree that
+        # grew for hours was enough to drop chunk frames.
+        report = await asyncio.to_thread(_find_usage_report, started)
+        if report is None:
+            # The command ran but wrote nothing we recognise — a version change in
+            # the transcript shape is the likely cause, and saying so beats
+            # returning an empty report that reads as "no usage".
+            raise HTTPException(
+                status_code=502,
+                detail="/usage produced no usageReport in the CLI's transcripts; the "
+                       "transcript shape may have changed in this CLI version")
+        return report
+    finally:
+        shutil.rmtree(spawn_cwd, ignore_errors=True)
+        _cleanup_project_dir(spawn_cwd)
 
 
 @app.get("/usage")

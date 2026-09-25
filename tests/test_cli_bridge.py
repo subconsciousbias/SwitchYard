@@ -21,6 +21,15 @@ sys.path.insert(0, HERE)
 # The provider every test here assumes `server` was loaded under.
 MODULE_PROVIDER = "opencode"
 os.environ["PROVIDER"] = MODULE_PROVIDER
+# Issue #132: server.CLAUDE_PROJECTS is captured from CLAUDE_PROJECTS_DIR at
+# import time (same env-capture rule that applies to SWITCHYARD_PLANS in the
+# rest of the suite). Pin it to a fresh temp dir so the per-run cleanup
+# helper and the find/scan tests start from an empty tree and can write into
+# it without touching the operator's real ~/.claude/projects. Assigned, not
+# setdefault: a stray export from the operator's shell would otherwise leak
+# into every run of this file.
+os.environ["CLAUDE_PROJECTS_DIR"] = tempfile.mkdtemp(
+    prefix="clib-claude-projects-")
 
 from _modules import load  # noqa: E402
 
@@ -3630,6 +3639,389 @@ def test_codex_usage_report_401_when_auth_json_is_empty():
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(sessions_tmp, ignore_errors=True)
     print("  codex /usage -> 401 when auth.json is present but empty")
+
+
+# ----------------------------------------- issue #132: cleanup of per-run project dirs ---
+# `server.CLAUDE_PROJECTS` is captured at import (env-capture rule pinned at the
+# top of this file) so the tests below share one tempdir for the duration of
+# the run. Each test writes its own subtrees inside it and rmtree's them in
+# the finally block -- no test reaches into the operator's real
+# ~/.claude/projects.
+
+def test_claude_text_path_cleans_up_its_project_dir():
+    """Every Claude spawn leaves a project dir under
+    ``server.CLAUDE_PROJECTS`` named after the mangled spawn cwd (issue #132).
+    ``_run_cli_attempt`` must remove it after the spawn returns so a long-lived
+    sidecar doesn't accumulate one dir per request.
+
+    A fake Claude CLI computes the mangled name from its own cwd and writes
+    one JSONL into the corresponding project dir; the assert is that the dir
+    is gone after ``_run_cli_attempt`` returns.
+
+    ``server.CLAUDE_PROJECTS`` is baked into the script at write time
+    rather than read from the environment: the subprocess's env is the
+    ``subprocess_env()`` allowlist and does not include
+    ``CLAUDE_PROJECTS_DIR`` (issue #116, intentionally narrow), so the
+    script cannot derive it from os.environ. Hardcoding the path keeps the
+    test offline and does not depend on the bridge widening its allowlist.
+    """
+    import asyncio
+    import shutil
+
+    projects_root = Path(server.CLAUDE_PROJECTS)
+    assert projects_root.is_dir(), projects_root
+    projects_path = str(projects_root)
+
+    fake_cli = tempfile.NamedTemporaryFile(
+        "w", suffix=".py", prefix="clib-cp-", delete=False)
+    fake_cli.write(
+        "import json, os, re\n"
+        # The CLI mangles any non-alphanumeric cwd char to '-' to pick its
+        # project dir. Mirror that here so the fake writes into the same
+        # path the helper is supposed to clean up.
+        f"mangled = re.sub(r'[^A-Za-z0-9]', '-', os.getcwd())\n"
+        f"target = os.path.join({projects_path!r}, mangled)\n"
+        "os.makedirs(target, exist_ok=True)\n"
+        # Empty JSONL is fine: the cleanup helper only needs the dir to
+        # exist so it has something to remove.
+        "open(os.path.join(target, 'sess.jsonl'), 'w').close()\n"
+        # Claude parser reads either a single JSON object or stream-json.
+        # The single-object shape is simplest.
+        "print(json.dumps({'result': 'ok', 'usage': "
+        "    {'input_tokens': 1, 'output_tokens': 1}}))\n")
+    fake_cli.close()
+
+    saved = (server.CLI, server.BARE, server.PROFILE, server.PROVIDER)
+    try:
+        server.CLI = sys.executable
+        server.BARE = False
+        server.PROVIDER = "claude"
+        server.PROFILE = dict(server.PROFILES["claude"], args=[fake_cli.name])
+        asyncio.run(server.run_cli("hi", None, "m"))
+        # The fake CLI wrote exactly one project dir under
+        # `server.CLAUDE_PROJECTS`. After the call that subtree must be
+        # gone, otherwise we have the same leak the issue describes.
+        leftovers = sorted(p.name for p in projects_root.iterdir()
+                           if p.is_dir())
+        assert leftovers == [], (
+            f"_run_cli_attempt left project dirs behind: {leftovers}")
+        # And any stray jsonl at the root (not in a subdir) would also be
+        # a sign the helper wrote into the wrong place.
+        stray = [p.name for p in projects_root.iterdir() if p.is_file()]
+        assert stray == [], stray
+        print(f"  claude text-path: project dir under "
+              f"{projects_root.name}/<mangled> removed by _run_cli_attempt")
+    finally:
+        (server.CLI, server.BARE, server.PROFILE, server.PROVIDER) = saved
+        os.unlink(fake_cli.name)
+        # Defensive: blow away anything a future regression leaves behind
+        # so the next test starts clean.
+        for entry in projects_root.iterdir():
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+
+
+def test_find_usage_report_filters_by_since_and_returns_first_match():
+    """``_find_usage_report(since)`` is the scan behind the claude /usage
+    report. It must skip transcripts whose mtime is well before ``since``
+    (a /usage command from `time.time() - 0` should not surface a 30-day-old
+    hit) and return the first matching ``usageReport`` it walks into after
+    sorting by mtime desc -- not the newest overall if it is older than
+    ``since``.
+    """
+    import shutil
+    import time as _time
+
+    projects_root = Path(server.CLAUDE_PROJECTS)
+    now = _time.time()
+    # Anything older than ~6s is filtered out by the mtime<since-5 guard.
+    since = now - 1.0
+
+    # Stale report: written an hour ago, claims to be a usage report.
+    stale_proj = projects_root / "stale-project"
+    stale_proj.mkdir(parents=True, exist_ok=True)
+    stale_jsonl = stale_proj / "stale.jsonl"
+    stale_jsonl.write_text(json.dumps({
+        "type": "result",
+        "usageReport": {"rate_limits": {"stale": True}}}) + "\n")
+    stale_mtime = now - 3600
+    os.utime(stale_jsonl, (stale_mtime, stale_mtime))
+
+    # Fresh report: written just now, has a different rate_limits body.
+    fresh_proj = projects_root / "fresh-project"
+    fresh_proj.mkdir(parents=True, exist_ok=True)
+    fresh_jsonl = fresh_proj / "fresh.jsonl"
+    fresh_body = {"rate_limits": {"primary": {"used": 7, "limit": 100}}}
+    fresh_jsonl.write_text(json.dumps({
+        "type": "result",
+        "usageReport": fresh_body}) + "\n")
+
+    try:
+        report = server._find_usage_report(since)
+        assert report is not None, "no usageReport returned"
+        # The fresh report must win -- it is the only one newer than since.
+        assert report["rate_limits"]["primary"]["used"] == 7, report
+        # The stale marker must not have leaked through: if it did, the
+        # since guard regressed.
+        assert "stale" not in json.dumps(report), report
+        print("  _find_usage_report: mtime<since-5 filtered, fresh wins")
+    finally:
+        shutil.rmtree(stale_proj, ignore_errors=True)
+        shutil.rmtree(fresh_proj, ignore_errors=True)
+
+
+def test_usage_report_runs_scan_helpers_off_the_event_loop():
+    """``usage_report`` is async, but the rglob scans it triggers are sync.
+    They MUST run via ``asyncio.to_thread`` so the portal's 1-Hz /usage
+    poll does not stall the event loop. Monkey-patch the scan helpers and
+    verify they were called from a worker thread, not the loop thread.
+
+    The Claude branch also spawns ``claude -p /usage``; that subprocess
+    is replaced with a stub so the test stays offline. The Codex branch
+    reads ``CODEX_HOME/auth.json`` first; the test points CODEX_HOME at a
+    tempdir with a non-empty auth.json so the 401 path does not short-circuit
+    before reaching ``_codex_rate_limits``.
+    """
+    import asyncio
+    import shutil
+    import threading
+    from fastapi import HTTPException
+
+    loop_thread = threading.current_thread()
+    captured: list[tuple[str, threading.Thread]] = []
+
+    def fake_find_usage_report(since):
+        captured.append(("claude", threading.current_thread()))
+        return {"rate_limits": {"primary": {"used": 1, "limit": 10}}}
+
+    def fake_codex_rate_limits():
+        captured.append(("codex", threading.current_thread()))
+        return {"rate_limits": {"primary": {"used": 1, "limit": 10}},
+                "observed_at": 0}
+
+    codex_home_tmp = Path(tempfile.mkdtemp(prefix="clib-ot-codex-home-"))
+    (codex_home_tmp / "auth.json").write_text("{}")
+    codex_sessions_tmp = Path(tempfile.mkdtemp(prefix="clib-ot-codex-sessions-"))
+
+    saved = (server._find_usage_report, server._codex_rate_limits,
+             server.PROVIDER, server.CODEX_SESSIONS)
+    saved_home = os.environ.get("CODEX_HOME")
+    real_exec = asyncio.create_subprocess_exec
+
+    async def fake_exec(*args, **kwargs):
+        class _Stub:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                return (b"", b"")
+        return _Stub()
+
+    try:
+        server._find_usage_report = fake_find_usage_report
+        server._codex_rate_limits = fake_codex_rate_limits
+        server.CODEX_SESSIONS = codex_sessions_tmp
+        os.environ["CODEX_HOME"] = str(codex_home_tmp)
+        # First the Claude branch: it goes through the subprocess stub
+        # and reaches `_find_usage_report` via asyncio.to_thread.
+        server.PROVIDER = "claude"
+        asyncio.create_subprocess_exec = fake_exec
+        try:
+            asyncio.run(server.usage_report())
+        except HTTPException:
+            pass
+        # Then the Codex branch: no subprocess, but `_codex_rate_limits`
+        # is wrapped in to_thread the same way.
+        server.PROVIDER = "codex"
+        try:
+            asyncio.run(server.usage_report())
+        except HTTPException:
+            pass
+        # The two helpers must each have been called exactly once, and
+        # never on the loop thread -- if they were, asyncio.to_thread
+        # was bypassed and the test that calls itself "off-thread" lies.
+        names = [n for n, _ in captured]
+        assert names == ["claude", "codex"], names
+        for name, thread in captured:
+            assert thread is not loop_thread, (
+                f"{name} scan ran on the event-loop thread {thread!r}; "
+                "asyncio.to_thread was bypassed")
+        print("  usage_report: claude + codex scans both ran off the loop thread")
+    finally:
+        (server._find_usage_report, server._codex_rate_limits,
+         server.PROVIDER, server.CODEX_SESSIONS) = saved
+        if saved_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = saved_home
+        asyncio.create_subprocess_exec = real_exec
+        shutil.rmtree(codex_home_tmp, ignore_errors=True)
+        shutil.rmtree(codex_sessions_tmp, ignore_errors=True)
+
+
+def test_usage_report_cleans_per_call_cwd_when_spawn_raises():
+    """``usage_report`` makes a fresh ``tempfile.mkdtemp(prefix="sy-cli-")``
+    cwd before spawning the inner CLI. Reviewer finding, PR #322 cycle 2:
+    a subprocess spawn that fails (missing binary, wrong arch, renamed
+    mid-deploy) used to leak that fresh temp dir because the cleanup
+    ``finally:`` only followed the spawn. The fix wraps the
+    ``create_subprocess_exec`` await in the same outer ``try:``, so the
+    fresh temp dir is reclaimed even when the spawn itself raises.
+
+    The test makes the inner spawn raise FileNotFoundError. The exception
+    propagates (FastAPI wraps unhandled exceptions into a 500 at the
+    transport layer; the helper itself does not catch it). The contract
+    we care about is post-raise cleanup: the fresh sy-cli-* cwd the call
+    created must not survive the exception.
+    """
+    import asyncio
+
+    projects_root = Path(server.CLAUDE_PROJECTS)
+    before = sorted(p.name for p in projects_root.iterdir() if p.is_dir())
+    # Snapshot any pre-existing sy-cli-* tempdirs our test process
+    # itself created in the last minute (other tests can leave them
+    # around, but we only care about the leak this call would add).
+    import time as _t
+    pre_tmp = {
+        p.name for p in Path(tempfile.gettempdir()).iterdir()
+        if p.name.startswith("sy-cli-") and p.is_dir()
+        and p.stat().st_mtime > _t.time() - 60}
+
+    saved = (server.PROVIDER, server.PROFILE)
+    real_exec = asyncio.create_subprocess_exec
+
+    async def boom_exec(*args, **kwargs):
+        raise FileNotFoundError(
+            errno.ENOENT, "simulated missing CLI binary", args[0])
+
+    try:
+        server.PROVIDER = "claude"
+        asyncio.create_subprocess_exec = boom_exec
+        raised = None
+        try:
+            asyncio.run(server.usage_report())
+        except (FileNotFoundError, OSError) as exc:
+            raised = exc
+        assert raised is not None, (
+            "expected FileNotFoundError from the simulated spawn failure")
+
+        # After the call returns, no new project dirs should have landed
+        # under CLAUDE_PROJECTS. The fresh sy-cli-* cwd was cleaned up
+        # by the outer try/finally, so its <sanitized cwd>/ project dir
+        # would have been too (had anything been written to it -- the
+        # spawn raised before any JSONL was produced, so on this path
+        # the project dir never even appeared).
+        after = sorted(p.name for p in projects_root.iterdir() if p.is_dir())
+        assert after == before, (
+            f"a fresh project dir landed under {projects_root}: "
+            f"before={before}, after={after}")
+        # The fresh sy-cli-* cwd created this call must NOT survive the
+        # exception -- if any new one shows up, the cleanup regressed.
+        post_tmp = {
+            p.name for p in Path(tempfile.gettempdir()).iterdir()
+            if p.name.startswith("sy-cli-") and p.is_dir()
+            and p.stat().st_mtime > _t.time() - 60}
+        leaked = post_tmp - pre_tmp
+        assert not leaked, (
+            f"usage_report leaked a fresh per-call cwd on spawn failure: "
+            f"{leaked}")
+        print("  usage_report: per-call sy-cli-* cwd cleaned up on "
+              "subprocess spawn failure")
+    finally:
+        (server.PROVIDER, server.PROFILE) = saved
+        asyncio.create_subprocess_exec = real_exec
+
+
+def test_prune_codex_rollouts_removes_old_keeps_fresh():
+    """``_prune_codex_rollouts`` deletes ``CODEX_SESSIONS/**/*.jsonl``
+    older than ``CODEX_ROLLOUT_RETENTION_HOURS`` and leaves fresh ones
+    alone. A simulated unlink failure on one old rollout must not abort
+    the rest of the walk (logged-and-ignored contract): even when one
+    file's ``unlink`` raises OSError, the remaining old files are
+    pruned and the fresh one survives.
+
+    Reviewer finding, PR #322 cycle 2: the original stub used
+    ``chmod(S_IRUSR)`` on the file alone, but on Linux ``unlink()``
+    needs write permission on the PARENT directory, not the file --
+    so the chmod did not exercise the failure path. The stub now
+    overrides ``Path.unlink`` on a single entry to raise
+    ``PermissionError``, which is what a real parent-dir EACCES
+    produces. The helper's ``except OSError`` branch is the path under
+    test; if a future bug raises outside that branch, the walk would
+    abort on the next iteration and the assertions below would
+    pinpoint that.
+    """
+    import shutil
+    import time as _time
+
+    sessions_root = Path(server.CODEX_SESSIONS)
+    if sessions_root.exists():
+        shutil.rmtree(sessions_root)
+    sessions_root.mkdir(parents=True)
+
+    saved_retention = server.CODEX_ROLLOUT_RETENTION_HOURS
+    # 1 ms window so "an hour ago" is unambiguously out of retention
+    # without sleeping the test.
+    server.CODEX_ROLLOUT_RETENTION_HOURS = 0.001
+
+    now = _time.time()
+    old_mtime = now - 3600
+
+    old1 = sessions_root / "old-1.jsonl"
+    old1.write_text("{}\n")
+    os.utime(old1, (old_mtime, old_mtime))
+
+    old2 = sessions_root / "old-2.jsonl"
+    old2.write_text("{}\n")
+    os.utime(old2, (old_mtime, old_mtime))
+
+    # A file the prune cannot unlink: stub Path.unlink on this one entry
+    # to raise PermissionError, the way a permissions error on the PARENT
+    # directory would (reviewer finding, PR #322 cycle 2: chmod 0400 on
+    # the file alone doesn't exercise the failure path on Linux, because
+    # unlink() needs write on the PARENT, not the file). The helper's
+    # `except OSError` branch is the path under test; if a future bug
+    # raises outside that branch, the test will catch it (the walk would
+    # then abort on the next iteration, leaving `fresh` and the second
+    # `old*` file either removed or not depending on iteration order --
+    # either way the helper did not honour its logged-and-ignored contract).
+    unreadable = sessions_root / "old-unreadable.jsonl"
+    unreadable.write_text("{}\n")
+    os.utime(unreadable, (old_mtime, old_mtime))
+    real_unlink = type(unreadable).unlink
+    raised = []
+
+    def boom(self):
+        if self == unreadable:
+            raised.append(self)
+            raise PermissionError("simulated EACCES on parent dir")
+        return real_unlink(self)
+
+    fresh = sessions_root / "fresh.jsonl"
+    fresh.write_text("{}\n")
+
+    try:
+        server.Path.unlink = boom
+        server._prune_codex_rollouts()
+        # The unreadable entry refused to unlink. Old1 and old2 are
+        # also old -- iteration order over rglob is unspecified but the
+        # walk MUST keep going past the boom, and fresh MUST be retained.
+        assert fresh.exists(), f"{fresh.name} must be retained"
+        assert old1.exists() is False and old2.exists() is False, (
+            f"walk aborted on the simulated failure: "
+            f"old1={old1.exists()!r}, old2={old2.exists()!r}")
+        assert raised, "the simulated unlink failure never fired -- did " \
+            "the test stub attach correctly?"
+        print("  codex retention: old rollouts pruned, fresh kept; "
+              "unlink failures do not abort the walk")
+    finally:
+        try:
+            server.Path.unlink = real_unlink
+        except (AttributeError, TypeError):
+            pass
+        server.CODEX_ROLLOUT_RETENTION_HOURS = saved_retention
+        shutil.rmtree(sessions_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -5509,6 +5509,268 @@ def test_tool_calls_turn_reports_last_call_context_and_zero_billed():
           f"(mid-loop)")
 
 
+# --------------------------------------- teardown: remove per-session project dir --
+def test_end_session_removes_claude_project_dir_for_a_mcp_relay_session():
+    """`last_call_usage` reads `~/.claude/projects/<sanitized spawn_dir>/<uuid>.jsonl`
+    during the final turn response build; teardown (reap/end_session/shutdown
+    drain) runs strictly after the response is produced, so deleting the
+    project dir on the teardown path cannot race the read.
+
+    This test pins both halves of that contract for a session whose workdir
+    is the production-shape ``/relay/<session_id>``:
+      (1) `last_call_usage` reads the file the fake CLI wrote under a temp
+          CLAUDE_PROJECTS root, before end_session is called.
+      (2) After end_session runs, the per-session project dir
+          `<sanitized spawn_dir>` is gone (the parent's other dirs are
+          untouched).
+
+    Reviewer finding, PR #322 cycle 2: the previous version of this test
+    used ``mkdtemp(prefix="mcpb-test-")`` to simulate the fallback path,
+    but the helper's ownership test was ``spawn_dir.name == session.id``,
+    which matches the production ``/relay/<session_id>`` shape and not
+    the fallback's ``mcpb-<id8>-<random>``. The cycle-3 fix adds a
+    disjunction in the helper (``name == session_id`` OR
+    ``^mcpb-<id8>-``); this test pins the production half of that
+    disjunction end-to-end through ``end_session``. The matching
+    ``test_end_session_removes_claude_project_dir_for_a_mcp_fallback_session``
+    pins the fallback shape (also cycle-3).
+    """
+    saved = server.cli_bridge.CLAUDE_PROJECTS
+    saved_provider = server.PROVIDER
+    tmp = Path(tempfile.mkdtemp(prefix="mcpb-projects-cleanup-"))
+    try:
+        server.cli_bridge.CLAUDE_PROJECTS = tmp
+        session = _new_session()
+        # Production workdir shape: /relay/<session_id>. The helper's
+        # ownership test is `spawn_dir.name == session.id`, which the
+        # session.uuid-as-dirname satisfies exactly.
+        session.spawn_dir = "/relay/" + session.id
+        # Sibling kept around: a different session's project dir in the same
+        # parent must NOT be collateral damage.
+        sibling = tmp / re.sub(r"[^A-Za-z0-9]", "-", str(spawn_dir_alt(session)))
+        sibling.mkdir(parents=True, exist_ok=True)
+        usage = {"input_tokens": 17, "output_tokens": 4,
+                 "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        _write_inner_transcript(session, tmp, [usage])
+        # (1) read still works before teardown
+        assert server.last_call_usage(session) == {
+            "input_tokens": 17, "output_tokens": 4,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+        }, server.last_call_usage(session)
+        target = tmp / re.sub(r"[^A-Za-z0-9]", "-", session.spawn_dir)
+        assert target.is_dir(), list(tmp.iterdir())
+
+        # (2) teardown path removes the project's <sanitized workdir> dir
+        # but nothing else. Session.workdir is an mcpb-test-* tmpdir from
+        # _new_session; clean that up too.
+        asyncio.run(server.end_session(session))
+
+        assert not target.exists(), \
+            f"project dir was not removed: {target} ({list(tmp.iterdir())})"
+        assert sibling.is_dir(), \
+            "sibling project dir was collateral damage from teardown"
+        _drop(session)
+        shutil.rmtree(Path(session.workdir), ignore_errors=True)
+    finally:
+        server.PROVIDER = saved_provider
+        server.cli_bridge.CLAUDE_PROJECTS = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  teardown: last_call_usage reads the transcript before, "
+          "end_session removes the /relay/<session_id> project dir (sibling kept)")
+
+
+def spawn_dir_alt(session: "server.Session") -> Path:
+    """Helper: a fresh /relay/<uuid> shape different from session.spawn_dir.
+
+    Used by the sibling-must-not-be-collateral check above; the sibling
+    has a new uuid, so its sanitized basename is a different dir under
+    the same CLAUDE_PROJECTS root.
+    """
+    return Path("/relay/alt-" + uuid.uuid4().hex)
+
+
+def test_end_session_removes_claude_project_dir_for_a_mcp_fallback_session():
+    """The companion to ``test_end_session_removes_claude_project_dir_for_a_mcp_relay_session``:
+    pins the ``mkdtemp(prefix=f"mcpb-{session_id[:8]}-")`` fallback shape
+    that ``new_workdir`` returns when ``MCP_WORKDIR_ROOT`` cannot be
+    ``mkdir``'d (Dockerfile.sidecar usually makes ``/relay`` sticky, so
+    this is rare; it is the path tests and unusual deployments take).
+
+    The cycle-2 helper accepted only the ``/relay/<session_id>`` shape
+    (basename equals session.uuid exactly); it explicitly did not accept
+    this fallback, leaking the corresponding project dir on every
+    fallback-path session. Reviewer finding, PR #322 cycle 3: cycle-2
+    trade a leak in the production path for a leak in the fallback
+    path. This test pins the cycle-3 fix -- the helper's disjunction
+    accepts both shapes, and the fallback's project dir is reclaimed.
+    """
+    saved = server.cli_bridge.CLAUDE_PROJECTS
+    saved_provider = server.PROVIDER
+    tmp = Path(tempfile.mkdtemp(prefix="mcpb-projects-fallback-"))
+    try:
+        server.cli_bridge.CLAUDE_PROJECTS = tmp
+        session = _new_session()
+        # Fallback shape: mkdtemp's prefix is `mcpb-<session_id[:8]>-<rand>`.
+        # The base name is NOT equal to the full session id; matching only
+        # the full uuid would leak this path.
+        fallback = Path(tempfile.mkdtemp(
+            prefix=f"mcpb-{session.id[:8]}-",
+            dir="/tmp"))
+        session.spawn_dir = str(fallback)
+        usage = {"input_tokens": 11, "output_tokens": 7,
+                 "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        _write_inner_transcript(session, tmp, [usage])
+        # (1) read still works before teardown
+        assert server.last_call_usage(session) == {
+            "input_tokens": 11, "output_tokens": 7,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+        }, server.last_call_usage(session)
+        target = tmp / re.sub(r"[^A-Za-z0-9]", "-", session.spawn_dir)
+        assert target.is_dir(), list(tmp.iterdir())
+
+        # (2) teardown path removes the fallback's project dir too.
+        asyncio.run(server.end_session(session))
+
+        assert not target.exists(), (
+            f"fallback-shape project dir was not removed: {target} "
+            f"({list(tmp.iterdir())})")
+        _drop(session)
+        shutil.rmtree(fallback, ignore_errors=True)
+    finally:
+        server.PROVIDER = saved_provider
+        server.cli_bridge.CLAUDE_PROJECTS = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  teardown: end_session also removes the mcpb-<id8>-* fallback "
+          "shape's project dir (cycle-3 fix for cycle-2 regression)")
+
+
+def test_end_session_keeps_project_dir_for_a_non_owned_spawn_cwd():
+    """A mirrored caller cwd shares one Claude project dir across every
+    session for that caller, and a project dir owned by another session
+    / shadowed under another path is not ours to reclaim.
+
+    Pinned against three non-owned shapes:
+      A. caller mirror `/Users/me/proj` -- basename `proj` ≠ session.id.
+      B. caller mirror `/Users/me/repos/mcpb-fleetside` -- basename
+         `mcpb-fleetside` starts with `mcpb-` but is NOT this session.id
+         (reviewer finding, PR #322 cycle 2: the old `mcpb-` basename
+         guard would have wrongly deleted this shared project dir).
+      C. someone else's `/relay/<other-uuid>` workdir -- basename is a
+         fresh uuid, not session.id, and rmtree would race that other
+         session's live `last_call_usage` read of its own transcript.
+
+    In every case the per-session project dir survives `end_session`.
+    """
+    saved = server.cli_bridge.CLAUDE_PROJECTS
+    saved_provider = server.PROVIDER
+    tmp = Path(tempfile.mkdtemp(prefix="mcpb-projects-guard-"))
+    try:
+        server.cli_bridge.CLAUDE_PROJECTS = tmp
+        # Case A: caller-mirror spawn path. The basename is the caller's
+        # own `proj`, never a session uuid we minted.
+        mirror_a = Path("/Users/me/proj")
+        a = _new_session()
+        a.spawn_dir = str(mirror_a)
+        _write_inner_transcript(a, tmp, [{"input_tokens": 1, "output_tokens": 1,
+                                          "cache_read_input_tokens": 0,
+                                          "cache_creation_input_tokens": 0}])
+        target_a = tmp / re.sub(r"[^A-Za-z0-9]", "-", str(mirror_a))
+        assert target_a.is_dir()
+
+        # Case B: caller mirror whose LAST segment starts with `mcpb-` but
+        # is the caller's, not ours. The old basename guard would have
+        # deleted it; the new `name == session.id` guard refuses because
+        # `mcpb-fleetside` is not a hex uuid.
+        mirror_b = Path("/Users/me/repos/mcpb-fleetside")
+        b = _new_session()
+        b.spawn_dir = str(mirror_b)
+        _write_inner_transcript(b, tmp, [{"input_tokens": 2, "output_tokens": 2,
+                                          "cache_read_input_tokens": 0,
+                                          "cache_creation_input_tokens": 0}])
+        target_b = tmp / re.sub(r"[^A-Za-z0-9]", "-", str(mirror_b))
+        assert target_b.is_dir()
+
+        # Case C: someone else's /relay/<uuid> -- the production shape,
+        # but a DIFFERENT uuid, not this session's. We must not touch it.
+        other_id = uuid.uuid4().hex
+        other = _new_session()
+        other.spawn_dir = "/relay/" + other_id
+        _write_inner_transcript(other, tmp, [{"input_tokens": 3, "output_tokens": 3,
+                                               "cache_read_input_tokens": 0,
+                                               "cache_creation_input_tokens": 0}])
+        target_c = tmp / re.sub(r"[^A-Za-z0-9]", "-", other.spawn_dir)
+        assert target_c.is_dir()
+
+        asyncio.run(server.end_session(a))
+        asyncio.run(server.end_session(b))
+        # We do NOT end_session `other` -- it's the "another live session"
+        # shape, simulating a sibling whose transcript is still in use.
+        assert target_a.is_dir(), f"mirror A wrongly removed: {target_a}"
+        assert target_b.is_dir(), f"mirror B wrongly removed: {target_b}"
+        assert target_c.is_dir(), f"sibling session's project dir wrongly removed: {target_c}"
+
+        _drop(a)
+        _drop(b)
+        _drop(other)
+    finally:
+        server.PROVIDER = saved_provider
+        server.cli_bridge.CLAUDE_PROJECTS = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  teardown guard: caller mirrors (/Users/me/proj, "
+          "/Users/me/repos/mcpb-fleetside) and a sibling session's "
+          "/relay/<other-uuid> project dir all survive end_session")
+
+
+def test_cleanup_project_dir_is_noop_off_claude_provider():
+    """The helper short-circuits on non-claude providers: a codex/opencode
+    spawn cwd never produces a Claude transcript, so any project dir under
+    CLAUDE_PROJECTS for it (if one somehow exists) must NOT be removed on
+    teardown -- it is someone else's, not ours to reclaim."""
+    saved = server.cli_bridge.CLAUDE_PROJECTS
+    saved_provider = server.PROVIDER
+    tmp = Path(tempfile.mkdtemp(prefix="mcpb-projects-nop-"))
+    try:
+        server.cli_bridge.CLAUDE_PROJECTS = tmp
+        # Use a session-shaped spawn_dir whose basename IS a session id
+        # we control, so the provider switch is the ONLY difference
+        # between the no-op case and the reclaim case below.
+        session = _new_session()
+        spawn_dir = Path("/relay/" + session.id)
+        session.spawn_dir = str(spawn_dir)
+        # Plant a project dir the helper would normally claim.
+        sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(spawn_dir))
+        planted = tmp / sanitized
+        planted.mkdir(parents=True, exist_ok=True)
+        sentinel = planted / "sentinel.jsonl"
+        sentinel.write_text("not empty\n")
+
+        # codex profile: same PROVIDER switch the bridge uses to gate the
+        # helper. After the helper runs, the planted dir must still be
+        # there even though spawn_dir.name == session.id would otherwise
+        # authorize the cleanup.
+        server.PROVIDER = "codex"
+        server._cleanup_project_dir(spawn_dir, session.id)
+        assert planted.is_dir() and sentinel.is_file(), \
+            "codex profile must NOT remove a Claude project dir"
+        # And sanity: the helper is callable as a no-op with None too.
+        assert server._cleanup_project_dir(None, session.id) is None
+
+        # Switch back to claude: now the dir IS reclaimed. (Proves the
+        # provider gate is the only thing keeping the dir alive above.)
+        server.PROVIDER = "claude"
+        server._cleanup_project_dir(spawn_dir, session.id)
+        assert not planted.exists(), (
+            f"claude profile should reclaim its own /relay/<session_id> "
+            f"project dir: {list(tmp.iterdir())}")
+        _drop(session)
+    finally:
+        server.PROVIDER = saved_provider
+        server.cli_bridge.CLAUDE_PROJECTS = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  cleanup: codex/opencode profiles no-op; claude reclaims "
+          "/relay/<session_id> project dirs")
+
+
 def test_no_inner_transcript_keeps_old_usage_and_bills_mirror_it():
     """An empty/nonexistent transcript root is the common state for callers
     that have not yet finished their first CLI turn, or run a provider with

@@ -1097,6 +1097,72 @@ def cleanup_workdir(workdir: Path) -> None:
     shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _cleanup_project_dir(spawn_dir: Path | None, session_id: str) -> None:
+    """Remove the per-cwd Claude transcript project dir for this session.
+
+    Claude Code writes its transcript under
+    `~/.claude/projects/<sanitized spawn_dir|workdir>/<uuid>.jsonl`; the
+    per-session cwd we run the CLI in leaves one of these project dirs
+    behind on every session. The CLI reads its transcript synchronously
+    during the final turn response build -- render_turn calls
+    _with_context_usage -> last_call_usage, which opens the JSONL directly
+    -- and the teardown path (reap/end_session/shutdown drain) runs strictly
+    after the response is produced, so deleting here cannot race the read.
+
+    Ownership test: delete iff ``spawn_dir`` is the per-session workdir
+    this relay created. Two shapes count as ours:
+
+      * ``/relay/<session_id>`` -- the workdir that ``new_workdir``
+        returns when ``MCP_WORKDIR_ROOT`` is creatable (the common path,
+        Dockerfile.sidecar makes ``/relay`` sticky + world-writable).
+        Basename equals ``session_id``.
+
+      * ``mkdtemp(prefix=f"mcpb-{session_id[:8]}-")`` -- the workdir
+        ``new_workdir`` falls back to when the relay root cannot be
+        ``mkdir``'d (Dockerfile.sidecar usually makes ``/relay`` sticky
+        so this is rare; it is the path tests take). Basename starts
+        with ``mcpb-<session_id[:8]>-``.
+
+    The ``session_id`` test matches the production shape only -- it was
+    deliberately not extended to the fallback shape initially (cycle 2),
+    which the cycle-3 forge reviewer flagged as a regression. The
+    disjunction below accepts either shape; both reject caller mirrors
+    (a mirror's basename is the caller's, never a uuid-prefix we minted)
+    and adjacent-session workdirs. The fallback regex is anchored at the
+    start so ``/Users/me/repos/mcpb-fleetside`` is rejected (its basename
+    is not the caller's, but neither is ``mcpb-`` followed by an 8-char
+    hex session-id prefix and a separator).
+
+    Anything else -- a mirror of ``/Users/me/proj``, a caller's
+    ``/Users/me/repos/mcpb-*`` whose last segment starts with mcpb-
+    by name only, another session's ``/relay/<other-uuid>``, or any
+    arbitrary path -- is left untouched: those project dirs are
+    refcount-shared with live sibling sessions (mirrors in particular)
+    and rmtree would race their ``last_call_usage`` reads.
+    """
+    if PROVIDER != "claude":
+        return
+    if spawn_dir is None:
+        return
+    basename = Path(str(spawn_dir)).name
+    # Ownership: ``/relay/<session_id>`` (production) -- basename IS
+    # the session_id. The full-uuid match alone misses the ``mcpb-``
+    # fallback shape because its basename is ``mcpb-<id8>-<random>``;
+    # disjunction below accepts that one too.
+    session_match = basename == session_id
+    fallback_match = bool(re.match(
+        rf"^mcpb-{re.escape(session_id[:8])}-[A-Za-z0-9_]+$", basename))
+    if not (session_match or fallback_match):
+        return
+    sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(spawn_dir))
+    project_dir = cli_bridge.CLAUDE_PROJECTS / sanitized
+    # Direct child of CLAUDE_PROJECTS only -- never reach into a nested dir
+    # that this session did not create.
+    if project_dir.parent != cli_bridge.CLAUDE_PROJECTS:
+        return
+    shutil.rmtree(project_dir, ignore_errors=True)
+
+
 def new_workdir(session_id: str) -> Path:
     """Create the per-session directory beneath MCP_WORKDIR_ROOT.
 
@@ -1560,6 +1626,19 @@ async def end_session(session: Session) -> None:
     session.dead = True
     SESSIONS.pop(session.id, None)
     cleanup_workdir(Path(session.workdir))
+    # Claude files one transcript project dir per spawn cwd under
+    # `~/.claude/projects/`. last_call_usage reads it from the final turn
+    # (render_turn runs before this), so deleting here cannot race the read.
+    # Best-effort: a leak here is a slow disk-fill, not a correctness bug,
+    # and the helper itself swallows its own errors. Belt and braces the
+    # off-thread wrapper anyway -- never raise into the teardown path.
+    try:
+        await asyncio.to_thread(_cleanup_project_dir,
+                                Path(session.spawn_dir) if session.spawn_dir else None,
+                                session.id)
+    except Exception as exc:
+        log.warning("project dir cleanup failed for session %s: %s",
+                    session.id, exc)
     release_mirror(session.spawn_dir, session.id)
     if session.holds_slot:
         session.holds_slot = False
@@ -2392,6 +2471,16 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
         log.warning("start_session failed to build argv: %s", exc, exc_info=True)
         await cli_bridge._gate.release()
         cleanup_workdir(workdir)
+        # Same Claude project-dir cleanup as end_session. argv build failed
+        # before any CLI spawn ran, so the CLI never wrote a transcript --
+        # but the workdir fallback (mkdtemp prefix mcpb-) and the relay root
+        # both leave an empty project dir behind, and the helper is safe
+        # against that case (it just removes whatever is there if any).
+        try:
+            await asyncio.to_thread(_cleanup_project_dir, spawn_dir, session_id)
+        except Exception as cleanup_exc:
+            log.warning("project dir cleanup failed for session %s: %s",
+                        session_id, cleanup_exc)
         release_mirror(str(spawn_dir), session_id)
         if img_dir is not None:
             shutil.rmtree(img_dir, ignore_errors=True)
