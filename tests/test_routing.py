@@ -2650,6 +2650,91 @@ def test_perishable_writer_preserves_other_plan_score_when_re_polled():
           f"(pre={pre:.4f}, post={post:.4f})")
 
 
+def test_perishable_writer_targets_window_not_weekly_scoped():
+    """A current `weekly_scoped` reading MUST NOT override the plan's target
+    window percent when scoring perishable members. The example claude-max
+    probe payload reports both `weekly_all` (98%) and `weekly_scoped` (12%)
+    -- `weekly_scoped` is one model's share of the same week, so treating it
+    as the rank would understate the week's room (12% used -> 88% room)
+    and rank the same member ahead of every other lane body member.
+    Per `plans.example.yaml:704`, weekly_scoped is deliberately not mapped
+    onto the rank; the writer scores every fresh member on the target window
+    only. A regression reintroducing `scoped_pct` would yield 88% room and
+    the wrong rank first.
+
+    Parity check: with NO `weekly_scoped` facts at all, the rank is the same
+    as with one -- the writer never depends on the side-channel reading.
+    """
+    from dataclasses import replace
+    from switchyard.portal.app import (
+        _recompute_perishable_for_plan, _TIER_OFFSET)
+
+    async def score_once(*, with_scoped: bool):
+        reg, slots, _picker, ledger = build_with_policy()
+        lanes = dict(reg.lanes)
+        lanes["perishable-test"] = replace(
+            reg.lanes["apex"],
+            key="perishable-test",
+            tail=[],
+            strategy="perishable",
+            description="",
+        )
+        reg2 = models.Registry(settings=reg.settings, plans=reg.plans,
+                               lanes=lanes)
+        reset = time.time() + 7 * 86400
+        # Plan's target window (the rank's source of truth).
+        await ledger.note_reported_percent("claude-max", 98.0, reset,
+                                           window="weekly")
+        if with_scoped:
+            # Side-channel reading from the example probe payload. The
+            # current writer must ignore it; the old override would have
+            # used 12.0 here and produced 88% room.
+            await ledger.note_reported_percent("claude-max", 12.0, reset,
+                                               window="weekly_scoped")
+        plan_a = reg2.plans["claude-max"]
+        await _recompute_perishable_for_plan(reg2, ledger, plan_a)
+        order = await ledger.get_lane_order("perishable-test")
+        return order, reset
+
+    with_scoped, reset_a = run(score_once(with_scoped=True))
+    without_scoped, reset_b = run(score_once(with_scoped=False))
+    # Only the just-probed plan's ref is in the hash on a first poll;
+    # openai/astra has no previous, so it lands in `unknown` and is not
+    # written. Both runs return the single scored ref, claude-max/fable.
+    assert [m["ref"] for m in with_scoped["members"]] == ["claude-max/fable"], (
+        with_scoped["members"])
+    assert [m["ref"] for m in without_scoped["members"]] == ["claude-max/fable"], (
+        without_scoped["members"])
+    fable_with = with_scoped["members"][0]
+    fable_without = without_scoped["members"][0]
+    # The stored score is tier-shifted: leading family bucket gets tier 1
+    # (highest), raw score added on top. Raw score with 2% room and ~168h
+    # reset is ~2/168; with 88% room (the regression) it would be ~88/168.
+    # Both runs use the same reset value, so hours match modulo time drift.
+    hours = max(1.0, (reset_a - time.time()) / 3600.0)
+    expected_raw = 2.0 / hours
+    expected_score = _TIER_OFFSET + expected_raw
+    regression_raw = 88.0 / hours
+    regression_score = _TIER_OFFSET + regression_raw
+    # 1. The with_scoped run must reflect the target window (2% room),
+    #    not the regression (88% room). The 0.01 vs 0.1 gap is the margin
+    #    that lets one assertion fail loudly if the override is restored
+    #    while leaving room for floating-point / time-drift noise.
+    assert abs(fable_with["score"] - expected_score) < 0.01, (
+        fable_with["score"])
+    assert abs(fable_with["score"] - regression_score) > 0.1, (
+        f"score {fable_with['score']:.4f} matches the regression case "
+        f"({regression_score:.4f})")
+    # 2. The without_scoped run produces the same rank -- the writer is
+    #    indifferent to the side-channel reading's presence.
+    assert abs(fable_with["score"] - fable_without["score"]) < 0.01, (
+        fable_with["score"], fable_without["score"])
+    print(f"  with weekly_scoped: score={fable_with['score']:.4f} (target "
+          f"room 2%, expected ~{expected_score:.4f}); "
+          f"without weekly_scoped: score={fable_without['score']:.4f} "
+          f"(parity); regression would be {regression_score:.4f}")
+
+
 def test_perishable_one_adjacent_swap_reconciles_added_and_removed_refs():
     """`_one_adjacent_swap` drops refs from `previous` that have left the
     lane (a config edit, a member's plan disabled, etc.) and appends refs

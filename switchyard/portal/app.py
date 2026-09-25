@@ -420,10 +420,6 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
     # only trusts `gate5h` as a gate, and an old `>90%` row is the kind of
     # false positive that quietly suppresses a plan until its next poll.
     this_plan_gate5h = gate_pct is not None and gate_pct > 90
-    scoped = await ledger.window_facts(plan.key, "weekly_scoped")
-    scoped_current = reported_is_current(scoped, "week")
-    scoped_pct = (_as_float(scoped.get("reported_pct_used"))
-                  if scoped_current else None)
 
     for lane in affected_lanes:
         # Read the previous lane order once: it carries the OTHER plans'
@@ -462,9 +458,12 @@ async def _recompute_perishable_for_plan(reg, ledger, plan) -> None:
                 continue  # tail handled separately, never ranked
             ref = member.ref
             if member.plan_key == plan.key:
-                # This plan just probed: use fresh facts.
-                member_pct = (scoped_pct if scoped_pct is not None
-                              else target_pct)
+                # This plan just probed: use fresh facts on the target window.
+                # `weekly_scoped`-style readings (one model's share of the same
+                # week) are deliberately NOT read here -- the rank lives on the
+                # plan's target window only, so percent and reset describe the
+                # same window.
+                member_pct = target_pct
                 member_room = (None if member_pct is None
                                else max(0.0, 100.0 - member_pct))
                 score = perishable_score(member_room, target_reset)
