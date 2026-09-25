@@ -6,3 +6,11 @@ environmentRecipes:
     name: DTC
     create: ~/.local/share/orca-tasks/recipe-create-auto-trigger.sh
     destroy: ~/.local/share/orca-tasks/recipe-destroy.sh
+
+  # Opilio (trial): same container, but runs are started through Opilio's
+  # API instead of the in-container runner. Pick this recipe per workspace;
+  # the DTC entry above is the old runner and stays as fallback.
+  - id: docker-task-opilio
+    name: DTC via Opilio
+    create: ~/.local/share/orca-tasks/recipe-create-opilio.sh
+    destroy: ~/.local/share/orca-tasks/recipe-destroy.sh
