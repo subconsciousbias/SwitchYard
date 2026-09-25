@@ -21,6 +21,22 @@ IDLE_WAIT="${IDLE_WAIT:-240}"
 
 rcli() { docker compose exec -T redis redis-cli -n 1 "$@"; }
 
+# The hold THIS run set and has not yet lifted. Released on any exit, so a
+# Ctrl-C, a killed shell or a `set -e` stop mid-recreate lifts it now instead
+# of leaving the seat out of rotation until DRAIN_TTL runs down. Only our own
+# key is touched: the value is compared first, so a cooldown something else
+# wrote in the meantime (a real quota wall) is left alone.
+held_plan=""; held_val=""
+release_hold() {
+  [ -n "$held_plan" ] || return 0
+  if [ "$(rcli GET "sy:cool:$held_plan" 2>/dev/null | tr -d '\r')" = "$held_val" ]; then
+    rcli DEL "sy:cool:$held_plan" >/dev/null 2>&1 || true
+  fi
+  held_plan=""; held_val=""
+}
+trap release_hold EXIT
+trap 'exit 130' INT TERM
+
 if [ "$#" -gt 0 ]; then svcs=("$@"); else
   mapfile -t svcs < <(docker compose config --services | grep -- '-sidecar$')
 fi
@@ -32,7 +48,9 @@ for svc in "${svcs[@]}"; do
   port="$(docker exec "$cid" printenv SIDECAR_PORT 2>/dev/null || echo 8081)"
   echo -n "==> $svc (plan=${plan:-?}) "
   if [ -n "$plan" ] && [ -z "$(rcli GET "sy:cool:$plan" | tr -d '\r')" ]; then
-    rcli SET "sy:cool:$plan" "maintenance|$(( $(date +%s) + DRAIN_TTL ))" EX "$DRAIN_TTL" >/dev/null
+    held_val="maintenance|$(( $(date +%s) + DRAIN_TTL ))"
+    rcli SET "sy:cool:$plan" "$held_val" EX "$DRAIN_TTL" >/dev/null
+    held_plan="$plan"
     cooled=1
   else
     cooled=0      # already cooled by something real: leave that alone
@@ -51,7 +69,7 @@ for svc in "${svcs[@]}"; do
     s="$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo none)"
     [ "$s" = healthy ] && break; sleep 2
   done
-  [ "$cooled" = 1 ] && rcli DEL "sy:cool:$plan" >/dev/null
+  [ "$cooled" = 1 ] && release_hold
   echo "$s"
   [ "$s" = healthy ] || { echo "$svc did not come back healthy; check: docker compose logs --tail=40 $svc" >&2; exit 1; }
 done
