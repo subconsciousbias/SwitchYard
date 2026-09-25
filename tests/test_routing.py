@@ -1206,6 +1206,70 @@ def test_the_generated_config_declares_no_general_fallbacks():
           f"re-enters through async_pre_call_hook, not via a router retry")
 
 
+def test_context_window_fallbacks_only_key_on_real_deployments_not_lanes():
+    """Every context-window fallback's source key MUST be a real
+    deployment ``model_name``, never a lane name. litellm's
+    ``fallback_lookup_groups`` resolves a fallback chain against
+    ``(pre-routing selection, metadata["model_group"], kwargs["model"])``
+    and ``router.py:_update_kwargs_before_fallbacks`` stamps
+    ``metadata["model_group"]`` from the model string the router was
+    invoked with -- which is the deployment string the pre-call hook
+    wrote (e.g. ``sy.local-box.qwen``), never a lane name (``local``).
+    A lane-keyed entry is therefore unreachable dead config: the router
+    never sees a request whose ``model`` is the lane key, so the
+    fallback chain never fires. The pre-fix ``gen_litellm.py`` emitted
+    both shapes; this test fails against today's generator output and
+    passes once the lane-keyed loop is removed.
+
+    The targets of every entry are still constrained to real deployment
+    names (the contract the existing test pins at lines 1194-1203), and
+    the existing pin in ``test_picker_context_window.py:455-491`` is
+    kept satisfied: every named target is a real deployment, and every
+    source key now is too.
+    """
+    from switchyard import gen_litellm
+    from switchyard import models
+
+    cfg = gen_litellm.build(os.environ["SWITCHYARD_PLANS"])
+    rs = cfg["router_settings"]
+    cw = rs["context_window_fallbacks"]
+    assert cw, (
+        "fixture must produce at least one context_window_fallbacks "
+        "entry; got an empty list")
+
+    # Every source key must be a real deployment model_name, never a
+    # lane key. The deployment names in this generated config come from
+    # ``Model.deployment`` (e.g. ``sy.local-box.qwen``); the lane names
+    # come from ``Registry.lanes.keys()`` (e.g. ``local``). The two
+    # sets are disjoint on purpose -- the lane aliases the loop at
+    # gen_litellm.py:76-91 emits are model_name="local", NOT a real
+    # deployment, so a "local"-keyed fallback entry is dead config.
+    deployment_names = {m["model_name"] for m in cfg["model_list"]}
+    lane_names = set(models.load().lanes.keys())
+    src_keys = [next(iter(entry.keys())) for entry in cw]
+    for src in src_keys:
+        assert src in deployment_names, (
+            f"context_window_fallbacks source key {src!r} is not a "
+            f"real deployment model_name; got source keys {src_keys}, "
+            f"lane names {sorted(lane_names)}, deployment names "
+            f"{sorted(deployment_names)}")
+        assert src not in lane_names, (
+            f"context_window_fallbacks source key {src!r} is a lane "
+            f"name; lane-keyed entries are unreachable dead config "
+            f"because the router stamps metadata['model_group'] from "
+            f"the deployment string, not the lane name. Got source "
+            f"keys {src_keys}, lane names {sorted(lane_names)}")
+    # And every named target is a real deployment, matching the
+    # existing pin.
+    for entry in cw:
+        for src, targets in entry.items():
+            for t in targets:
+                assert t in deployment_names, (src, t, sorted(deployment_names)[:5])
+    print(f"  context_window_fallbacks: {len(cw)} entries, all source "
+          f"keys are real deployment names ({sorted(set(src_keys))}), "
+          f"no lane names in {sorted(lane_names)}")
+
+
 def test_a_lane_board_separates_its_own_traffic_from_a_sibling_lanes():
     """A model in several lanes is busy for all of them, but the traffic belongs
     to whichever lane claimed it.

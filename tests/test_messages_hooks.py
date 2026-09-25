@@ -88,6 +88,27 @@ def _first_period_key(redis: FakeRedis, plan_key: str) -> str | None:
     return None
 
 
+def _failure_count(redis: FakeRedis, plan_key: str) -> int:
+    """How many failure rows ``ledger.record`` has written for ``plan_key``.
+
+    Reads every period bucket so a multi-window plan does not under-report.
+    Returns 0 when no bucket exists yet (which is the expected pre-failure
+    state).
+    """
+    n = 0
+    for k, v in redis.hashes.items():
+        if k.startswith(f"sy:usage:{plan_key}:p:"):
+            for fk, fv in v.items():
+                if isinstance(fk, bytes):
+                    fk = fk.decode()
+                if fk == "failures":
+                    try:
+                        n += int(float(fv))
+                    except (TypeError, ValueError):
+                        pass
+    return n
+
+
 # ----------------------------------------------------------------------------
 # Build helpers -- run inside ``asyncio.run`` so the test bodies stay sync.
 # ----------------------------------------------------------------------------
@@ -2169,6 +2190,1172 @@ async def _release_picker(h, ctx):
     needs a fresh release path on its own state.
     """
     await h.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
+
+
+# ============================================================================
+# Section 7: CONTEXT-window fallback success books the served plan
+# ============================================================================
+# A router-level ``context_window_fallbacks`` walk reuses the same nested
+# metadata["switchyard"] ctx across attempts (litellm.router_utils.
+# fallback_event_handlers.run_async_fallback only shallow-copies the metadata
+# per hop). Pre-fix this caused a permanent double-booking hole: the failure
+# on the first attempt claimed ``_TERMINATED = "failure"``, which
+# short-circuited ``_finish_success`` on the fallback attempt -- one
+# subscription's quota was spent and another's was credited. The fix
+# classifies BEFORE claiming the marker and routes CONTEXT verdicts onto a
+# path that does not claim ``_TERMINATED`` (a per-request ``_ctx_fail_booked_hops``
+# set dedupes the same-request double-fire instead).
+def test_context_window_fallback_success_books_served_plan_and_drops_lease():
+    """Two-attempt CONTEXT-fallback regression: a context-window failure on
+    attempt 1 (pick = local-box/qwen) is followed by a successful fallback
+    on attempt 2 (served = openrouter/mimo). Pre-fix this case was a silent
+    ledger hole: attempt 1 claimed ``_TERMINATED = "failure"``, and
+    attempt 2's ``_finish_success`` short-circuited on the marker so the
+    served plan's quota was never debited. Post-fix the CONTEXT failure
+    takes a path that does not claim the marker, the served plan's tokens
+    land on its own ledger bucket, no slot is claimed on the served plan,
+    and a pre-set session lease on the picked plan is dropped so the next
+    turn re-leases onto a sibling with a bigger window.
+
+    The shape mirrors ``test_buffered_messages_served_deployment_mismatch_reattributes_cost``
+    (:502): same `_hidden_params["model_id"]` -> router_id contract, same
+    ``async_post_call_success_hook` -> ``_finish_success`` path. The
+    CONTEXT-failure wiring is new: a ``ContextWindowExceededError`` (the
+    litellm exception class) reaches ``_finish_failure`` and routes through
+    the new CONTEXT branch.
+    """
+    h, reg, slots, _ledger, _policy, redis, pick = _build(claim_lane="local")
+    # pick is local-box/qwen; the served fallback is openrouter/mimo (the
+    # only sibling with a strictly-larger context_window).
+    siblings = [
+        m for m in reg.models.values()
+        if m.ref != pick.model.ref and m.context_window and m.context_window > pick.model.context_window
+    ]
+    assert siblings, (
+        "fixture must have at least one bigger-window sibling for the "
+        "fallback path to be exercisable; got "
+        f"{[(m.ref, m.context_window) for m in reg.models.values() if m.context_window]}")
+    served = siblings[0]
+    served_ref = served.ref
+    served_plan_key = reg.plan_of(served).key
+    picked_plan_key = pick.plan.key
+    assert served_plan_key != picked_plan_key, (
+        "test needs two plans so the served fallback is on a different "
+        "plan from the pick; both landed on "
+        f"{picked_plan_key}/{served_plan_key}")
+
+    # A session lease pre-set by an earlier turn. The CONTEXT verdict must
+    # drop it: the session would otherwise keep landing on the
+    # too-small-window plan every turn.
+    session = "sess-context-fallback"
+    lease_ttl = reg.settings.lease_ttl_seconds
+    asyncio.run(slots.set_lease(session, pick.model.ref, lease_ttl))
+    assert asyncio.run(slots.get_lease(session)) == pick.model.ref, (
+        "fixture lease must be live before the failure")
+
+    ctx = _ctx_for(pick, call_type="anthropic_messages")
+    ctx["session"] = session  # so drop_lease has something to drop
+
+    # A real litellm exception -- the class _finish_failure's CONTEXT branch
+    # recognises through the prose regex on its message.
+    from litellm import ContextWindowExceededError
+    exc = ContextWindowExceededError(
+        message=(
+            "This model's maximum context length is 131072 tokens. "
+            "However, you requested 200000 tokens."
+        ),
+        model=pick.model.ref,
+        llm_provider="openai",
+    )
+
+    async def go():
+        # Attempt 1: CONTEXT failure. async_post_call_failure_hook owns
+        # /v1/messages failures (LiteLLM 1.101.0 does NOT fire
+        # async_log_failure_event for anthropic_messages), so drive it
+        # through that path -- the same shape /v1/messages failures
+        # take in production.
+        await h.async_post_call_failure_hook(
+            request_data={"metadata": _meta_for(ctx)},
+            original_exception=exc,
+            user_api_key_dict=None,
+        )
+        # The CONTEXT branch must NOT have claimed the marker.
+        post_failure_terminated = ctx.get(_TERMINATED)
+        post_failure_ctx_flag = ctx.get("_ctx_fail_booked_hops")
+        # Pre-set lease must be dropped.
+        lease_after_failure = await slots.get_lease(session)
+        # The picked plan got a failure record.
+        picked_keys = [
+            k for k in redis.hashes.keys()
+            if k.startswith(f"sy:usage:{picked_plan_key}:p:")
+        ]
+        picked_bucket = _bucket_sync(redis, picked_keys[0]) if picked_keys else {}
+
+        # Attempt 2: the litellm router moves the request to a sibling
+        # deployment. _hidden_params["model_id"] carries that sibling's
+        # router_id, exactly the shape a production response carries
+        # (gen_litellm.py stamps ``model_info["id"]`` with
+        # ``Model.router_id``). async_post_call_success_hook fires for
+        # /v1/messages; _finish_success resolves the served plan via
+        # ``_check_served_deployment``.
+        response = _anthropic_response(pick, usage={
+            "input_tokens": 333, "output_tokens": 44,
+        })
+        response["_hidden_params"] = {
+            "model_id": served.router_id,
+        }
+        await h.async_post_call_success_hook(
+            data={"metadata": _meta_for(ctx)},
+            user_api_key_dict=None,
+            response=response,
+        )
+        served_keys = [
+            k for k in redis.hashes.keys()
+            if k.startswith(f"sy:usage:{served_plan_key}:p:")
+        ]
+        served_bucket = _bucket_sync(redis, served_keys[0]) if served_keys else {}
+        return (
+            post_failure_terminated, post_failure_ctx_flag, lease_after_failure,
+            picked_bucket, served_bucket,
+        )
+
+    (
+        post_failure_terminated, post_failure_ctx_flag, lease_after_failure,
+        picked_bucket, served_bucket,
+    ) = asyncio.run(go())
+
+    # Marker was NOT claimed by the CONTEXT failure (so the fallback success
+    # was allowed to run).
+    assert post_failure_terminated is None, (
+        f"CONTEXT failure must not claim _TERMINATED (would suppress "
+        f"the fallback success); got {post_failure_terminated!r}")
+    # The per-hop dedupe set has the hop this call contributed. The
+    # /v1/messages post-call-only test uses kwargs without a router
+    # stamp, so the hop is the -1 sentinel. The set is what keeps a
+    # real OpenAI-shape double-fire of async_log + async_post_call on
+    # one attempt from booking twice.
+    assert post_failure_ctx_flag == {-1}, (
+        f"per-hop dedupe set must contain the booked hop; got "
+        f"{post_failure_ctx_flag!r}")
+    # Session lease was dropped by the CONTEXT verdict so the next turn
+    # re-leases onto a sibling with a bigger window.
+    assert lease_after_failure is None, (
+        f"CONTEXT verdict must drop the session lease; got {lease_after_failure!r}")
+    # The picked plan got a failure record -- failure-side bookkeeping
+    # still ran on the path that did the work.
+    assert picked_bucket["failures"] >= 1, (
+        f"picked plan ({picked_plan_key}) must record the CONTEXT "
+        f"failure; got {picked_bucket}")
+    # The served plan got the tokens from the successful fallback.
+    assert served_bucket["prompt_tokens"] == 333, served_bucket
+    assert served_bucket["completion_tokens"] == 44, served_bucket
+    assert served_bucket["requests"] == 1, served_bucket
+    # And the success-side bookkeeping claimed the marker for attempt 2.
+    assert ctx[_TERMINATED] == "success", ctx.get(_TERMINATED)
+    # No slot left claimed on either plan. _finish_success does NOT
+    # claim-and-release a slot on the served plan (a post-hoc claim gates
+    # nothing -- the picker is the only placement owner), so the served
+    # plan was never inflight to begin with.
+    assert asyncio.run(slots.in_flight(picked_plan_key)) == 0
+    assert asyncio.run(slots.in_flight(served_plan_key)) == 0
+    print(f"  CONTEXT failure on {pick.model.ref}: lease dropped, "
+          f"failure recorded on {picked_plan_key}; fallback success on "
+          f"{served_ref} (plan={served_plan_key}) booked "
+          f"{int(served_bucket['prompt_tokens'])} prompt / "
+          f"{int(served_bucket['completion_tokens'])} completion; "
+          f"ctx[_TERMINATED]={ctx.get(_TERMINATED)!r}; no slot claimed "
+          f"on either plan")
+
+
+def test_non_context_failure_still_claims_marker_and_suppresses_success():
+    """Non-CONTEXT control for the no-router-metadata path: a 5xx on
+    attempt 1 with kwargs that carry no ``attempted_fallbacks``
+    stamp (the internal-caller shape; older-litellm shapes; the proxy
+    side of ``async_post_call_failure_hook`` on builds without the
+    in-place entry stamp) must still claim ``_TERMINATED`` so a later
+    success on the same attempt short-circuits unbooked.
+
+    Today the route is single-deployment (the generated config carries
+    ``num_retries=0`` and no general fallbacks), so no runtime
+    success can come -- but the claim keeps the bookkeeping
+    idempotent for the OpenAI-shape double-fire case where
+    ``async_log_failure_event`` and ``async_post_call_failure_hook``
+    both reach ``_finish_failure`` for one attempt.
+
+    The production-shaped companion at hop=0 lives in
+    ``test_non_context_failure_with_router_entry_stamp_claims_marker``
+    below.
+    """
+    h, _reg, slots, _ledger, _policy, _redis, pick = _build(claim_lane="local")
+    ctx = _ctx_for(pick, call_type="acompletion")
+    kwargs = {"metadata": _meta_for(ctx)}
+
+    class _Upstream5xx(Exception):
+        status_code = 502
+
+    async def go():
+        # Attempt 1: a non-CONTEXT 5xx -- the existing claim-marker path.
+        await h.async_log_failure_event(
+            kwargs=kwargs, response_obj=None,
+            start_time=None, end_time=None,
+        )
+        post_failure_terminated = ctx.get(_TERMINATED)
+        # A later "success" (in production: litellm's router-level
+        # context_window_fallbacks walking to a sibling -- the same
+        # single-member deployment group, hence still the same plan).
+        response = {
+            "id": "x", "object": "chat.completion",
+            "model": pick.model.ref,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 7},
+        }
+        await h.async_log_success_event(
+            kwargs=kwargs, response_obj=response,
+            start_time=None, end_time=None,
+        )
+        return post_failure_terminated
+
+    post_failure_terminated = asyncio.run(go())
+    # The 5xx claimed the marker as today.
+    assert post_failure_terminated == "failure", (
+        f"non-CONTEXT failure must claim _TERMINATED; got "
+        f"{post_failure_terminated!r}")
+    # And the later success short-circuited -- the marker is still
+    # ``failure``, so the request was never booked.
+    assert ctx[_TERMINATED] == "failure", (
+        f"later success on a non-CONTEXT failure must no-op; got "
+        f"ctx[_TERMINATED]={ctx[_TERMINATED]!r}")
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 0
+    print(f"  non-CONTEXT 5xx on {pick.model.ref}: marker claimed; "
+          f"later success no-op'd via first-line check")
+
+
+def test_context_window_failure_double_fire_books_exactly_one_failure():
+    """Same-request double-fire dedup: an OpenAI-shaped request fires both
+    ``async_log_failure_event`` and ``async_post_call_failure_hook`` for
+    one CONTEXT attempt (LiteLLM does this for the buffered OpenAI routes
+    on a router-level retry). The CONTEXT branch must dedup so exactly
+    one failure record survives per request -- matching today's
+    one-record-per-request semantics.
+
+    The non-CONTEXT case has the existing ``_TERMINATED`` marker. The
+    CONTEXT branch cannot reuse it (would suppress the fallback success),
+    so the per-hop dedupe (``_ctx_fail_booked_hops`` set) is the
+    sole guard against double-booking, and the test pins the set on
+    that account.
+    """
+    h, _reg, slots, _ledger, _policy, redis, pick = _build(claim_lane="local")
+    ctx = _ctx_for(pick, call_type="acompletion")  # NOT in UNLOGGED_CALL_TYPES
+    from litellm import ContextWindowExceededError
+    exc = ContextWindowExceededError(
+        message="prompt is too long: 200000 tokens exceeds the maximum of 131072",
+        model=pick.model.ref,
+        llm_provider="openai",
+    )
+    kwargs = {"metadata": _meta_for(ctx), "exception": exc}
+
+    async def go():
+        # Both hooks fire for one CONTEXT attempt. The first call books
+        # the failure; the second sees the same hop in the per-hop
+        # dedupe set and no-ops.
+        await h.async_log_failure_event(
+            kwargs=kwargs, response_obj=None,
+            start_time=None, end_time=None,
+        )
+        first_failure_count = _failure_count(
+            redis, pick.plan.key,
+        )
+        first_hops_flag = ctx.get("_ctx_fail_booked_hops")
+        await h.async_post_call_failure_hook(
+            request_data={"metadata": _meta_for(ctx)},
+            original_exception=exc,
+            user_api_key_dict=None,
+        )
+        second_failure_count = _failure_count(
+            redis, pick.plan.key,
+        )
+        return first_failure_count, second_failure_count, first_hops_flag
+
+    first_count, second_count, first_hops_flag = asyncio.run(go())
+    # First call did the work: failure counter incremented once, the
+    # per-hop dedupe set now has the hop (the no-router-metadata
+    # sentinel -1).
+    assert first_count == 1, (
+        f"first CONTEXT hook must book one failure record; got "
+        f"{first_count}")
+    assert first_hops_flag == {-1}, (
+        f"first CONTEXT hook must add the hop to _ctx_fail_booked_hops; "
+        f"got {first_hops_flag!r}")
+    # Second hook saw the dedup and no-op'd: counter unchanged.
+    assert second_count == first_count, (
+        f"second CONTEXT hook must no-op via the per-hop dedupe; got "
+        f"{first_count} -> {second_count}")
+    # Marker NOT claimed -- CONTEXT never claims (a sibling success
+    # could still arrive and must be allowed to book).
+    assert ctx.get(_TERMINATED) is None, (
+        f"CONTEXT branch must not claim _TERMINATED; got "
+        f"{ctx.get(_TERMINATED)!r}")
+    assert ctx.get("_ctx_fail_booked_hops") == {-1}
+    # Exactly one failure record on the picked plan -- the second hook
+    # must not have re-booked.
+    plan_keys = [
+        k for k in redis.hashes.keys()
+        if k.startswith(f"sy:usage:{pick.plan.key}:p:")
+    ]
+    assert plan_keys, "no period bucket for the failed plan"
+    bucket = _bucket_sync(redis, plan_keys[0])
+    assert bucket["failures"] == 1, (
+        f"CONTEXT double-fire must leave exactly one failure record; "
+        f"got {bucket}")
+    # Slot was released exactly once.
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 0
+    print(f"  CONTEXT double-fire: 1 failure record ({int(bucket['failures'])}), "
+          f"slot released once, ctx[_TERMINATED]={ctx.get(_TERMINATED)!r}, "
+          f"_ctx_fail_booked_hops={sorted(ctx.get('_ctx_fail_booked_hops') or set())!r}")
+
+
+def test_multihop_sibling_non_context_failure_books_sibling_plan():
+    """Multi-hop CONTEXT-window-fallbacks walk where a sibling hop fails
+    with a non-CONTEXT verdict (e.g. a 5xx or 401 on the fallback
+    deployment) must:
+
+      * Book the CONTEXT failure against the picked plan (hop 0),
+        without claiming ``_TERMINATED`` so a later success on yet
+        another sibling could still book.
+      * Book the non-CONTEXT failure against the sibling plan (hop 1),
+        not the picked plan. The pre-fix implementation used ``ctx["plan"]``
+        for every hop's verdict, which meant an AUTH hop on a sibling
+        cooled the picked plan for 1800s (the plan did nothing wrong),
+        a TRANSIENT hop bumped the picked plan's breaker streak (the
+        wrong plan's ladder), and the sibling's plan saw no failure row
+        at all for the attempt that actually failed on it.
+      * Run per-hop dedupe: each hop gets exactly one failure row.
+      * Apply per-hop verdict cooldown: the sibling's TRANSIENT cooldown
+        lands on the sibling, not on the picked plan; the picked plan
+        stays untouched (the only failure the picker ever made was the
+        CONTEXT one, which carries ``cooldown_seconds=0``).
+
+    The lifecycle this exercises (uses the production-shaped kwargs
+    the router stamps at walk entry, ``attempted_fallbacks = 0``):
+
+      async_log_failure_event(kwargs=hop0_kwargs, exc=ContextWindow…)
+        -> hop=0, books CONTEXT failure on picked plan, adds
+           ``_ctx_fail_booked_hops = {0}``.
+      async_log_failure_event(kwargs=hop1_kwargs, exc=Upstream5xx)
+        -> hop=1, books non-CONTEXT failure on sibling plan, adds
+           ``_ctx_fail_booked_hops = {0, 1}``. The marker is NOT
+           claimed mid-walk (would suppress a sibling success on a
+           later hop -- the #186 hole).
+    """
+    h, reg, slots, _ledger, _policy, redis, pick = _build(claim_lane="local")
+    siblings = [
+        m for m in reg.models.values()
+        if m.ref != pick.model.ref and m.context_window and m.context_window > pick.model.context_window
+    ]
+    assert siblings, (
+        "fixture must have at least one bigger-window sibling for the "
+        "fallback walk to be exercisable; got "
+        f"{[(m.ref, m.context_window) for m in reg.models.values() if m.context_window]}")
+    served = siblings[0]
+    served_ref = served.ref
+    served_plan_key = reg.plan_of(served).key
+    picked_plan_key = pick.plan.key
+    assert served_plan_key != picked_plan_key, (
+        "test needs the bigger-window sibling on a different plan so "
+        "verdict + failure-row attribution has two distinct buckets to "
+        "test against; both landed on "
+        f"{picked_plan_key}/{served_plan_key}")
+    picked_deployment = pick.model.deployment
+    served_deployment = served.deployment
+
+    ctx = _ctx_for(pick, call_type="acompletion")
+    from litellm import ContextWindowExceededError
+
+    async def go():
+        # Hop 0: a real CONTEXT failure on the picked deployment. Routers
+        # always fire ``async_log_failure_event`` per attempt for the
+        # OpenAI-shaped call types; drive this through that hook with
+        # the production-shaped kwargs the router stamps at walk
+        # entry (``attempted_fallbacks = 0`` -- router.py:7582,
+        # ``async_function_with_fallbacks``).
+        hop0_ctxw_exc = ContextWindowExceededError(
+            message=(
+                "This model's maximum context length is 131072 tokens. "
+                "However, you requested 200000 tokens."
+            ),
+            model=pick.model.ref,
+            llm_provider="openai",
+        )
+        hop0_meta = dict(_meta_for(ctx))
+        hop0_meta["attempted_fallbacks"] = 0
+        hop0_kwargs = {
+            "model": picked_deployment,
+            "litellm_params": {"metadata": hop0_meta},
+            "exception": hop0_ctxw_exc,
+        }
+        await h.async_log_failure_event(
+            kwargs=hop0_kwargs, response_obj=None,
+            start_time=None, end_time=None,
+        )
+        # Walk failed the picked deployment for context; litellm
+        # walks to the sibling. The sibling returns a 5xx. ``run_async_fallback``
+        # catches any exception per hop and the walk bubbles the last
+        # error up, so ``async_log_failure_event`` fires for hop 1 with
+        # ``attempted_fallbacks=1`` and ``kwargs["model"]`` rewritten to
+        # the sibling's deployment string by ``_update_kwargs_before_fallbacks``.
+        class _Sibling5xx(Exception):
+            status_code = 503
+            message = "upstream temporarily unavailable"
+
+        hop1_exc = _Sibling5xx()
+        hop1_kwargs_meta = dict(_meta_for(ctx))
+        hop1_kwargs_meta["attempted_fallbacks"] = 1
+        hop1_kwargs = {
+            "model": served_deployment,
+            "litellm_params": {"metadata": hop1_kwargs_meta},
+            "exception": hop1_exc,
+        }
+        await h.async_log_failure_event(
+            kwargs=hop1_kwargs, response_obj=None,
+            start_time=None, end_time=None,
+        )
+        # Snapshot the per-plan state after both hops.
+        picked_keys = [
+            k for k in redis.hashes.keys()
+            if k.startswith(f"sy:usage:{picked_plan_key}:p:")
+        ]
+        served_keys = [
+            k for k in redis.hashes.keys()
+            if k.startswith(f"sy:usage:{served_plan_key}:p:")
+        ]
+        picked_bucket = (
+            _bucket_sync(redis, picked_keys[0]) if picked_keys else {}
+        )
+        served_bucket = (
+            _bucket_sync(redis, served_keys[0]) if served_keys else {}
+        )
+        # The per-plan cooldown key. ``_apply_verdict`` calls
+        # ``slots.bump_and_cool`` for TRANSIENT outcomes; the sibling's
+        # cooldown should land on the sibling's plan, not the picked
+        # plan's.
+        return (
+            picked_bucket, served_bucket,
+            ctx.get(_TERMINATED),
+            ctx.get("_ctx_fail_booked_hops"),
+        )
+
+    (
+        picked_bucket, served_bucket,
+        terminated_flag, hops_flag,
+    ) = asyncio.run(go())
+
+    # The CONTEXT hop didn't claim ``_TERMINATED``; the non-CONTEXT
+    # mid-walk hop ALSO did not claim it -- mirroring CONTEXT's
+    # no-claim behavior. The walk raised (no sibling success is
+    # coming) but a non-CONTEXT mid-walk has no way to know that at
+    # hop time; claiming ``_TERMINATED="failure"`` would suppress
+    # ``_finish_success`` on a later hop and re-open the original #186
+    # ledger hole. The marker stays unset until either a primary-like
+    # arm claims it (none fired here for this mid-walk test -- hop
+    # 0 used the production-shaped kwargs-with-stamp entry, so the
+    # claim condition ``hop <= 0 AND not is_context`` could have
+    # applied to hop 0 if it was non-CONTEXT; hop 1 is mid-walk and
+    # explicitly skips the claim per the rule) or a sibling success
+    # claims ``"success"``.
+    assert terminated_flag is None, (
+        f"mid-walk non-CONTEXT hop must not claim _TERMINATED (would "
+        f"suppress a sibling success on a later hop); got "
+        f"{terminated_flag!r}")
+    # Per-hop dedupe set records both attempts. The test drives hop 0
+    # with the production-shaped ``attempted_fallbacks=0`` kwargs
+    # (router entry stamp on the picked deployment), so the set must
+    # contain 0 (from the CONTEXT CONTEXT attempt) and 1 (from hop
+    # 1's 5xx).
+    expected_hops = {0, 1}
+    assert (hops_flag or set()) >= expected_hops, (
+        f"per-hop dedupe set must record both attempted_fallbacks "
+        f"(0 for the router entry stamp, 1 for the first sibling); "
+        f"got {hops_flag!r}")
+    # Both hops contributed at least the explicit stamps.
+    for h in expected_hops:
+        assert h in (hops_flag or set()), (
+            f"per-hop dedupe set must record hop {h}; got {hops_flag!r}")
+    # The picked plan got the CONTEXT failure row. (non-CONTEXT path
+    # also tries to write one on this plan, but only the CONTEXT hop
+    # resolves target = picked_plan.)
+    assert picked_bucket.get("failures", 0) >= 1, (
+        f"picked plan ({picked_plan_key}) must record at least the "
+        f"CONTEXT failure; got {picked_bucket}")
+    # The sibling plan got its OWN non-CONTEXT failure row, attributed
+    # to the sibling model. Pre-fix this bucket stayed empty (every
+    # failure row landed on the picked plan).
+    assert served_bucket.get("failures", 0) >= 1, (
+        f"served plan ({served_plan_key}) must record the hop-1 failure "
+        f"on the sibling deployment; got {served_bucket}")
+    # And the model-scoped row for the served ref is on the served plan,
+    # not the picked one -- a key sanity check.
+    served_model_rows = [
+        k for k in redis.hashes.keys()
+        if k.startswith(f"sy:usage:{served_plan_key}:m:{served_ref}:")
+    ]
+    assert served_model_rows, (
+        f"served ref {served_ref} must have its own model-scoped bucket "
+        f"under {served_plan_key}; got "
+        f"{[k for k in redis.hashes.keys() if k.startswith('sy:usage:')]}")
+    # No slot left claimed on either plan. Both hops' releases collapse
+    # onto ctx["plan"] (the picked plan); the sibling was never inflight
+    # so its in_flight was always 0.
+    assert asyncio.run(slots.in_flight(picked_plan_key)) == 0
+    assert asyncio.run(slots.in_flight(served_plan_key)) == 0
+    print(
+        f"  multi-hop walk: picked ({picked_plan_key}) booked "
+        f"{int(picked_bucket.get('failures', 0))} failure, served "
+        f"({served_plan_key}) booked "
+        f"{int(served_bucket.get('failures', 0))} failure (model "
+        f"{served_ref}); per-hop dedupe={sorted(hops_flag)}; "
+        f"ctx[_TERMINATED]={terminated_flag!r}"
+    )
+
+
+def test_multihop_5xx_then_success_books_served_plan():
+    """Residual #186 hole from cycle 2: a three-attempt CONTEXT-window-
+    fallbacks walk where hop 1 fails with a non-CONTEXT verdict and
+    hop 2 succeeds on a second sibling. Pre-fix the non-CONTEXT hop
+    claimed ``_TERMINATED="failure"`` mid-walk, so hop 2's
+    ``_finish_success`` short-circuited and the served plan's tokens
+    were never booked -- exactly the bug this PR sets out to fix,
+    reopening as soon as the chain has more than one fallback target
+    and the first sibling hops with a non-CONTEXT error.
+
+    Post-fix (this commit) the non-CONTEXT mid-walk branch mirrors
+    CONTEXT's no-claim behavior: ``_TERMINATED`` is left unset on
+    every per-hop mid-walk arm (int attempted_fallbacks stamps). The
+    only arms that claim ``_TERMINATED="failure"`` are the primary
+    sentinel -- fires when no walked fallback ever started (single
+    attempt) or the proxy-side async_post_call was the terminal arm
+    after every hop is exhausted.
+
+    The fixture's autoloaded context_window_fallbacks config only
+    emits one sibling target per source deployment (the local 1M-
+    context member is intentionally absent in tests/plans.yaml, see
+    the comment at ``config/plans.example.yaml:925-927``), so this
+    test injects a synthetic 2M-context sibling on the openrouter
+    plan via ``Registry.replace`` to give the walk 2 fallback
+    targets. The injection is local to this test (the handler's
+    registry is swapped and the original is not mutated); the rest
+    of the suite uses the autoloaded fixture untouched.
+    """
+    from dataclasses import replace as _replace
+    from switchyard import models as _models
+    h, reg, slots, _ledger, _policy, redis, pick = _build(claim_lane="local")
+    siblings = [
+        m for m in reg.models.values()
+        if m.ref != pick.model.ref and m.context_window and m.context_window > pick.model.context_window
+    ]
+    assert siblings, (
+        "fixture must have at least one bigger-window sibling; got "
+        f"{[(m.ref, m.context_window) for m in reg.models.values() if m.context_window]}")
+    # Inject a second sibling on the same plan so the chain has 2
+    # targets and the router can walk past an exhausted hop 1.
+    openrouter_plan = reg.plans["openrouter"]
+    synth_model = _models.Model(
+        key="mimo-2m",
+        plan_key="openrouter",
+        model="openai/mimo-2m-synthetic",
+        context_window=openrouter_plan.models["mimo"].context_window * 2,
+    )
+    synth_models = {**openrouter_plan.models, "mimo-2m": synth_model}
+    new_openrouter = _replace(openrouter_plan, models=synth_models)
+    new_plans = {**reg.plans, "openrouter": new_openrouter}
+    h.registry = _models.Registry(
+        settings=reg.settings, plans=new_plans, lanes=reg.lanes,
+    )
+    # Re-resolve the plan/model references against the new registry.
+    reg = h.registry
+    sibling_a = reg.models[siblings[0].ref]
+    sibling_a_plan_key = reg.plan_of(sibling_a).key
+    sibling_b = reg.models["openrouter/mimo-2m"]
+    sibling_b_plan_key = reg.plan_of(sibling_b).key
+    picked_plan_key = pick.plan.key
+    assert sibling_a_plan_key != picked_plan_key, (
+        "first sibling must be on a different plan than the pick so the "
+        "served-plan attribution has somewhere distinct to land")
+    assert sibling_b.ref != sibling_a.ref, (
+        f"second sibling must be a different model ref from the first "
+        f"so the success-side served-deployment resolution has somewhere "
+        f"distinct to land; both landed on {sibling_a.ref}")
+
+    ctx = _ctx_for(pick, call_type="acompletion")
+    from litellm import ContextWindowExceededError
+
+    async def go():
+        # Hop 0: a CONTEXT failure on the picked deployment. The
+        # router stamps ``attempted_fallbacks = 0`` in place on the
+        # metadata at walk entry (``router.py::async_function_with_fallbacks``
+        # verified for both the 1.101.0 gateway pin and the 1.102.1
+        # test gate), so this hop carries the entry stamp just like a
+        # real production call does. Building the kwargs with the
+        # stamp keeps the fixture aligned with the wire shape the
+        # cycle-3 review verified, so the per-hop dedupe set
+        # collision with the post-call tail (`0 in booked_hops`) is
+        # exercised end-to-end here.
+        hop0_exc = ContextWindowExceededError(
+            message=(
+                "This model's maximum context length is 131072 tokens. "
+                "However, you requested 200000 tokens."
+            ),
+            model=pick.model.ref,
+            llm_provider="openai",
+        )
+        hop0_meta = dict(_meta_for(ctx))
+        hop0_meta["attempted_fallbacks"] = 0
+        hop0_kwargs = {
+            "model": pick.model.deployment,
+            "litellm_params": {"metadata": hop0_meta},
+            "exception": hop0_exc,
+        }
+        await h.async_log_failure_event(
+            kwargs=hop0_kwargs, response_obj=None,
+            start_time=None, end_time=None,
+        )
+
+        # Hop 1: a non-CONTEXT 5xx on sibling A (a different plan from
+        # the pick). THIS hop is the focus of the BLOCKER finding:
+        # pre-fix it would claim ``_TERMINATED="failure"`` and suppress
+        # the success on hop 2.
+        class _SiblingA5xx(Exception):
+            status_code = 503
+            message = "upstream temporarily unavailable"
+
+        hop1_meta = dict(_meta_for(ctx))
+        hop1_meta["attempted_fallbacks"] = 1
+        hop1_kwargs = {
+            "model": sibling_a.deployment,
+            "litellm_params": {"metadata": hop1_meta},
+            "exception": _SiblingA5xx(),
+        }
+        await h.async_log_failure_event(
+            kwargs=hop1_kwargs, response_obj=None,
+            start_time=None, end_time=None,
+        )
+
+        # Snapshot mid-walk state BEFORE hop 2 succeeds (so the
+        # BLOCKER's exact behaviour can be asserted: at this point
+        # ctx[_TERMINATED] must still be unset, proving hop 1's
+        # non-CONTEXT mid-walk branch did NOT claim the marker that
+        # would otherwise suppress hop 2's success).
+        mid_walk_terminated = ctx.get(_TERMINATED)
+
+        # Hop 2: a SUCCESS on sibling B (also a different plan from the
+        # pick, and a different plan from sibling A). The
+        # _hidden_params["model_id"] carries sibling B's router_id --
+        # the resolved wire shape for the success side. If hop 1 had
+        # claimed ``_TERMINATED="failure"``, this hook's first-line
+        # check would short-circuit and the served plan's tokens would
+        # never book.
+        response = {
+            "id": "x", "object": "chat.completion",
+            "model": sibling_b.ref,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 500, "completion_tokens": 80},
+        }
+        response["_hidden_params"] = {"model_id": sibling_b.router_id}
+        await h.async_log_success_event(
+            kwargs={
+                "model": sibling_b.deployment,
+                "litellm_params": {"metadata": hop1_meta},
+            },
+            response_obj=response,
+            start_time=None, end_time=None,
+        )
+
+        # Snapshot every relevant counter.
+        picked_keys = [
+            k for k in redis.hashes.keys()
+            if k.startswith(f"sy:usage:{picked_plan_key}:p:")
+        ]
+        sibling_a_keys = [
+            k for k in redis.hashes.keys()
+            if k.startswith(f"sy:usage:{sibling_a_plan_key}:p:")
+        ]
+        sibling_b_keys = [
+            k for k in redis.hashes.keys()
+            if k.startswith(f"sy:usage:{sibling_b_plan_key}:p:")
+        ]
+        return (
+            mid_walk_terminated,
+            ctx.get(_TERMINATED),
+            _bucket_sync(redis, picked_keys[0]) if picked_keys else {},
+            _bucket_sync(redis, sibling_a_keys[0]) if sibling_a_keys else {},
+            _bucket_sync(redis, sibling_b_keys[0]) if sibling_b_keys else {},
+        )
+
+    (
+        mid_walk_terminated, post_walk_terminated,
+        picked_bucket, sibling_a_bucket, sibling_b_bucket,
+    ) = asyncio.run(go())
+
+    # CRITICAL: hop 1's non-CONTEXT branch did NOT claim ``_TERMINATED``
+    # mid-walk (mirroring CONTEXT's no-claim behaviour). Pre-fix this
+    # was "failure" and would have suppressed hop 2's success.
+    assert mid_walk_terminated is None, (
+        f"hop 1 (non-CONTEXT mid-walk) must NOT claim _TERMINATED or "
+        f"hop 2's success is suppressed -- the original #186 hole. "
+        f"Got {mid_walk_terminated!r}")
+    # After hop 2 success the marker is "success": the served plan's
+    # tokens were booked.
+    assert post_walk_terminated == "success", (
+        f"_finish_success must run on hop 2 and claim 'success'; got "
+        f"{post_walk_terminated!r}")
+    # The picked plan got the CONTEXT failure row.
+    assert picked_bucket.get("failures", 0) >= 1, (
+        f"picked plan ({picked_plan_key}) must record the CONTEXT "
+        f"failure; got {picked_bucket}")
+    # Sibling A got the non-CONTEXT hop-1 failure row (and the
+    # transient verdict + cooldown -- the cooldown bumps its ladder,
+    # not the picked plan's). Pre-fix this bucket was empty for
+    # cross-plan walks.
+    assert sibling_a_bucket.get("failures", 0) >= 1, (
+        f"sibling-a plan ({sibling_a_plan_key}) must record hop 1's "
+        f"5xx; got {sibling_a_bucket}")
+    # The served plan got the tokens from the successful fallback.
+    # sibling_a and sibling_b live on the same plan in this fixture
+    # (the openrouter singleton), so the period bucket aggregates
+    # both hops: 1 failure row from hop 1 plus 1 success row from
+    # hop 2. The booking-side assertions are on the aggregated
+    # bucket -- 1+ requests (hop 1's failure row counts a request
+    # too), the exact success tokens, and 1 failure row.
+    assert sibling_b_bucket.get("requests", 0) >= 1, (
+        f"served plan ({sibling_b_plan_key}) must record at least "
+        f"the successful fallback as one request (hop 1 also bumps "
+        f"requests via the failure row when both siblings share the "
+        f"plan); got {sibling_b_bucket}")
+    assert sibling_b_bucket.get("prompt_tokens", 0) == 500, (
+        f"served plan must book the prompt tokens from the "
+        f"successful fallback; got {sibling_b_bucket}")
+    assert sibling_b_bucket.get("completion_tokens", 0) == 80, (
+        f"served plan must book the completion tokens from the "
+        f"successful fallback; got {sibling_b_bucket}")
+    assert sibling_b_bucket.get("failures", 0) >= 1, (
+        f"served plan must record the hop-1 5xx failure row alongside "
+        f"the hop-2 success; got {sibling_b_bucket}")
+    # And the picked plan did NOT receive the success-side tokens
+    # (its bucket has only the CONTEXT failure row -- no requests,
+    # no prompt tokens, no completion tokens -- because every served
+    # plan row landed on the openrouter bucket).
+    assert picked_bucket.get("requests", 0) <= 1, (
+        f"picked plan has at most 1 request (the CONTEXT failure row); "
+        f"got {picked_bucket}")
+    assert picked_bucket.get("prompt_tokens", 0) == 0, (
+        f"picked plan must NOT receive success-side prompt tokens "
+        f"(the served plan owns the request); got {picked_bucket}")
+    assert picked_bucket.get("completion_tokens", 0) == 0, (
+        f"picked plan must NOT receive success-side completion "
+        f"tokens; got {picked_bucket}")
+    # Slot was released from the picked plan; sibling plans were never
+    # inflight (placement only ever claimed on the picked plan).
+    assert asyncio.run(slots.in_flight(picked_plan_key)) == 0
+    assert asyncio.run(slots.in_flight(sibling_a_plan_key)) == 0
+    assert asyncio.run(slots.in_flight(sibling_b_plan_key)) == 0
+    print(
+        f"  three-hop walk: picked ({picked_plan_key}) CONTEXT "
+        f"failure {int(picked_bucket.get('failures', 0))}; sibling-a "
+        f"({sibling_a_plan_key}) hop-1 5xx "
+        f"{int(sibling_a_bucket.get('failures', 0))}; sibling-b "
+        f"({sibling_b_plan_key}) success "
+        f"{int(sibling_b_bucket.get('requests', 0))} req / "
+        f"{int(sibling_b_bucket.get('prompt_tokens', 0))} prompt / "
+        f"{int(sibling_b_bucket.get('completion_tokens', 0))} completion; "
+        f"ctx[_TERMINATED]={post_walk_terminated!r}"
+    )
+
+
+def test_sibling_hop_classified_with_sibling_plan_family():
+    """Cross-family SHOULD-FIX: the verdict for a sibling hop is
+    classified with the SIBLING plan's ``provider_family`` (the
+    plan that produced the error), not the picked plan's family.
+
+    Pre-fix ``_finish_failure`` called ``_classify_failure(exception,
+    plan.provider_family)`` where ``plan`` was always ``ctx["plan"]``
+    (the picked plan). On a cross-family walk (the picker picked
+    minimax-ultra/m3, the router walked to a glm sibling for context)
+    a sibling's vendor code was interpreted through the wrong table:
+    MiniMax 1113 (insufficient balance / ZAI) was unknown to the
+    MiniMax table and fell through to a generic verdict (RATE_LIMITED,
+    BAD_REQUEST or TRANSIENT depending on the HTTP status) instead of
+    ``QUOTA_EXHAUSTED``. The verdict then ran on the right plan but
+    with the wrong semantics.
+
+    Post-fix the classification reads ``target.provider_family`` where
+    ``target`` is the served failure plan resolved by
+    ``_resolve_served_failure_plan`` from ``kwargs["model"]``.
+
+    The assertion is white-box: wrap ``classify`` to capture every
+    ``family=`` it received, then drive a hop 1 sibling failure and
+    assert the recorded family equals the sibling plan's
+    ``provider_family`` (the post-fix value), not the picked plan's
+    (the pre-fix value).
+    """
+    from dataclasses import replace as _replace
+    from switchyard import classify as _classify_mod
+
+    # Pick a real MiniMax plan (family='minimax') as the picked plan;
+    # pick its first member; pick a ZAI plan (family='zai') sibling
+    # with strictly-larger context_window (synthesised so the
+    # generator's walk would target it). The fixture's autoloaded
+    # context_window is None for most providers, so we synthesise a
+    # window via dataclasses.replace.
+    h, reg, slots, _ledger, _policy, redis, pick = _build()
+    # Switch the picked plan to a minimax plan for the test. The picker
+    # was called with no lane, so we kept the fixture's default pick;
+    # for this test we explicitly resolve a minimax pick using the
+    # picker, then restore ``h.registry`` to use that synthesis.
+    # Resolve a minimax-family plan/model (any minimax member) and
+    # use it as the picked plan/model.
+    minimax_models = [
+        m for m in reg.models.values() if reg.plan_of(m).provider_family == "minimax"
+    ]
+    assert minimax_models, (
+        "fixture must include at least one minimax-family model; got "
+        f"{[(m.ref, reg.plan_of(m).provider_family) for m in reg.models.values() if reg.plan_of(m).provider_family]}")
+    pick = minimax_models[0]
+    picked_plan = reg.plan_of(pick)
+    picked_family = picked_plan.provider_family
+    assert picked_family == "minimax", picked_family
+
+    # Build a sibling on a ZAI plan with strictly-larger context_window
+    # so the failure-row target differs from the picked plan. Take any
+    # ZAI model and bump its window past minimax's default.
+    zai_models = [
+        m for m in reg.models.values() if reg.plan_of(m).provider_family == "zai"
+    ]
+    assert zai_models, (
+        "fixture must include at least one zai-family model; got "
+        f"{[(m.ref, reg.plan_of(m).provider_family) for m in reg.models.values() if reg.plan_of(m).provider_family]}")
+    sibling = zai_models[0]
+    sibling_plan = reg.plan_of(sibling)
+    sibling_family = sibling_plan.provider_family
+    assert sibling_family == "zai", sibling_family
+    assert sibling.ref != pick.ref, (
+        "sibling must differ from pick so _resolve_served_failure_plan "
+        "returns the sibling plan, not the picked plan")
+    assert sibling_plan.key != picked_plan.key, (
+        "sibling must be on a different plan than the pick")
+
+    # Synthesise context windows on both plans so registry.model_for_deployment
+    # / model_for_router_id still resolve and the walk-target distinction
+    # works (this is what _resolve_served_failure_plan reads, not
+    # context_window per se). The actual contract tested is which
+    # provider_family classify received, so the synthesis is irrelevant
+    # to the assertion.
+    new_models_for_pick = dict(picked_plan.models)
+    new_models_for_pick[pick.key] = _replace(pick, context_window=131072)
+    new_picked_plan = _replace(picked_plan, models=new_models_for_pick)
+    new_models_for_sibling = dict(sibling_plan.models)
+    new_models_for_sibling[sibling.key] = _replace(sibling, context_window=262144)
+    new_sibling_plan = _replace(sibling_plan, models=new_models_for_sibling)
+    new_plans = {**reg.plans,
+                 picked_plan.key: new_picked_plan,
+                 sibling_plan.key: new_sibling_plan}
+    h.registry = type(reg)(
+        settings=reg.settings, plans=new_plans, lanes=reg.lanes,
+    )
+
+    # Build a ctx as if the pre-call hook had picked the minimax
+    # model and the picker had populated ``caller_env`` etc.
+    # ``_ctx_for`` reads ``pick.lane / pick.plan.key / pick.model.ref``;
+    # we manually build the ctx to avoid the picker round-trip.
+    from switchyard.hooks import META_KEY
+    ctx = {
+        "lane": "test-cross-family",
+        "plan": picked_plan.key,
+        "model": pick.ref,
+        "request_id": "rid-cross-family-test",
+        "session": None,
+        "sticky": False,
+        "claimed_at": 0.0,
+        "cap": pick.max_parallel,
+        "direct": False,
+        "needs_tools": False,
+        "needs_images": False,
+        "pinned": False,
+        "picked_group_gid": "",
+        "picked_group_strategy": "",
+        "call_type": "acompletion",
+    }
+    # Wrap classify to capture every (family, status, message) call.
+    captured: list[dict] = []
+    original = _classify_mod.classify
+
+    def _spy(status, message, *, family=None, body=None, retry_after=None,
+             default_cooldown=900):
+        captured.append({
+            "family": family, "status": status,
+            "message": (
+                message[:80] if isinstance(message, str) else str(message)
+            ),
+        })
+        return original(
+            status, message, family=family, body=body,
+            retry_after=retry_after, default_cooldown=default_cooldown,
+        )
+
+    # Patch the classify the handler uses (its imported binding in
+    # hooks.py -- the test resolves the binding via the module).
+    from switchyard import hooks as _hooks_mod
+    real_handler_classify = _hooks_mod.classify
+    _hooks_mod.classify = _spy
+    try:
+        # Drive a non-CONTEXT sibling hop: kwargs["model"] is the
+        # sibling's deployment (so _resolve_served_failure_plan
+        # returns the sibling's plan), and ``attempted_fallbacks=1``
+        # so the dedupe uses the per-hop int slot. The exception
+        # carries a ``status_code`` attribute so the new
+        # ``_provider_error`` gate in ``_finish_failure`` does NOT
+        # short-circuit it to ``Outcome.INTERNAL`` -- the test wants
+        # ``classify`` to actually run with the sibling family's
+        # ``FAMILIES`` table.
+        class _SiblingZAIQuotaError(Exception):
+            status_code = 400
+            message = "ZAI vendor code 1113 with insufficient balance body"
+
+        sibling_meta = {META_KEY: ctx, "attempted_fallbacks": 1}
+        sibling_kwargs = {
+            "model": sibling.deployment,
+            "litellm_params": {"metadata": sibling_meta},
+            "exception": _SiblingZAIQuotaError(),
+        }
+        asyncio.run(h.async_log_failure_event(
+            kwargs=sibling_kwargs, response_obj=None,
+            start_time=None, end_time=None,
+        ))
+    finally:
+        _hooks_mod.classify = real_handler_classify
+
+    # The handler should have called classify with the SIBLING plan's
+    # family (post-fix). Pre-fix it would have called classify with
+    # the picked plan's family.
+    sibling_calls = [
+        c for c in captured
+        if c["family"] == sibling_family
+    ]
+    assert sibling_calls, (
+        f"sibling hop must classify with the sibling plan's "
+        f"provider_family={sibling_family!r}; recorded families "
+        f"{[c['family'] for c in captured]}")
+    picked_calls = [
+        c for c in captured
+        if c["family"] == picked_family
+    ]
+    assert not picked_calls, (
+        f"sibling hop must NOT classify with the picked plan's "
+        f"family={picked_family!r} (would interpret the sibling's "
+        f"vendor code through the wrong table); recorded families "
+        f"{[c['family'] for c in captured]}")
+    # Slot was released on the picked plan (sibling was never inflight).
+    assert asyncio.run(slots.in_flight(picked_plan.key)) == 0
+    print(
+        f"  cross-family walk: classify called with "
+        f"{len(captured)} family(ies); sibling hop used "
+        f"{sibling_family!r} (correct); picked-family "
+        f"{picked_family!r} not used (correct)."
+    )
+
+
+def test_single_attempt_non_context_with_router_entry_stamp_claims_marker():
+    """Production-shape companion to
+    ``test_non_context_failure_still_claims_marker_and_suppresses_success``:
+    the router stamps ``attempted_fallbacks = 0`` on the metadata at
+    walk entry (``router.py::async_function_with_fallbacks:7582`` in
+    place), so a single-attempt non-CONTEXT failure for an OpenAI-
+    shape route arrives with the entry stamp and ``hop = 0``. The
+    contract
+    ``non-CONTEXT primary-like arms (hop <= 0) claim _TERMINATED`` so
+    a same-attempt late success can't double-book must hold for this
+    shape too -- not only for the no-router-metadata path
+    (``hop = -1``) that the cycle-2 test exercises.
+
+    Pre-fix this test would have failed: the cycle-2 implementation
+    only claimed ``_TERMINATED`` on ``hop == -1``, silently dropping
+    the production contract for router traffic that always stamps
+    ``0``. The cycle-3 fix widens the claim to ``hop <= 0`` so both
+    the entry stamp and the no-router-metadata sentinel claim. The
+    cycle-3 review verified that this is the invariant the router
+    actually emits (1.101.0 + 1.102.1).
+    """
+    h, _reg, slots, _ledger, _policy, _redis, pick = _build(claim_lane="local")
+    ctx = _ctx_for(pick, call_type="acompletion")
+    # Production shape: kwargs carries the router's entry stamp.
+    hop0_meta = dict(_meta_for(ctx))
+    hop0_meta["attempted_fallbacks"] = 0
+    kwargs = {
+        "model": pick.model.deployment,
+        "litellm_params": {"metadata": hop0_meta},
+        "exception": None,
+    }
+
+    # Drive through the unified ``_finish_failure`` so the production-
+    # shaped kwargs are read end-to-end. The None exception is fine
+    # here -- the cycle-3 _finish_failure classifies with empty
+    # message + no status (TRANSIENT unclassified), enough to
+    # exercise the marker-claim branch on hop <= 0.
+    asyncio.run(_drive_log_failure(h, kwargs, ctx))
+    post_failure_terminated = ctx.get(_TERMINATED)
+    assert post_failure_terminated == "failure", (
+        f"non-CONTEXT failure at hop=0 (router entry stamp) must claim "
+        f"_TERMINATED='failure'; got {post_failure_terminated!r}")
+    # And the per-hop dedupe set has hop 0.
+    assert ctx.get("_ctx_fail_booked_hops") == {0}, (
+        f"per-hop dedupe set must contain the entry stamp; got "
+        f"{ctx.get('_ctx_fail_booked_hops')!r}")
+    # Slot was released (idempotent zrem).
+    assert asyncio.run(slots.in_flight(pick.plan.key)) == 0
+    print(
+        f"  router-stamped non-CONTEXT (hop=0) on "
+        f"{pick.model.ref}: marker claimed "
+        f"({post_failure_terminated!r}); per-hop dedupe={sorted(ctx.get('_ctx_fail_booked_hops') or set())!r}"
+    )
+
+
+def test_midwalk_non_context_does_not_write_verdict_applied_marker():
+    """Cycle-3 finding: the verdict's ``_verdict_applied`` marker skip
+    was keyed on the verdict's ``is_context`` only -- a non-CONTEXT
+    mid-walk hop (``hop = 1``) wrote ``ctx["_verdict_applied"] =
+    rid``, and ``ctx["request_id"]`` is shared across the whole walk,
+    so the marker then suppressed every later hop's verdict in the
+    same request. The reachable shape the reviewer cites: hop 0
+    CONTEXT (no marker), hop 1 sibling 5xx (TRANSIENT verdict, marker
+    written), hop 2 sibling 401 (AUTH verdict **suppressed** -- the
+    sibling that actually rejected the request never gets the 1800s
+    cooldown or the ``note_exhaustion`` it should).
+
+    Post-fix (this commit) ``skip_marker = is_context or hop > 0``,
+    so every mid-walk arm (``hop >= 1``) skips the marker write
+    regardless of verdict type. The marker is still written only on
+    primary-like arms (hop <= 0) where it dedupes the OpenAI
+    double-fire.
+
+    This test drives the exact two-non-CONTEXT-siblings shape on
+    an injected openrouter 2-target chain (the fixture's autoloaded
+    chain only has 1 sibling, but the suffix reproduces the same
+    dedupe behavior on a 2-hop openrouter walk).
+    """
+    from dataclasses import replace as _replace
+    from switchyard import models as _models
+    h, reg, slots, _ledger, _policy, redis, pick = _build(claim_lane="local")
+    siblings = [
+        m for m in reg.models.values()
+        if m.ref != pick.model.ref and m.context_window and m.context_window > pick.model.context_window
+    ]
+    assert siblings, "fixture must have at least one bigger sibling"
+    or_plan = reg.plans["openrouter"]
+    synth = _models.Model(
+        key="mimo-2m", plan_key="openrouter",
+        model="openai/mimo-2m-synthetic",
+        context_window=or_plan.models["mimo"].context_window * 2,
+    )
+    new_or = _replace(
+        or_plan,
+        models={**or_plan.models, "mimo-2m": synth},
+    )
+    new_plans = {**reg.plans, "openrouter": new_or}
+    h.registry = type(reg)(
+        settings=reg.settings, plans=new_plans, lanes=reg.lanes,
+    )
+    reg = h.registry
+    sibling_a = reg.models[siblings[0].ref]
+    sibling_b = reg.models["openrouter/mimo-2m"]
+    assert sibling_a.ref != sibling_b.ref
+
+    ctx = _ctx_for(pick, call_type="acompletion")
+    from switchyard.hooks import META_KEY
+
+    async def go():
+        # Hop 1: non-CONTEXT TRANSIENT 5xx on sibling A (mid-walk).
+        # Production-shaped kwargs carries ``attempted_fallbacks = 1``.
+        class _SiblingA5xx(Exception):
+            status_code = 503
+            message = "upstream temporarily unavailable"
+
+        hop1_meta = {META_KEY: ctx, "attempted_fallbacks": 1}
+        hop1_kwargs = {
+            "model": sibling_a.deployment,
+            "litellm_params": {"metadata": hop1_meta},
+            "exception": _SiblingA5xx(),
+        }
+        await h.async_log_failure_event(
+            kwargs=hop1_kwargs, response_obj=None,
+            start_time=None, end_time=None,
+        )
+        # The marker must NOT be written on a mid-walk hop. The
+        # ``_verdict_applied`` ctx key stays unset, so the next hop
+        # is free to apply its verdict. (The TRANSIENT verdict on
+        # hop 1 still cools the sibling; the test asserts the MARKER
+        # behaviour, not the cooldown.)
+        mid_walk_marker = ctx.get("_verdict_applied")
+        # Hop 2: non-CONTEXT AUTH 401 on sibling B (mid-walk). With
+        # the cycle-3 fix, the marker is still unset, so hop 2's
+        # verdict lands fully (no suppression by hop 1's marker).
+        class _SiblingBAuth(Exception):
+            status_code = 401
+            message = "credentials rejected"
+
+        hop2_meta = {META_KEY: ctx, "attempted_fallbacks": 2}
+        hop2_kwargs = {
+            "model": sibling_b.deployment,
+            "litellm_params": {"metadata": hop2_meta},
+            "exception": _SiblingBAuth(),
+        }
+        await h.async_log_failure_event(
+            kwargs=hop2_kwargs, response_obj=None,
+            start_time=None, end_time=None,
+        )
+        post_walk_marker = ctx.get("_verdict_applied")
+        return mid_walk_marker, post_walk_marker, ctx.get("_TERMINATED")
+
+    mid_walk_marker, post_walk_marker, terminated_flag = asyncio.run(go())
+
+    # The marker is NOT written on the mid-walk hop. Pre-fix it
+    # would have been written here (cycle-3 finding).
+    assert mid_walk_marker is None, (
+        f"mid-walk hop (hop=1) must NOT write _verdict_applied (the "
+        f"shared request_id would suppress the next hop's verdict); "
+        f"got {mid_walk_marker!r}")
+    # The marker is also NOT written on hop 2 (still mid-walk). The
+    # post-walk marker check is just to confirm the unified rule
+    # applies on every hop >= 1.
+    assert post_walk_marker is None, (
+        f"mid-walk hop (hop=2) must NOT write _verdict_applied; got "
+        f"{post_walk_marker!r}")
+    # ``_TERMINATED`` is unset for the same reason (mid-walk arms
+    # never claim -- a later hop's success must still be allowed to
+    # book).
+    assert terminated_flag is None, (
+        f"mid-walk hops must not claim _TERMINATED (a later success "
+        f"would be suppressed); got {terminated_flag!r}")
+    # Per-hop dedupe set has both int stamps.
+    assert ctx.get("_ctx_fail_booked_hops") == {1, 2}, (
+        f"per-hop dedupe set must record both attempted_fallbacks; "
+        f"got {ctx.get('_ctx_fail_booked_hops')!r}")
+    print(
+        f"  mid-walk non-CONTEXT (hop=1, hop=2) on "
+        f"{sibling_a.ref} + {sibling_b.ref}: marker never written "
+        f"(mid-walk_marker={mid_walk_marker!r}, post_walk_marker="
+        f"{post_walk_marker!r}); ctx[_TERMINATED]={terminated_flag!r}; "
+        f"per-hop dedupe={sorted(ctx.get('_ctx_fail_booked_hops') or set())!r}"
+    )
+
+
+async def _drive_log_failure(h, kwargs, ctx):
+    """Bare ``_finish_failure`` driver for tests that do not care
+    which hook fires the call.
+    """
+    exception = kwargs.get("exception")
+    return await h._finish_failure(
+        ctx, exception, kwargs=kwargs,
+    )
 
 
 if __name__ == "__main__":

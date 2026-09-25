@@ -130,14 +130,20 @@ def build(plans_path: str) -> dict:
                   if m.ref != model.ref and m.context_window > model.context_window][:2]
         if bigger:
             context_fallbacks.append({model.deployment: bigger})
-    for lane_key in reg.lanes:
-        members = reg.lane_members(lane_key)
-        if not members or not members[0].context_window:
-            continue
-        bigger = [m.deployment for m in sized
-                  if m.context_window > members[0].context_window][:2]
-        if bigger:
-            context_fallbacks.append({lane_key: bigger})
+    # Lane-keyed entries are NOT emitted: a context_window_fallbacks source
+    # key is resolved by litellm.router_utils.fallback_event_handlers.
+    # fallback_lookup_groups against (pre-routing selection,
+    # ``metadata["model_group"]``, ``kwargs["model"]``). The router stamps
+    # ``metadata["model_group"]`` from the model string it was invoked with
+    # (``router.py:_update_kwargs_before_fallbacks``), which is the
+    # deployment string the pre-call hook wrote -- never a lane name. A
+    # lane-keyed entry is therefore unreachable dead config: the proxy
+    # never sees a request whose router-side model is the lane key. The
+    # failure fallback loop that used to live here is removed; deployment-
+    # keyed entries above already cover every named deployment in the
+    # registry. The lane aliases still exist in model_list for the
+    # /v1/models advertisement and virtual-key model access checks
+    # (the loop at lines 76-91), unrelated to this fallback table.
 
     return {
         "model_list": model_list,

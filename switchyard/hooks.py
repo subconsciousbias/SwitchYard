@@ -726,6 +726,12 @@ class SwitchyardHandler(CustomLogger):
         Failure accounting for ``/v1/messages`` is owned by
         ``async_post_call_failure_hook``; this hook stays out of the way for
         those call types and runs ``_finish_failure`` for everything else.
+
+        ``kwargs`` is threaded into ``_finish_failure`` so the failure side
+        can see the per-hop state ``run_async_fallback`` stamps on it
+        (``kwargs["litellm_params"]["metadata"]["attempted_fallbacks"]`` for
+        the per-hop dedupe key, ``kwargs["model"]`` for resolving which
+        deployment actually produced the error on a multi-hop walk).
         """
         ctx = self._ctx(kwargs)
         if not ctx:
@@ -733,7 +739,9 @@ class SwitchyardHandler(CustomLogger):
         if ctx.get("call_type") in UNLOGGED_CALL_TYPES:
             return
         await self._finish_failure(
-            ctx, kwargs.get("exception") or kwargs.get("original_exception"),
+            ctx,
+            kwargs.get("exception") or kwargs.get("original_exception"),
+            kwargs=kwargs,
         )
 
     async def _finish_success(
@@ -818,78 +826,393 @@ class SwitchyardHandler(CustomLogger):
         await self._absorb_limit_headers(plan.key, kwargs)
         return True
 
-    async def _finish_failure(self, ctx: dict, exception: Exception | None) -> bool:
-        """Common failure accounting. Idempotent via the ctx marker.
+    async def _finish_failure(
+        self, ctx: dict, exception: Exception | None,
+        kwargs: dict | None = None,
+    ) -> bool:
+        """Common failure accounting. Idempotent via the per-hop dedupe set.
 
-        Same marker as ``_finish_success``: whichever path runs first wins, so
-        a slot cannot be released twice when both ``async_log_failure_event``
-        and ``async_post_call_failure_hook`` fire for the same request (which
-        LiteLLM does for the buffered OpenAI routes on a router-level retry).
+        Per-hop dedupe keys (``hop``) come from the router's
+        ``attempted_fallbacks`` stamp on ``kwargs["litellm_params"]
+        ["metadata"]``. The router writes this stamp in two places:
 
-        For a streamed ``/v1/messages`` that errored mid-stream, the iterator
-        stashes any partial usage it managed to parse on ctx under
+          * in-place on the metadata at walk entry, ``0`` (the entry
+            stamp) -- ``router.py::async_function_with_fallbacks:7582``;
+          * per-hop on a rebinding copy of the metadata,
+            ``fallback_depth`` (1 / 2 / …) -- ``router_utils/
+            fallback_event_handlers.run_async_fallback``.
+
+        The rebinding copy is what ``async_log_failure_event`` sees
+        on each hop; the proxy-side ``request_data`` for
+        ``async_post_call_failure_hook`` keeps the in-place entry
+        stamp (``0``) because the per-hop rebinds are intentional
+        detached copies. ``hop = 0`` and ``hop >= 1`` therefore
+        correspond to real production shapes. ``hop = -1`` is the
+        no-router-stamp sentinel for callers that pass ``kwargs``
+        without ``attempted_fallbacks`` (older-litellm shapes,
+        internal callers with ``kwargs=None``, the proxy-side
+        ``async_post_call_failure_hook`` in builds without the
+        in-place entry stamp).
+
+        Dedupe has two layers working together:
+
+          * ``_TERMINATED`` -- the cross-hook idempotency marker.
+            Non-CONTEXT primary-like arms (``hop <= 0``: the router's
+            entry stamp on hop 0, or the no-router-metadata sentinel
+            ``-1``) set it to ``"failure"`` to suppress a same-attempt
+            late success; CONTEXT verdicts and non-CONTEXT mid-walk
+            arms (``hop >= 1``) leave it unset so a sibling success
+            on a later hop can still book. The success side sets it
+            to ``"success"``.
+
+          * ``_ctx_fail_booked_hops`` (set of int) -- per-hop dedupe.
+            ``run_async_fallback`` catches any ``Exception`` per hop,
+            so a context-window-fallbacks walk that exhausts every
+            sibling and bubbles the last error here fires
+            ``async_log_failure_event`` once per attempt. Each attempt
+            carries the router's stamp so every hop gets its own
+            slot (``{0, 1, 2, …}``). The OpenAI-shape double-fire
+            (``async_log`` + ``async_post_call`` for one attempt)
+            dedupes via the same entry stamp (``0``): the proxy-side
+            ``request_data`` carries the in-place ``0``, the
+            ``async_log`` hop also stamps ``0``, the set collapses
+            them. ``/v1/messages`` failures (only
+            ``async_post_call`` fires) take whatever slot the proxy
+            stamped.
+
+        The per-hop de-dupe has no special branches: every shape --
+        int stamp, sentinel stamp, proxy in-place stamp -- slots into
+        the same set.
+
+        CONTEXT-window failures are the documented exception to the
+        claim-marker rule for the mid-walk extension: a non-CONTEXT
+        failure on hop 1 is no evidence the walk is done -- the
+        router can still try hop 2 on another sibling, succeed, and
+        expect ``_finish_success`` to book the served plan. Claiming
+        ``_TERMINATED`` here would re-open the original #186 ledger
+        hole: hop 2 succeeds → ``_finish_success`` first-line checks
+        the marker → returns False → served plan's tokens never
+        booked. Non-CONTEXT mid-walk therefore mirrors CONTEXT's
+        no-claim behavior on the marker write too (passes
+        ``skip_marker=True`` to ``_apply_verdict``); only the
+        primary-like arms (hop <= 0) write the marker. A late
+        verdict from a later hop is then free to apply its own
+        cooldown / ladder bump rather than getting silently
+        suppressed by the earlier hop's marker.
+
+        For a streamed ``/v1/messages`` that errored mid-stream, the
+        iterator stashes any partial usage it managed to parse on ctx under
         ``_stream_collected_usage``. We book those tokens as part of the
         failure record so a partial stream is not silently dropped on the
         ledger -- the bounded loss the reviewer's design accepts -- and we
-        do NOT reset the transient-failure streak (this is the failure path,
-        not success). The verdict and cooldown ladder still run as usual.
+        do NOT reset the transient-failure streak (this is the failure
+        path, not success). The verdict and cooldown ladder still run as
+        usual.
         """
         if ctx.get(_TERMINATED):
             return False
-        ctx[_TERMINATED] = "failure"
-        self._stop_heartbeat(ctx["request_id"])
-        await self.picker.release(ctx["plan"], ctx["request_id"], ctx["model"])
-        plan = self.registry.plans.get(ctx["plan"])
-        # No failed_ref marker: the routed-to deployment IS the served one,
-        # there is no router-level retry to feed it into (num_retries=0), and
-        # the caller's retry re-enters through async_pre_call_hook which gets
-        # its own fresh pick against the cooldowns this failure just set.
-        #
-        # A TEXT_LOST failure charged the provider for output tokens even
-        # though the sidecar swallowed the answer — book them so the
-        # effective $/Mtok denominator and the burn-rate timer see the real
-        # spend. Other shapes keep the zero-token record they always had.
-        if plan:
-            # Issue #64: TEXT_LOST shape. The sidecar swallowed the answer
-            # but the provider charged tokens; the contract message names
-            # them so the ledger books the real spend.
-            msg = str(getattr(exception, "message", None) or exception) if exception is not None else ""
-            tokens = extract_no_text_tokens(msg) if msg else None
-            if tokens is not None:
-                prompt_tokens, completion_tokens = tokens
-                await self.ledger.record(
-                    plan, failed=True,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    model=ctx["model"],
+
+        # Detect the per-hop key from kwargs. ``hop`` is the router's
+        # ``attempted_fallbacks`` stamp when present, or ``-1`` when
+        # the caller passed kwargs without that stamp (no-router-
+        # metadata path). Every shape -- real production int stamps
+        # (``0`` for entry, ``>= 1`` for siblings) and the sentinel --
+        # slots into one ``_ctx_fail_booked_hops`` set below.
+        hop_meta = (
+            (kwargs.get("litellm_params") or {}).get("metadata")
+            if kwargs is not None else None
+        )
+        if not isinstance(hop_meta, dict):
+            hop_meta = (
+                (kwargs.get("metadata") if kwargs is not None else None)
+                or {}
+            )
+        if not isinstance(hop_meta, dict):
+            hop_meta = {}
+        attempted = hop_meta.get("attempted_fallbacks")
+        hop: int = attempted if isinstance(attempted, int) else -1
+        booked_hops: set[int] = ctx.setdefault("_ctx_fail_booked_hops", set())
+
+        if hop == -1:
+            # No-router-metadata sentinel. kwargs arrived without a
+            # router ``attempted_fallbacks`` stamp -- internal callers
+            # with ``kwargs=None``, legacy fixtures, the proxy side of
+            # ``async_post_call_failure_hook`` in builds without the
+            # in-place entry stamp. The router always stamps ``0`` at
+            # walk entry in both litellm 1.101.0 and 1.102.1, so
+            # production router traffic never reaches this branch.
+            # Book into the dedupe set; the set dedupes both shapes
+            # uniformly, so a same-shape second call short-circuits
+            # via ``-1 in booked_hops`` rather than a per-shape flag.
+            if -1 in booked_hops:
+                return False
+            booked_hops.add(-1)
+        else:
+            # Per-hop dedupe for multi-hop walks. Each
+            # ``async_log_failure_event`` carries a distinct
+            # ``attempted_fallbacks`` stamp the router wrote per hop,
+            # so a multi-hop context-window-fallbacks walk books every
+            # hop exactly once.
+            if hop in booked_hops:
+                return False
+            booked_hops.add(hop)
+
+        # INTERNAL short-circuit. A bare exception -- Redis
+        # ConnectionError, asyncio CancelledError, our own bookkeeping
+        # bug -- has no provider-shaped signal (no SDK APIError
+        # subclass, no int-coercible ``status_code``). Sending those
+        # through ``classify`` would land them in the string-and-HTTP
+        # classifier's TRANSIENT branch and cool the plan on a
+        # problem we caused. ``_provider_error`` gates that: a
+        # non-provider exception is logged once, the dedupe set has
+        # already claimed this hop so the second arm of an OpenAI
+        # double-fire short-circuits above, and the path below
+        # applies ``Verdict(Outcome.INTERNAL, 0, ...)``.
+        if exception is not None and not _provider_error(exception):
+            plan_key = ctx.get("plan", "?")
+            rid = ctx.get("request_id", "?")
+            log.exception(
+                "switchyard internal fault on plan=%s request_id=%s: %r",
+                plan_key, rid, exception,
+            )
+            # Claim the terminal marker here for non-provider
+            # exceptions too. The INTERNAL verdict's
+            # ``is_our_fault=True`` makes ``_apply_verdict`` short-
+            # circuit at the top guard (no cooldown, no streak bump);
+            # the marker still has to be set so a same-attempt late
+            # success can't double-book and so the OpenAI double-fire
+            # tail (``async_post_call_failure_hook`` after
+            # ``async_log_failure_event``) takes the second-line check
+            # and short-circuits via ``_TERMINATED`` instead of
+            # double-firing the slot release + log. The
+            # ``hop <= 0`` rule from cycle 3 covers this: primary-like
+            # arms claim, mid-walk arms (``hop >= 1``) do not.
+            if hop <= 0:
+                ctx[_TERMINATED] = "failure"
+            served_plan, served_ref = (
+                self._resolve_served_failure_plan(ctx, kwargs)
+            )
+            target = served_plan or self.registry.plans.get(plan_key)
+            # Symmetric with the classify-driven path below:
+            # ``_stop_heartbeat`` cancels the per-request beat task
+            # (idempotent -- ``self._beats.pop`` returns silently if no
+            # task was registered) so the InnoDB-style touch loop
+            # stops touching Redis on the next tick. Skipping the
+            # call here would leak at most one interval of useless
+            # touches (the beat self-stops when ``slots.touch``
+            # observes the claim gone), but every other terminal arm
+            # in this function stops the beat for symmetry, so this
+            # branch does too.
+            self._stop_heartbeat(ctx["request_id"])
+            await self.picker.release(
+                ctx["plan"], ctx["request_id"], ctx["model"],
+            )
+            if target is not None:
+                await self._record_failure(
+                    target, exception, ctx, served_ref=served_ref,
                 )
-            else:
-                # Main: streamed /v1/messages that errored mid-stream --
-                # partial usage the iterator stashed on ctx. Booking those
-                # tokens is the bounded partial-loss the design accepts.
-                partial = ctx.get("_stream_collected_usage")
-                if isinstance(partial, dict) and partial:
-                    # Partial usage means the streaming hook got at least one
-                    # message_start or message_delta out before the upstream
-                    # failed. Booking those tokens alongside the failure counter
-                    # is the bounded partial-loss the design accepts; not
-                    # resetting transient_failures is the whole point of moving
-                    # the success finalize out of the iterator's exception arm.
-                    prompt_tokens, completion_tokens = _prompt_completion_tokens(
-                        None, partial,
-                    )
-                    await self.ledger.record(
-                        plan,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        cost=0.0,
-                        failed=True,
-                        model=ctx["model"],
-                    )
-                else:
-                    await self.ledger.record(plan, failed=True, model=ctx["model"])
-        await self._handle_failure(ctx, exception)
+                await self._apply_verdict(
+                    target,
+                    Verdict(Outcome.INTERNAL, 0, "switchyard internal fault"),
+                    ctx,
+                )
+            return True
+
+        # Resolve the serving deployment for THIS hop's failure, the way
+        # ``_finish_success`` does for the success side. A hop's
+        # ``kwargs["model"]`` is the deployment string the router picked for
+        # that hop (``run_async_fallback`` rewrites ``kwargs["model"]``
+        # per iteration, ``router.py:_update_kwargs_before_fallbacks``
+        # stamps it on the hop's metadata), so:
+        #   * hop 0 (no fallback): ``kwargs["model"]`` is the picked
+        #     deployment; the ctx-equality branch returns the picked
+        #     plan, and ``target`` collapses to ``ctx["plan"]``.
+        #   * hop 1+ (sibling): ``kwargs["model"]`` is a sibling
+        #     deployment; ``target`` is the sibling's plan -- the plan
+        #     whose actual 400 / 5xx produced the row. A failure row on
+        #     the wrong plan would corrupt that plan's quota / breaker
+        #     streak (an AUTH hop on a sibling cools the sibling for
+        #     1800s instead of the picked plan; a TRANSIENT hop bumps
+        #     the sibling's ladder instead of the picked plan's).
+        served_plan, served_ref = self._resolve_served_failure_plan(ctx, kwargs)
+        target = served_plan or self.registry.plans.get(ctx.get("plan", ""))
+
+        # Classify against ``target``'s provider family (the plan that
+        # actually produced the error), not the picked plan's family.
+        # The vendor-code table is family-keyed: a MiniMax 1008
+        # insufficiency arriving as HTTP 500 on a sibling should
+        # classify as QUOTA_EXHAUSTED, not TRANSIENT, and that needs
+        # the sibling plan's family in the classify call. Without this
+        # re-class the verdict lands on the right plan but with the
+        # wrong semantics (e.g. ``note_exhaustion`` against a plan that
+        # is not actually exhausted). ``family=None`` when the target
+        # plan is gone (registry hot-swap); the prose-only CONTEXT
+        # regex still classifies correctly without a vendor-code table.
+        classify_family = target.provider_family if target else None
+        verdict = (
+            self._classify_failure(exception, classify_family)
+            if exception is not None else None
+        )
+        is_context = (
+            verdict is not None and verdict.outcome is Outcome.CONTEXT
+        )
+
+        # Marker claim. CONTEXT never claims (a sibling success may
+        # still arrive). The mid-walk call (hop >= 1) likewise never
+        # claims: ``run_async_fallback`` walks up to ``max_fallbacks``
+        # siblings and catches any exception per hop, so a 5xx on hop
+        # 1 is no evidence the walk is exhausted, and claiming
+        # ``_TERMINATED`` would suppress hop 2's ``_finish_success``
+        # and re-open the original #186 ledger hole. The primary-like
+        # arms (hop <= 0 -- the router's entry stamp on hop 0, or the
+        # no-router-metadata sentinel ``-1``) are safe to claim: no
+        # walked fallback can still fire after them.
+        if not is_context and hop <= 0:
+            ctx[_TERMINATED] = "failure"
+        self._stop_heartbeat(ctx["request_id"])
+        # Slot release always goes against ctx["plan"]: the slot was
+        # claimed on the picked plan only; sibling slots were never
+        # claimed in placement, so a release against ctx["plan"] is
+        # the only one with anything to release. picker.release is
+        # idempotent (zrem of a missing key), so a no-op release on
+        # the picked plan after a multi-hop walk that already
+        # heart-beat-stopped is safe.
+        await self.picker.release(
+            ctx["plan"], ctx["request_id"], ctx["model"],
+        )
+        if target is not None:
+            await self._record_failure(
+                target, exception, ctx, served_ref=served_ref,
+            )
+            if verdict is not None:
+                # ``skip_marker`` is True for CONTEXT verdicts (whose
+                # sibling success may still be in flight) AND for any
+                # mid-walk hop (hop >= 1, where ctx["request_id"] is
+                # shared with subsequent hops and a marker would suppress
+                # a legitimate later verdict). Only primary-like arms
+                # (hop <= 0) write the marker.
+                await self._apply_verdict(
+                    target, verdict, ctx,
+                    skip_marker=is_context or hop > 0,
+                )
         return True
+
+    def _resolve_served_failure_plan(
+        self, ctx: dict, kwargs: dict | None,
+    ):
+        """Which plan produced THIS hop's failure, when the router rewrote
+        the request across a context-window-fallbacks walk.
+
+        Mirrors ``_check_served_deployment``'s logic but for the failure
+        side: ``kwargs["model"]`` on a failed attempt is the deployment
+        the router was trying on this hop, which may be a sibling
+        deployment on a different plan when the walk moved on.
+
+        Returns ``(plan, ref)``:
+
+          * ``plan`` is the serving plan -- ``None`` when no plan owns the
+            hop's ``kwargs["model"]`` (registry hot-swap raced, unrecognised
+            deployment string). The caller falls back to ``ctx["plan"]``.
+          * ``ref`` is the deployment that actually returned the error,
+            so the ledger row keys the failure to the right model on the
+            right plan.
+
+        ``ctx["plan"]`` / ``ctx["model"]`` are the picked plan and model;
+        on hop 0 (no fallback), ``kwargs["model"]`` equals ``ctx["model"]``
+        and the ctx-equality branch returns the picked pair unchanged.
+        """
+        picked = self.registry.plans.get(ctx.get("plan", ""))
+        if kwargs is None:
+            return picked, ctx.get("model")
+        served_name = kwargs.get("model")
+        if not served_name:
+            return picked, ctx.get("model")
+        served_str = str(served_name)
+        served = (self.registry.model_for_deployment(served_str)
+                  or self.registry.model_for_router_id(served_str))
+        if served is None or served.ref == ctx.get("model"):
+            return picked, ctx.get("model")
+        actual = self.registry.plan_of(served)
+        log.warning(
+            "failure was picked for %s but produced by %s -- the "
+            "context-window-fallbacks walk moved the request across "
+            "plans mid-failure. Booking the row + verdict to %s.",
+            ctx.get("model"), served.ref, actual.key,
+        )
+        return actual, served.ref
+
+    async def _record_failure(
+        self, plan, exception: Exception | None, ctx: dict,
+        served_ref: str | None = None,
+    ) -> None:
+        """Book the failure row onto the ledger. Pulled out of
+        ``_finish_failure`` so the CONTEXT and non-CONTEXT paths share the
+        same TEXT_LOST / partial-usage / bare-record logic.
+
+        ``served_ref`` is the deployment that actually produced the error
+        on this hop (the plan was resolved by ``_resolve_served_failure_plan``
+        from ``kwargs["model"]``). Defaults to ``ctx["model"]`` when the
+        caller did not resolve a served ref -- the picked-model fallback
+        when ``kwargs`` carries no per-hop info, which keeps
+        ``/v1/messages`` failures (only the post-call hook fires there)
+        attributed the same way as before.
+        """
+        model = served_ref or ctx["model"]
+        msg = (
+            str(getattr(exception, "message", None) or exception)
+            if exception is not None else ""
+        )
+        tokens = extract_no_text_tokens(msg) if msg else None
+        if tokens is not None:
+            prompt_tokens, completion_tokens = tokens
+            await self.ledger.record(
+                plan, failed=True,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                model=model,
+            )
+            return
+        partial = ctx.get("_stream_collected_usage")
+        if isinstance(partial, dict) and partial:
+            prompt_tokens, completion_tokens = _prompt_completion_tokens(
+                None, partial,
+            )
+            await self.ledger.record(
+                plan,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cost=0.0,
+                failed=True,
+                model=model,
+            )
+            return
+        await self.ledger.record(plan, failed=True, model=model)
+
+    def _classify_failure(
+        self, exception: Exception, family: str | None,
+    ) -> Any:
+        """Classify a failure exception. Pulled out so the CONTEXT branch in
+        ``_finish_failure`` can classify without going through
+        ``_handle_failure`` (which re-runs the classify anyway). Returns the
+        same ``Verdict`` the existing flow would produce.
+        """
+        status = (
+            getattr(exception, "status_code", None)
+            or getattr(exception, "code", None)
+        )
+        try:
+            status = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            status = None
+        retry_after = _retry_after(exception)
+        return classify(
+            status,
+            str(getattr(exception, "message", None) or exception),
+            family=family,
+            body=_error_body(exception),
+            retry_after=retry_after,
+            default_cooldown=self.registry.settings.default_cooldown_seconds,
+        )
 
     async def async_post_call_success_hook(
         self, data: dict, user_api_key_dict: UserAPIKeyAuth, response, **_: Any
@@ -1293,67 +1616,96 @@ class SwitchyardHandler(CustomLogger):
         ``async_log_failure_event`` for them, verified 1.101.0); OpenAI-shaped
         routes can call BOTH hooks, in which case ``_finish_failure`` short-
         circuits on the second arrival.
+
+        The proxy fires this hook ONCE per request (after the router has
+        walked every fallback hop). ``router.py::async_function_with_fallbacks``
+        writes the in-place entry stamp (``0``) on the metadata at walk
+        entry, so a real proxy-side ``request_data`` lands on
+        ``hop = 0``; per-hop stamps (``1 / 2 / …``) go onto rebinding
+        copies that the proxy never sees. Passing ``request_data``
+        through anyway costs nothing -- ``_finish_failure`` collapses
+        no-hop-info to the ``hop = -1`` sentinel and routes every
+        shape (int, sentinel, proxy in-place) through one
+        ``_ctx_fail_booked_hops`` dedupe set. For a /v1/messages
+        failure that owns the request solo, the booker is the proxy
+        arm; for an OpenAI-shape request where ``async_log`` already
+        booked the same int stamp, the set collapses the second
+        arrival to a no-op.
+
+        Follow-up / residual: the served-deployment attribution in
+        ``_resolve_served_failure_plan`` is hop-scoped -- on the
+        ``async_log`` path, ``kwargs["model"]`` is the deployment the
+        router rewrote on that hop, so a sibling's error resolves
+        to the sibling's plan. On this hook's path ``request_data
+        ["model"]`` is the pre-call-hook's picked deployment
+        (proxy-side, never rebound by the router), so for an
+        exhausted ``/v1/messages`` walk the final sibling's error
+        still attributes to the picked plan. Today's generated
+        config (``num_retries=0``, no general fallbacks) means
+        a final AUTH/QUOTA_EXHAUSTED on the sibling lands the
+        1800s cooldown on the wrong plan -- pre-existing behaviour,
+        not a regression of this PR, and not fixable without a
+        litellm-side signal of the last failing deployment on the
+        proxy path. Filed as a follow-up against #186.
         """
         meta = (request_data or {}).get("metadata") or {}
         ctx = meta.get(META_KEY)
         if isinstance(ctx, dict):
-            await self._finish_failure(ctx, original_exception)
-
-    async def _handle_failure(self, ctx: dict, exc: Exception | None) -> None:
-        plan = self.registry.plans.get(ctx.get("plan", ""))
-        if plan is None or exc is None:
-            return
-        if not _provider_error(exc):
-            # A bare exception -- Redis gone, asyncio CancelledError, our own
-            # bookkeeping bug -- is SwitchYard's fault, never the provider's.
-            # Feed the verdict through _apply_verdict rather than returning
-            # directly so we share one verdict-handling path; the verdict is
-            # Outcome.INTERNAL, which is_our_fault, so _apply_verdict's first
-            # guard writes nothing to Redis and runs no streak bump / lease
-            # drop. The slot release + failure-ledger record already happened
-            # in _finish_failure and are untouched.
-            plan_key = ctx.get("plan", "?")
-            rid = ctx.get("request_id", "?")
-            log.exception(
-                "switchyard internal fault on plan=%s request_id=%s: %r",
-                plan_key, rid, exc,
+            await self._finish_failure(
+                ctx, original_exception, kwargs=request_data,
             )
-            await self._apply_verdict(
-                plan, Verdict(Outcome.INTERNAL, 0, "switchyard internal fault"), ctx,
-            )
+
+    async def _apply_verdict(
+        self, plan, verdict, ctx: dict, *, skip_marker: bool = False,
+    ) -> None:
+        """Act on a classified failure: cool the plan, learn, release the lease.
+
+        ``skip_marker=True`` skips writing the per-attempt
+        ``_verdict_applied`` marker. The marker dedupes verdict
+        side-effects on a request -- but a context-window-fallbacks
+        walk's attempts share the single ``ctx["request_id"]`` (the
+        picker minted it once, ``run_async_fallback`` does not rewrite
+        it), so a marker check that says "already applied for this
+        attempt" actually fires for the whole walk and would suppress a
+        legitimate later hop's verdict. ``_finish_failure`` sets the
+        flag for any arm where a later hop could still surface a
+        verdict -- CONTEXT verdicts (whose sibling success is the
+        documented case) AND mid-walk hops (hop >= 1, whose sibling
+        verdict would otherwise be silently dropped). Only the
+        primary-like arms (hop <= 0, the entry stamp or the
+        no-router-metadata sentinel) write the marker.
+
+        INTERNAL verdicts (plan-key ``_INTERNAL_*`` -- switchyard's
+        own plumbing: ``pick_direct`` raised, settings invalid,
+        heartbeat dead, etc.) carry ``cooldown_seconds=0`` already and
+        ``is_our_fault`` is True for them, so they short-circuit on the
+        same guard to never cool the provider and never drop the
+        session lease.
+        """
+        # BAD_REQUEST is the only "our fault" outcome that drops out
+        # without bookkeeping -- a malformed prompt is not the
+        # provider's problem. CONTEXT falls through to the drop-lease
+        # block below: a session leased to a too-small plan must
+        # re-lease onto a sibling with a bigger window on the next
+        # turn. CONTEXT verdicts carry ``cooldown_seconds=0``, so the
+        # cooldown branches never fire even though they sit between
+        # this guard and the drop-lease block. INTERNAL verdicts
+        # share the short-circuit reason: switchyard raised, not the
+        # provider, so we never cool the provider's capacity.
+        if verdict.outcome is Outcome.BAD_REQUEST or verdict.outcome is Outcome.INTERNAL:
             return
-        status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-        try:
-            status = int(status) if status is not None else None
-        except (TypeError, ValueError):
-            status = None
-        retry_after = _retry_after(exc)
-        verdict = classify(
-            status, str(getattr(exc, "message", None) or exc),
-            family=plan.provider_family,
-            body=_error_body(exc),
-            retry_after=retry_after,
-            default_cooldown=self.registry.settings.default_cooldown_seconds,
-        )
-        await self._apply_verdict(plan, verdict, ctx)
 
-    async def _apply_verdict(self, plan, verdict, ctx: dict) -> None:
-        """Act on a classified failure: cool the plan, learn, release the lease."""
-        if verdict.is_our_fault:
-            return  # our fault (bad prompt, our plumbing): never cool the provider
-
-        # CRITICAL double-count guard. async_log_failure_event fires PER
-        # ATTEMPT and async_post_call_failure_hook fires once more after the
-        # router's retries exhaust — both call _apply_verdict with the same
-        # ctx object, because the router reuses the kwargs dict across
-        # attempts. Without a per-attempt marker, a single 5xx would look
-        # like two, doubling the streak and the cooldown ladder. The new
-        # request_id minted for the re-pick is the natural key.
+        # Per-request verdict dedupe. ``ctx["request_id"]`` is shared
+        # across the whole walk, so the marker fires for every
+        # subsequent call within one request. ``skip_marker`` short-
+        # circuits the write so a CONTEXT or mid-walk hop's verdict
+        # does not silently block a legitimate later verdict in the
+        # same walk.
         marker = ctx.get("_verdict_applied")
         rid = ctx.get("request_id")
-        if marker and marker == rid:
-            return  # already applied for this attempt
-        if rid:
+        if marker and marker == rid and not skip_marker:
+            return  # already applied for this attempt (legacy backstop)
+        if rid and not skip_marker:
             ctx["_verdict_applied"] = rid
 
         if verdict.outcome is Outcome.QUOTA_EXHAUSTED:
@@ -1418,11 +1770,16 @@ class SwitchyardHandler(CustomLogger):
         # permanently out of rotation: dead quota (QUOTA_EXHAUSTED), dead
         # subscription (PLAN_DEAD), broken credentials (AUTH), and — the
         # upstream route/deployment failure case — any verdict the classifier
-        # marked with drop_lease=True (today: HTTP 404). A session leased to
+        # marked with drop_lease=True (today: HTTP 404). CONTEXT verdicts
+        # also drop the lease: a session leased to a plan whose window is
+        # too small for the prompt would otherwise keep landing on it every
+        # turn until the cooldown TTL passed; dropping it lets the next pick
+        # re-lease onto a sibling with a bigger window. A session leased to
         # the failing plan would otherwise keep landing on the dead capacity
         # every turn until the cooldown TTL passed; dropping it lets the
         # next pick re-lease onto a live sibling.
-        if (verdict.outcome in (Outcome.QUOTA_EXHAUSTED, Outcome.PLAN_DEAD, Outcome.AUTH)
+        if (verdict.outcome in (Outcome.QUOTA_EXHAUSTED, Outcome.PLAN_DEAD, Outcome.AUTH,
+                                Outcome.CONTEXT)
                 or verdict.drop_lease) and ctx.get("session"):
             await self.slots.drop_lease(ctx["session"])
 
