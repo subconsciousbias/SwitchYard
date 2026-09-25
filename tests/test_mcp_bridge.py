@@ -7553,6 +7553,402 @@ def test_continue_followup_refreshes_session_max_tokens_from_per_turn_body():
           "(session.max_tokens now follows the per-turn body)")
 
 
+# ------------------- parked session: CLI dies mid-loop reaps on finally -----
+def test_run_session_finally_reaps_a_parked_session_after_cli_exit_1():
+    """A fake CLI that exits 1 while its tool_call is parked must NOT leave
+    the session parked forever.
+
+    Before this fix, `run_session`'s finally only called `session.touch()`.
+    Every CLI failure path inside `_run_session_attempt` (502 on nonzero
+    exit, 408 on PROCESS_TIMEOUT, the 500 crash handler) only resolved the
+    `turn_future` -- a no-op on the delivered tool_calls future -- and never
+    ended the session. The parked tool_call futures stayed unresolved, so
+    tool_server.py's HTTP POST blocked forever, the inner CLI sat wedged on
+    the reply, and the follow-up arrived to find a session that looked
+    live but would never answer.
+
+    The fix: `finally` calls `note_preempted(session.id)` and
+    `await reap_session(session)` when the session is not dead AND
+    `session.awaiting_followup` is True (a normal park keeps run_session
+    awaiting proc.communicate, so reaching finally with the flag still
+    set means the driver died mid-loop). This test drives the
+    nonzero-exit branch directly with a hand-built parked session and a
+    fake CLI that exits 1 with a stderr line; _run_session_attempt hits
+    the generic 502 path (line 1537) and the finally must reap.
+
+    Mirrors the parked-session setup in
+    `test_followup_503_on_saturated_gate_leaves_session_parked` (park
+    via `_new_session` + `register_tool_call`, await the tool_calls turn,
+    mark `awaiting_followup`/`holds_slot`).
+    """
+    fake_cli = _write_fake_cli(
+        "import sys\n"
+        "sys.stderr.write('boom\\n')\n"
+        "sys.exit(1)\n")
+
+    async def scenario():
+        saved_gate = server.cli_bridge._gate
+        gate = server.cli_bridge.Gate()
+        server.cli_bridge._gate = gate
+        saved_sessions = dict(server.SESSIONS)
+        server.SESSIONS.clear()
+        try:
+            session = _new_session()
+            session.new_turn()
+            parked = asyncio.create_task(
+                server.register_tool_call(session.id, "get_weather",
+                                          {"city": "Oslo"}))
+            await asyncio.sleep(0)
+            turn = await session.turn_future
+            assert turn["type"] == "tool_calls", turn
+            call = turn["calls"][0]
+            session.awaiting_followup = True
+            session.holds_slot = False
+
+            # CLI dies mid-park with a nonzero exit. _run_session_attempt
+            # hits the generic 502 path (no auth/limit/status match for
+            # the fake's stderr), resolves turn_future as 502 (no-op since
+            # it is already done), returns None. The new finally reaps.
+            await server.run_session(session, [sys.executable, fake_cli])
+            # End-of-fix invariants: dead, gone from SESSIONS, id
+            # remembered as preempted, gate untouched (parked sessions
+            # hold no slot by design; reap_session's holds_slot guard
+            # skips release).
+            assert session.dead, session.dead
+            assert session.id not in server.SESSIONS, dict(server.SESSIONS)
+            assert session.id in server.PREEMPTED, dict(server.PREEMPTED)
+            assert gate.in_flight == 0, gate.in_flight
+            # fail_pending fired in reap_session, so the parked register
+            # tool_call task raised HTTPException 504 (register_tool_call's
+            # RuntimeError -> 504 mapping). Drain it so its outcome is
+            # observed; future regressions that leave the parked future
+            # unresolved would log "future exception was never retrieved".
+            return session, parked, call.id
+        finally:
+            server.SESSIONS.clear()
+            server.SESSIONS.update(saved_sessions)
+            server.cli_bridge._gate = saved_gate
+
+    session, parked, parked_call_id = asyncio.run(scenario())
+    # Drain the parked task OUTSIDE the scenario so the suppressed
+    # HTTPException doesn't get a "future exception was never retrieved"
+    # warning if the test runner exits first.
+    with contextlib.suppress(Exception):
+        parked.result()
+    print(f"  run_session finally reaped parked session {session.id[:8]}... "
+          f"after CLI exit 1 (dead, gone, in PREEMPTED, gate in_flight=0); "
+          f"parked call {parked_call_id[:12]}... failed via fail_pending")
+
+
+def test_run_session_finally_reaps_a_parked_session_after_process_timeout():
+    """The PROCESS_TIMEOUT kill branch must reap a parked session on finally
+    too -- the timeout kills the proc but otherwise leaves the session in
+    the exact same half-state as a crash.
+
+    Same harness as the exit-1 test, with a short PROCESS_TIMEOUT override
+    and a fake CLI that hangs past it. _run_session_attempt hits the
+    asyncio.TimeoutError branch (line 1502), kills the proc, resolves
+    turn_future as 408 (no-op), returns None. The finally must reap.
+    """
+    saved_timeout = server.PROCESS_TIMEOUT
+    server.PROCESS_TIMEOUT = 0.3
+    try:
+        fake_cli = _write_fake_cli(
+            "import time\n"
+            "time.sleep(10)\n")
+
+        async def scenario():
+            saved_gate = server.cli_bridge._gate
+            gate = server.cli_bridge.Gate()
+            server.cli_bridge._gate = gate
+            saved_sessions = dict(server.SESSIONS)
+            server.SESSIONS.clear()
+            try:
+                session = _new_session()
+                session.new_turn()
+                parked = asyncio.create_task(
+                    server.register_tool_call(session.id, "get_weather",
+                                              {"city": "Oslo"}))
+                await asyncio.sleep(0)
+                turn = await session.turn_future
+                assert turn["type"] == "tool_calls", turn
+                session.awaiting_followup = True
+                session.holds_slot = False
+
+                # The wait_for(PROCESS_TIMEOUT=0.3) fires; proc.kill() runs;
+                # resolve_final(408) is a no-op on the delivered turn_future.
+                # The new finally reaps.
+                await server.run_session(session, [sys.executable, fake_cli])
+                assert session.dead, session.dead
+                assert session.id not in server.SESSIONS, dict(server.SESSIONS)
+                assert session.id in server.PREEMPTED, dict(server.PREEMPTED)
+                assert gate.in_flight == 0, gate.in_flight
+                return session, parked
+            finally:
+                server.SESSIONS.clear()
+                server.SESSIONS.update(saved_sessions)
+                server.cli_bridge._gate = saved_gate
+
+        session, parked = asyncio.run(scenario())
+        with contextlib.suppress(Exception):
+            parked.result()
+        print(f"  run_session finally reaped parked session {session.id[:8]}... "
+              f"after PROCESS_TIMEOUT (dead, gone, in PREEMPTED, gate "
+              f"in_flight=0)")
+    finally:
+        server.PROCESS_TIMEOUT = saved_timeout
+
+
+def test_followup_after_parked_cli_died_rebuilds_via_preempted():
+    """A follow-up arriving after a parked session's CLI died must rebuild
+    from the request history, NOT block on the missing parked call.
+
+    Drives the full follow-up path end-to-end:
+      1. park a session via _new_session + register_tool_call,
+      2. kill the CLI with a fake that exits 1 -- run_session's new
+         finally reaps the session and adds its id to PREEMPTED,
+      3. post a follow-up via handle_followup; the lookup misses
+         SESSIONS, sees the id in PREEMPTED, and rebuilds via
+         resume_gone_session (stubbed start_session so the test does not
+         spawn a real CLI for the rebuilt turn).
+
+    Asserts the rebuild fired (start_session called once, response is the
+    stub), the slot was released (gate.in_flight back to 0), and the
+    parked register_tool_call task was failed by reap_session's
+    fail_pending (no orphan future-warning on exit).
+
+    Mirrors the rebuild-stub pattern from
+    `test_followup_superseded_mid_turn_rebuilds_instead_of_500` (stubbed
+    start_session, fresh gate).
+    """
+    fake_cli = _write_fake_cli(
+        "import sys\nsys.exit(1)\n")
+    captured: list = []
+    restore = _stub_start_session(captured)
+    try:
+        async def scenario():
+            saved_gate = server.cli_bridge._gate
+            gate = server.cli_bridge.Gate()
+            server.cli_bridge._gate = gate
+            saved_sessions = dict(server.SESSIONS)
+            server.SESSIONS.clear()
+            try:
+                session = _new_session()
+                session.new_turn()
+                parked = asyncio.create_task(
+                    server.register_tool_call(session.id, "get_weather",
+                                              {"city": "Oslo"}))
+                await asyncio.sleep(0)
+                turn = await session.turn_future
+                assert turn["type"] == "tool_calls", turn
+                call = turn["calls"][0]
+                session.awaiting_followup = True
+                session.holds_slot = False
+
+                # Step 1: CLI dies mid-park. The new finally reaps.
+                await server.run_session(session, [sys.executable, fake_cli])
+                assert session.id not in server.SESSIONS
+                assert session.id in server.PREEMPTED
+
+                # Step 2: follow-up arrives. handle_followup looks the id
+                # up in SESSIONS (miss), checks PREEMPTED (hit), and
+                # routes to resume_gone_session -> start_session (stub).
+                body = {"model": "m",
+                        "tools": [{"type": "function", "function": {
+                            "name": "get_weather", "description": "",
+                            "parameters": {"type": "object",
+                                           "properties": {"city": {
+                                               "type": "string"}}}}}],
+                        "messages": [
+                            {"role": "user", "content": "weather?"},
+                            {"role": "assistant", "content": None,
+                             "tool_calls": [{"id": call.id, "type": "function",
+                                              "function": {"name": "get_weather",
+                                                           "arguments": '{"city":"Oslo"}'}}]},
+                            {"role": "tool", "tool_call_id": call.id,
+                             "content": '{"temp_c":-3}'},
+                        ]}
+                tool_msgs = body["messages"][2:]
+                response = await server.handle_followup(body, tool_msgs, None)
+                with contextlib.suppress(Exception):
+                    parked.result()
+                return response, captured, gate.in_flight
+            finally:
+                server.SESSIONS.clear()
+                server.SESSIONS.update(saved_sessions)
+                server.cli_bridge._gate = saved_gate
+
+        response, captured, in_flight = asyncio.run(scenario())
+        # Rebuild fired -- start_session was called exactly once. The
+        # follow-up got the same rebuilt response the stub returns.
+        assert len(captured) == 1, captured
+        assert response == {"stubbed": True}, response
+        # Slot released back to the gate: resume_gone_session acquired via
+        # acquire_resume_slot, then the stub released it.
+        assert in_flight == 0, in_flight
+        print("  follow-up after parked-CLI crash rebuilt via PREEMPTED: "
+              "start_session called once, response=stubbed, gate in_flight=0")
+    finally:
+        restore()
+
+
+# ------------------- tool_server.py: finite CALLBACK_TIMEOUT default -------
+def test_tool_server_callback_timeout_default_is_session_ttl_plus_60():
+    """tool_server.py must compute its default CALLBACK_TIMEOUT as
+    SESSION_TTL + 60 (a finite ceiling, not None), so a bridge that goes
+    silent or dies never leaves the inner CLI's urlopen blocked for a day.
+    An explicit SWITCHYARD_CALLBACK_TIMEOUT env value still wins.
+
+    tool_server reads env vars at import time, so the test imports it in
+    a subprocess under several env combinations and reads the printed
+    CALLBACK_TIMEOUT back. Loopback is allowed by the conftest socket
+    guard; only real-provider hosts are blocked.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-cbto-"))
+    tools_path = workdir / "tools.json"
+    tools_path.write_text("[]")
+    saved_env = {k: os.environ.get(k) for k in (
+        "SWITCHYARD_CALLBACK_TIMEOUT", "MCP_SESSION_TTL_SECONDS")}
+    try:
+        cases = [
+            # (MCP_SESSION_TTL_SECONDS, expected default)
+            ("120",   180.0),    # 120 + 60
+            ("1800",  1860.0),   # the default; mirrors server.py
+            ("3600",  3660.0),
+        ]
+        for ttl, expected in cases:
+            env = {**os.environ,
+                   "SWITCHYARD_TOOLS_FILE": str(tools_path),
+                   "SWITCHYARD_SESSION_ID": "abcd",
+                   "SWITCHYARD_CALLBACK_URL": "http://127.0.0.1:1",
+                   "MCP_SESSION_TTL_SECONDS": ttl}
+            env.pop("SWITCHYARD_CALLBACK_TIMEOUT", None)
+            proc = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys, json; "
+                 "sys.path.insert(0, %r); "
+                 "import tool_server; "
+                 "print(json.dumps({'CALLBACK_TIMEOUT': "
+                 "tool_server.CALLBACK_TIMEOUT}))"
+                 % MCP_BRIDGE_DIR],
+                env=env, capture_output=True, text=True, timeout=10,
+            )
+            assert proc.returncode == 0, (proc.stdout, proc.stderr)
+            data = json.loads(proc.stdout.strip())
+            assert data["CALLBACK_TIMEOUT"] == expected, \
+                f"MCP_SESSION_TTL_SECONDS={ttl}: expected {expected}, " \
+                f"got {data['CALLBACK_TIMEOUT']}"
+
+        # An explicit SWITCHYARD_CALLBACK_TIMEOUT still wins, regardless of
+        # MCP_SESSION_TTL_SECONDS (and even when the explicit value is
+        # below the computed default).
+        for explicit in ("42", "5", "9999"):
+            env = {**os.environ,
+                   "SWITCHYARD_TOOLS_FILE": str(tools_path),
+                   "SWITCHYARD_SESSION_ID": "abcd",
+                   "SWITCHYARD_CALLBACK_URL": "http://127.0.0.1:1",
+                   "MCP_SESSION_TTL_SECONDS": "1800",
+                   "SWITCHYARD_CALLBACK_TIMEOUT": explicit}
+            proc = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys, json; "
+                 "sys.path.insert(0, %r); "
+                 "import tool_server; "
+                 "print(json.dumps({'CALLBACK_TIMEOUT': "
+                 "tool_server.CALLBACK_TIMEOUT}))"
+                 % MCP_BRIDGE_DIR],
+                env=env, capture_output=True, text=True, timeout=10,
+            )
+            assert proc.returncode == 0, (proc.stdout, proc.stderr)
+            data = json.loads(proc.stdout.strip())
+            assert data["CALLBACK_TIMEOUT"] == float(explicit), \
+                f"SWITCHYARD_CALLBACK_TIMEOUT={explicit}: expected " \
+                f"{float(explicit)}, got {data['CALLBACK_TIMEOUT']}"
+        print("  tool_server CALLBACK_TIMEOUT default = SESSION_TTL+60 "
+              "(120+60=180, 1800+60=1860, 3600+60=3660 verified); "
+              "explicit SWITCHYARD_CALLBACK_TIMEOUT=42/5/9999 wins")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_write_claude_mcp_config_injects_callback_timeout_into_harness_env():
+    """write_claude_mcp_config (the claude MCP harness writer) must inject
+    SWITCHYARD_CALLBACK_TIMEOUT into the stdio child's env dict. The
+    harness dict is the only reliable way both stdio children get the
+    value (claude + opencode); tool_server.py's SESSION_TTL+60 default
+    is the safety net for harnesses that don't pass it.
+
+    Pinned against the same SESSION_TTL constant server.py uses, so a
+    drift on either side (call SESSION_TTL + N off-by-one, drop the env
+    entry, drop write_opencode_dir's parallel injection) is caught by
+    this test.
+
+    Also asserts the operator-override path: if SWITCHYARD_CALLBACK_TIMEOUT
+    is set in the sidecar's own environment (the container-scope the
+    reviewer flagged in finding 4), both writers forward it verbatim
+    rather than unconditionally clobbering it with SESSION_TTL+60.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="mcpb-claudecbto-"))
+    saved_env = os.environ.get("SWITCHYARD_CALLBACK_TIMEOUT")
+    try:
+        tools_path = workdir / "tools.json"
+        tools_path.write_text("[]")
+
+        # Default path: no operator override -> SESSION_TTL+60 is written
+        # into both stdio children's env dicts, identical to the value
+        # tool_server.py would compute as a safety net.
+        if "SWITCHYARD_CALLBACK_TIMEOUT" in os.environ:
+            del os.environ["SWITCHYARD_CALLBACK_TIMEOUT"]
+        mcp_json = server.write_claude_mcp_config(workdir, "sess-x", tools_path)
+        cfg = json.loads(mcp_json.read_text())
+        env = cfg["mcpServers"]["switchyard"]["env"]
+        assert env["SWITCHYARD_CALLBACK_TIMEOUT"] == str(server.SESSION_TTL + 60), \
+            env
+        # The three documented keys are still all present (regression
+        # guard against this PR accidentally dropping one).
+        assert env["SWITCHYARD_TOOLS_FILE"] == str(tools_path), env
+        assert env["SWITCHYARD_SESSION_ID"] == "sess-x", env
+        assert env["SWITCHYARD_CALLBACK_URL"].startswith("http://"), env
+        # And write_opencode_dir gets the same value on its parallel
+        # `environment` block.
+        server.write_opencode_dir(workdir, "sess-y", tools_path)
+        ocfg = json.loads((workdir / "opencode.json").read_text())
+        ocfg_env = ocfg["mcp"]["switchyard"]["environment"]
+        assert ocfg_env["SWITCHYARD_CALLBACK_TIMEOUT"] == str(server.SESSION_TTL + 60), \
+            ocfg_env
+
+        # Operator-override path: an operator-tuned value at container
+        # scope is forwarded verbatim by BOTH writers, so the contract
+        # is enforced at the writer (not left to whichever stdio harness
+        # resolves env-precedence). Use a value clearly distinct from the
+        # default so a regression that always writes the default is
+        # caught.
+        os.environ["SWITCHYARD_CALLBACK_TIMEOUT"] = "77"
+        mcp_json = server.write_claude_mcp_config(workdir, "sess-x2",
+                                                   tools_path)
+        cfg = json.loads(mcp_json.read_text())
+        assert cfg["mcpServers"]["switchyard"]["env"][
+            "SWITCHYARD_CALLBACK_TIMEOUT"] == "77", cfg
+        server.write_opencode_dir(workdir, "sess-y2", tools_path)
+        ocfg = json.loads((workdir / "opencode.json").read_text())
+        assert ocfg["mcp"]["switchyard"]["environment"][
+            "SWITCHYARD_CALLBACK_TIMEOUT"] == "77", ocfg
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        if saved_env is None:
+            os.environ.pop("SWITCHYARD_CALLBACK_TIMEOUT", None)
+        else:
+            os.environ["SWITCHYARD_CALLBACK_TIMEOUT"] = saved_env
+    print(f"  write_claude_mcp_config + write_opencode_dir inject "
+          f"SWITCHYARD_CALLBACK_TIMEOUT=SESSION_TTL+60={server.SESSION_TTL+60:.0f} "
+          f"by default; operator override 77 is forwarded verbatim")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

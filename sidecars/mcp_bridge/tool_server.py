@@ -29,11 +29,20 @@ PROTOCOL_VERSION = "2024-11-05"
 TOOLS_FILE = os.environ["SWITCHYARD_TOOLS_FILE"]
 SESSION_ID = os.environ["SWITCHYARD_SESSION_ID"]
 CALLBACK_URL = os.environ["SWITCHYARD_CALLBACK_URL"].rstrip("/")
-# No timeout here by default -- server.py's session TTL and reaper are what
-# bound how long a call may sit parked, not this process. A caller may be
-# minutes into a build or a test suite when it finally answers.
+# Finite callback timeout so a bridge that goes silent or dies never leaves the
+# inner CLI's urlopen blocked for a day. server.py writes
+# SWITCHYARD_CALLBACK_TIMEOUT into the harness env from SESSION_TTL + 60 (see
+# write_claude_mcp_config / write_opencode_dir); reading it here is the safety
+# net for harnesses that only pass the documented three vars. An explicit
+# SWITCHYARD_CALLBACK_TIMEOUT env value still wins. The default mirrors the
+# server-side default (MCP_SESSION_TTL_SECONDS, 1800 s) plus a one-minute
+# grace to outlast a parked session that the reaper is about to reap.
 _raw_timeout = os.environ.get("SWITCHYARD_CALLBACK_TIMEOUT", "")
-CALLBACK_TIMEOUT = float(_raw_timeout) if _raw_timeout else None
+if _raw_timeout:
+    CALLBACK_TIMEOUT = float(_raw_timeout)
+else:
+    _session_ttl = float(os.environ.get("MCP_SESSION_TTL_SECONDS", "1800"))
+    CALLBACK_TIMEOUT = _session_ttl + 60
 # How often to send notifications/progress for a parked call.
 #
 # This is not cosmetic: an MCP *client* times its own requests out, and the
@@ -90,6 +99,24 @@ def call_back(name: str, arguments: dict) -> dict:
         return {"content": [{"type": "text",
                               "text": f"switchyard bridge unreachable: {exc.reason}"}],
                 "isError": True}
+    except OSError as exc:
+        # A connect-time timeout surfaces as urllib.error.URLError(TimeoutError)
+        # (caught by the URLError branch above). A read-time timeout after
+        # the connection succeeded escapes as a raw TimeoutError --
+        # socket.timeout is the same class on Python 3.10+, and TimeoutError
+        # is a subclass of OSError, so this single except covers both. A raw
+        # OSError also covers ECONNRESET/EPIPE from a bridge that died
+        # mid-call. Without this branch either escape surfaces as an
+        # unhandled stderr traceback in the tool thread that the CLI may
+        # treat as a hard protocol error -- prefer an explicit isError reply
+        # the model can act on instead, and brand it by exception class so
+        # a mid-call reset does not read as a 31-minute timeout.
+        if isinstance(exc, TimeoutError):
+            text = (f"switchyard bridge timed out after "
+                    f"{CALLBACK_TIMEOUT:.0f}s: {exc}")
+        else:
+            text = f"switchyard bridge connection failed: {exc}"
+        return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
 async def keep_alive(token, lock: asyncio.Lock) -> None:

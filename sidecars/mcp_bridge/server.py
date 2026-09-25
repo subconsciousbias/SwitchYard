@@ -1196,6 +1196,18 @@ def write_claude_mcp_config(workdir: Path, session_id: str, tools_path: Path) ->
                     "SWITCHYARD_TOOLS_FILE": str(tools_path),
                     "SWITCHYARD_SESSION_ID": session_id,
                     "SWITCHYARD_CALLBACK_URL": CALLBACK_BASE,
+                    # Belt-and-braces: tool_server.py defaults to
+                    # SESSION_TTL+60 from MCP_SESSION_TTL_SECONDS, but
+                    # this env entry is the only reliable way BOTH stdio
+                    # children (claude + opencode) see the same value
+                    # without depending on harness-side merge order. An
+                    # operator-tuned SWITCHYARD_CALLBACK_TIMEOUT at
+                    # container scope is forwarded verbatim here so the
+                    # contract is enforced at the writer, not left to
+                    # whichever stdio harness resolves env precedence.
+                    "SWITCHYARD_CALLBACK_TIMEOUT":
+                        os.environ.get("SWITCHYARD_CALLBACK_TIMEOUT")
+                        or str(SESSION_TTL + 60),
                 },
             }
         }
@@ -1245,6 +1257,16 @@ def write_opencode_dir(workdir: Path, session_id: str, tools_path: Path,
                 "SWITCHYARD_TOOLS_FILE": str(tools_path),
                 "SWITCHYARD_SESSION_ID": session_id,
                 "SWITCHYARD_CALLBACK_URL": CALLBACK_BASE,
+                # See write_claude_mcp_config: tool_server.py's
+                # SESSION_TTL+60 default is a safety net for harnesses
+                # that don't pass this; both stdio children receive it
+                # here so the value is reliable and identical across
+                # the two providers, and an operator-tuned
+                # SWITCHYARD_CALLBACK_TIMEOUT at container scope is
+                # forwarded verbatim just like in the claude writer.
+                "SWITCHYARD_CALLBACK_TIMEOUT":
+                    os.environ.get("SWITCHYARD_CALLBACK_TIMEOUT")
+                    or str(SESSION_TTL + 60),
             },
             "enabled": True,
         }
@@ -1618,6 +1640,34 @@ async def run_session(session: Session, argv: list[str],
         session.resolve_final({"type": "error", "status": 500, "detail": str(exc)})
     finally:
         session.touch()
+        # Crash/timeout teardown for a parked session: a normal park leaves
+        # run_session still awaiting `proc.communicate`, so reaching `finally`
+        # with `awaiting_followup` still True means the inner CLI died mid-
+        # loop -- the 502/408/turn-future-already-delivered paths in
+        # `_run_session_attempt` (and the crash handler above) only resolve
+        # the turn_future and never end the session, so the parked tool_call
+        # futures would block tool_server.py's HTTP POST forever. Reap the
+        # session here: fail the pending calls, kill the lingering proc,
+        # free the slot, and remember the id so the follow-up rebuilds
+        # rather than being refused as a caller error. The session.dead
+        # guard inside reap_session (via end_session) keeps this idempotent
+        # against a concurrent reaper/supersede that already won, and a
+        # parked session holds no gate slot so there is nothing to double-
+        # release. Cancellation is re-raised so an in-flight reap during
+        # uvicorn's --timeout-graceful-shutdown is not silently swallowed;
+        # the idle reaper is the backstop for any session left behind by
+        # a cancelled reap, and the same CancelledError convention applies
+        # in `_on_shutdown` (see that block's long-form comment).
+        if (not session.dead
+                and session.awaiting_followup):
+            try:
+                note_preempted(session.id)
+                await reap_session(session)
+            except asyncio.CancelledError:
+                raise
+            except Exception as reap_exc:
+                log.warning("run_session finally reap failed for %s: %s",
+                            session.id, reap_exc)
 
 
 async def end_session(session: Session) -> None:
@@ -2954,6 +3004,17 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
     try:
         session.touch()
         await session.new_turn()
+        # Belt and braces (the primary teardown is run_session's finally):
+        # a fast follow-up can read SESSIONS[wanted], unpark, resolve the
+        # parked call futures, and reach here AFTER the inner CLI died and
+        # run_session's finally already reaped the session for those very
+        # calls. The freshly-installed turn_future has no flush coming --
+        # fail over to resume_gone_session like the typed catches below
+        # rather than awaiting a turn nobody will resolve.
+        if session.dead:
+            return await resume_gone_session(
+                body, body.get("tools") or [], session.id, request,
+                why="session died before the new turn resolved")
         result = await await_turn(session, request)
         response = render_turn(session, result, body.get("model"))
         # Cache the rendered response so a later duplicate delivery of THIS
