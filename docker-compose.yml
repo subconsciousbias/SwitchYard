@@ -117,6 +117,13 @@ services:
       LOCAL_API_BASE: ${LOCAL_API_BASE:-http://host.docker.internal:11434/v1}
       LOCAL_API_KEY: ${LOCAL_API_KEY:-}
       GATEWAY_WORKERS: ${GATEWAY_WORKERS:-2}
+      # LiteLLM's aiohttp pool keeps an idle upstream connection for 120s by
+      # default, but the sidecars' uvicorn closes an idle one after 5s. A
+      # request that reuses a connection the sidecar has just closed fails as
+      # a 500 "Broken pipe" / "Server disconnected" (and a tool-loop
+      # follow-up lost that way strands its parked CLI session). Idle
+      # connections now close on the gateway side first.
+      AIOHTTP_KEEPALIVE_TIMEOUT: ${AIOHTTP_KEEPALIVE_TIMEOUT:-3}
       # The only service that legitimately holds secrets: every key listed in
       # config/plans.yaml's `os.environ/NAME` references. Named explicitly so a
       # lane 401 names the missing variable instead of failing silently.
