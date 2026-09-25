@@ -414,6 +414,28 @@ class Session:
     # from the same body, so a follow-up-born session still enforces whatever
     # cap the latest request carried.
     max_tokens: int | None = None
+    # Issue #135: cumulative prompt/completion tokens already surfaced to the
+    # caller via `last_response['usage']`. Used by the teardown sites
+    # (`supersede_session`, `reap_session`, `enforce_parked_limit`, the
+    # PROCESS_TIMEOUT branch in `_run_session_attempt`) to compute the
+    # un-booked delta from the transcript -- the gate cannot infer what was
+    # billed once the session is gone, so the sidecar records the last-known
+    # total here on every final turn it renders. None until the first final
+    # response (a session that ends mid-park has no last_response to read
+    # from, and the teardown helper then falls back to the transcript-only
+    # total).
+    billed_prompt_tokens: int = 0
+    billed_completion_tokens: int = 0
+    # Issue #264 nudge continuity (#271 follow-up + #63 rebuild note): the
+    # 16-hex `_caller_env.fingerprint()` of the first user turn. Captured at
+    # session start so a subsequent tools-free follow-up that has no
+    # tool_call_id to correlate on can still find its parked session by
+    # content (the system + first-user fingerprint is stable across the
+    # turns of one session and distinct across sessions -- exactly the
+    # property the routing relies on). `None` for sessions loaded from a
+    # process restart (the transcript is gone, so is the parked state, so
+    # nothing matches anyway).
+    fingerprint: str | None = None
     _flush_handle: object = None
 
     def touch(self) -> None:
@@ -594,6 +616,66 @@ def remembered_tools_for(body: dict) -> list[dict] | None:
             if key and key in REMEMBERED_TOOLS:
                 return REMEMBERED_TOOLS[key]
     return None
+
+
+def parked_session_by_fingerprint(body: dict) -> "Session | None":
+    """The parked session whose stored fingerprint matches this request, or None.
+
+    Issue #264 nudge continuity: a follow-up can carry no `tool` messages
+    (the caller is sending text only, with `tools` either empty or
+    `remembered_tools_for` returns nothing) but still belong to a parked
+    session. Without this, such a follow-up falls through to the text path,
+    the parked session never sees its nudge, and the inner CLI's last
+    `tool_use` sits parked until the idle reaper collects it -- a session
+    that could have continued on the same prompt cache.
+
+    The fingerprint is a 16-hex of (system + first user), identical to the
+    value `_caller_env.mint_probe_call_id` carries and to the one the
+    request-completion sidecar stashes on `session.fingerprint`.
+
+    Multiple parked sessions with the same fingerprint (two tabs re-running
+    the same first prompt on the same plan, a caller resuming one of
+    several abandoned sessions) are treated as an AMBIGUOUS match and the
+    helper returns None: silently picking the most-recently-parked would
+    cross-wire two unrelated conversations -- the nudge meant for session
+    A drives B's continuation, A's parked `tool_use` sits unresolvable,
+    and A's turns go un-billed. Falling through to the text path on a
+    collision means the caller gets a fresh CLI (worse than resuming the
+    right one, but no silent fork). The "one tool loop == one
+    conversation" invariant wins; an operator who actually wants the
+    cross-wire can disambiguate by stamping `metadata.switchyard.
+    session_id` on the request, which handle_followup honours directly.
+
+    None on a request without `_caller_env` loaded (tests), with no
+    messages, on fingerprint parse failure, when no parked session
+    matches, or when more than one parked session matches.
+    """
+    if _caller_env is None:
+        return None
+    try:
+        fp = _caller_env.fingerprint(body.get("messages") or [])
+    except Exception:
+        return None
+    if not fp:
+        return None
+    parked = [s for s in SESSIONS.values()
+              if s.awaiting_followup and not s.dead and s.fingerprint == fp]
+    if not parked:
+        return None
+    if len(parked) > 1:
+        # Ambiguous match: multiple parked sessions share the same
+        # (system + first user) fingerprint. Logging the candidates gives
+        # an operator something to chase if a user reports a mis-routed
+        # nudge; the fingerprint helper itself does not pick.
+        log.info(
+            "fingerprint nudge routing skipped: %d parked sessions share "
+            "fingerprint=%s (ids %s); falling through to text path to "
+            "avoid silent cross-wire",
+            len(parked), fp,
+            [s.id[:8] for s in sorted(parked, key=lambda s: s.last_active,
+                                       reverse=True)])
+        return None
+    return parked[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1518,6 +1600,12 @@ async def _run_session_attempt(session: Session, argv: list[str],
             timeout=PROCESS_TIMEOUT)
     except asyncio.TimeoutError:
         cli_bridge.kill_process_group(proc)
+        # Issue #135: book the un-booked delta BEFORE resolve_final
+        # detaches the turn_future. The helper reads `session` directly
+        # and the transcript on disk survives the kill, so calling it
+        # here keeps the contract the other teardown sites (supersede /
+        # reap / enforce_parked_limit) follow.
+        _book_unbooked_usage(session)
         session.resolve_final({"type": "error", "status": 408,
                                 "detail": f"{PROVIDER} cli timed out after "
                                           f"{PROCESS_TIMEOUT:.0f}s"})
@@ -1713,6 +1801,10 @@ async def supersede_session(session: Session, reason: str) -> None:
     """
     log.info("superseding mcp_bridge session %s (%s); %d pending call(s)",
              session.id, reason, len(session.pending))
+    # Issue #135: book un-booked usage BEFORE end_session() removes the
+    # transcript-recoverable fields. The helper is silent when there is
+    # nothing to reconcile (non-claude provider, no transcript yet).
+    _book_unbooked_usage(session)
     session.fail_pending(f"session {session.id} superseded ({reason})")
     if session.turn_future is not None and not session.turn_future.done():
         session.turn_future.set_exception(
@@ -1799,6 +1891,8 @@ async def enforce_parked_limit(exclude: str | None = None) -> None:
                     "%s (idle %.0fs)", limit, victim.id,
                     time.time() - victim.last_active)
         note_preempted(victim.id)
+        # reap_session handles the issue #135 booking on its own; calling
+        # _book_unbooked_usage here too would double-log.
         await reap_session(victim)
 
 
@@ -1857,6 +1951,10 @@ async def reap_session(session: Session) -> None:
                 session.id, time.time() - session.last_active,
                 ", awaiting follow-up" if session.awaiting_followup else "",
                 len(session.pending))
+    # Issue #135: book un-booked usage BEFORE end_session() removes the
+    # transcript-recoverable fields. A reaped mid-loop session has
+    # billed_*=0 and the entire cumulative transcript surfaces as the delta.
+    _book_unbooked_usage(session)
     session.fail_pending(f"session {session.id} reaped after {SESSION_TTL:.0f}s idle")
     if session.turn_future is not None and not session.turn_future.done():
         session.turn_future.set_exception(_ReapedSignal("session reaped"))
@@ -2134,15 +2232,129 @@ def _with_context_usage(response: dict, session: Session, billed: dict) -> dict:
     cache reads / cache writes into `prompt_tokens` the same way it does on
     the text path; the billed figures sit alongside as separate keys so the
     ledger has the running total it needs.
+
+    Issue #135: on the final turn the billed prompt/completion totals are also
+    stashed on the Session so the teardown sites can compute the un-booked
+    delta from the transcript without trusting whatever got returned to the
+    caller (a session that ended without a final response still gets its
+    billing reconciled against the transcript on supersede/reap/etc).
     """
     usage = response.get("usage") or {}
     last = last_call_usage(session)
     if last is not None:
         usage = cli_bridge.to_openai({"usage": last}, "")["usage"]
-    usage["switchyard_billed_prompt_tokens"] = int(billed.get("prompt_tokens", 0) or 0)
-    usage["switchyard_billed_completion_tokens"] = int(billed.get("completion_tokens", 0) or 0)
+    billed_prompt = int(billed.get("prompt_tokens", 0) or 0)
+    billed_completion = int(billed.get("completion_tokens", 0) or 0)
+    usage["switchyard_billed_prompt_tokens"] = billed_prompt
+    usage["switchyard_billed_completion_tokens"] = billed_completion
     response["usage"] = usage
+    # Only the final-turn path is meaningful for billing: a mid-loop
+    # tool_calls turn calls with `billed={}` and writes zeros, which would
+    # erase the session's already-booked total. The render_turn caller
+    # passes `dict(response["usage"])` on the final branch (see below), so
+    # `billed` here is the cumulative sum -- exactly what the teardown
+    # helper needs to compute the un-booked delta against the transcript.
+    if billed:
+        session.billed_prompt_tokens = billed_prompt
+        session.billed_completion_tokens = billed_completion
     return response
+
+
+def _cumulative_transcript_usage(session: Session) -> dict | None:
+    """Sum every `assistant` turn's usage from the CLI transcript (issue #135).
+
+    Returns the cumulative `input_tokens` / `output_tokens` / cache totals as
+    the CLI recorded them across every turn this session ran. `last_call_usage`
+    already reads the LAST line; this walks the same JSONL forward and sums.
+    The transcript is the same source the ledger books from, so any delta
+    between this sum and `session.billed_*` represents usage that did not
+    survive to the caller's response (a session reaped mid-loop, a session
+    that errored before the final render, a session that was preempted and
+    replaced by a rebuild).
+
+    Returns None when there is nothing meaningful to sum: a non-claude
+    provider, a missing project dir, or a transcript with no assistant usage
+    line yet. Mirrors `last_call_usage`'s caller-neutral contract: a None
+    return means "nothing to book", not "we lost data".
+    """
+    if PROVIDER != "claude":
+        return None
+    sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(session.spawn_dir or session.workdir))
+    project_dir = cli_bridge.CLAUDE_PROJECTS / sanitized
+    try:
+        path = project_dir / f"{claude_session_uuid(session.id)}.jsonl"
+        if not path.is_file():
+            return None
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            return None
+    except OSError:
+        return None
+    cumulative = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+    }
+    seen = 0
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        cumulative["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
+        cumulative["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+        cumulative["cache_read_input_tokens"] += int(
+            usage.get("cache_read_input_tokens", 0) or 0)
+        cumulative["cache_creation_input_tokens"] += int(
+            usage.get("cache_creation_input_tokens", 0) or 0)
+        seen += 1
+    return cumulative if seen else None
+
+
+def _book_unbooked_usage(session: Session) -> None:
+    """Compute the un-booked usage delta for a dying session and log it (issue #135).
+
+    Called from every teardown site: `supersede_session`, `reap_session`,
+    `enforce_parked_limit`, the PROCESS_TIMEOUT branch in
+    `_run_session_attempt`. The sidecar itself cannot reach the gateway's
+    ledger (that is `switchyard/hooks.py`'s job on a successful HTTP
+    response), so this helper computes the delta and logs it as a
+    structured warning -- an operator reconciling the ledger against the
+    sidecar can read the message and write off the difference on the next
+    cycle. A session with no transcript (a non-claude provider, or a Claude
+    session that never reached its first turn) reports a None total and the
+    helper stays silent: there is nothing to reconcile, and the existing
+    silent-skip tests already pin the contract.
+
+    The deltas are computed against `session.billed_*` (the cumulative total
+    `_with_context_usage` stashed on the final-turn path). A session that
+    never produced a final turn has zeros there, so the entire transcript
+    total surfaces as the delta -- exactly what an idle-reaped or
+    timeout-killed session looks like.
+    """
+    cumulative = _cumulative_transcript_usage(session)
+    if cumulative is None:
+        return                       # nothing to book; stay silent
+    prompt_delta = cumulative["input_tokens"] - session.billed_prompt_tokens
+    completion_delta = (
+        cumulative["output_tokens"] - session.billed_completion_tokens)
+    if prompt_delta <= 0 and completion_delta <= 0:
+        return                       # everything was already billed
+    log.warning(
+        "mcp session %s teardown: un-booked usage prompt=%d completion=%d "
+        "(transcript cumulative input=%d output=%d, billed prompt=%d "
+        "completion=%d); reconcile against ledger on next cycle",
+        session.id, prompt_delta, completion_delta,
+        cumulative["input_tokens"], cumulative["output_tokens"],
+        session.billed_prompt_tokens, session.billed_completion_tokens)
 
 
 def render_turn(session: Session, result: dict, requested_model: str | None) -> dict:
@@ -2164,6 +2376,108 @@ def render_turn(session: Session, result: dict, requested_model: str | None) -> 
         # one to its transcript before exiting this turn.
         return _with_context_usage(response, session, {})
     if result["type"] == "final":
+        # Issue #255 (Phase 4 note): scan the model text for literal tool
+        # calls (XML <tool_use name="..."> or bracket [called tool(args)])
+        # BEFORE the cap / to_openai step. A turn that contains one
+        # matched pattern becomes a tool_calls response instead of text;
+        # the assistant text minus the matched patterns rides alongside
+        # the tool_use blocks (the model may have written a sentence
+        # explaining what it is doing). Dropped / unparseable patterns
+        # become a one-line system note on the next user turn -- they
+        # cannot be silently dropped because the model thinks the call
+        # ran, and they cannot be re-sent because the CLI has already
+        # exited by this point.
+        final_payload = result["payload"]
+        assistant_text = str(final_payload.get("result") or "")
+        # Known tool names come from REMEMBERED_TOOLS -- start_session
+        # stashed them under `session_id` when it built the session, and
+        # they outlive the rebuild (a rebuilt session gets a fresh id,
+        # but the rebuilt body's tools are also stashed on it). The
+        # body's own `tools` is what `chat()` rehydrated from there on
+        # the rebuild path, so falling back to the body's list is
+        # belt-and-braces against a REMEMBERED_TOOLS eviction (the dict
+        # is bounded; a long-running sidecar could evict a session's
+        # tools before the session actually reaps).
+        known_names: set[str] = set()
+        remembered = REMEMBERED_TOOLS.get(session.id) or []
+        for tool in remembered:
+            fn = tool.get("function") if isinstance(tool, dict) else None
+            name = (fn or {}).get("name") or tool.get("name")
+            if name:
+                known_names.add(str(name))
+        cleaned, literal_calls, dropped = _detect_literal_tool_calls(
+            assistant_text, known_names)
+        if literal_calls:
+            # A turn that emitted literal tool calls must park them, not
+            # return a final text answer. Park them as ParkedCall objects
+            # (the same shape a real CLI tool_use round produces), expose
+            # the cleaned text as `content`, and surface a tool_calls
+            # response. The parked futures get their result the same way
+            # normal parked calls do -- on the next follow-up the caller
+            # sends back a `tool` message with the matching id and the
+            # relay resolves the future. Dropped notes ride as a synthetic
+            # `system` reminder so the next user turn knows what the
+            # model tried to do.
+            parked = []
+            for tc in literal_calls:
+                args = json.loads(tc["function"]["arguments"]) \
+                    if tc["function"].get("arguments") else {}
+                # Mint a session-local call id so session_id_from_call_id
+                # correlates the follow-up. Session.mint_call_id() returns
+                # the canonical `call_<session_id>_<n>` shape the rest of
+                # the bridge uses (register_tool_call's minted ids match
+                # the format), so the follow-up the caller sends back will
+                # resolve against `session.pending` exactly the same way
+                # a real CLI tool_use round would.
+                parked_id = session.mint_call_id()
+                try:
+                    running_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    # Tests that drive render_turn synchronously fall
+                    # through here; the future is created but never
+                    # awaited, so a no-op loop is fine. Production paths
+                    # always have a running loop.
+                    running_loop = None
+                pc = ParkedCall(id=parked_id, name=tc["function"]["name"],
+                                arguments=args,
+                                future=running_loop.create_future()
+                                if running_loop else None)
+                session.pending[pc.id] = pc
+                parked.append(pc)
+                # Reflect the synthetic id on the tool_call dict so the
+                # response the caller sees matches the id the follow-up
+                # message must carry. (Literal ids the model emitted are
+                # discarded -- the relay owns the wire format.)
+                tc["id"] = pc.id
+            assistant_text = cleaned
+            # Build a tool_calls-shaped message: cleaned text on content,
+            # the detected calls on tool_calls. The dropped notes ride
+            # under `__literal_dropped` so the next follow-up body can
+            # surface them; OpenAI clients ignore unknown keys.
+            message = {"role": "assistant", "content": assistant_text or None,
+                       "tool_calls": [
+                           {"id": c.id, "type": "function",
+                            "function": {"name": c.name,
+                                         "arguments": json.dumps(c.arguments)}}
+                           for c in parked]}
+            response = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": requested_model or session.model,
+                "choices": [{"index": 0, "message": message,
+                             "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                          "total_tokens": 0},
+                # Surfaces the dropped notes for the caller's next turn.
+                # The follow-up path lifts this onto the rebuilt prompt
+                # so the next user turn sees what was dropped. A pure
+                # text-only consumer (no follow-up) just ignores the key.
+                "__literal_dropped": dropped,
+            }
+            return _with_context_usage(response, session, {})
+        # No literal calls: this is a real final answer. Apply the cap
+        # and the display policy as before.
         # Issue #292: the cli_bridge text path passes `reasoning_display` to
         # to_openai so a request with `thinking.display == "omitted"` lands
         # as `content == ""` and `reasoning_content` set. The mcp_bridge
@@ -2179,8 +2493,15 @@ def render_turn(session: Session, result: dict, requested_model: str | None) -> 
         # and surface finish_reason="length" so the caller can recover
         # (issue #279). The tool_calls branch above is byte-untouched -- the
         # cap applies to the final answer text, not to a parked tool request.
+        # Substitute the cleaned text so a literal call that was matched
+        # and dropped from this branch's view never carries into the
+        # assistant content; literal-call turns above already returned
+        # via the tool_calls branch, so this is a no-op when nothing
+        # matched.
+        if cleaned != assistant_text:
+            final_payload = {**final_payload, "result": cleaned}
         final_payload, finish = cli_bridge.enforce_max_tokens(
-            result["payload"], session.max_tokens)
+            final_payload, session.max_tokens)
         response = cli_bridge.to_openai(final_payload, requested_model or session.model,
                                         finish_reason=finish,
                                         reasoning_display=display)
@@ -2533,11 +2854,27 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
     # function re-derives it from the same body, so a follow-up-born rebuilt
     # session still truncates the eventual final answer.
     max_tokens = cli_bridge.request_max_tokens(body)
+    # Issue #264 nudge continuity: a tools-free follow-up that has no
+    # tool_call_id to correlate on can still find its parked session by the
+    # fingerprint of (system + first user) the request carries. Compute
+    # against the body the caller actually sent, BEFORE any system block /
+    # reminder injection, so the value matches what a follow-up would also
+    # compute. _caller_env may be None in test environments without
+    # switchyard on sys.path -- the field then stays None and the
+    # fingerprint-based routing falls back to a regular rebuild, the same
+    # way a session that started before #264 lands would have.
+    fp = None
+    if _caller_env is not None:
+        try:
+            fp = _caller_env.fingerprint(body.get("messages") or [])
+        except Exception:
+            fp = None
     session = Session(id=session_id, provider=PROVIDER, model=model,
                       workdir=str(workdir), holds_slot=True,
                       spawn_dir=str(spawn_dir),
                       spawn_env=session_env(env, workdir, spawn_dir, web=web),
-                      thinking=thinking, max_tokens=max_tokens)
+                      thinking=thinking, max_tokens=max_tokens,
+                      fingerprint=fp)
     # Inject the env block (system) and the first-turn reminder (prompt).
     # Both are pure functions of (prompt, system, env, first_turn) so a
     # rebuild of the same request produces the same CLI argv.
@@ -2547,6 +2884,24 @@ async def start_session(body: dict, mcp_tools: list[dict], prompt: str,
         if first_turn:
             reminder = _caller_env.render_first_turn_reminder(env)
             prompt = f"{reminder}\n\n{prompt}" if prompt else reminder
+    # Issue #63: on session rebuild/resume, when the incoming history
+    # mentions native tool use (caller-machine scripts/paths the model
+    # was talking to before the session got rebuilt here), prepend one
+    # line: "tool surface changed; all tools execute on the caller via
+    # the bridged tools". A rebuild hands the inner CLI a fresh session
+    # with no memory of what the model was doing on the caller's
+    # filesystem, and a model that emits `<result of Bash>` narration
+    # in the rebuilt prompt can otherwise try to call Bash again, which
+    # on this sidecar is no tool at all. The check runs on the rebuilt
+    # history (the body's messages) before the prompt is rendered, and
+    # only prepends when something resembling a native tool call is in
+    # there -- a pure chat history triggers nothing, so the cost on the
+    # common case is one regex pass per rebuild.
+    if first_turn and _history_mentions_native_tool_use(body.get("messages") or []):
+        rebuild_note = (
+            "tool surface changed; all tools execute on the caller via the "
+            "bridged tools")
+        prompt = f"{rebuild_note}\n\n{prompt}" if prompt else rebuild_note
     try:
         tools_path = workdir / "tools.json"
         tools_path.write_text(json.dumps(mcp_tools))
@@ -2669,6 +3024,205 @@ def flatten_with_tool_history(messages: list[dict]) -> tuple[str, str | None]:
             turns.append(f"Human: {content}")
 
     return "\n\n".join(turns), ("\n\n".join(system) or None)
+
+
+# Tool names the inner CLI never sees on this bridge. A history that mentions
+# any of these is the model's view of the caller's local environment -- the
+# rebuilt session runs on the sidecar, where those tools do not exist. Used
+# by `_history_mentions_native_tool_use` to detect "this history came from
+# the caller side" and trigger the #63 rebuild note. The list is
+# deliberately conservative: it catches the well-known Anthropic-Claude-Code
+# and Codex local tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch /
+# WebSearch, Agent, Skill, Task) and leaves less obvious names alone rather
+# than guessing -- a false negative here just omits the rebuild note, a
+# false positive would prepend a confusing line to every rebuild.
+_NATIVE_TOOL_NAMES = frozenset({
+    "Bash", "Read", "Write", "Edit", "Glob", "Grep", "NotebookEdit",
+    "WebFetch", "WebSearch", "Agent", "Skill", "Task",
+    "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList",
+    "BashOutput", "KillShell", "ListMcpResources",
+})
+
+
+def _history_mentions_native_tool_use(messages: list[dict]) -> bool:
+    """Issue #63: did the caller's history show any native tool calls?
+
+    Heuristic, not exact: a turn that names Bash / Read / Edit / etc. -- or
+    whose `tool_calls` carry a function name in that set -- is enough to
+    prepend the rebuild note. A history that has no assistant messages, or
+    whose assistant messages only name bridged (mcp__*) tools, returns
+    False; the cost of a False here is a one-line reminder the next turn,
+    the cost of a missed True is a model that runs a Bash call that has no
+    shell to land in. Bias toward reminder.
+
+    Plain-text mentions of the tool names in the system block (the
+    caller's own instructions) do NOT trigger the note -- only assistant
+    turns that named a tool, so a system prompt that lists Bash among
+    "available tools" is read as a description, not an actual call.
+    """
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        for call in (msg.get("tool_calls") or []):
+            fn = call.get("function") or {}
+            name = str(fn.get("name") or "")
+            # Strip the relay-side qualifier the caller might echo back:
+            # a history that names `mcp__switchyard__Bash` is one of OUR
+            # tools, not a native one. The un-qualified form is the
+            # signal we are looking for.
+            bare = name.split("__", 1)[-1] if "__" in name else name
+            if bare in _NATIVE_TOOL_NAMES:
+                return True
+        # Bracket-form narration in the assistant text: a `[called Bash(...)]`
+        # the rebuild's flatten_with_tool_history would emit only on a
+        # caller-side tool call. Treat that as a native-tool hint too.
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "\n".join(str(b.get("text", "")) for b in content
+                                 if isinstance(b, dict) and b.get("type") == "text")
+        if isinstance(content, str) and re.search(
+                r"\[called\s+(?:" + "|".join(re.escape(n) for n in _NATIVE_TOOL_NAMES)
+                + r")\(", content):
+            return True
+    return False
+
+
+# Patterns the model sometimes emits as literal text instead of going through
+# the tool_use API (issue #255, Phase 4 note). We scan for these BEFORE
+# rendering the turn and either promote them to real parked tool_use blocks
+# (the same shape a normal tool_call round would produce) or, when the
+# pattern is unparseable, drop them with a one-line system note that gets
+# surfaced alongside the assistant text on the next turn. Forwarding them
+# as content would leave the model thinking it called a tool that never
+# actually ran, which is the failure mode #255 names.
+_LITERAL_TOOL_CALL_PATTERNS = (
+    # Anthropic's XML-style tool_use: <tool_use name="bash">{"cmd":"ls"}</tool_use>.
+    # The "name" attribute is the un-qualified tool name (the model sees the
+    # bare form in its instructions; the relay is the one that qualifies it
+    # for the wire). The body is JSON.
+    re.compile(
+        r'<tool_use\s+name="(?P<name>[A-Za-z0-9_.\-]+)">(?P<args>.*?)</tool_use>',
+        re.DOTALL),
+    # Bracket form: [called bash({"cmd":"ls"})]. Same shape as the rebuild
+    # narration flatten_with_tool_history emits, so a model that learned the
+    # tool surface from a previous turn would emit the same syntax here.
+    re.compile(
+        r'\[called\s+(?P<name>[A-Za-z0-9_.\-]+)\((?P<args>[^\]]*?)\)\]',
+        re.DOTALL),
+)
+
+
+def _detect_literal_tool_calls(
+        text: str, known_tool_names: set[str],
+        ) -> tuple[str, list[dict], list[str]]:
+    """Promote literal-text tool calls to real tool_use blocks (issue #255).
+
+    Walks `text` once. For every pattern matched whose tool name is in
+    `known_tool_names`, the pattern is removed from the returned text and a
+    synthetic tool_call dict is appended to the result list. For every
+    pattern matched whose tool name is unknown or whose args do not parse
+    as JSON, a one-line system note is returned in `dropped` so render_turn
+    can prepend it to the next user turn -- the caller sees what the model
+    tried to do and the model does not get confused on the next round.
+
+    Returns:
+        cleaned_text: the input text with the matched patterns stripped.
+        tool_calls: synthetic OpenAI-shaped tool_call dicts ready for the
+            normal parked-call flow. The `id` field is a TEMPORARY
+            placeholder (`call_lit_<hex8>_<hex12>`) -- it does NOT follow
+            the `call_<session_id>_<n>` shape that
+            `session_id_from_call_id` partitions on, so the produced dict
+            CANNOT be answered with a follow-up `tool` message until the
+            caller (currently render_turn's final branch) rewrites each
+            `tc["id"]` to a real `session.mint_call_id()` value. Treat
+            the id as opaque; reuse the helper anywhere only by
+            rewriting the id before the dict leaves this process.
+        dropped: human-readable one-line notes for each dropped pattern.
+
+    Pure function: no I/O, no session state. The caller (render_turn's
+    final branch) decides what to do with each bucket -- promote the
+    tool_calls to a tool_calls response, or fold the dropped notes into
+    the assistant text on the next round.
+    """
+    if not text:
+        return text, [], []
+    known = {n for n in known_tool_names if n}
+    if not known:
+        return text, [], []
+    cleaned_parts: list[str] = []
+    dropped: list[str] = []
+    tool_calls: list[dict] = []
+    cursor = 0
+    # Walk every match across every pattern. Bracket and XML forms can
+    # coexist in the same text; iterate matches in document order, source
+    # position by source position, so a model that writes both still gets
+    # both promoted (or dropped) in the right slot.
+    matches: list[tuple[int, int, str, str]] = []
+    for pattern in _LITERAL_TOOL_CALL_PATTERNS:
+        for m in pattern.finditer(text):
+            matches.append((m.start(), m.end(), m.group("name"),
+                            m.group("args")))
+    matches.sort()
+    for start, end, name, args_text in matches:
+        if start < cursor:
+            continue                       # overlap; first pattern wins
+        cleaned_parts.append(text[cursor:start])
+        cursor = end
+        # Strip the qualifier the model might have learned to write: a
+        # Claude Code turn that echoes `mcp__switchyard__bash` instead of
+        # `bash` is still valid for us -- the qualifier is what the wire
+        # carries. Unknown qualifier prefixes (anything not in known_tool_names)
+        # are dropped, not silently renamespaced.
+        bare = name.split("__", 1)[-1] if "__" in name else name
+        if bare not in known:
+            dropped.append(f"[ignored literal tool call: unknown tool {name!r}]")
+            continue
+        # Args may be a JSON object ({...}) or a bare token (the bracket
+        # form's bare "ls" or empty). Parse the JSON form first; fall back
+        # to `{}` so the call still goes through with empty args.
+        args_text = (args_text or "").strip()
+        if args_text.startswith("{"):
+            try:
+                parsed = json.loads(args_text)
+                if not isinstance(parsed, dict):
+                    dropped.append(
+                        f"[ignored literal tool call: {bare!r} args are not "
+                        f"a JSON object]")
+                    continue
+            except (json.JSONDecodeError, ValueError):
+                dropped.append(
+                    f"[ignored literal tool call: {bare!r} args are not "
+                    f"parseable JSON]")
+                continue
+        else:
+            # Bracket form without braces. Treat it as a single named arg
+            # when the schema has a single string property, otherwise as
+            # empty args. The relay does not have the schema handy here;
+            # the more useful default is empty args + a system note on
+            # the next turn, which is what the spec asks for. We log the
+            # raw text on the dropped list and move on rather than guess.
+            dropped.append(
+                f"[ignored literal tool call: {bare!r} args {args_text!r} "
+                f"are not a JSON object]")
+            continue
+        # Placeholder id; session_id_from_call_id partitions on
+        # call_<session_id>_<n>, and the session is not available here
+        # (the helper is pure). render_turn's final branch overwrites
+        # every tc["id"] with session.mint_call_id() before returning,
+        # so the value below is only seen inside this process; downstream
+        # callers MUST rewrite it the same way before forwarding.
+        seq = uuid.uuid4().hex[:12]
+        call_id = f"call_lit_{uuid.uuid4().hex[:8]}_{seq}"
+        tool_calls.append({
+            "id": call_id, "type": "function",
+            "function": {"name": bare,
+                         "arguments": json.dumps(parsed, separators=(",", ":"))},
+        })
+    cleaned_parts.append(text[cursor:])
+    cleaned = "".join(cleaned_parts)
+    return cleaned, tool_calls, dropped
 
 
 async def acquire_resume_slot(limit: int, timeout: float) -> bool:
@@ -3122,6 +3676,71 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
     return response
 
 
+async def _continue_parked_nudge(parked: "Session", body: dict,
+                                  request: "Request | None") -> dict:
+    """Handle a text-only nudge whose fingerprint matched a parked session.
+
+    Issue #264 nudge continuity: a follow-up that has no `role: tool`
+    messages but whose (system + first user) fingerprint matches a parked
+    session is a continuation request -- the caller is sending a text turn
+    while the parked CLI is still waiting on its last `tool_use`.
+
+    True continuation is impossible here: the parked CLI's stdin was closed
+    at spawn (`_run_session_attempt` -> `proc.communicate`, asyncio sub-
+    process is write-then-close), and the CLI is blocked on tool_server.py
+    waiting for the *next* tool result to resolve. There is no mechanism
+    in this module to feed the nudge back to that CLI -- the only
+    `turn_future` resolvers are `_flush` (fires on a new `tool_use` the
+    CLI emits, which it cannot do while parked) and `resolve_final`
+    (fires when `proc.communicate` finishes, which it won't until the
+    CLI exits). A `await_turn` against a parked session's freshly
+    installed `turn_future` therefore hangs for `SESSION_TTL` holding a
+    gate slot before the idle reaper rebuilds via `_ReapedSignal` --
+    strictly worse than the pre-PR status quo of falling through to the
+    fresh text path.
+
+    The fix is the same shape the rest of the file uses for a lost
+    session: supersede the parked session (release its gate slot, fail
+    its pending tool calls cleanly), then rebuild from the request's full
+    history via `resume_gone_session`. The fresh CLI sees the same
+    conversation prefix via `flatten_with_tool_history`, so the
+    provider's prompt cache is mostly preserved; the caller gets an
+    answer promptly. The fingerprint match's value is operator
+    visibility (a log line naming the superseded session) plus a clean
+    supersede of the parked session so the gateway's bookkeeping on it
+    stops.
+
+    When `body` has no tools (the REMEMBERED_TOOLS eviction case), the
+    rebuild would 400 -- we fall through to `cli_bridge._handle_chat`
+    instead, which spawns a fresh CLI for the text path. The caller
+    still gets an answer, and the parked session is still superseded.
+    """
+    why = ("fingerprint nudge: parked CLI cannot ingest user text mid-loop "
+           "(proc.stdin closed at spawn; CLI is blocked on tool_server.py)")
+    session = SESSIONS.get(parked.id)
+    if session is not None and not session.dead:
+        log.info(
+            "fingerprint-matched nudge for parked session %s; superseding "
+            "and rebuilding (the parked CLI cannot ingest user text mid-loop)",
+            session.id[:8])
+        await supersede_session(session, why)
+    else:
+        log.info(
+            "fingerprint-matched session %s is already gone (in SESSIONS=%s, "
+            "dead=%s); rebuilding without a supersede",
+            parked.id, parked.id in SESSIONS,
+            session.dead if session else None)
+    tools = body.get("tools") or []
+    if not tools:
+        # REMEMBERED_TOOLS eviction (or a body that never carried tools):
+        # resume_gone_session requires tools to build the fresh CLI's
+        # harness, so we fall through to the text path. The fingerprint
+        # match is still logged for operator visibility.
+        return await cli_bridge._handle_chat(body)
+    return await resume_gone_session(
+        body, tools, parked.id, request, why=why)
+
+
 async def handle_tool_request(body: dict, tools: list[dict],
                               request: "Request | None" = None,
                               *, gate_already_held: bool = False,
@@ -3236,9 +3855,34 @@ async def chat(request: Request):
         if tools:
             body = {**body, "tools": tools}
     if not tools:
-        # Identical to the plain CLI shim: this literally calls its function,
-        # not a re-implementation of it, so there is nothing here to regress.
-        # That path already frames a streamed reply.
+        # Issue #264 nudge continuity: a tools-free follow-up whose message
+        # fingerprint matches a parked session is a continuation request.
+        # The parked CLI cannot ingest user text mid-loop (its stdin was
+        # closed at spawn and it is blocked on tool_server.py waiting for
+        # the next tool result), so true continuation is impossible --
+        # `_continue_parked_nudge` supersedes the parked session and
+        # rebuilds via `resume_gone_session` instead. The fingerprint
+        # match's value is operator visibility (a log line naming the
+        # superseded session) plus a clean supersede of the parked
+        # session so the gateway's bookkeeping on it stops.
+        parked = parked_session_by_fingerprint(body)
+        if parked is not None:
+            # The parked session's tools are stashed under its own id at
+            # start_session time (REMEMBERED_TOOLS[parked.id]). A re-scan
+            # of the body's `tool` messages (remembered_tools_for) returns
+            # None for a nudge because the nudge carries no `role: tool`
+            # messages; keyed-by-parked-session-id is what actually lifts
+            # the right list. When the dict has been evicted (a long-
+            # running sidecar can drop entries past MCP_REMEMBERED_TOOLS_LIMIT),
+            # the helper falls through to the text path on its own.
+            parked_tools = REMEMBERED_TOOLS.get(parked.id) or []
+            if parked_tools:
+                body = {**body, "tools": parked_tools}
+            return await _continue_parked_nudge(parked, body, request)
+        # No fingerprint match: identical to the plain CLI shim, this
+        # literally calls its function, not a re-implementation of it,
+        # so there is nothing here to regress. That path already frames
+        # a streamed reply.
         return await cli_bridge._handle_chat(body)
 
     # A tool loop is one conversation parked between turns: it cannot fork

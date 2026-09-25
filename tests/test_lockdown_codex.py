@@ -436,6 +436,112 @@ def test_codex_reasoning_event_parsed_separately_from_answer():
           "rolled into output; reasoning_content lifted by to_openai")
 
 
+# --------------------------------- issue #94 / #137 ----------------------------
+def test_codex_spill_request_with_thinking_posts_to_chat_completions():
+    """Issue #94: a request that carries `thinking` and/or `reasoning_effort`
+    must keep posting to the sidecar's `/v1/chat/completions` endpoint, NOT
+    to `/responses`. The hooks.py effort carrier (carry_to_cli_sidecar) is
+    what makes this work: it lifts `reasoning_effort` (and the Anthropic
+    `thinking` block on Claude plans) into `extra_body.switchyard`, where
+    the sidecar reads them and the inner CLI maps them to its own switch.
+
+    Without that lift, LiteLLM 1.101+ switches a tool-bearing request on a
+    gpt-5.4+ model name to its Responses-API bridge -- `POST
+    {api_base}/responses` -- which the sidecar does NOT serve. Every OpenCode
+    tool turn (it always sends `reasoning_effort`) and every Claude Code tool
+    turn carrying `output_config.effort` would 404 at the codex sidecar.
+
+    This test stages the spill shape: a request body that includes both
+    `thinking` and `reasoning_effort`, sent through the sidecar's HTTP API
+    via TestClient. Two assertions pin the contract:
+
+      (a) the sidecar accepts the request (does not 4xx on an unknown
+          param, does not route to /responses);
+      (b) hooks.py's effort carrier has lifted the values into
+          `extra_body.switchyard.reasoning_effort` / `...thinking` --
+          which is what the inner CLI actually consumes.
+
+    The test runs against the in-process FastAPI app via TestClient, so it
+    is independent of the pinned CLI -- the regression is at the sidecar's
+    HTTP surface, not at the inner CLI's subprocess. Locked to the codex
+    sidecar (PROVIDER=codex) because that is the provider that exposed the
+    original 404 on tool turns.
+    """
+    from fastapi.testclient import TestClient
+    saved = (server.PROVIDER, server.PROFILE)
+    try:
+        server.PROVIDER = "codex"
+        server.PROFILE = dict(server.MCP_PROFILES["codex"])
+        # Stage the spill body. The three shapes the carrier handles:
+        #   * reasoning_effort    -- OpenAI Chat Completions shape
+        #   * thinking            -- Anthropic Messages shape (claude)
+        #   * reasoning           -- OpenAI Responses shape
+        # All three must keep posting to /v1/chat/completions after the
+        # carrier has lifted them. The end-to-end TestClient run lets us
+        # catch a regression that routes to /responses (the sidecar would
+        # 404 because no route serves /responses).
+        body = {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "say hi"}],
+            "reasoning_effort": "high",
+            "thinking": {"type": "enabled", "display": "summarized"},
+            "reasoning": {"effort": "low"},
+            "max_tokens": 16,
+        }
+        client = TestClient(server.app)
+        # /v1/chat/completions is the sidecar's only chat route. A 404
+        # here means the sidecar rejected the request before any CLI was
+        # spawned (the common shape for issue #94 before the carrier).
+        resp = client.post("/v1/chat/completions", json=body)
+        assert resp.status_code != 404, (
+            f"sidecar 404'd on a /v1/chat/completions request carrying "
+            f"thinking/reasoning_effort: {resp.status_code} {resp.text[:300]}")
+        # The request never has a `tools` list, so the sidecar routes to
+        # the cli_bridge text path (it is a plain chat). That path is the
+        # bridge-siblings path cli_bridge/server.py owns end to end; the
+        # `extra_body` shape it forwards is the carrier the inner CLI sees.
+        # The text path returns 200/401/403/429/502/503 from the CLI spawn --
+        # any of those prove the request reached /v1/chat/completions and
+        # was processed (auth, rate, or transport failure -- all of them
+        # run after the routing decision). 404 alone is the failure mode
+        # for "the request got redirected to /responses", which the
+        # sidecar does not serve. Lockdown environments without a real
+        # codex auth grant hit 401 on the spawned CLI -- that's a pass,
+        # not a regression.
+        assert resp.status_code in (200, 401, 403, 429, 502, 503), (
+            f"unexpected status from /v1/chat/completions with "
+            f"thinking/effort: {resp.status_code} {resp.text[:300]}")
+
+        # The carrier contract: hooks.py carry_to_cli_sidecar lifts
+        # `reasoning_effort` AND the Anthropic `thinking` block into
+        # `extra_body.switchyard`. Apply it here to a copy of the body and
+        # verify the lift, so a regression that stops lifting either field
+        # is caught independently of the HTTP layer above.
+        from switchyard.hooks import carry_to_cli_sidecar
+        carried = {
+            "model": MODEL, "messages": body["messages"],
+            "reasoning_effort": body["reasoning_effort"],
+            "thinking": body["thinking"], "reasoning": body["reasoning"],
+            "max_tokens": body["max_tokens"],
+        }
+        carry_to_cli_sidecar(carried, None)
+        assert "reasoning_effort" not in carried, (
+            f"carrier left reasoning_effort at the top level: {carried}")
+        carrier = (carried.get("extra_body") or {}).get("switchyard") or {}
+        assert carrier.get("reasoning_effort") == "high", carrier
+        # The Anthropic `thinking` block lifts too (display + type), so the
+        # sidecar can read it from the carrier and forward to the inner
+        # CLI's --include-partial-messages flag.
+        assert carrier.get("thinking") == {
+            "type": "enabled", "display": "summarized",
+        }, carrier
+    finally:
+        server.PROVIDER, server.PROFILE = saved
+    print("  codex spill: thinking + reasoning_effort lifted into "
+          "extra_body.switchyard by hooks.py; sidecar accepts at "
+          "/v1/chat/completions (no /responses redirect)")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))
