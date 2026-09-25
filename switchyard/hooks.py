@@ -20,6 +20,7 @@ re-pick there was never going to fire even with num_retries=1.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -27,6 +28,7 @@ import os
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
 from litellm.integrations.custom_logger import CustomLogger
@@ -1298,6 +1300,7 @@ class SwitchyardHandler(CustomLogger):
             return
 
         splitter = ReasoningSplitter()
+        last_chunk: Any = None
         async for chunk in self._stream_chunks(response, request_data):
             try:
                 choices = getattr(chunk, "choices", None) or []
@@ -1313,12 +1316,105 @@ class SwitchyardHandler(CustomLogger):
                         delta.reasoning_content = prior + reasoning
             except Exception:                 # never break a stream over this
                 log.debug("reasoning split skipped for one chunk", exc_info=True)
+            last_chunk = chunk
             yield chunk
 
         trailing_content, trailing_reasoning = splitter.flush()
         if trailing_content or trailing_reasoning:
             log.debug("stream ended mid-tag; flushed %d content, %d reasoning chars",
                       len(trailing_content), len(trailing_reasoning))
+            # The flush() tail got logged but never yielded before this
+            # change -- every chunk we already yielded above has been
+            # written to the response, so dropping this loses the last
+            # character (or two, or seven) of the answer silently. Stamp
+            # the trailing content/reasoning onto one synthetic chunk
+            # cloned from the last frame so the real terminal chunk
+            # keeps its `finish_reason` and the client sees the full
+            # model output. The synthesis mirrors the chunk loop's own
+            # "never break a stream over this" contract (just above): a
+            # raise in ``_tail_chunk`` -- a frozen Pydantic chunk with
+            # non-copyable internals, or any chunk shape this hook does
+            # not tolerate -- falls back to the SimpleNamespace skeleton
+            # path so the streaming response still completes with the
+            # tail carried on a recognizable frame.
+            try:
+                tail = self._tail_chunk(last_chunk, trailing_content, trailing_reasoning)
+            except Exception:                 # never break a stream over this
+                log.debug("tail chunk clone failed; falling back to skeleton",
+                          exc_info=True)
+                tail = self._tail_chunk(None, trailing_content, trailing_reasoning)
+            yield tail
+
+    def _tail_chunk(self, last_chunk: Any, content: str, reasoning: str) -> Any:
+        """Build a synthetic OpenAI-shaped chunk carrying the splitter's flush tail.
+
+        Mirrors the shape of the last yielded chunk so the client receives the
+        trailing content / reasoning on a same-shape frame (the real terminal
+        chunk keeps its ``finish_reason`` -- the synthetic one carries
+        ``finish_reason=None`` so the producer's stop marker still terminates
+        the stream). Falls back to a minimal OpenAI skeleton when the stream
+        emitted no frames of its own (the zero-chunk / all-headers case) or
+        when the deep-copy path failed and the caller wants the trailing text
+        still delivered on a recognizable frame.
+
+        For ``n > 1`` streams (the proxy serves multi-choice via
+        ``litellm.completion(n=...)`` -- see
+        ``tests/test_request_params.py::test_streamed_n_emits_every_choice``),
+        the deep-copied frame keeps every other choice from ``last_chunk``
+        untouched; stamping only ``choices[0]`` would leave choices[1..]'s
+        final ``delta.content`` re-delivered on this synthetic frame (a
+        duplicated tail) and their real ``finish_reason`` (e.g. ``"stop"``)
+        on a non-terminal chunk (a duplicated terminal signal). The splitter
+        itself only ever reads ``choices[0]`` (just above), so the splitter
+        tail for choices[1..] is silently unattributable in any case; strip
+        the secondary choices' delta content and finish_reason so this
+        synthetic frame never re-delivers a secondary choice's tail.
+        """
+        if last_chunk is None:
+            delta = SimpleNamespace(
+                content=content,
+                reasoning_content=(reasoning if reasoning else None),
+                role=None,
+            )
+            choice = SimpleNamespace(
+                index=0, delta=delta, finish_reason=None,
+            )
+            return SimpleNamespace(choices=[choice])
+        cloned = copy.deepcopy(last_chunk)
+        choices = getattr(cloned, "choices", None) or []
+        if not choices:
+            choices.append(SimpleNamespace(
+                index=0, delta=SimpleNamespace(), finish_reason=None,
+            ))
+            cloned.choices = choices
+        frame = choices[0]
+        delta = getattr(frame, "delta", None)
+        if delta is None:
+            delta = SimpleNamespace()
+            frame.delta = delta
+        delta.content = content
+        if reasoning:
+            delta.reasoning_content = reasoning
+        frame.finish_reason = None
+        # Blank every secondary choice so the synthetic frame does not
+        # re-deliver their previous tail / finish_reason on a frame that
+        # the splitter never wrote content for. ``choices[0]`` keeps the
+        # flushed content + ``finish_reason=None``; ``choices[1..]`` keep
+        # their index/delta object but lose their content and finish.
+        for secondary in choices[1:]:
+            secondary_delta = getattr(secondary, "delta", None)
+            if secondary_delta is not None:
+                # ``setattr`` (rather than rebind) keeps pydantic field
+                # validators happy where the field type expects ``str``
+                # but previously carried ``None`` is acceptable on the
+                # wire -- the API sends ``"content": null`` for empty
+                # deltas already.
+                try:
+                    secondary_delta.content = None
+                except Exception:
+                    pass
+            secondary.finish_reason = None
+        return cloned
 
     async def _stream_chunks(self, response: Any, request_data: dict):
         """Yield every byte/chunk from `response` and finish streamed accounting.

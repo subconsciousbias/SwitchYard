@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -3356,6 +3357,463 @@ async def _drive_log_failure(h, kwargs, ctx):
     return await h._finish_failure(
         ctx, exception, kwargs=kwargs,
     )
+
+
+# ============================================================================
+# Issue #188 — splitter flush tail must reach the client, not just the log.
+#
+# `ReasoningSplitter.flush()` returns whatever the splitter is still
+# holding back when the stream ends — a partial tag opener/closer that
+# straddled a chunk boundary, or the trailing reasoning of an unclosed
+# think block. Before this fix, ``async_post_call_streaming_iterator_hook``
+# only logged the tail (``log.debug("stream ended mid-tag; flushed ...")``)
+# without yielding anything, so the client silently lost the last one or
+# two characters of every streamed response that ended mid-tag. The fix
+# yields one synthetic OpenAI-shaped chunk carrying the tail, cloned from
+# the last emitted frame so the terminal ``finish_reason`` on the real
+# last chunk is preserved.
+#
+# ``_OAIStreamingChunk`` mirrors the OpenAI-shaped stream chunk the
+# hook reads via ``getattr(chunk, "choices", None)`` /
+# ``getattr(delta, ...)``. ``acompletion`` is NOT in
+# ``UNLOGGED_CALL_TYPES``, so the streamer takes the bare-pass-through
+# arm with the disconnect-cleanup try/except — but the splitter-path
+# applies regardless of call_type once the OpenAI-shape condition above
+# matches, so the test wires that path with the cheapest call_type for
+# the OpenAI shape.
+# ============================================================================
+
+
+class _OAIStreamingChunk:
+    """Fake OpenAI-shaped streaming chunk with mutable attributes.
+
+    Mirrors the shape the streaming hook reads
+    (``chunk.choices[0].delta.content``); mutable by design so the
+    splitter's reasoning-split path can rewrite ``delta.content`` and
+    ``delta.reasoning_content`` in place, and so a deep-copied synthetic
+    tail chunk can stamp the flushed tail without disturbing the
+    already-yielded source.
+
+    ``choices`` (optional): when supplied, a list of
+    ``(content, reasoning_content, finish_reason)`` tuples, one per
+    choice (n > 1 streams). When omitted, a single choice carrying the
+    positional ``content / reasoning_content / finish_reason`` is built.
+    """
+    def __init__(self, content="", reasoning_content=None, finish_reason=None,
+                 choices=None):
+        self.id = "chatcmpl-fake"
+        self.object = "chat.completion.chunk"
+        self.created = 0
+        self.model = "fake-model"
+        if choices is None:
+            self.choices = [_OAIChoice(
+                content=content, reasoning_content=reasoning_content,
+                finish_reason=finish_reason,
+            )]
+        else:
+            self.choices = [
+                _OAIChoice(content=c, reasoning_content=r, finish_reason=fr)
+                for c, r, fr in choices
+            ]
+            for idx, choice in enumerate(self.choices):
+                choice.index = idx
+
+
+class _OAIChoice:
+    def __init__(self, content="", reasoning_content=None, finish_reason=None):
+        self.index = 0
+        self.finish_reason = finish_reason
+        self.delta = _OAIDelta(
+            content=content, reasoning_content=reasoning_content,
+        )
+
+
+class _OAIDelta:
+    def __init__(self, content="", reasoning_content=None, role=None):
+        self.content = content
+        self.reasoning_content = reasoning_content
+        self.role = role
+
+
+def _concat_streamed(chunks):
+    """Walk every yielded chunk, concatenating each chunk's delta.content
+    / delta.reasoning_content into separate strings, and capture the
+    ``finish_reason`` carried by every chunk. Returns
+    ``(content, reasoning, count, last_chunk, finish_reasons)``.
+
+    Tests assert on the second-to-last ``finish_reason`` to verify the
+    real terminal chunk (which sits just before the synthetic tail) is
+    preserved untouched — the synthetic tail itself carries
+    ``finish_reason=None`` by design.
+    """
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    count = 0
+    last = None
+    finish_reasons: list = []
+    for c in chunks:
+        count += 1
+        last = c
+        for choice in getattr(c, "choices", None) or []:
+            d = getattr(choice, "delta", None)
+            finish_reasons.append(getattr(choice, "finish_reason", None))
+            if d is None:
+                continue
+            t = getattr(d, "content", None)
+            if t:
+                content_parts.append(t)
+            r = getattr(d, "reasoning_content", None)
+            if r:
+                reasoning_parts.append(r)
+    return (
+        "".join(content_parts), "".join(reasoning_parts),
+        count, last, finish_reasons,
+    )
+
+
+async def _drive_split(h, request_data, chunks):
+    """Drive the streaming hook over a list of OpenAI-shaped chunks."""
+    async def produce():
+        for c in chunks:
+            yield c
+    out = []
+    async for c in h.async_post_call_streaming_iterator_hook(
+        user_api_key_dict=None, response=produce(), request_data=request_data,
+    ):
+        out.append(c)
+    return out
+
+
+def test_streaming_splitter_flush_yields_trailing_partial_tag_as_content():
+    """Test (a): a streamed response whose last chunk ended mid-tag
+    (the trailing ``<`` of ``The answer is x <``) used to lose the
+    ``<`` — pre-fix the splitter would call ``flush()`` and then drop
+    the result because the chunk loop had already exited. Post-fix one
+    synthetic chunk carrying the trailing partial tag opener is yielded,
+    and the client-visible concatenated content is the full model
+    output, not the truncated ``The answer is x ``.
+    """
+    h, _reg, _slots, _ledger, _policy, _redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="acompletion")
+    request_data = {"metadata": _meta_for(ctx)}
+
+    chunks = [
+        _OAIStreamingChunk(content="The answer is x "),
+        _OAIStreamingChunk(content="<", finish_reason="stop"),
+    ]
+
+    yielded = asyncio.run(_drive_split(h, request_data, chunks))
+    content, reasoning, count, _last, finish_reasons = _concat_streamed(yielded)
+
+    # Full model output reached the client.
+    assert content == "The answer is x <", content
+    # No reasoning split happened (we are not inside a think block).
+    assert reasoning == "", reasoning
+    # Three chunks: two source frames plus the synthetic tail that
+    # carries the flushed ``<``. The terminal source frame's
+    # ``finish_reason`` is unchanged — the synthetic's is None.
+    assert count == len(chunks) + 1, (
+        f"expected {len(chunks)} + 1 chunks (incl. synthetic tail), "
+        f"got {count}: "
+        f"{[getattr(c.choices[0].delta, 'content', '') for c in yielded]}")
+    # Frame-by-frame finish_reason: the second source frame carries
+    # ``stop``, the synthetic tail carries ``None`` (so the real
+    # terminal chunk keeps its ``finish_reason``).
+    assert finish_reasons[:-1] == [None, "stop"], finish_reasons
+    # Sanity-check the synthetic tail: ``finish_reason=None`` and
+    # content is just the flushed opener, with no reasoning split.
+    tail = yielded[-1]
+    assert tail.choices[0].finish_reason is None, (
+        tail.choices[0].finish_reason)
+    assert tail.choices[0].delta.content == "<", (
+        tail.choices[0].delta.content)
+    assert not getattr(tail.choices[0].delta, "reasoning_content", None), (
+        tail.choices[0].delta)
+    print(f"  trailing '<' yielded as synthetic chunk; concatenated "
+          f"content={content!r}, count={count}")
+
+
+def test_streaming_splitter_flush_yields_unterminated_think_tail_as_reasoning():
+    """Test (b): an unterminated ``<think>`` block — the model opened a
+    think tag, streamed reasoning, and ended without ever emitting
+    ``</think>``. The splitter holds back the very last char (``<``) as
+    a possible ``</`` prefix so the next chunk can complete the closing
+    tag. Pre-fix, ``flush()`` correctly returned that held-back char as
+    reasoning — but the streaming hook never yielded it, so the client
+    silently lost the last character of every unterminated think-block
+    stream. Post-fix, the synthetic chunk stamps the held-back char onto
+    ``reasoning_content`` so the full chain of thought reaches the
+    client.
+
+    Chunks: three frames — the ``<think>`` opener, the reasoning body,
+    and a trailing single ``<`` char that the splitter holds back as a
+    possible ``</`` prefix. The splitter feeds the open tag
+    (``in_think`` flips to True), emits the body verbatim through
+    ``feed``, holds back the trailing ``<``, and on ``flush()`` returns
+    ``("", "<")``. The synthetic tail lands the ``<`` back onto
+    ``reasoning_content``; the ``content`` side is empty because the
+    splitter is still in_think on flush. The held-back ``<`` lands on
+    the tail rather than being silently dropped.
+    """
+    h, _reg, _slots, _ledger, _policy, _redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="acompletion")
+    request_data = {"metadata": _meta_for(ctx)}
+
+    chunks = [
+        _OAIStreamingChunk(content="<think>"),
+        _OAIStreamingChunk(content="body content"),
+        _OAIStreamingChunk(content="<", finish_reason="stop"),
+    ]
+
+    yielded = asyncio.run(_drive_split(h, request_data, chunks))
+    content, reasoning, count, _last, finish_reasons = _concat_streamed(yielded)
+
+    # All of the content stream's traffic is reasoning: nothing leaked
+    # into ``delta.content``.
+    assert content == "", content
+    # The body arrives via feed (chunk 2) and the held-back ``<`` lands
+    # on the synthetic tail (chunk 4) — the concatenation is the full
+    # model output.
+    assert reasoning == "body content<", reasoning
+    assert count == len(chunks) + 1, (
+        f"expected {len(chunks)} + 1 (incl. synthetic tail), got "
+        f"{count}: deltas="
+        f"{[getattr(c.choices[0].delta, 'content', '') for c in yielded]}")
+    # The synthetic tail carries the held-back ``<`` as
+    # ``reasoning_content``; the real terminal chunk keeps its
+    # ``finish_reason=stop`` and the synthetic's is None.
+    assert finish_reasons[:-1] == [None, None, "stop"], finish_reasons
+    tail = yielded[-1]
+    assert tail.choices[0].finish_reason is None, (
+        tail.choices[0].finish_reason)
+    assert not getattr(tail.choices[0].delta, "content", None), (
+        tail.choices[0].delta.content)
+    assert tail.choices[0].delta.reasoning_content == "<", (
+        tail.choices[0].delta.reasoning_content)
+    print(f"  held-back '<' yielded as reasoning_content on synthetic "
+          f"tail; concatenated reasoning={reasoning!r}, count={count}")
+
+
+def test_streaming_splitter_flush_blank_secondary_choices_on_n_gt_1():
+    """Reviewer should-fix: synthetic tail must not re-deliver n>1 choices' tail.
+
+    For ``n > 1`` streams the proxy serves every choice on every chunk and
+    the splitter only ever reads ``choices[0]``, so the splitter-flush
+    tail can only be attributed to choice 0. If the synthetic tail kept
+    choices[1..]'s previously-yielded ``delta.content`` and ``finish_reason``
+    untouched, a client walking the stream would see:
+
+    * the secondary choice's final ``delta.content`` re-delivered on the
+      synthetic tail frame (a duplicated tail for choices[1..]), and
+    * that secondary choice's real ``finish_reason`` (e.g. ``"stop"``)
+      riding on a non-terminal chunk (a duplicated terminal signal --
+      a client that terminates on the first ``finish_reason`` it sees
+      would cut the stream short right after the real terminal chunk).
+
+    The fix strips both on the synthetic tail: ``delta.content = None``
+    and ``finish_reason = None`` for every secondary choice, leaving
+    ``choices[0]`` carrying the flushed content / reasoning and a
+    ``finish_reason=None`` so the real terminal chunk on ``choices[0]``
+    is the only stop signal on the wire for that choice.
+
+    Chunks: a two-choice stream ending mid-tag on ``choices[0]`` only --
+    choice 1 was already done with ``"done "`` and the real
+    ``finish_reason="stop"`` on the last frame. The synthetic tail must
+    carry ``choices[0].delta.content = "<"`` and ``finish_reason=None``
+    while ``choices[1]`` has its ``delta.content`` blanked to ``None``
+    and its ``finish_reason`` blanked to ``None`` -- NOT re-delivered.
+    """
+    h, _reg, _slots, _ledger, _policy, _redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="acompletion")
+    request_data = {"metadata": _meta_for(ctx)}
+
+    # Stream shape:
+    #
+    #   chunk 1 (choices[0]="(prefix ", choices[1]="X"):
+    #     splitter.feed("(prefix ") -> emits "(prefix " (no tag boundary
+    #     straddled); choices[1] is untouched by the splitter path.
+    #
+    #   chunk 2 (choices[0]="<", choices[1]="Y", finish_reason=stop):
+    #     splitter.feed("<") -> content="" reasoning="" (held back as a
+    #     possible ``</`` prefix); choices[1] passes through with content
+    #     "Y" untouched.
+    #
+    #   synthetic tail (clone of chunk 2):
+    #     With the fix: choices[0].content = "<" (from splitter.flush),
+    #     choices[0].finish_reason = None; choices[1].delta.content
+    #     blanked to None and choices[1].finish_reason blanked to None --
+    #     the synthetic frame must NOT re-deliver "Y" or carry "stop" on
+    #     choices[1] (a duplicated terminal signal that would cut a
+    #     client's stream short after the real terminal chunk).
+    chunks = [
+        _OAIStreamingChunk(choices=[
+            ("(prefix ", None, None),
+            ("X", None, None),
+        ]),
+        _OAIStreamingChunk(choices=[
+            ("<", None, None),
+            ("Y", None, "stop"),
+        ]),
+    ]
+
+    yielded = asyncio.run(_drive_split(h, request_data, chunks))
+    _content, _reasoning, count, _last, _frs = _concat_streamed(yielded)
+
+    assert count == len(chunks) + 1, (
+        f"expected {len(chunks)} + 1 (incl. synthetic tail), got {count}")
+
+    tail = yielded[-1]
+    assert len(tail.choices) == 2, (
+        f"synthetic tail must keep the same number of choices as "
+        f"last_chunk, got {len(tail.choices)}")
+
+    # choices[0]: carried the flushed tail, finish_reason cleared.
+    assert tail.choices[0].delta.content == "<", (
+        tail.choices[0].delta.content)
+    assert tail.choices[0].finish_reason is None, (
+        tail.choices[0].finish_reason)
+
+    # choices[1] (secondary): delta.content MUST be blanked to None -- a
+    # re-delivered "Y" would have been the pre-fix bug (the synthetic
+    # frame would re-emit a tail the splitter never wrote).
+    assert tail.choices[1].delta.content is None, (
+        f"choices[1].delta.content must be blanked on synthetic tail, "
+        f"got {tail.choices[1].delta.content!r}")
+    # choices[1].finish_reason MUST be blanked to None too -- the previous
+    # frame had finish_reason="stop" and would otherwise appear as a
+    # duplicated terminal signal on a non-terminal chunk.
+    assert tail.choices[1].finish_reason is None, (
+        f"choices[1].finish_reason must be blanked on synthetic tail, "
+        f"got {tail.choices[1].finish_reason!r}")
+    print("  n>1 synthetic tail: choices[0] carries flushed '<' + "
+          "finish_reason=None; choices[1].content blanked to None, "
+          "choices[1].finish_reason blanked to None (was 'stop')")
+
+
+def test_streaming_splitter_flush_falls_back_when_clone_raises():
+    """Reviewer should-fix: ``_tail_chunk`` cloning raising falls back.
+
+    The chunk-loop arm (lines above) wraps the per-chunk split in
+    ``try/except Exception`` with the comment "never break a stream
+    over this". The synthetic tail emission must follow the same
+    invariant: a raise inside ``_tail_chunk`` (frozen pydantic chunk
+    with non-copyable internals, a chunk whose ``__deepcopy__`` /
+    ``setattr`` shape this hook does not tolerate, etc.) must NOT
+    propagate out of the iterator -- that would tear the streaming
+    response at the very end after every real chunk had been
+    delivered, strictly worse than the pre-fix behaviour.
+
+    Falls back to the ``last_chunk=None`` skeleton path on the
+    failure arm so the trailing content / reasoning still arrives
+    on a recognizable OpenAI-shaped frame (``choices[0]`` skeleton).
+
+    The fix is exercised by stubbing ``_tail_chunk`` to raise on the
+    populated-branch path and return a SimpleNamespace skeleton on
+    the fallback path; the hook is then driven over the issue's
+    ``["The answer is x ", "<"]`` repro, and the synthesized tail
+    on the wire is asserted to be the skeleton (no clone).
+    """
+    h, _reg, _slots, _ledger, _policy, _redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="acompletion")
+    request_data = {"metadata": _meta_for(ctx)}
+
+    calls = {"n": 0}
+
+    def _stub_tail_chunk(last_chunk, content, reasoning):  # noqa: ANN001
+        # Force the clone path to raise once (mimicking a frozen
+        # Pydantic chunk) so the hook's outer try/except fires.
+        calls["n"] += 1
+        if calls["n"] == 1 and last_chunk is not None:
+            raise TypeError("simulated frozen chunk; deepcopy not supported")
+        # Fallback path: same as the ``last_chunk is None`` arm.
+        delta = SimpleNamespace(
+            content=content,
+            reasoning_content=(reasoning if reasoning else None),
+            role=None,
+        )
+        choice = SimpleNamespace(
+            index=0, delta=delta, finish_reason=None,
+        )
+        return SimpleNamespace(choices=[choice])
+
+    # Patch the bound method for the duration of this call.
+    original = h._tail_chunk
+    h._tail_chunk = _stub_tail_chunk
+    try:
+        chunks = [
+            _OAIStreamingChunk(content="The answer is x "),
+            _OAIStreamingChunk(content="<", finish_reason="stop"),
+        ]
+        yielded = asyncio.run(_drive_split(h, request_data, chunks))
+    finally:
+        h._tail_chunk = original
+
+    content, _reasoning, count, _last, finish_reasons = _concat_streamed(yielded)
+
+    # Full output delivered, no exception tore the stream.
+    assert calls["n"] == 2, (
+        f"_tail_chunk should have been called twice (clone attempt + "
+        f"skeleton fallback), got {calls['n']}")
+    assert content == "The answer is x <", content
+    assert count == len(chunks) + 1, (
+        f"expected {len(chunks)} + 1 (incl. fallback tail), got {count}")
+    # The synthetic tail is the skeleton: choices[0] only, content=``<``.
+    tail = yielded[-1]
+    assert len(tail.choices) == 1, (
+        f"skeleton fallback must carry a single choice, got {len(tail.choices)}")
+    assert tail.choices[0].delta.content == "<", (
+        tail.choices[0].delta.content)
+    assert tail.choices[0].finish_reason is None, (
+        tail.choices[0].finish_reason)
+    # The real terminal chunk kept its ``finish_reason="stop"``: the
+    # synthetic tail carries ``None`` on the skeleton.
+    assert finish_reasons[:-1] == [None, "stop"], finish_reasons
+    print(f"  clone raise -> SimpleNamespace skeleton fallback; "
+          f"concat={content!r}, count={count}, _tail_chunk calls={calls['n']}")
+
+
+def test_streaming_splitter_flush_tail_inside_unterminated_think_block():
+    """Test (c): a fully closed stream yields no synthetic chunk beyond
+    the source shapes. Chunks ``["already done ", "no flush tail"]``
+    carry no OPEN tag, no partial-CLOSE prefix; the splitter emits
+    everything via ``feed``, ``flush()`` returns ``("", "")``, and the
+    hook yields the source shapes only — no spurious synthetic frame
+    is appended.
+
+    This is the negative-side regression pin: the synthetic emission
+    must be conditional on ``flush()`` returning non-empty, otherwise
+    every streamed response would gain a phantom chunk at end-of-stream.
+    Pre-fix the hook never yielded a synthetic chunk (the bug); post-fix
+    it yields one only when there is something to deliver.
+    """
+    h, _reg, _slots, _ledger, _policy, _redis, pick = _build()
+    ctx = _ctx_for(pick, call_type="acompletion")
+    request_data = {"metadata": _meta_for(ctx)}
+
+    chunks = [
+        _OAIStreamingChunk(content="already done "),
+        _OAIStreamingChunk(content="no flush tail", finish_reason="stop"),
+    ]
+
+    yielded = asyncio.run(_drive_split(h, request_data, chunks))
+    content, reasoning, count, last, finish_reasons = _concat_streamed(yielded)
+
+    # No synthetic chunk was added: the chunk count is exactly the
+    # number of source shapes.
+    assert count == len(chunks), (
+        f"expected {len(chunks)} chunks (no synthetic tail), got "
+        f"{count}: "
+        f"{[getattr(c.choices[0].delta, 'content', '') for c in yielded]}")
+    # Terminal source chunk keeps its real finish_reason — and since
+    # there is no synthetic frame, ``last`` IS that real terminal chunk.
+    assert finish_reasons == [None, "stop"], finish_reasons
+    assert last.choices[0].finish_reason == "stop", (
+        last.choices[0].finish_reason)
+    # No raw content leaked into the response.
+    assert content == "already done no flush tail", content
+    assert reasoning == "", reasoning
+    print(f"  closed stream yielded exactly {count} chunks (no "
+          f"synthetic); concatenated content={content!r}")
 
 
 if __name__ == "__main__":
