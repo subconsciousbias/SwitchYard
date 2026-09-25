@@ -23,6 +23,7 @@ from .. import models
 from ..picker import Picker
 from ..policy import CapacityPolicy
 from ..probes import Prober
+from ..promotions import Promotions
 from ..slots import SlotTable
 from ..periods import windows_remaining
 from ..usage import (
@@ -300,6 +301,7 @@ async def startup() -> None:
     state.update(
         registry=registry, redis=redis, slots=slots, ledger=ledger, policy=policy,
         picker=Picker(registry, slots, policy), prober=Prober(redis, ledger),
+        promotions=Promotions(redis),
     )
     state["poller"] = asyncio.create_task(_poll_probes())
 
@@ -819,6 +821,11 @@ async def collect_plans() -> list[dict]:
         facts = await ledger.quota_facts(plan.key)
         capacity = await policy.effective(plan)
         probe = await state["prober"].status(plan.key) if plan.probe else None
+        # `.get` so a test harness that builds `state` by hand without the
+        # promotions store still renders the board.
+        promos = (await state["promotions"].view(
+            plan.key, reg.settings.promo_alert_days)
+            if state.get("promotions") else {"items": []})
         # Models are what lanes name; the plan is what owns the limits. Named
         # `model_rows` rather than `models`, which is the imported module.
         model_refs = [m.ref for m in plan.models.values()]
@@ -941,6 +948,15 @@ async def collect_plans() -> list[dict]:
                 alerting.append(
                     f"quota probe failing: {probe.get('last_error') or 'probe is misconfigured — check portal logs'}"
                 )
+        # A promotion about to lapse with something left: the only thing that
+        # saves it is someone using it, so it belongs with the other alerts.
+        for p in promos["items"]:
+            if p["expiring_soon"]:
+                left = (f"{p['remaining']:,.0f} {p['currency']}".strip()
+                        if p["remaining"] is not None else "unused")
+                alerting.append(
+                    f"{p['label'] or p['id']}: {left} left, expires in "
+                    f"{max(0.0, p['days_left']):.0f}d")
         # A provider refusing us on connection count means max_parallel is set
         # higher than the plan allows. Different fix from a quota wall, so it
         # gets its own warning instead of looking like rate limiting.
@@ -981,6 +997,7 @@ async def collect_plans() -> list[dict]:
             "capacity": capacity,
             "pace": pace,
             "probe": probe,
+            "promotions": promos,
             "windows": windows_remaining(plan.quota.period, plan.expires),
             "models": model_rows,
             "cli_backed": plan.is_cli_backed,
@@ -1035,6 +1052,8 @@ async def api_state() -> dict:
                 "learned_cap": r["capacity"].learned,
                 "cap_reason": r["capacity"].reason,
                 "pacing": r["pace"],
+                # Bonus credits / resets posted for this plan, with countdown.
+                "promotions": r["promotions"],
                 "alerting": r["alerting"],
             }
             for r in plans
@@ -1231,6 +1250,40 @@ async def set_pacing(enabled: str = "toggle") -> dict:
         want = enabled in ("on", "true", "1", "yes")
     now_on = await policy.set_pacing(want)
     return {"pacing": now_on, "configured_default": state["registry"].settings.pacing.enabled}
+
+
+@app.post("/admin/plans/{plan_key}/promotions")
+async def set_promotions(plan_key: str, request: Request):
+    """Replace a plan's promotion list (bonus credits, one-off resets).
+
+    Body: `{"promotions": [{"id", "kind", "label", "applies_to", "total",
+    "remaining", "currency", "expires_at", "observed_at"}, ...],
+    "source": "..."}`. Set semantics: the posted list IS the list, so post
+    `[]` to clear. Validated as a whole; a bad item rejects the post and the
+    previous list stays. Display only -- routing never reads it.
+    """
+    if plan_key not in state["registry"].plans:
+        return JSONResponse({"error": "unknown plan"}, status_code=404)
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be an object"}, status_code=400)
+    try:
+        saved = await state["promotions"].replace(
+            plan_key, body.get("promotions"), source=body.get("source") or "")
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return {"plan": plan_key, "promotions": len(saved)}
+
+
+@app.get("/api/promotions")
+async def api_promotions() -> dict:
+    """Every plan's promotions with countdowns, for a reminder job to read."""
+    reg = state["registry"]
+    return {key: await state["promotions"].view(key, reg.settings.promo_alert_days)
+            for key in reg.plans}
 
 
 @app.post("/admin/plans/{plan_key}/uncool")

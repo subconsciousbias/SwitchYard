@@ -258,6 +258,9 @@ class CallerEnvironmentSettings:
 @dataclass(frozen=True)
 class Settings:
     drain_within_days: int = 21
+    # The board flags a plan's promotion (bonus credit, one-off reset) when it
+    # expires within this many days with something left. Display only.
+    promo_alert_days: int = 7
     lease_ttl_seconds: int = 1800
     # How long a mid-tool-loop follow-up waits for a slot on its pinned plan
     # before spilling to a peer. Zero means spill immediately — the pin never

@@ -220,6 +220,15 @@ def fixture(reg):
             "models": _preview_models(plan, reg, projection),
             "cli_backed": plan.is_cli_backed,
             "probe": None,
+            # One live promotion on subscription rows, so the preview
+            # exercises the promotion line under the plan name.
+            "promotions": ({"source": "preview", "updated_at": None, "items": [
+                {"id": "cloud-credit", "kind": "credit",
+                 "label": "Cloud session credit", "applies_to": "cloud sessions",
+                 "total": 250.0, "remaining": 250.0, "currency": "USD",
+                 "expires_at": None, "observed_at": None, "days_left": 5.0,
+                 "expired": False, "used_up": False, "expiring_soon": True},
+            ]} if plan.is_subscription else {"items": []}),
         })
 
     capacity = {"lanes": lanes,

@@ -20,6 +20,18 @@
              needed to key the grid; here a count says how wide that grid is. #}
           · {{ r.models|length }} {{ 'model' if r.models|length == 1 else 'models' }}
         </div>
+        {# Promotions (bonus credit, one-off reset): one line each, only while
+           live. The countdown is the point -- they are worth something only
+           until the date. Expiring-soon ones also get an alert chip. #}
+        {% for p in (r.promotions or {}).get('items', []) %}
+          {% if not p.expired and not p.used_up %}
+            <div class="muted nowrap" style="font-size:12px"
+                 title="{{ p.applies_to or 'promotion' }}{% if (r.promotions or {}).get('source') %} · from {{ r.promotions.source }}{% endif %}">
+              <span class="tag {{ 'warn' if p.expiring_soon else 'ok' }}">{{ p.kind }}</span>
+              {{ p.label or p.id }}{% if p.remaining is not none %}: {{ '{:,.0f}'.format(p.remaining) }}{% if p.total is not none %}/{{ '{:,.0f}'.format(p.total) }}{% endif %} {{ p.currency }}{% endif %}{% if p.days_left is not none %} · {{ '%.0f'|format(p.days_left) }}d left{% endif %}
+            </div>
+          {% endif %}
+        {% endfor %}
       </td>
       <td style="min-width:190px" title="{{ hr.basis }}">
         {# One bar per quota window. The window closest to biting is the one in

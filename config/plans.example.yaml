@@ -24,6 +24,10 @@ settings:
   # waiting its turn would leave quota unspent. See "Expiring plans" in the
   # README.
   drain_within_days: 21
+  # The board flags a plan's promotion (a bonus credit or one-off reset posted
+  # to POST /admin/plans/{plan}/promotions) once it expires within this many
+  # days with something left. Display only; routing never reads promotions.
+  promo_alert_days: 7
   # How long a session keeps its model. Refreshed on every request, so an
   # active session never migrates; an idle one lets its slot go.
   lease_ttl_seconds: 1800
