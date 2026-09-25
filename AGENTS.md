@@ -30,3 +30,9 @@ from `.opencode/opencode.json`. The rules they enforce:
 
 A block is a guard, not the prose — the prose in CLAUDE.md is for humans,
 the guards are here so the prose is never the only thing in the way.
+
+- **Design for the long view; build only what's needed now.** Build a
+  piece now only if deferring would create something to undo, break a
+  consumed contract, grow the retrofit, or leave a real risk today.
+  Contracts are versioned and evolve compatibly. See "Critical" in
+  [CLAUDE.md](CLAUDE.md) and `~/Documents/GitHub/Orchard_v4/CLAUDE.md`.

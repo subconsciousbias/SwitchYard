@@ -1,5 +1,29 @@
 # Working in this repo
 
+## Critical: design for the long view, build only what's needed now
+
+Orchard-wide rule; canonical text and checklist in
+`~/Documents/GitHub/Orchard_v4/CLAUDE.md` (read it before any design work).
+
+- **Design** knowing the end state (many users, tenants, hosts, regions;
+  production reliability and security). **Build** only the current need.
+- **Build now only if waiting costs more:** deferring would (1) create
+  something to undo later (a competing mechanism, an incompatible data shape,
+  a contract that can't evolve compatibly), (2) break a contract someone
+  already consumes, (3) make the eventual change touch everything written
+  meanwhile while now is cheap, or (4) leave a real risk in today's
+  deployment. A new system that plugs in later (auth, tenancy, HA, a
+  registry) is the same work later: don't build or pre-shape it.
+- **Don't design scale out:** if a future need would force rewriting what
+  we build now, change what we build now.
+- **Contracts are versioned and evolve backward-compatibly;** breaking
+  changes are new versions served side by side.
+- **Cheap-now defaults:** opaque unique IDs and cursors, UTC, typed APIs,
+  standard formats (CloudEvents, RFC 9457, RFC 9727), idempotency keys,
+  set-style operations over toggles.
+- **Cost exception:** a simple backend behind the right interface when the
+  scalable one is unreasonably costly; record simple → scalable → trigger.
+
 ## Never write to `.env`
 
 `.env` holds real API keys and OAuth paths that the user typed in by hand. It is
