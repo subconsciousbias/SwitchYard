@@ -42,8 +42,10 @@ from switchyard.models import Plan, Quota
 from switchyard.usage import (
     Ledger,
     model_effective_cost_per_mtok,
+    model_effective_cost_fields,
     model_effective_cost_per_session,
     effective_cost_per_mtok,
+    effective_cost_fields,
     reported_is_current,
     K_M_HOUR,
     K_M_DAY,
@@ -888,6 +890,815 @@ def test_prompt_completion_tokens_billed_completion_optional():
     prompt, completion = _prompt_completion_tokens(None, usage)
     assert prompt == 2_400_000, prompt
     assert completion == 0, completion
+
+
+# ---------------------------------------------------------------------------
+# Tests: windows_per_month and projection tiers
+# ---------------------------------------------------------------------------
+#
+# Projected monthly capacity follows a tiered basis:
+#   - Tier 1 (vendor): the provider gave us an absolute limit / remaining
+#     count, so cap = limit × windows_per_month(q.period), basis "vendor".
+#   - Tier 2 (bounded): only a percentage is current, but a previous
+#     same-window reading was carried forward by note_reported_percent.
+#     The pair (Δyard, Δpct) gives A_inf = Δyard × 100 / Δpct, which is
+#     an UPPER bound on the true per-window allowance (bypass ≥ 0).
+#     monthly_capacity_tokens stays A_cfg × wpm when A_cfg is set;
+#     capacity_upper_tokens carries A_inf × wpm.
+#   - Tier 3 (ledger): no prev pair. cap = A × wpm with
+#     A = q.allowance else observed_allowance_tokens; basis "ledger".
+#
+# A dollar-kind or unlimited window contributes no token capacity.
+# ---------------------------------------------------------------------------
+
+
+def test_windows_per_month_mapping():
+    """The 30-day-month scaling for each window kind.
+
+    Used by `_project_capacity` to fold per-window caps into a monthly
+    figure. The mapping is fixed: a 5h rolling window completes
+    4.8 cycles/day, 144/month; a week fits 30/7 ≈ 4.29 times in a
+    30-day month; "month" / None both stay at 1.0 (the window IS the
+    month); "day" is 30 days/month; unknown periods degrade to 1.0 so
+    a non-recognised window's cap stays exact rather than being multiplied
+    by a wrong factor.
+    """
+    from switchyard.periods import windows_per_month, DAYS_PER_MONTH
+
+    assert windows_per_month("month") == 1.0
+    assert windows_per_month(None) == 1.0
+    assert windows_per_month("week") == DAYS_PER_MONTH / 7
+    assert windows_per_month("rolling_5h") == DAYS_PER_MONTH * 24 / 5
+    assert windows_per_month("day") == float(DAYS_PER_MONTH)
+    # Unknown period: degrade to 1.0 (the cap stays exact).
+    assert windows_per_month("fortnight") == 1.0
+
+
+def test_window_headroom_tier1_vendor_absolute_limit():
+    """Tier 1: provider gave both remaining and limit -> cap = limit × wpm.
+
+    When `reported_remaining` and `reported_limit` are both current floats,
+    the vendor figure is ground truth. The window's projection is
+    `vendor_total × windows_per_month`, with `basis = "vendor"` and
+    `capacity_upper_tokens = None` (no ceiling needed; the vendor number
+    is exact). The plan-level projection inherits the same numbers
+    verbatim.
+    """
+    from switchyard.usage import window_headroom
+
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan()  # month window, allowance = 1_000_000
+    reset_at = time.time() + 3600
+
+    redis.hashes[K_WINDOW.format(plan=plan.key, window=plan.quota.label)] = {
+        "reported_remaining": "300000.0",
+        "reported_limit": "1000000.0",
+        "reported_at": str(time.time()),
+        "reset_at": str(reset_at),
+    }
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr = run(window_headroom(ledger, plan, plan.quota))
+    assert hr["pct_used"] == 70.0, hr
+    assert hr["limit"] == 1_000_000.0, hr
+    # Tier 1: monthly_capacity_tokens = vendor_total × 1.0 (month period).
+    assert hr["monthly_capacity_tokens"] == 1_000_000.0, hr
+    assert hr["capacity_basis"] == "vendor", hr
+    assert hr["capacity_upper_tokens"] is None, hr
+    assert hr["cfg_monthly_capacity_tokens"] == 1_000_000.0, hr
+    assert hr["off_router_tokens_est"] is None, hr
+
+
+def test_window_headroom_tier1_reorders_absolutes_before_pct_only():
+    """A window with both reported_pct_used AND reported_remaining current
+    takes the absolutes branch, not the percent-only branch.
+
+    Before the reorder, the percent-only branch ran first; with no limit
+    to derive from, it short-circuited and the absolutes were discarded.
+    Putting absolutes first means a window with BOTH gets the vendor
+    figure (tier 1) and the percent figure is unused. The bypass-attribution
+    issue this avoids: deriving `consumed = pct/100 × remaining` would
+    silently drop whatever the account spent outside SwitchYard.
+    """
+    from switchyard.usage import window_headroom
+
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan()  # month window
+    reset_at = time.time() + 3600
+
+    redis.hashes[K_WINDOW.format(plan=plan.key, window=plan.quota.label)] = {
+        "reported_pct_used": "50.0",         # would imply 500_000 used
+        "reported_remaining": "700000.0",    # actually 300_000 used
+        "reported_limit": "1000000.0",
+        "reported_at": str(time.time()),
+        "reset_at": str(reset_at),
+    }
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr = run(window_headroom(ledger, plan, plan.quota))
+    # Absolutes win: pct_used derived from (limit - remaining) / limit.
+    assert hr["pct_used"] == 30.0, hr
+    assert hr["consumed"] == 300_000.0, hr
+    assert hr["limit"] == 1_000_000.0, hr
+    # Tier 1: vendor basis.
+    assert hr["capacity_basis"] == "vendor", hr
+
+
+def test_window_headroom_tier2_bounded_with_valid_prev_pair():
+    """Tier 2: pct current, valid (prev, current) pair -> bounded basis.
+
+    `note_reported_percent` carries the previous pct+yard pair forward
+    only when the old reset_at matches the new one (same window in force)
+    AND the new pct is >= the old one. With that pair available, the
+    inference gives A_inf = Δyard × 100 / Δpct (an UPPER bound on the
+    true per-window allowance because some traffic may have run off the
+    router). The cfg allowance stays in `monthly_capacity_tokens`; the
+    inferred ceiling lives in `capacity_upper_tokens`.
+    """
+    from switchyard.usage import window_headroom
+
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan()  # month, allowance 1_000_000
+    reset_at = time.time() + 3600
+
+    # First reading: 20% used, 200_000 yard tokens.
+    redis.hashes[K_WINDOW.format(plan=plan.key, window=plan.quota.label)] = {
+        "reported_pct_used": "20.0",
+        "reported_at_yard_tokens": "200000.0",
+        "reported_at": str(time.time() - 600),
+        "reset_at": str(reset_at),
+    }
+    # Second reading: 50% used, 400_000 yard tokens. Note the carry
+    # happens inside note_reported_percent -- here we simulate the
+    # carried-forward state directly so the test focuses on the
+    # tier-2 inference in window_headroom.
+    redis.hashes[K_WINDOW.format(plan=plan.key, window=plan.quota.label)] = {
+        "prev_pct_used": "20.0",
+        "prev_pct_yard_tokens": "200000.0",
+        "reported_pct_used": "50.0",
+        "reported_at_yard_tokens": "400000.0",
+        "reported_at": str(time.time()),
+        "reset_at": str(reset_at),
+    }
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr = run(window_headroom(ledger, plan, plan.quota))
+    # Inference: A_inf = (400k - 200k) * 100 / (50 - 20) = 666_666.67.
+    # A_inf=666_666 < A_cfg=1_000_000 ⇒ A_cfg wins; the inferred ceiling
+    # is the UPPER bound (bypass ≥ 0 makes A_inf <= A_true).
+    assert hr["pct_used"] == 50.0, hr
+    assert hr["capacity_basis"] == "bounded", hr
+    assert hr["monthly_capacity_tokens"] == 1_000_000.0, hr
+    # capacity_upper_tokens = A_inf × wpm = 666_666.67 × 1.0.
+    assert abs(hr["capacity_upper_tokens"] - (200_000 * 100 / 30)) < 1.0, hr
+    # off_router = A_cfg * Δpct/100 − Δyard = 1_000_000 * 0.30 - 200_000 = 100_000.
+    assert hr["off_router_tokens_est"] == 100_000.0, hr
+
+
+def test_window_headroom_tier2_bounded_positive_off_router_augments_basis():
+    """A positive `off_router_tokens_est` augments the basis string with
+    "lower bound (off-router inferred)" phrasing. The board surfaces the
+    bypass signal on the affected window without spending a row on a
+    label. The wording is distinct from the tier-3 "observed (where it
+    ran out last time)" path, so the tooltip text tells the operator
+    which case fired even though both glyphs are in the `≤` family.
+    """
+    from switchyard.usage import window_headroom
+
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan()
+    reset_at = time.time() + 3600
+
+    redis.hashes[K_WINDOW.format(plan=plan.key, window=plan.quota.label)] = {
+        "prev_pct_used": "10.0",
+        "prev_pct_yard_tokens": "50000.0",
+        "reported_pct_used": "60.0",   # Δpct = 50
+        "reported_at_yard_tokens": "100000.0",  # Δyard = 50_000
+        "reported_at": str(time.time()),
+        "reset_at": str(reset_at),
+    }
+    # A_inf = 50_000 * 100 / 50 = 100_000 (well below A_cfg=1_000_000)
+    # off_router = 1_000_000 * 0.50 - 50_000 = 450_000 > 0.
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr = run(window_headroom(ledger, plan, plan.quota))
+    assert hr["off_router_tokens_est"] == 450_000.0, hr
+    assert "lower bound (off-router inferred)" in hr["basis"], hr
+    # And the wording is NOT the unrelated tier-3 phrase.
+    assert "observed (where it ran out last time)" not in hr["basis"], hr
+
+
+def test_window_headroom_tier2_degrades_to_tier3_when_no_prev_pair():
+    """Tier 2 only fires when the prev pair is valid; without it the
+    window degrades to tier 3 (ledger basis). The inference is NEVER
+    applied on the strength of a single reading -- the bypass estimate
+    needs at least one comparison point, and a single percentage is
+    just a number, not an allowance.
+    """
+    from switchyard.usage import window_headroom
+
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = fake_plan()  # allowance = 1_000_000
+    reset_at = time.time() + 3600
+
+    # Only one reading on file -- no prev pair to compare against.
+    redis.hashes[K_WINDOW.format(plan=plan.key, window=plan.quota.label)] = {
+        "reported_pct_used": "30.0",
+        "reported_at": str(time.time()),
+        "reset_at": str(reset_at),
+    }
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr = run(window_headroom(ledger, plan, plan.quota))
+    assert hr["capacity_basis"] == "ledger", hr
+    # Tier 3 with A_cfg = 1_000_000: monthly_capacity = 1_000_000 × 1.0.
+    assert hr["monthly_capacity_tokens"] == 1_000_000.0, hr
+    assert hr["capacity_upper_tokens"] is None, hr
+    assert hr["off_router_tokens_est"] is None, hr
+
+
+def test_window_headroom_tier3_uses_observed_allowance_when_no_cfg():
+    """Tier 3 with no q.allowance falls back to observed_allowance_tokens.
+
+    After one cycle, `note_exhaustion` writes the tokens consumed at
+    exhaustion into the window's hash as `observed_allowance_tokens`.
+    A plan that never had a configured allowance (e.g. inferred from
+    a hard-fail) still gets a headroom projection -- the observed
+    figure IS the per-window allowance, scaled to a month via wpm.
+    """
+    from switchyard.usage import window_headroom
+
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = Plan(
+        key="obs-plan",
+        label="Observed plan",
+        models={},
+        quotas=[Quota(kind="tokens", period="week", allowance=None)],
+        monthly_cost=0.0,
+        metered=False,
+    )
+    reset_at = time.time() + 3600
+    redis.hashes[K_WINDOW.format(plan=plan.key, window=plan.quota.label)] = {
+        "reported_pct_used": "10.0",
+        "observed_allowance_tokens": "300000.0",
+        "reported_at": str(time.time()),
+        "reset_at": str(reset_at),
+    }
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr = run(window_headroom(ledger, plan, plan.quota))
+    # weekly period: wpm = 30/7 ≈ 4.29.
+    expected = 300_000.0 * (30 / 7)
+    assert abs(hr["monthly_capacity_tokens"] - expected) < 1.0, hr
+    assert hr["capacity_basis"] == "ledger", hr
+    assert hr["cfg_monthly_capacity_tokens"] is None, hr
+
+
+def test_window_headroom_dollar_kind_has_no_token_projection():
+    """Dollar-kind windows contribute no token capacity. A dollar
+    allowance cannot be projected to tokens -- the spec keeps the
+    historical rate with its caveat. The projection fields are all
+    None on a dollars window.
+    """
+    from switchyard.usage import window_headroom
+
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = Plan(
+        key="dollar-plan",
+        label="Dollar plan",
+        models={},
+        quotas=[Quota(kind="dollars", period="month", allowance=20.0)],
+        monthly_cost=0.0,
+        metered=True,
+    )
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr = run(window_headroom(ledger, plan, plan.quota))
+    assert hr["monthly_capacity_tokens"] is None, hr
+    assert hr["capacity_basis"] is None, hr
+    assert hr["capacity_upper_tokens"] is None, hr
+    assert hr["cfg_monthly_capacity_tokens"] is None, hr
+    assert hr["off_router_tokens_est"] is None, hr
+
+
+def test_window_headroom_unlimited_has_no_token_projection():
+    """Unlimited windows contribute no token capacity. Same shape as
+    dollars: an unmetered plan has no cap to project."""
+    from switchyard.usage import window_headroom
+
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    plan = Plan(
+        key="unl-plan",
+        label="Unlimited plan",
+        models={},
+        quotas=[Quota(kind="unlimited", period="week")],
+        monthly_cost=0.0,
+        metered=False,
+    )
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr = run(window_headroom(ledger, plan, plan.quota))
+    assert hr["monthly_capacity_tokens"] is None, hr
+    assert hr["capacity_basis"] is None, hr
+
+
+def test_headroom_folds_projection_argmin():
+    """Plan-level projection is the argmin of per-window monthly caps.
+
+    A plan with two windows (a 5h and a weekly) projects to the smaller
+    of the two per-window caps. The basis follows the argmin window:
+    a vendor-tier 5h binding below a tier-2 weekly ceiling is exact,
+    so the plan-level basis is "vendor". The argmin's window label is
+    surfaced so the board can name the binding source.
+    """
+    from switchyard.usage import headroom
+
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    reset_at = time.time() + 3600
+    plan = Plan(
+        key="two-win",
+        label="Two windows",
+        models={},
+        quotas=[
+            Quota(kind="tokens", period="rolling_5h", name="5h",
+                  allowance=500_000),
+            Quota(kind="tokens", period="week", allowance=40_000_000),
+        ],
+        monthly_cost=0.0,
+        metered=False,
+    )
+    # 5h window: vendor basis, 500_000 × 144 = 72_000_000/month.
+    redis.hashes[K_WINDOW.format(plan=plan.key, window="5h")] = {
+        "reported_remaining": "200000.0",
+        "reported_limit": "500000.0",
+        "reported_at": str(time.time()),
+        "reset_at": str(reset_at),
+    }
+    # Weekly window: no current reading -> falls to tier 3 (ledger).
+    with _patch_now(datetime(2025, 9, 21, 14, 30, 0, tzinfo=timezone.utc)):
+        hr = run(headroom(ledger, plan))
+    assert hr["projection"]["window"] == "5h", hr["projection"]
+    # 5h × 144 = 72_000_000; weekly × (30/7) ≈ 171_428_571. Argmin = 5h.
+    assert hr["projection"]["capacity_tokens"] == 500_000 * 144, hr["projection"]
+    assert hr["projection"]["basis"] == "vendor", hr["projection"]
+
+
+def test_note_reported_percent_carries_prev_pair_same_window():
+    """The first call writes (pct, yard). The second call, with the same
+    reset_at and a non-decreasing pct, carries the previous pair to
+    `prev_pct_used` / `prev_pct_yard_tokens`. The carry rides the SAME
+    hash so `window_facts` continues to fetch everything in one round trip.
+    """
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    reset_at = time.time() + 3600
+
+    async def go():
+        await ledger.note_reported_percent(
+            "p", 20.0, reset_at, window="weekly", yard_tokens=200_000.0)
+        facts = await ledger.window_facts("p", "weekly")
+        # First call has no prev pair (this IS the first call).
+        assert "prev_pct_used" not in facts, facts
+        assert facts["reported_pct_used"] == 20.0, facts
+        assert facts["reported_at_yard_tokens"] == 200_000.0, facts
+
+        await ledger.note_reported_percent(
+            "p", 50.0, reset_at, window="weekly", yard_tokens=400_000.0)
+        facts = await ledger.window_facts("p", "weekly")
+        assert facts["reported_pct_used"] == 50.0, facts
+        # Carry: prev pair is the FIRST call's values.
+        assert facts["prev_pct_used"] == 20.0, facts
+        assert facts["prev_pct_yard_tokens"] == 200_000.0, facts
+        # New stamp alongside the new reading.
+        assert facts["reported_at_yard_tokens"] == 400_000.0, facts
+        return facts
+
+    run(go())
+
+
+def test_note_reported_percent_carry_skipped_on_window_rollover():
+    """A new reading whose pct is LOWER than the previous one is treated as
+    a window rollover -- the prior pair is dropped, NOT carried forward.
+    Carrying it would attach the previous window's yard tally to the new
+    window's percentage and project off the wrong bucket.
+    """
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    reset_at = time.time() + 3600
+
+    async def go():
+        await ledger.note_reported_percent(
+            "p", 80.0, reset_at, window="weekly", yard_tokens=8_000_000.0)
+        # A fresh reading with a LOWER pct (window rolled over): carry is skipped.
+        await ledger.note_reported_percent(
+            "p", 5.0, reset_at, window="weekly", yard_tokens=500_000.0)
+        facts = await ledger.window_facts("p", "weekly")
+        # The new reading IS on file; the previous pair was NOT carried.
+        assert facts["reported_pct_used"] == 5.0, facts
+        assert "prev_pct_used" not in facts, facts
+        return facts
+
+    run(go())
+
+
+def test_note_reported_percent_stale_prev_pair_cleared_on_rollover():
+    """A stale prev pair from a rolled-over window is cleared, not just
+    skipped on the next write.
+
+    The carry path SKIPS writing a new prev_* pair when the rollover or
+    reset-mismatch gate fires, but the OLD prev_* pair can survive on
+    the hash (a successful carry earlier in the same plan's lifetime
+    wrote them). Without an explicit clear, a later
+    `_infer_allowance_from_pair` would project arithmetic across two
+    unrelated windows: Δpct spanning the boundary, Δyard stretching
+    across the rollover. This test pins the explicit-clear behaviour
+    (HDEL on the stale pair) so the inference degrades to tier 3
+    instead of surfacing a bogus tier-2 ceiling.
+
+    Sequence: R1+R2 build a valid carry (prev=(pct0, yard0)). R3
+    triggers a reset_at mismatch (no reset_at vs the original T1) and
+    clears the pair. R4 is the inference-time check: even though
+    `reported_pct_used` is fresh and current, the cleared pair leaves
+    the inference unable to run.
+    """
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    reset_at_1 = time.time() + 3600
+
+    async def go():
+        # R1: first reading — seeds the hash with reported_pct + yard.
+        await ledger.note_reported_percent(
+            "p", 5.0, reset_at_1, window="weekly", yard_tokens=500_000.0)
+        # R2: same window, higher pct — carry writes prev=(5, 500K).
+        await ledger.note_reported_percent(
+            "p", 8.0, reset_at_1, window="weekly", yard_tokens=800_000.0)
+        mid = await ledger.window_facts("p", "weekly")
+        # Sanity: the carry succeeded.
+        assert mid.get("prev_pct_used") == 5.0, mid
+        assert mid.get("prev_pct_yard_tokens") == 500_000.0, mid
+        # R3: NEW reading with NO reset_at — same_window becomes False
+        # because the new reset is None (not equal to reset_at_1).
+        # Carry is skipped AND the stale pair is cleared.
+        await ledger.note_reported_percent(
+            "p", 12.0, None, window="weekly", yard_tokens=1_200_000.0)
+        facts = await ledger.window_facts("p", "weekly")
+        # The prev pair must be GONE (cleared), not just absent because
+        # nothing was written — this is the explicit HDEL the fix added.
+        assert "prev_pct_used" not in facts, facts
+        assert "prev_pct_yard_tokens" not in facts, facts
+        # The current reading IS on file.
+        assert facts["reported_pct_used"] == 12.0, facts
+        assert facts["reported_at_yard_tokens"] == 1_200_000.0, facts
+        # R4: pct-decreasing rollover — carry skipped again, pair still
+        # cleared (HDEL is idempotent on absent fields).
+        await ledger.note_reported_percent(
+            "p", 2.0, None, window="weekly", yard_tokens=200_000.0)
+        facts2 = await ledger.window_facts("p", "weekly")
+        assert "prev_pct_used" not in facts2, facts2
+        assert "prev_pct_yard_tokens" not in facts2, facts2
+        return facts2
+
+    run(go())
+
+
+def test_infer_allowance_from_pair_returns_none_when_prev_cleared():
+    """`_infer_allowance_from_pair` returns None when the prev pair has
+    been cleared by a rollover / reset-mismatch.
+
+    Regression bar for the stale-pair bug: the inference path must NOT
+    promote a half-cleared hash to a tier-2 ceiling. With `prev_pct_used`
+    absent, every guard in the inference fires (float(None) raises) and
+    the helper returns None — `window_headroom` then falls through to
+    the tier-3 (ledger) branch on the next call.
+    """
+    from switchyard.usage import _infer_allowance_from_pair
+    # Hash with the current reading but NO prev pair — the cleared
+    # state after a rollover.
+    facts = {"reported_pct_used": "30.0",
+             "reported_at_yard_tokens": "1500000.0"}
+    used = {"prompt_tokens": 1_000_000.0, "completion_tokens": 500_000.0}
+    assert _infer_allowance_from_pair(facts, used) is None
+
+
+def test_note_reported_percent_carry_skipped_on_reset_change():
+    """A different reset_at means a different window is in force; the
+    previous pair is not about this window and must NOT be carried
+    forward. Same defensive logic as the rollover check, on the other
+    side of the comparison.
+    """
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+
+    async def go():
+        await ledger.note_reported_percent(
+            "p", 20.0, time.time() + 3600, window="weekly", yard_tokens=200_000.0)
+        # Same pct, different reset_at -> different window, no carry.
+        await ledger.note_reported_percent(
+            "p", 30.0, time.time() + 7200, window="weekly", yard_tokens=300_000.0)
+        facts = await ledger.window_facts("p", "weekly")
+        assert facts["reported_pct_used"] == 30.0, facts
+        assert "prev_pct_used" not in facts, facts
+        return facts
+
+    run(go())
+
+
+def test_note_reported_percent_without_yard_tokens():
+    """The yard_tokens param is optional: callers that don't have the
+    token tally still get the carry forward for the percentage side
+    alone, but no off-router estimate can be computed (no yard delta).
+    The carry gate fires only when both halves of the prev pair are
+    present; if `yard_tokens` is None on the previous call, the prev
+    pair is never written, so the next pct-only reading degrades to
+    tier 3 (no inference possible).
+    """
+    redis = FakeRedis()
+    ledger = Ledger(redis)
+    reset_at = time.time() + 3600
+
+    async def go():
+        await ledger.note_reported_percent(
+            "p", 10.0, reset_at, window="weekly")  # no yard_tokens
+        await ledger.note_reported_percent(
+            "p", 20.0, reset_at, window="weekly")  # also no yard_tokens
+        facts = await ledger.window_facts("p", "weekly")
+        # yard_tokens was None on both calls, so neither call wrote
+        # reported_at_yard_tokens; with the yard side absent, the
+        # carry gate cannot fire on the second call (it requires the
+        # prev pair in full), so prev_pct_used / prev_pct_yard_tokens
+        # are never written.
+        return facts
+
+    facts = run(go())
+    # Both calls wrote `reported_pct_used`; the second one's gate is
+    # not satisfied (no prev_pct_yard_tokens), so prev_pct_used is
+    # NOT written. Tier 2 needs the full pair.
+    assert "prev_pct_used" not in facts, facts
+    assert "prev_pct_yard_tokens" not in facts, facts
+
+
+# ---------------------------------------------------------------------------
+# Tests: Effective $/Mtok with projection (issue #218)
+# ---------------------------------------------------------------------------
+#
+# `effective_cost_fields` / `model_effective_cost_fields` thread a
+# `projected` dict (the same `headroom()['projection']` shape) into the
+# rate computation. With `projected=None` the helpers fall back to the
+# historical fee/burned shape so existing tests stay meaningful; with a
+# projection the subscription rate is `fee / (cap / 1e6)` independent of
+# burn — the whole point of the fix.
+# ---------------------------------------------------------------------------
+
+
+def test_effective_cost_fields_stable_across_month():
+    """A subscription's projected rate is the same on day 3 as on day 30.
+
+    With the historical `fee / tokens_so_far` shape, the same plan's rate
+    drifted downward through the month (the issue's table at $1.000 →
+    $0.200 → $0.100). The projection uses the binding window's monthly
+    capacity instead, which is fixed for the whole month, so two readings
+    at different burn levels return the same figure. The 1M-token
+    threshold that the historical branch gates on is also gone — the
+    projection is independent of burn.
+    """
+    plan = fake_plan(monthly_cost=132.0)
+    # Same projection at two different burn levels.
+    proj = {"capacity_tokens": 40_000_000, "basis": "vendor",
+            "upper_tokens": None, "cfg_capacity_tokens": 40_000_000}
+    early = effective_cost_fields(plan, 5_000_000, 0.0, projected=proj)
+    late = effective_cost_fields(plan, 60_000_000, 0.0, projected=proj)
+    assert early["rate"] == late["rate"], (early, late)
+    # Vendor tier: 132 / 40 = $3.30/Mtok, no upper.
+    assert early["rate"] == 3.30, early
+    assert early["basis"] == "vendor", early
+    assert early["upper"] is None, early
+    # Below-1M burn still produces a number with a projection (no gate).
+    very_early = effective_cost_fields(plan, 500_000, 0.0, projected=proj)
+    assert very_early["rate"] == 3.30, very_early
+
+
+def test_effective_cost_fields_tier1_vendor():
+    """Tier 1 (vendor): a stated absolute gives an exact rate.
+
+    `basis="vendor"` -> rate = fee / (vendor_cap / 1e6), upper None
+    (the vendor number is ground truth, no ceiling needed). The board
+    reads basis="vendor" and renders the small "vendor" tag.
+    """
+    plan = fake_plan(monthly_cost=132.0)
+    proj = {"capacity_tokens": 1_000_000, "basis": "vendor",
+            "upper_tokens": None, "cfg_capacity_tokens": 1_000_000}
+    fields = effective_cost_fields(plan, 5_000_000, 0.0, projected=proj)
+    assert fields["rate"] == 132.0, fields  # 132 / 1 = 132
+    assert fields["basis"] == "vendor", fields
+    assert fields["upper"] is None, fields
+
+
+def test_effective_cost_fields_tier2_bounded_with_cfg():
+    """Tier 2 (bounded) WITH A_cfg: rate at cfg end, upper at inferred ceiling.
+
+    The cfg allowance stays in `monthly_capacity_tokens` (the inference
+    NEVER replaces A_cfg); `capacity_upper_tokens` carries the inferred
+    ceiling. The board renders `$low–high/Mtok`. This is the case the
+    plan calls "tier-2-with-A_cfg renders rate at the configured-allowance
+    end and upper at the inferred ceiling".
+    """
+    plan = fake_plan(monthly_cost=132.0)
+    # cfg cap = 1M, inferred ceiling = 666_666.67 (less than cfg)
+    proj = {"capacity_tokens": 1_000_000, "basis": "bounded",
+            "upper_tokens": 666_666.67, "cfg_capacity_tokens": 1_000_000}
+    fields = effective_cost_fields(plan, 5_000_000, 0.0, projected=proj)
+    assert fields["rate"] == 132.0, fields  # cfg end: 132 / 1
+    assert fields["basis"] == "bounded", fields
+    # Inferred-ceiling rate: 132 / 0.66666667 = 198.0
+    assert abs(fields["upper"] - 198.0) < 0.01, fields
+
+
+def test_effective_cost_fields_tier2_bounded_no_cfg():
+    """Tier 2 (bounded) WITHOUT A_cfg: ceiling IS the rate, basis stays "bounded".
+
+    With no cfg allowance the inference becomes the monthly capacity.
+    The board renders the rate with a `≤` prefix (basis="bounded" tells
+    it to), so the operator reads it as an upper bound on the true rate.
+    `upper` is suppressed in the helper's return when `upper_cap == cap`
+    (the inference equals the cap), so the template does not print the
+    same number twice for the no-A_cfg path.
+    """
+    plan = fake_plan(monthly_cost=132.0)
+    proj = {"capacity_tokens": 666_666.67, "basis": "bounded",
+            "upper_tokens": 666_666.67, "cfg_capacity_tokens": None}
+    fields = effective_cost_fields(plan, 5_000_000, 0.0, projected=proj)
+    # Inferred allowance IS the cap: 132 / 0.66666667 = 198.0
+    assert abs(fields["rate"] - 198.0) < 0.01, fields
+    assert fields["basis"] == "bounded", fields
+    # upper is None when the inferred ceiling equals the cap -- the
+    # template would render the same number twice otherwise.
+    assert fields["upper"] is None, fields
+
+
+def test_effective_cost_fields_tier2_bounded_inferred_exceeds_cfg():
+    """Tier 2 (bounded) with A_inf > A_cfg: template renders the range
+    with the inferred-ceiling end as the low side.
+
+    When the cfg allowance under-counted the plan, the inference gives
+    A_inf > A_cfg. The rate derived from `cap` (cfg end) is higher than
+    the rate derived from `upper_cap` (inferred-ceiling end). The helper
+    still returns `rate = fee/cap` and `upper = fee/upper_cap`; the
+    template sorts them into `low = upper` and `high = rate`, attaching
+    `≤` to `high` so the upper bound always reads as the high end. This
+    is the regression bar for the template's low/high ordering -- every
+    prior test fixture had A_inf < A_cfg and missed the inversion.
+    """
+    plan = fake_plan(monthly_cost=10.0)
+    # cfg allowance 1M (smaller cap ⇒ higher rate), inferred 2M
+    # (larger cap ⇒ lower rate). Truth: $5/Mtok ≤ actual ≤ $10/Mtok.
+    proj = {"capacity_tokens": 1_000_000, "basis": "bounded",
+            "upper_tokens": 2_000_000, "cfg_capacity_tokens": 1_000_000,
+            "window": "monthly"}
+    fields = effective_cost_fields(plan, 500_000, 0.0, projected=proj)
+    # Helper returns the cfg-end rate as `rate` and the inferred-ceiling
+    # rate as `upper`. Template re-sorts to low/high on display; the
+    # helper's "rate" is the higher of the two when A_inf > A_cfg.
+    assert fields["rate"] == 10.0, fields  # fee / 1M
+    assert fields["upper"] == 5.0, fields  # fee / 2M
+    # The board's effective display is "low ≤ high" with ≤ on the
+    # high end -- assert the helper's two values so the template's
+    # sort logic has a stable contract to render against.
+    assert fields["basis"] == "bounded", fields
+
+
+def test_effective_cost_fields_tier3_ledger():
+    """Tier 3 (ledger): configured allowance, no projection ceiling.
+
+    Falls through to the historical shape: fee / cap / 1M. The board
+    shows the rate with a "yard" tag (basis="ledger") — assumes all
+    traffic went through SwitchYard. upper is None.
+    """
+    plan = fake_plan(monthly_cost=132.0)
+    proj = {"capacity_tokens": 5_000_000, "basis": "ledger",
+            "upper_tokens": None, "cfg_capacity_tokens": 5_000_000}
+    fields = effective_cost_fields(plan, 5_000_000, 0.0, projected=proj)
+    # 132 / 5 = 26.4
+    assert fields["rate"] == 26.4, fields
+    assert fields["basis"] == "ledger", fields
+    assert fields["upper"] is None, fields
+
+
+def test_effective_cost_fields_metered_ignores_projection():
+    """Metered plans keep the historical rate even with a projection dict.
+
+    The plan's economics are pay-as-you-go — there is no quota window
+    to project from, so the rate is `metered_cost / tokens_so_far`,
+    basis "ledger", upper None. The projection dict, if passed, is
+    silently ignored on the metered branch.
+    """
+    plan = fake_plan(monthly_cost=0.0, metered=True)
+    proj = {"capacity_tokens": 1_000_000, "basis": "vendor",
+            "upper_tokens": None, "cfg_capacity_tokens": 1_000_000}
+    fields = effective_cost_fields(plan, 40_000_000, 20.0, projected=proj)
+    assert fields["rate"] == 0.50, fields  # 20 / 40
+    assert fields["basis"] == "ledger", fields  # not "vendor"
+    assert fields["upper"] is None, fields
+
+
+def test_effective_cost_fields_no_projection_historical_fallback():
+    """No projection: subscription falls back to the historical shape.
+
+    Keeps the existing tests meaningful: with `projected=None` the rate
+    is `fee / tokens_so_far` (subject to the 1M-token gate), so the
+    original `test_effective_cost_per_mtok_unchanged` still passes.
+    """
+    plan = fake_plan(monthly_cost=132.0)
+    fields = effective_cost_fields(plan, 40_000_000, 0.0, projected=None)
+    assert fields["rate"] == 3.30, fields
+    assert fields["basis"] == "ledger", fields
+
+
+def test_effective_cost_fields_5pct_to_10pct_upper_bound_scenario():
+    """The issue's 5%→10% scenario: 1B SwitchYard delta ⇒ 20B inferred ceiling
+    against a 40B truth. The displayed rate is an UPPER bound, not a fact.
+
+    Concrete numbers from issue #218:
+      - Vendor reports 5% used; the operator then runs 1B tokens through
+        SwitchYard AND 1B tokens through the vendor CLI directly.
+      - Vendor truth: 5pp = 2B total ⇒ true allowance 40B.
+      - Inference from SwitchYard's delta alone: 1B / 0.05 = 20B — half
+        the truth, so the projected rate comes out 2× too high.
+
+    The direction of error is fixed and provable: bypass ≥ 0 ⇒
+    A_inferred ≤ A_true ⇒ the inferred $/Mtok is always an upper bound.
+    This test asserts the helper returns the upper-bound rate, not a
+    bare point estimate, when A_cfg exists (tier-2-with-A_cfg path).
+    """
+    plan = fake_plan(monthly_cost=100.0)
+    # Configure the bound: A_cfg = 40B (the truth), inferred = 20B.
+    # monthly_capacity_tokens = 40B × wpm; capacity_upper_tokens = 20B × wpm.
+    from switchyard.periods import windows_per_month
+    wpm = windows_per_month("month")  # = 1.0
+    cfg_cap = 40_000_000_000 * wpm
+    inferred_cap = 20_000_000_000 * wpm
+    proj = {"capacity_tokens": cfg_cap, "basis": "bounded",
+            "upper_tokens": inferred_cap, "cfg_capacity_tokens": cfg_cap}
+    fields = effective_cost_fields(plan, 1_000_000_000, 0.0, projected=proj)
+    # rate = 100 / 40000 = $0.0025/Mtok (cfg end)
+    assert abs(fields["rate"] - (100.0 / 40_000.0)) < 1e-9, fields
+    # upper = 100 / 20000 = $0.005/Mtok (inferred ceiling)
+    assert abs(fields["upper"] - (100.0 / 20_000.0)) < 1e-9, fields
+    # The ceiling IS the upper bound on the true rate. The board renders
+    # this as $0.0025–0.005/Mtok so the operator sees the bound, not a
+    # single fabricated figure.
+    assert fields["basis"] == "bounded", fields
+    assert fields["upper"] > fields["rate"], (fields["rate"], fields["upper"])
+
+
+def test_model_effective_cost_fields_subscription_projects_from_binding():
+    """Per-model rows inherit the plan-level projection.
+
+    The per-model share cancels for subscriptions, so the projected rate
+    is the same plan-level figure every model shows. The portal passes
+    the same `projected` to every row via `_model_eff_fields`, so the
+    rendered values match across the row.
+    """
+    plan = fake_plan(monthly_cost=132.0)
+    proj = {"capacity_tokens": 40_000_000, "basis": "vendor",
+            "upper_tokens": None, "cfg_capacity_tokens": 40_000_000}
+    # Big model slice, small model slice — same rate.
+    big = model_effective_cost_fields(
+        plan, 25_000_000, 0.0, 40_000_000, projected=proj)
+    small = model_effective_cost_fields(
+        plan, 5_000_000, 0.0, 40_000_000, projected=proj)
+    assert big["rate"] == small["rate"] == 3.30, (big, small)
+    assert big["basis"] == small["basis"] == "vendor", (big, small)
+    # Below-1M model tokens still produces a number with a projection —
+    # no gate on the per-model share when projecting.
+    tiny = model_effective_cost_fields(
+        plan, 100_000, 0.0, 40_000_000, projected=proj)
+    assert tiny["rate"] == 3.30, tiny
+
+
+def test_model_effective_cost_fields_subscription_historical_share_cancels():
+    """Without a projection, the per-model share still cancels.
+
+    Backwards-compat path: subscription rows gate on 1M plan tokens,
+    spend_m = fee·m/t, and `spend_m / (m/1M) = fee / (t/1M)` — the
+    plan's own rate, identical for every model.
+    """
+    plan = fake_plan(monthly_cost=132.0)
+    a = model_effective_cost_fields(
+        plan, 20_000_000, 0.0, 40_000_000, projected=None)
+    b = model_effective_cost_fields(
+        plan, 5_000_000, 0.0, 40_000_000, projected=None)
+    assert a["rate"] == b["rate"] == 3.30, (a, b)
+    assert a["basis"] == b["basis"] == "ledger", (a, b)
+
+
+def test_effective_cost_fields_below_1m_no_projection():
+    """Below 1M tokens with no projection returns None — same as before."""
+    plan = fake_plan(monthly_cost=132.0)
+    fields = effective_cost_fields(plan, 500_000, 0.0, projected=None)
+    assert fields["rate"] is None, fields
+    assert fields["basis"] is None, fields
+    assert fields["upper"] is None, fields
 
 
 # ---------------------------------------------------------------------------

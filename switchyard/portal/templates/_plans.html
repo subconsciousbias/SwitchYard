@@ -56,8 +56,40 @@
               <span class="muted nowrap" style="font-size:12px"
                     >no allowance · used {{ '{:,.0f}'.format(w.consumed or 0) }}</span>
             {% endif %}
+            {# Off-router burn (issue #218): a positive off_router_tokens_est
+               from a tier-2 bounded projection means SwitchYard's ledger
+               grew slower than the cfg allowance predicts, which can only
+               happen if some traffic bypassed the router. Surface the
+               estimate as a first-class line under the affected bar so
+               the operator can see "why does this plan drain faster than
+               my numbers suggest" without opening a tooltip. Empty string
+               when the estimate is unknown or non-positive -- only the
+               bounded-tier positive case renders, keeping row heights
+               even for plans whose projections don't trip the bypass. #}
+            {% set offr = w.get('off_router_tokens_est') %}
+            {% if offr is not none and offr > 0 %}
+              <div class="muted nowrap" style="font-size:12px; margin-top:2px"
+                   title="tokens this window inferred to have run outside SwitchYard (cfg × Δpct/100 − Δyard; positive ⇒ bypass present)">
+                off-router ≈ {{ offr|compact }} tok
+              </div>
+            {% endif %}
           </div>
         {% endfor %}
+        {# Projected monthly capacity (issue #218): a one-line caption under
+           the per-window bars that names the binding window's monthly cap,
+           with the basis string in the cell tooltip already. Only shows when
+           we actually have a number — an unknown / dollar-only / unlimited
+           plan gets the em-dash so the row height stays even. The "≤"
+           prefix marks a bounded (tier 2) ceiling so the operator sees that
+           the figure is an upper bound, not the configured allowance. #}
+        {% set proj = hr.get('projection') or {} %}
+        {% set proj_cap = proj.get('capacity_tokens') %}
+        {% if proj_cap is not none %}
+          <div class="muted nowrap" style="font-size:12px; margin-top:4px"
+               title="projected monthly capacity from {{ proj.get('window') or '?' }} ({{ proj.get('basis') or '?' }})">
+            {% if proj.get('upper_tokens') is not none %}≤{% endif %}{{ '{:,.0f}'.format(proj_cap) }}<span class="muted"> tok/mo</span>
+          </div>
+        {% endif %}
       </td>
       <td class="mono nowrap">
         {% set c = r.capacity %}
@@ -130,7 +162,52 @@
       <td class="mono nowrap">
         {% for m in r.models %}
           <div style="font-size:12px{% if not loop.last %};margin-bottom:3px{% endif %}">
-            {% if m.eff_cost is not none %}${{ '%.2f'|format(m.eff_cost) }}<span class="muted">/Mtok</span>
+            {# Issue #218: Effective $/Mtok now projects from the binding
+               quota window. Each row carries a provenance `eff_cost_basis`
+               that tells the board what kind of number this is:
+                 - "vendor"  -> the provider gave an absolute; small
+                   "vendor" tag on the right, tooltip "vendor-reported
+                   allowance"
+                 - "bounded" -> only a percentage was current; prefix the
+                   rate with "≤" so the operator reads the figure as an
+                   upper bound, and render a range `$low–high/Mtok` when
+                   `eff_cost_upper` is set (cfg allowance vs inferred
+                   ceiling). Tooltip explains the bypass-attribution gap.
+                 - "ledger"  -> local allowance / observed fallback;
+                   small "yard" tag, tooltip "assumes all traffic went
+                   through SwitchYard"
+               Glyphs, not prose, so a glance at the row reads the tier
+               without a tooltip hover. `m.get` keeps a fixture row
+               without the new keys renderable as the legacy em-dash
+               path, so older test fixtures don't blow up the template. #}
+            {% set basis = m.get('eff_cost_basis') %}
+            {% set upper = m.get('eff_cost_upper') %}
+            {% if m.eff_cost is not none %}
+              {# Tier-2 range: the cfg end and the inferred-ceiling end
+                 can sit on either side of each other depending on which
+                 allowance is bigger, so the template sorts them into
+                 `low` and `high` and puts the `≤` glyph on `high` —
+                 `high` is always the upper bound on the true rate, the
+                 `≤` reads as "the loose end". Without this the cell
+                 would render `≤$10.00 –$5.00` whenever the cfg under-
+                 counted the allowance. #}
+              {% if basis == 'bounded' and upper is not none %}
+                {% if m.eff_cost < upper %}
+                  {% set low = m.eff_cost %}{% set high = upper %}
+                {% else %}
+                  {% set low = upper %}{% set high = m.eff_cost %}
+                {% endif %}
+                ${{ '%.2f'|format(low) }}<span class="muted">–</span>≤${{ '%.2f'|format(high) }}<span class="muted">/Mtok</span>
+              {% else %}
+                {% if basis == 'bounded' %}≤{% endif %}${{ '%.2f'|format(m.eff_cost) }}<span class="muted">/Mtok</span>
+              {% endif %}
+              {% if basis == 'vendor' %}
+                <span class="muted" style="font-size:11px" title="vendor-reported allowance">vendor</span>
+              {% elif basis == 'bounded' %}
+                <span class="muted" style="font-size:11px" title="allowance inferred from % deltas; off-router usage can only make the true rate lower">≤</span>
+              {% elif basis == 'ledger' %}
+                <span class="muted" style="font-size:11px" title="assumes all traffic went through SwitchYard">yard</span>
+              {% endif %}
             {% else %}<span class="muted">—</span>{% endif %}
             {# Per-model $/session (issue #76): the fee allocated by session
                share, shown beneath the per-Mtok line in the same mono/nowrap

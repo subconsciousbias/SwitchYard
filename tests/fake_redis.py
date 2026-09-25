@@ -304,9 +304,14 @@ class FakeRedis:
         self._purge_expired(key)
         return self.hashes.get(key, {}).get(field)
 
-    async def hdel(self, key, field):
+    async def hdel(self, key, *fields):
         self._purge_expired(key)
-        return 1 if self.hashes.get(key, {}).pop(field, None) is not None else 0
+        # Matches Redis HDEL semantics: accepts one or more field names
+        # in a single call and returns the number of fields that were
+        # actually removed. The single-field shape is preserved for
+        # callers that only need to drop one.
+        return sum(1 for f in fields
+                   if self.hashes.get(key, {}).pop(f, None) is not None)
 
     async def incr(self, key):
         self._purge_expired(key)

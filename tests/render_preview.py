@@ -28,16 +28,55 @@ TPL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "switchyard", "portal", "templates")
 
 
-def _window(q, frac, allowance, ahead):
+def _project_plan_for_preview(windows):
+    """Fold per-window caps into a plan-level projection dict for the fixture.
+
+    Same shape as `headroom()['projection']` -- the template uses the
+    `capacity_tokens` and `window` fields to render the "tok/mo" caption.
+    """
+    candidates = [w for w in windows
+                  if w.get("monthly_capacity_tokens") is not None
+                  and w.get("monthly_capacity_tokens", 0) > 0]
+    if not candidates:
+        return {"capacity_tokens": None, "basis": None,
+                "upper_tokens": None, "cfg_capacity_tokens": None,
+                "window": None}
+    argmin = min(candidates, key=lambda w: w["monthly_capacity_tokens"])
+    return {"capacity_tokens": argmin["monthly_capacity_tokens"],
+            "basis": argmin.get("capacity_basis"),
+            "upper_tokens": argmin.get("capacity_upper_tokens"),
+            "cfg_capacity_tokens": argmin.get("cfg_monthly_capacity_tokens"),
+            "window": argmin.get("window")}
+
+
+def _window(q, frac, allowance, ahead, off_router=None):
     # Two distinct reset horizons so the preview exercises per-window captions:
     # the constraint window (5h-style) is close, the target (weekly) is days
     # out. collect_plans formats this via _fmt_reset; do the same here so the
     # preview shows what the real page will.
     from switchyard.portal.app import _fmt_reset
+    from switchyard.periods import windows_per_month
     if q.role == "constraint":
         reset_at = time.time() + 2 * 3600
     else:
         reset_at = time.time() + 4 * 86400
+    wpm = windows_per_month(q.period)
+    # Projection fields mirror window_headroom's defaults: a tokens-kind
+    # window with a known allowance projects `allowance * wpm` per month
+    # on the "ledger" basis. Dollars / unlimited get None for everything.
+    if q.kind == "tokens" and allowance:
+        monthly_cap = allowance * wpm
+        monthly_fields = {"monthly_capacity_tokens": monthly_cap,
+                          "capacity_basis": "ledger",
+                          "capacity_upper_tokens": None,
+                          "cfg_monthly_capacity_tokens": monthly_cap,
+                          "off_router_tokens_est": off_router}
+    else:
+        monthly_fields = {"monthly_capacity_tokens": None,
+                          "capacity_basis": None,
+                          "capacity_upper_tokens": None,
+                          "cfg_monthly_capacity_tokens": None,
+                          "off_router_tokens_est": off_router}
     return {"window": q.label, "role": q.role, "period": q.period, "allowance": allowance,
             "basis": "configured", "consumed": allowance * frac, "consumed_frac": frac,
             "pace_line": allowance * 0.5, "ahead_by": ahead, "allowed_rate": 100.0,
@@ -46,7 +85,8 @@ def _window(q, frac, allowance, ahead):
             "pct_used": frac * 100, "limit": allowance, "kind": q.kind,
             "used_tokens": allowance * frac, "used_cost": 0.0,
             "reset_at": reset_at, "reset_human": _fmt_reset(reset_at),
-            "last_exhausted_at": None}
+            "last_exhausted_at": None,
+            **monthly_fields}
 
 
 def fixture(reg):
@@ -129,15 +169,33 @@ def fixture(reg):
 
     rows = []
     for plan in reg.plans.values():
-        ws = [_window(q, 0.95 if q.role == "constraint" else 0.30,
-                      2e6 if q.role == "constraint" else 4e7,
-                      8e5 if q.role == "constraint" else -4e6) for q in plan.quotas]
+        # Issue #218: pick one constraint window with a positive
+        # off-router estimate so the preview exercises the
+        # "off-router ≈ X tok" line under its bar (the only line
+        # the template renders for a positive estimate). Other
+        # windows stay None so the regression bar (no line) is
+        # visible too.
+        ws = []
+        for q in plan.quotas:
+            off_router = 1.2e9 if (q.role == "constraint"
+                                    and plan.is_subscription) else None
+            ws.append(_window(q,
+                              0.95 if q.role == "constraint" else 0.30,
+                              2e6 if q.role == "constraint" else 4e7,
+                              8e5 if q.role == "constraint" else -4e6,
+                              off_router=off_router))
         tgt = next((w for w in ws if w["role"] == "target"), ws[0])
         binding = max(ws, key=lambda w: w["pct_used"])
+        projection = _project_plan_for_preview(ws)
         rows.append({
             "plan": plan,
             "headroom": {**tgt, "windows": ws, "binding": binding,
-                         "binding_is_target": binding is tgt},
+                         "binding_is_target": binding is tgt,
+                         # Plan-level projection (issue #218): mirror what
+                         # headroom() now writes so the preview exercises the
+                         # template's "tok/mo" caption path. Use the
+                         # argmin window's fields verbatim.
+                         "projection": projection},
             "reset_human": "in 22h",
             "in_flight": 1,
             "cooled": False, "cooldown_remaining": 0, "cooldown_reason": "",
@@ -159,27 +217,7 @@ def fixture(reg):
                       "remaining_seconds": 8e4, "consumed_frac": 0.3,
                       "projected_end_frac": 0.7} if plan.is_subscription else None),
             "windows": windows_remaining(plan.quota.period, plan.expires),
-            "models": [{
-                "key": m.key, "ref": m.ref, "label": m.display,
-                "provider_model": m.model, "enabled": m.enabled,
-                "cap": plan.cap_for(m), "narrowed": m.max_parallel is not None,
-                "context_window": m.context_window,
-                "lanes": reg.lanes_using(m),
-                # Economics live at model level: a subscription allocates its fee
-                # pro-rata by token share; metered plans show their own spend.
-                "burn": {"cost_per_hour": 0.42 if m.enabled else 0.0,
-                         "tokens_per_hour": 5e5 if m.enabled else 0.0},
-                "month_tokens": 1.23e7 if m.enabled else 0.0,
-                "month_cost": 8.10 if m.enabled else 0.0,
-                "n_sessions": 150 if m.enabled else 0,
-                "eff_cost": 0.66 if m.enabled and plan.monthly_cost else None,
-                # Mirror the live shape: $/session populated on enabled rows,
-                # None where the threshold or fee would gate it. The preview
-                # template uses m.get('eff_cost_session') so an absent key also
-                # renders cleanly.
-                "eff_cost_session": 0.73 if m.enabled and plan.monthly_cost
-                                    else None,
-            } for m in plan.models.values()],
+            "models": _preview_models(plan, reg, projection),
             "cli_backed": plan.is_cli_backed,
             "probe": None,
         })
@@ -316,6 +354,156 @@ def _build_preview_groups(reg, lane_key, rows_by_ref):
     return out
 
 
+def _preview_models(plan, reg, projection):
+    """Issue #218: model rows carry Effective $/Mtok with provenance.
+
+    Builds the model rows through the canonical helper
+    `model_effective_cost_fields` with the same `projected` the live
+    portal threads into `collect_plans`. The fixture's burn / month
+    figures are picked so the rows are populated and the rendered
+    template exercises every glyph (vendor / ≤ / yard):
+
+      - `claude-max` subscription: `basis="vendor"` (cap = cfg × wpm,
+        no inferred ceiling) so the row renders the "vendor" tag.
+      - `minimax` subscription: `basis="bounded"` with a synthetic
+        `upper_tokens` so the row renders the ≤ prefix AND a range.
+      - metered plans: `basis="ledger"` so the row renders the
+        "yard" tag.
+    """
+    from switchyard.portal.app import _model_eff_fields
+    # Build a tier-mixed projection per plan so the preview shows
+    # every glyph. claude-max is vendor (exact allowance), minimax
+    # is bounded (cfg + inferred upper), everything else stays
+    # ledger (local fallback).
+    projected_for_plan = dict(projection)
+    if "claude-max" in plan.key:
+        projected_for_plan = {
+            "capacity_tokens": 40_000_000, "basis": "vendor",
+            "upper_tokens": None, "cfg_capacity_tokens": 40_000_000,
+            "window": "weekly",
+        }
+    elif "minimax" in plan.key:
+        projected_for_plan = {
+            "capacity_tokens": 40_000_000, "basis": "bounded",
+            "upper_tokens": 25_000_000, "cfg_capacity_tokens": 40_000_000,
+            "window": "weekly",
+        }
+
+    out = []
+    for m in plan.models.values():
+        eff_kwargs = {"plan": plan,
+                      "model_tokens": 1.23e7 if m.enabled else 0.0,
+                      "model_cost": 8.10 if m.enabled else 0.0,
+                      "plan_tokens": 4e7,
+                      "projected": projected_for_plan}
+        if m.enabled and plan.monthly_cost:
+            eff_fields = _model_eff_fields(**eff_kwargs)
+            eff_cost = eff_fields["eff_cost"]
+            eff_basis = eff_fields["eff_cost_basis"]
+            eff_upper = eff_fields["eff_cost_upper"]
+        elif m.enabled and plan.metered:
+            # Metered: keep the historical shape (metered_cost / month_tokens)
+            # and basis "ledger" — never reaches a vendor/bounded projection.
+            eff_cost = round(8.10 / (1.23e7 / 1_000_000), 4)
+            eff_basis = "ledger"
+            eff_upper = None
+        else:
+            eff_cost = None
+            eff_basis = None
+            eff_upper = None
+        out.append({
+            "key": m.key, "ref": m.ref, "label": m.display,
+            "provider_model": m.model, "enabled": m.enabled,
+            "cap": plan.cap_for(m), "narrowed": m.max_parallel is not None,
+            "context_window": m.context_window,
+            "lanes": reg.lanes_using(m),
+            # Economics live at model level: a subscription allocates its fee
+            # pro-rata by token share; metered plans show their own spend.
+            "burn": {"cost_per_hour": 0.42 if m.enabled else 0.0,
+                     "tokens_per_hour": 5e5 if m.enabled else 0.0},
+            "month_tokens": 1.23e7 if m.enabled else 0.0,
+            "month_cost": 8.10 if m.enabled else 0.0,
+            "n_sessions": 150 if m.enabled else 0,
+            "eff_cost": eff_cost,
+            # Issue #218: provenance basis / upper for the Effective cell
+            # glyph (vendor / ≤ / yard) and tier-2 range rendering.
+            "eff_cost_basis": eff_basis,
+            "eff_cost_upper": eff_upper,
+            # Mirror the live shape: $/session populated on enabled rows,
+            # None where the threshold or fee would gate it. The preview
+            # template uses m.get('eff_cost_session') so an absent key also
+            # renders cleanly.
+            "eff_cost_session": 0.73 if m.enabled and plan.monthly_cost
+                                else None,
+        })
+    return out
+
+
+def _assert_effective_renders(html: str, rows: list[dict]) -> None:
+    """Issue #218 regression bar for the Effective cell + off-router line.
+
+    Asserts every visual contract the spec calls out: stable across the
+    month, tier glyphs render, off-router line renders when positive.
+    Raises AssertionError with a focused message on any miss so the
+    preview script (which `scripts/test.sh` invokes) goes non-zero.
+    """
+    # Tier glyphs in the rendered HTML.
+    if 'class="muted" style="font-size:11px" title="vendor-reported allowance">vendor' not in html:
+        raise AssertionError(
+            "Effective cell: vendor glyph missing — _plans.html did not "
+            "render the tier-1 tag for the claude-max fixture row")
+    if 'title="allowance inferred from % deltas; off-router usage can only make the true rate lower"' not in html:
+        raise AssertionError(
+            "Effective cell: bounded ≤ tooltip missing — _plans.html did "
+            "not render the tier-2 tag for the minimax fixture row")
+    if 'title="assumes all traffic went through SwitchYard">yard' not in html:
+        raise AssertionError(
+            "Effective cell: ledger yard tag missing — _plans.html did "
+            "not render the tier-3 tag for metered fixture rows")
+    # Range: the minimax row's eff_cost is $0.50 with eff_cost_upper=$0.80.
+    # Template renders the range as `$low–≤$high/Mtok` so the upper
+    # bound always reads as the high end (regardless of which side is
+    # numerically larger -- see the tier-2-with-A_inf>A_cfg case in
+    # tests/test_usage.py for the regression bar). The dash and the
+    # ≤ sit on either side of an HTML <span> wrapper, so the
+    # substring check skips the markup.
+    if "–</span>≤$" not in html:
+        raise AssertionError(
+            "Effective cell: tier-2 range separator (–≤$) missing — "
+            "eff_cost_upper did not render the high end of the range")
+    # Off-router line on a window with a positive estimate.
+    if "off-router ≈" not in html:
+        raise AssertionError(
+            "Quota cell: off-router line missing — _plans.html did not "
+            "render the first-class line under the affected window bar")
+    # Stable across the month: compute fields at two burn levels for the
+    # same projection and confirm they match. This is the regression bar
+    # for issue #218 itself (fee/tokens_so_far would differ between
+    # day 3 and day 30, the projected fee/cap does not).
+    from switchyard.usage import effective_cost_fields
+    from switchyard import models as _models
+    reg = _models.load()
+    some_plan = next((p for p in reg.plans.values() if p.monthly_cost and p.is_subscription), None)
+    if some_plan is not None:
+        proj = {"capacity_tokens": 40_000_000, "basis": "vendor",
+                "upper_tokens": None, "cfg_capacity_tokens": 40_000_000}
+        early = effective_cost_fields(some_plan, 5_000_000, 0.0, projected=proj)
+        late = effective_cost_fields(some_plan, 60_000_000, 0.0, projected=proj)
+        if early["rate"] != late["rate"]:
+            raise AssertionError(
+                f"Effective $/Mtok drifted across the month: {early['rate']} "
+                f"(5M burned) vs {late['rate']} (60M burned) — projection "
+                f"is not independent of burn, the issue's regression bar")
+    # Each model row in the fixture carries the new keys (eff_cost_basis,
+    # eff_cost_upper) — assertion: at least one row has a non-None basis.
+    has_basis = any(any(m.get("eff_cost_basis") for m in r["models"])
+                    for r in rows)
+    if not has_basis:
+        raise AssertionError(
+            "Fixture: no model row carries an eff_cost_basis — the new "
+            "field threading through collect_plans did not land")
+
+
 def _leaf_refs(group):
     """Local copy of `Group` leaf walking -- avoids the portal.groups import
     chain which requires a live Redis for the rotation-pointer reads."""
@@ -374,6 +562,12 @@ def main() -> int:
           f"{len(capacity['lanes'])} lanes, "
           f"{sum(len(r['headroom']['windows']) for r in rows)} quota windows, "
           f"{len(ctx['probes'])} probes")
+    # Issue #218 regression bar: the Effective cell + off-router line
+    # must render against this fixture. Assertions live here so the
+    # preview script (which `scripts/test.sh` invokes) goes non-zero on
+    # a layout or template regression. Rendered-then-asserted catches
+    # every Jinja error before the operator sees a stale preview.
+    _assert_effective_renders(html, rows)
     # A flat config renders zero group headers (regression bar); a
     # group-bearing config must show at least one. Print the relevant
     # excerpt so the operator can eyeball the layout without opening the

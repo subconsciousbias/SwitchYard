@@ -30,7 +30,7 @@ from ..usage import (
     drain_risk,
     family_partitioned_order,
     headroom,
-    model_effective_cost_per_mtok,
+    model_effective_cost_fields,
     model_effective_cost_per_session,
     perishable_score,
     reported_is_current,
@@ -772,6 +772,27 @@ async def collect_capacity() -> dict:
     }
 
 
+def _model_eff_fields(plan, model_tokens: float, model_cost: float,
+                      plan_tokens: float, projected: dict) -> dict:
+    """Project Effective $/Mtok fields for one model row.
+
+    Wraps `model_effective_cost_fields` once per row so the call site is
+    a single splat into the model row dict, avoiding three independent
+    calls that could in principle drift if the helper's behaviour ever
+    changes mid-render. Returns `{"eff_cost", "eff_cost_basis",
+    "eff_cost_upper"}` ready to splat into the model row.
+
+    `plan` is typed loosely here (Plan import is already present in this
+    module via `from .. import models`); annotating as `Plan` would
+    require re-importing the dataclass and ruff flags the unused name.
+    """
+    f = model_effective_cost_fields(
+        plan, model_tokens, model_cost, plan_tokens, projected=projected)
+    return {"eff_cost": f["rate"],
+            "eff_cost_basis": f["basis"],
+            "eff_cost_upper": f["upper"]}
+
+
 async def collect_plans() -> list[dict]:
     """One row per PLAN, because quota, cost and connection limits are the
     plan's. Each row lists the models it serves, which is what lanes name."""
@@ -804,6 +825,15 @@ async def collect_plans() -> list[dict]:
         model_overview = await ledger.model_overview(
             plan.key, model_refs, month
         ) if model_refs else {}
+        # Issue #218: thread the plan-level projection (computed by
+        # `headroom()["projection"]`) into per-model Effective $/Mtok so
+        # a subscription's rate is the projected fee/cap, not the
+        # historical fee/burned. The portal parity rule in
+        # switchyard/portal/CLAUDE.md requires the math to live in
+        # switchyard/usage.py -- `model_effective_cost_fields` is the
+        # canonical helper; we just thread its output onto the model
+        # rows here.
+        projected = (hr.get("projection") or {})
         # Distinct sessions this month for the plan as a whole (the UNION of
         # per-model HLLs, not the sum). The subscription rate
         # `monthly_cost / plan_sessions` is sensitive to this denominator --
@@ -842,11 +872,21 @@ async def collect_plans() -> list[dict]:
                 "month_tokens": overview.get("month_tokens", 0.0),
                 "month_cost": overview.get("month_cost", 0.0),
                 "n_sessions": overview.get("n_sessions", 0),
-                "eff_cost": model_effective_cost_per_mtok(
+                # Issue #218: subscription rows project the Effective
+                # $/Mtok from the plan-level binding window capacity
+                # instead of the historical fee/burned shape. One call
+                # per model keeps the per-row dict flat; the board
+                # picks its glyph off `eff_cost_basis` and renders a
+                # range when `eff_cost_upper` is set (tier 2 bounded).
+                # The portal parity rule in switchyard/portal/CLAUDE.md
+                # says the math has one home in `switchyard/usage.py`,
+                # so we only thread the canonical helper's output.
+                **_model_eff_fields(
                     plan,
                     overview.get("month_tokens", 0.0),
                     overview.get("month_cost", 0.0),
                     month_tokens,
+                    projected,
                 ),
                 "eff_cost_session": (
                     model_effective_cost_per_session(
@@ -974,6 +1014,13 @@ async def api_state() -> dict:
                         "month_tokens": m.get("month_tokens"),
                         "month_cost": m.get("month_cost"),
                         "effective_cost_per_mtok": m.get("eff_cost"),
+                        # Issue #218: surface the projection provenance
+                        # structurally so CLI consumers read fields, not
+                        # glyphs. `eff_cost_upper` is set only for tier-2
+                        # bounded projections; otherwise it's a None
+                        # #218 ship-it signal.
+                        "eff_cost_basis": m.get("eff_cost_basis"),
+                        "eff_cost_upper": m.get("eff_cost_upper"),
                     }
                     for m in r["models"] if m["enabled"]
                 ],

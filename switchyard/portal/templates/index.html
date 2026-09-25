@@ -56,6 +56,16 @@
 {% endif %}
 
 <h2>Subscriptions — quota, burn, and what they actually cost</h2>
+{# Issue #218: provenance glyphs on the Effective $/Mtok cell. Each row's
+   basis string maps to one of these three tags so the operator reads the
+   tier at a glance rather than opening tooltips. The glyphs sit in the
+   plans panel — keeping them in a single legend is what the existing
+   "binds first" pattern already does for the quota bars. #}
+<div class="legend" style="margin:-4px 0 10px">
+  <span class="k"><span class="muted" style="font-size:11px">vendor</span>vendor-reported allowance</span>
+  <span class="k"><span class="muted" style="font-size:11px">≤</span>inferred ceiling (off-router can only lower it)</span>
+  <span class="k"><span class="muted" style="font-size:11px">yard</span>assumes all traffic went through SwitchYard</span>
+</div>
 {% include "_plans.html" %}
 
 <footer>

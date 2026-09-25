@@ -440,6 +440,19 @@ opening eight vendor dashboards.
   subscriptions: the plan's fee ÷ tokens delivered (the token-share
   allocation cancels out, so every model on the plan shows the plan's rate
   once the plan crosses 1M). An em-dash means that threshold is not met yet.
+- **Projected monthly capacity** — under the per-window bars, the smallest
+  token cap a window implies for the 30-day month, with its basis. Three
+  tiers, in priority order: **vendor** (the provider gave an absolute
+  limit / remaining count, so the figure is exact), **bounded** (only a
+  percentage is current, but the prev same-window reading was carried
+  forward by the prober; the inferred allowance is an upper bound — some
+  traffic may have run off the router), and **ledger** (configured or
+  observed allowance, scaled to a month). Dollar-kind and unlimited
+  windows contribute no token projection. A `≤` prefix marks a tier-2
+  ceiling so the operator sees the figure is a lower bound, not the
+  configured allowance. The board renders this as one short caption per
+  plan row so you can spot a window whose cap is unrealistically small
+  without opening eight vendor dashboards.
 
 `GET /api/state` returns all of it as JSON for your own client. Burn rate,
 monthly tokens/cost, and effective $/Mtok live on each entry of `models[]`

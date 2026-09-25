@@ -442,8 +442,24 @@ class Prober:
                 else:
                     # Percent-only: there is no count to reconcile against our
                     # own tally, so store the percentage the provider states.
+                    # Thread the window's current token tally (`yard_tokens`)
+                    # so the NEXT percent-only reading can derive an upper-
+                    # bound allowance from the prev/new pair. Without this
+                    # yard tally, two successive percent readings still
+                    # project nothing: percentage alone is not a token
+                    # figure. `window_usage` is the SAME bucket the next
+                    # `window_headroom` call will read, so the carry is
+                    # consistent with the consumer's own comparison point.
+                    quota_for_window = next(
+                        (q for q in plan.quotas if q.label == r.window), None)
+                    yard_tokens = None
+                    if quota_for_window is not None:
+                        used = await self.ledger.window_usage(plan, quota_for_window)
+                        yard_tokens = (used.get("prompt_tokens", 0.0)
+                                       + used.get("completion_tokens", 0.0))
                     await self.ledger.note_reported_percent(
-                        plan.key, r.used_percent, r.reset_at, window=r.window)
+                        plan.key, r.used_percent, r.reset_at,
+                        window=r.window, yard_tokens=yard_tokens)
 
         primary = next((r for r in found if r.window == target), found[0])
 

@@ -1102,6 +1102,153 @@ def test_capture_strips_legacy_set_cookie_attributes():
     print(f"  legacy attrs stripped -> {cred.get('cookie')!r}")
 
 
+# ---------------------------------------------------------------------------
+# Tests: yard_tokens threading for percent-only readings
+# ---------------------------------------------------------------------------
+#
+# `note_reported_percent` is called with `yard_tokens` -- the window's
+# current token tally from `ledger.window_usage` -- so the NEXT percent
+# reading can derive an upper-bound allowance from the (prev, current)
+# pair. The prober threads this from the matching Quota in `plan.quotas`
+# (the Quota whose label matches the window name). Without that thread,
+# successive percent readings project nothing: percentage alone is not
+# a token figure.
+# ---------------------------------------------------------------------------
+
+
+def test_probe_threads_yard_tokens_into_percent_window():
+    """A percent-only reading threads the window's current token tally
+    onto `reported_at_yard_tokens` so the next reading has a comparison
+    point. The probe picks the Quota whose label matches `r.window` and
+    reads its `window_usage`; for a plan whose hash already has tokens
+    recorded, the yard figure rides the same `sy:qwin:{plan}:{window}`
+    hash as the percentage.
+    """
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+    from switchyard.usage import K_WINDOW
+
+    payload = {"model_remains": [{
+        "model_name": "general",
+        "current_interval_used_percent": "37.5%",
+        "current_weekly_used_percent": "12%",
+    }]}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/weekly_pct"
+
+    async def go():
+        redis = FakeRedis()
+        ledger = Ledger(redis)
+        prober = Prober(redis, ledger)
+        plan = models.load().plans["minimax-ultra"]
+        plan = replace(plan, probe=replace(plan.probe, url=url))
+        await prober.set_cookie(plan.key, "session=x")
+
+        # Seed the weekly period bucket with prompt + completion tokens.
+        # The percent-only branch then threads this yard onto the
+        # reported_at_yard_tokens field alongside the new pct reading.
+        period_key = K_WINDOW.format(plan=plan.key, window="weekly")
+        # window_facts reads the same hash; the percent call lands in
+        # the same hash. We pre-seed with a non-zero cost figure and
+        # zero tokens to confirm the prober pulls tokens (not cost).
+        redis.hashes[period_key] = {}
+        # The window_usage helper reads from K_PERIOD.{plan}.{period_key},
+        # not from K_WINDOW; seed both for the live path's helper.
+        from switchyard.usage import K_PERIOD, period_key as _period_key_fn
+        # Find the weekly quota to get its period-derived bucket key.
+        weekly_quota = next(q for q in plan.quotas if q.label == "weekly")
+        bucket_key = K_PERIOD.format(plan=plan.key,
+                                      period=_period_key_fn(weekly_quota.period))
+        redis.hashes[bucket_key] = {"prompt_tokens": "1234.0",
+                                     "completion_tokens": "567.0",
+                                     "cost": "9.99"}
+        result = await prober.run(plan)
+        facts = await ledger.window_facts(plan.key, "weekly")
+        return result, facts
+
+    result, facts = asyncio.run(go())
+    srv.shutdown()
+
+    assert result.ok, result
+    # Yard figure landed alongside the percent reading: tokens only,
+    # not cost. 1234 + 567 = 1801.
+    assert facts["reported_at_yard_tokens"] == 1801.0, facts
+    assert facts["reported_pct_used"] == 12.0, facts
+    print(f"  pct reading threads yard={facts['reported_at_yard_tokens']:.0f} "
+          f"tokens alongside pct={facts['reported_pct_used']:.0f}%")
+
+
+def test_probe_percent_reading_for_window_without_matching_quota_is_graceful():
+    """A percent-only reading whose window label does not match any Quota
+    in `plan.quotas` still lands; the yard_tokens default to None, the
+    carry is skipped on the next call. This is the contract for a probe
+    that publishes a window name the plan doesn't know about -- the
+    reading is preserved, but the inference path is inert.
+    """
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+
+    # A 'mystery' window the plan has no quota for.
+    payload = {"mystery_window": {"used_percent": "50.0"}}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/mystery"
+
+    async def go():
+        redis = FakeRedis()
+        ledger = Ledger(redis)
+        prober = Prober(redis, ledger)
+        plan = models.load().plans["minimax-ultra"]
+        # Custom windows: a single 'mystery' window reading.
+        probe = replace(plan.probe, url=url,
+                        windows={"mystery": {"used_percent": ["mystery_window.used_percent"]}},
+                        fields={})
+        plan = replace(plan, probe=probe)
+        await prober.set_cookie(plan.key, "session=x")
+        result = await prober.run(plan)
+        return result, await ledger.window_facts(plan.key, "mystery")
+
+    result, facts = asyncio.run(go())
+    srv.shutdown()
+
+    assert result.ok, result
+    assert facts["reported_pct_used"] == 50.0, facts
+    # No matching quota -> no yard_tokens stamped.
+    assert "reported_at_yard_tokens" not in facts, facts
+    print("  unknown window -> pct recorded, yard_tokens absent")
+
+
 if __name__ == "__main__":
     import _runner
     raise SystemExit(_runner.run(globals()))

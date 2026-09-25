@@ -17,6 +17,49 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
+# 30-day month. Used as the canonical denominator for projecting a window's
+# current rate onto a monthly figure: a window_per_month of 30 means the
+# pattern is one full window per month, so multiplying a window's allowance
+# or rate by 30 gives its monthly equivalent. This is a constant because the
+# board / picker math must agree on it, not a knob operators tune.
+DAYS_PER_MONTH = 30
+
+
+def windows_per_month(period: str | None) -> float:
+    """How many windows of `period` fit in one 30-day month.
+
+    Used by the projection logic in `window_headroom` to scale a window's
+    current allowance / rate up to a monthly capacity: e.g. a 5-hour rolling
+    window runs 144 times per 30-day month (30 days * 24 hours / 5 hours
+    per window = 144 windows), so the monthly capacity implied by a 5-hour
+    window is 144x the per-window figure.
+
+    Mapping, all keyed off the 30-day-month constant:
+
+      - None (no period / open-ended): 1.0 — there is no recurring window, so
+        treat the current allowance as already monthly.
+      - "month": 1.0 — the window IS the month.
+      - "week": 30/7 ≈ 4.2857 — a weekly window runs ~4.29 times per
+        30-day month (52.18 weeks per year / 12 months per year × 30/30 = 4.29).
+      - "rolling_5h": 30 * 24 / 5 = 144.0 — a rolling-5h bucket completes
+        exactly 4.8 cycles per day, 144 per month.
+      - "day": 30.0 — one window per day, 30 days per month.
+
+    Anything else falls back to 1.0: a window with an unrecognised period
+    can't be projected, so we don't pretend to know it; the projection
+    then degrades gracefully (cap stays at A_true × 1 = A_true).
+    """
+    if period in (None, "month"):
+        return 1.0
+    if period == "week":
+        return DAYS_PER_MONTH / 7
+    if period == "rolling_5h":
+        return DAYS_PER_MONTH * 24 / 5
+    if period == "day":
+        return float(DAYS_PER_MONTH)
+    return 1.0
+
+
 ROLL_5H = 5 * 3600
 
 

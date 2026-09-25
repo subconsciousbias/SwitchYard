@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from redis.asyncio import Redis
 
 from .models import Plan, Quota
-from .periods import expiry_moment, period_bounds
+from .periods import expiry_moment, period_bounds, windows_per_month
 
 
 def _now() -> datetime:
@@ -325,25 +325,134 @@ class Ledger:
 
     async def note_reported_percent(self, plan_key: str, used_percent: float | None,
                                     reset_at: float | None,
-                                    window: str | None = None) -> None:
+                                    window: str | None = None,
+                                    yard_tokens: float | None = None) -> None:
         """Record a percentage a provider stated, when it publishes no counts.
 
         MiniMax reports `current_weekly_used_percent` with every count set to -1,
         so there is nothing to reconcile against our own tally — the percentage
         IS the measurement. Kept in its own field so window_headroom can prefer
         it without ever mixing percent into a token or dollar total.
+
+        `yard_tokens` threads the window's current token tally (from
+        `ledger.window_usage`) onto the same hash so that the next
+        percentage-only reading can derive an upper-bound allowance from
+        the pair (prev_pct_used, prev_yard_tokens) -> (new_pct_used, new_yard_tokens).
+        Without this carry-forward, the only comparison point between
+        successive percent readings is the percentage itself, which is not
+        a token figure; the carry is what makes a vendor's percent reading
+        projectable into a token allowance.
+
+        Carry rules:
+          - Before overwriting the current `reported_pct_used`, the prior
+            value is moved to `prev_pct_used` and its companion
+            `prev_pct_yard_tokens` (read from `yard_tokens` of the prior
+            call, which now sits alongside it). The carry only fires when
+            the OLD `reset_at` matches the NEW one — a same-window
+            in-force read. A decrease in pct between two same-window
+            readings is treated as a window rollover and the carry is
+            dropped (the previous reading is no longer about this window).
         """
-        mapping = {}
+        # Read the existing hash BEFORE writing so we can detect a
+        # same-window carry and a rollover. The same key is used by the
+        # write below, so this is intentionally not pipelined — the order
+        # read-then-write has to be serialised against another probe
+        # landing on the same plan. The prober's `_poll_probes` loop
+        # debounces via `due()` so the read-then-write is usually safe,
+        # but `POST /admin/probes/{plan_key}/test` in
+        # `switchyard/portal/app.py` invokes `prober.run` directly with
+        # no `due()` gate, so a button click can interleave with the
+        # background poll on the same plan. The worst outcome is a
+        # skew `prev_pct_used` / `prev_pct_yard_tokens` pair — two
+        # callers each read the hash, both write a carry derived from
+        # the same snapshot, and the downstream inference projects
+        # arithmetic off a mismatched pair. The resulting tier-2 cap
+        # is advisory (the board labels it `≤`), not a fact, so the
+        # next poll replaces it within the probe interval — not worth
+        # WATCH/MULTI for an advisory figure.
+        key = (K_WINDOW.format(plan=plan_key, window=window) if window
+               else K_QUOTA.format(plan=plan_key))
+        prev_raw = await self.redis.hgetall(key) or {}
+
+        def _get(field: str) -> str | None:
+            v = prev_raw.get(field)
+            if v is None:
+                # Real Redis returns bytes keys + bytes values; the
+                # fake returns string keys + string values. Handle both
+                # so the carry works against either surface.
+                v = prev_raw.get(field.encode() if isinstance(field, str) else field)
+                if v is None:
+                    return None
+            if isinstance(v, bytes):
+                v = v.decode()
+            return v
+
+        prev_reset = _get("reset_at")
+        prev_pct = _get("reported_pct_used")
+        prev_yard = _get("reported_at_yard_tokens")
+
+        mapping: dict[str, str | float] = {}
         if used_percent is not None:
             mapping["reported_pct_used"] = max(0.0, min(100.0, float(used_percent)))
         if reset_at is not None:
             mapping["reset_at"] = reset_at
         if not mapping:
             return
+        # Carry the previous percent+yard pair forward ONLY when the old
+        # reset_at matches the new reset_at (same window in force) AND the
+        # new pct is >= the old one (a decrease is the window rolling
+        # over — the old pair is no longer about this window). Without
+        # this guard, a vendor's "fresh percent" written across a
+        # rollover would attach the previous window's token tally to
+        # the new window's percentage, projecting an allowance off the
+        # wrong bucket.
+        try:
+            prev_pct_f = float(prev_pct) if prev_pct is not None else None
+            prev_reset_f = float(prev_reset) if prev_reset is not None else None
+            new_reset_f = float(reset_at) if reset_at is not None else None
+            new_pct_f = float(used_percent) if used_percent is not None else None
+        except (TypeError, ValueError):
+            prev_pct_f = prev_reset_f = new_reset_f = new_pct_f = None
+        same_window = (
+            prev_reset_f is not None
+            and new_reset_f is not None
+            and prev_reset_f == new_reset_f
+        )
+        no_rollover = (
+            prev_pct_f is None
+            or new_pct_f is None
+            or new_pct_f >= prev_pct_f
+        )
+        prev_persisted = prev_pct is not None or prev_yard is not None
+        should_carry = (
+            same_window and no_rollover
+            and prev_pct is not None and prev_yard is not None
+        )
+        if should_carry:
+            mapping["prev_pct_used"] = prev_pct_f
+            mapping["prev_pct_yard_tokens"] = float(prev_yard)
+        if yard_tokens is not None:
+            # Stamp the new yard_tokens alongside the new pct so the NEXT
+            # carry can use it. The field is named to distinguish it from
+            # the prev_* fields; same-hash coexistence is intentional so
+            # window_facts continues to fetch everything in one round trip.
+            mapping["reported_at_yard_tokens"] = float(yard_tokens)
         mapping["reported_at"] = time.time()
-        key = (K_WINDOW.format(plan=plan_key, window=window) if window
-               else K_QUOTA.format(plan=plan_key))
         await self.redis.hset(key, mapping=mapping)
+        if not should_carry and prev_persisted:
+            # Carry is being skipped — either a window rollover (pct
+            # decreased) or a different window is in force (reset_at
+            # mismatch / missing). The stale pair would otherwise sit
+            # on the hash and survive into later readings, so a future
+            # `_infer_allowance_from_pair` call could project arithmetic
+            # across two unrelated windows (Δpct spanning the boundary,
+            # Δyard stretching across the rollover). Drop it via a
+            # follow-up HDEL — hset does not delete fields, and a single
+            # extra round trip per skipped carry keeps the carry logic
+            # local to this method. The next pct-only reading then
+            # degrades to tier 3 instead of surfacing a bogus tier-2
+            # ceiling.
+            await self.redis.hdel(key, "prev_pct_used", "prev_pct_yard_tokens")
 
     async def note_reported(self, plan_key: str, remaining: float | None,
                             reset_at: float | None, window: str | None = None,
@@ -763,17 +872,113 @@ async def headroom(ledger: Ledger, plan: Plan) -> dict:
     The target window (weekly, usually) is what pacing fills; a constraint
     window (the 5-hour burst) can still be the one that stops you first, so the
     board needs both.
+
+    Folds the per-window projection caps (added in `window_headroom`) into a
+    plan-level `hr["projection"]` dict:
+
+      - `capacity_tokens`: the smallest `monthly_capacity_tokens` across all
+        token-kind windows (the argmin -- the binding window's figure). When
+        no window yields a token capacity (all dollar / unlimited), this is
+        None.
+      - `basis`: the basis string of the argmin window. Argmin's basis is
+        provably correct: a vendor window binding below a tier-2 window's
+        lower-bound cap is exact, so the plan-level basis follows the
+        smallest cap.
+      - `upper_tokens`: the argmin window's `capacity_upper_tokens` (ceiling
+        for tier 2, None for tier 1 / 3). The board can render this as a
+        "≤ X" qualifier when the plan's own cap is a lower bound.
+      - `cfg_capacity_tokens`: the argmin window's `cfg_monthly_capacity_tokens`
+        -- the operator-typed plan figure if one exists.
+      - `window`: the label of the argmin window, so the board can point at
+        which window the projection came from.
+
+    The argmin is `min` on a single float key (the capacity). Ties go to
+    whichever window appears first in `plan.quotas`, which keeps the choice
+    deterministic when two windows produce the same number.
     """
     windows = [await window_headroom(ledger, plan, q) for q in plan.quotas]
     target = next((w for w in windows if w["role"] == "target"), windows[0])
     rated = [w for w in windows if w.get("pct_used") is not None]
     binding = max(rated, key=lambda w: w["pct_used"]) if rated else target
+    projection = _project_plan(windows)
     return {**target, "windows": windows, "binding": binding,
-            "binding_is_target": binding is target}
+            "binding_is_target": binding is target,
+            "projection": projection}
+
+
+def _project_plan(windows: list[dict]) -> dict:
+    """Fold the per-window projection caps into a plan-level dict.
+
+    Argmin of `monthly_capacity_tokens` across windows that produced one.
+    Returns `{"capacity_tokens": None, "basis": None, ...}` when no
+    window yields a token capacity (e.g. a plan whose every window is
+    dollar or unlimited).
+    """
+    candidates = [w for w in windows
+                  if w.get("monthly_capacity_tokens") is not None
+                  and w.get("monthly_capacity_tokens", 0) > 0]
+    if not candidates:
+        return {"capacity_tokens": None, "basis": None,
+                "upper_tokens": None, "cfg_capacity_tokens": None,
+                "window": None}
+    # Argmin: smallest cap wins. Ties keep the first window encountered
+    # in `plan.quotas` order (the order the caller built `windows` in),
+    # which is the operator-declared order -- consistent with the existing
+    # `target` window choice.
+    argmin = min(candidates, key=lambda w: w["monthly_capacity_tokens"])
+    return {"capacity_tokens": argmin["monthly_capacity_tokens"],
+            "basis": argmin.get("capacity_basis"),
+            "upper_tokens": argmin.get("capacity_upper_tokens"),
+            "cfg_capacity_tokens": argmin.get("cfg_monthly_capacity_tokens"),
+            "window": argmin.get("window")}
 
 
 async def window_headroom(ledger: Ledger, plan: Plan, q: Quota) -> dict:
-    """What the board shows in the 'quota left' column, for one window."""
+    """What the board shows in the 'quota left' column, for one window.
+
+    Returns the per-window dict (basis, pct_used, limit, consumed, ...) AND,
+    for `q.kind == "tokens"` windows, the projection fields used by
+    `headroom()` to fold per-window caps into a plan-level monthly
+    capacity: `monthly_capacity_tokens`, `capacity_basis`, `capacity_upper_tokens`,
+    `cfg_monthly_capacity_tokens`, `off_router_tokens_est`.
+
+    Projection tiers, in priority order:
+
+      Tier 1 (vendor): absolutes current via `reported_is_current`. The
+        provider gave us both remaining and a stated limit (or we can
+        reconstruct one from remaining + our tally), so the per-window
+        allowance is exact; cap = (limit or rem + consumed) × windows_per_month.
+        Upper bound is None — the vendor number is ground truth.
+
+      Tier 2 (bounded): pct current, no absolutes, but a previous
+        same-window reading was carried forward by `note_reported_percent`.
+        The pair (Δyard, Δpct) gives A_inf = Δyard × 100 / Δpct (the
+        implied allowance if NO usage ran off-router). A_inf ≤ A_true
+        always, because bypass ≥ 0; the derived rate is therefore an
+        UPPER bound, not the truth. When q.allowance (A_cfg) exists,
+        `monthly_capacity_tokens` stays A_cfg × windows_per_month (the
+        inference NEVER replaces A_cfg) and `capacity_upper_tokens`
+        carries the ceiling. Without A_cfg, `monthly_capacity_tokens`
+        itself becomes the inferred ceiling.
+
+      Tier 3 (ledger): no valid prev pair (only one reading on file, or a
+        rollover between the two). A = q.allowance else
+        observed_allowance_tokens; cap = A × windows_per_month; basis "ledger".
+
+    `off_router_tokens_est` is computed in tier 2 whenever A_cfg is
+    present and the prev pair is valid: it is the delta the inferred
+    allowance suggests was spent OUTSIDE SwitchYard between the two
+    readings (positive => some traffic bypassed us; negative => the
+    inferred rate actually beat A_cfg, which is impossible unless the
+    vendor's pct is rounding). A positive value adds "observed (where it
+    ran out last time)" phrasing to the window's basis string so the
+    board signals that off-router traffic is at play.
+
+    Dollar-kind and unlimited windows contribute NO token capacity: a
+    dollar allowance cannot be projected to tokens (vendor plans keep
+    the historical rate with its caveat). The projection fields are
+    present but None for those windows.
+    """
     used = await ledger.window_usage(plan, q)
     facts = await ledger.window_facts(plan.key, q.label)
     tokens = used["prompt_tokens"] + used["completion_tokens"]
@@ -786,7 +991,12 @@ async def window_headroom(ledger: Ledger, plan: Plan, q: Quota) -> dict:
 
     if q.kind == "unlimited":
         return {**meta, "kind": "unlimited", "pct_used": None, "basis": "local, unmetered",
-                "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
+                "used_tokens": tokens, "used_cost": used["cost"],
+                "monthly_capacity_tokens": None,
+                "capacity_basis": None, "capacity_upper_tokens": None,
+                "cfg_monthly_capacity_tokens": None,
+                "off_router_tokens_est": None,
+                **_reset(facts)}
 
     if q.kind == "dollars":
         consumed, limit, basis = used["cost"], q.allowance, "ledger ($ spent this period)"
@@ -796,19 +1006,14 @@ async def window_headroom(ledger: Ledger, plan: Plan, q: Quota) -> dict:
         consumed = tokens
         basis = "ledger (tokens this window)"
 
-    if (isinstance(facts.get("reported_pct_used"), float)
-            and reported_is_current(facts, q.period)):
-        # The provider gave a percentage and no counts. It is the best number
-        # available, so it wins outright — but there is no limit to report, and
-        # inventing one from our own tally would be a guess dressed as a fact.
-        # Gated on freshness: a stale reading (reset_at gone, reported_at from
-        # a previous period bucket) would lock the bar at 100% forever once the
-        # window rolls over and no probe updates it, which is the bug at #45.
-        return {**meta, "kind": q.kind, "pct_used": round(float(facts["reported_pct_used"]), 1),
-                "limit": None, "consumed": consumed,
-                "basis": "reported by provider (% only)",
-                "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
-
+    # Reordered: absolutes (reported_remaining / reported_limit) are checked
+    # BEFORE percent-only readings. Absolutes need NO token attribution from
+    # our own tally -- the provider gave us the numbers, so they are immune
+    # to the bypass-attribution problem that follows the percent-only path.
+    # Putting absolutes second (after pct-only) used to force every window
+    # with both kinds of data through the pct-only branch, which then had to
+    # re-derive a limit from `consumed / pct/100` -- a number that ignores
+    # everything spent outside SwitchYard.
     if (facts.get("reported_remaining") is not None
             and isinstance(facts.get("reported_remaining"), float)
             and reported_is_current(facts, q.period)):
@@ -820,19 +1025,261 @@ async def window_headroom(ledger: Ledger, plan: Plan, q: Quota) -> dict:
         # A stated limit beats reconstructing one from our own consumption.
         total = (float(facts["reported_limit"])
                  if isinstance(facts.get("reported_limit"), float) else rem + consumed)
-        return {**meta, "kind": q.kind, "pct_used": _pct(max(0.0, total - rem), total),
+        per_window = max(0.0, total - rem)
+        pct = _pct(per_window, total)
+        # Projection -- tier 1 (vendor) for tokens windows.
+        proj = _project_capacity(q, facts, used, tier=1,
+                                 vendor_total=total, pct_used=pct)
+        return {**meta, "kind": q.kind, "pct_used": pct,
                 "limit": total,
-                "consumed": max(0.0, total - rem), "basis": "reported by provider",
-                "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
+                "consumed": per_window, "basis": "reported by provider",
+                "used_tokens": tokens, "used_cost": used["cost"],
+                **proj, **_reset(facts)}
+
+    if (isinstance(facts.get("reported_pct_used"), float)
+            and reported_is_current(facts, q.period)):
+        # The provider gave a percentage and no counts. It is the best number
+        # available, so it wins outright -- but the limit is a derived figure,
+        # not a stated one. Gated on freshness: a stale reading (reset_at
+        # gone, reported_at from a previous period bucket) would lock the bar
+        # at 100% forever once the window rolls over and no probe updates it,
+        # which is the bug at #45.
+        pct = round(float(facts["reported_pct_used"]), 1)
+        # Projection -- tier 2 or 3 for tokens windows (no absolutes to use).
+        proj = _project_capacity(q, facts, used, tier=None,
+                                 vendor_total=None, pct_used=pct)
+        basis_str = "reported by provider (% only)"
+        # If tier 2 produced a positive off-router estimate, augment the
+        # basis with the lower-bound phrasing the spec calls for. Without
+        # this the board would not surface the bypass signal on the
+        # affected window. The wording is distinct from the unrelated
+        # tier-3 "observed (where it ran out last time)" path below --
+        # that one means the allowance came from observing the plan run
+        # out last cycle; this one means the inferred ceiling hints at
+        # off-router traffic so the figure is a lower bound on cost.
+        # Same honesty family, different mechanism.
+        if (q.kind == "tokens"
+                and proj.get("off_router_tokens_est") is not None
+                and proj["off_router_tokens_est"] > 0):
+            basis_str += " · lower bound (off-router inferred)"
+        return {**meta, "kind": q.kind, "pct_used": pct,
+                "limit": None, "consumed": consumed,
+                "basis": basis_str,
+                "used_tokens": tokens, "used_cost": used["cost"],
+                **proj, **_reset(facts)}
 
     if limit is None and isinstance(facts.get("observed_allowance_tokens"), float):
         obs = float(facts["observed_allowance_tokens"])
         if obs > 0:
             limit, basis = obs, "observed (where it ran out last time)"
 
+    # Tier 3 (ledger) for tokens windows; dollars/unknown contribute no
+    # token capacity. The fall-through path is also the one with no
+    # reported reading at all -- a window whose provider has never polled.
+    proj = _project_capacity(q, facts, used, tier=3,
+                             vendor_total=None, pct_used=None)
     return {**meta, "kind": q.kind, "pct_used": _pct(consumed, limit), "limit": limit,
             "consumed": consumed, "basis": basis,
-            "used_tokens": tokens, "used_cost": used["cost"], **_reset(facts)}
+            "used_tokens": tokens, "used_cost": used["cost"],
+            **proj, **_reset(facts)}
+
+
+def _project_capacity(q: Quota, facts: dict, used: dict,
+                      *, tier: int | None,
+                      vendor_total: float | None,
+                      pct_used: float | None) -> dict:
+    """Compute the projection fields for one window's quota row.
+
+    `tier` is the projection tier the caller picked based on which branch
+    it took in `window_headroom`: 1 (vendor / absolutes current), 2
+    (bounded / pct current with valid prev pair), 3 (ledger / no reading
+    or invalid prev pair), or None (the pct-only branch that needs to
+    decide tier 2 vs tier 3 based on the prev pair).
+
+    Returns a dict that can be splat-merged into the window row:
+
+      - `monthly_capacity_tokens`: the cap folded up to a 30-day month.
+        For tier 1 it is the vendor limit × windows_per_month(q.period).
+        For tier 2 it is A_cfg × windows_per_month when q.allowance is
+        set, else the inferred A_inf × windows_per_month. For tier 3
+        it is A × windows_per_month with A = q.allowance else
+        observed_allowance_tokens.
+      - `capacity_basis`: "vendor" | "bounded" | "ledger" -- the source
+        the cap is drawn from. Tier 2 with no A_cfg degrades to "ledger"
+        and the inferred A_inf becomes the monthly capacity (so the
+        board can still show a number); tier 3 is always "ledger".
+      - `capacity_upper_tokens`: the ceiling for tier 2 (A_inf × wpm),
+        None for tier 1 (no upper bound -- vendor is exact), None for
+        tier 3.
+      - `cfg_monthly_capacity_tokens`: A_cfg × windows_per_month when
+        A_cfg is set, None otherwise. This is the *plan's own* monthly
+        cap, kept distinct from the inferred/observed one.
+      - `off_router_tokens_est`: A_cfg × Δpct/100 − Δyard when tier 2
+        and A_cfg is set; None otherwise. Positive => some traffic
+        bypassed SwitchYard in the (prev, current) window.
+
+    Dollar-kind and unlimited windows get all-None fields (no token
+    projection possible): a dollar allowance cannot be converted to
+    tokens, and the Go plans keep the historical rate with its caveat.
+    """
+    wpm = windows_per_month(q.period)
+    none_proj = {"monthly_capacity_tokens": None,
+                 "capacity_basis": None, "capacity_upper_tokens": None,
+                 "cfg_monthly_capacity_tokens": None,
+                 "off_router_tokens_est": None}
+    if q.kind != "tokens":
+        return none_proj
+    a_cfg = q.allowance if isinstance(q.allowance, (int, float)) else None
+    cfg_monthly = (a_cfg * wpm) if a_cfg is not None and a_cfg > 0 else None
+
+    if tier == 1:
+        # Vendor absolutes: the provider's own total is the per-window
+        # allowance, no inference involved. Cap = vendor_total × wpm.
+        # Upper bound is None because the vendor number is exact.
+        if vendor_total is None or vendor_total <= 0:
+            # No stated limit and no fallback -> degrade to tier 3.
+            return _project_tier3(q, facts, wpm, a_cfg, cfg_monthly)
+        return {"monthly_capacity_tokens": vendor_total * wpm,
+                "capacity_basis": "vendor",
+                "capacity_upper_tokens": None,
+                "cfg_monthly_capacity_tokens": cfg_monthly,
+                "off_router_tokens_est": None}
+
+    # tier is None (pct-only branch) or tier == 2 explicitly: same math.
+    if tier is None or tier == 2:
+        inferred = _infer_allowance_from_pair(facts, used)
+        if inferred is None:
+            return _project_tier3(q, facts, wpm, a_cfg, cfg_monthly)
+        a_inf, delta_pct, delta_yard = inferred
+        cap_upper = a_inf * wpm
+        # off_router_tokens_est = A_cfg × Δpct/100 − Δyard when A_cfg
+        # exists and the prev pair is valid. Positive => some traffic
+        # bypassed SwitchYard between the two probes (the cfg allowance
+        # saw more spend than our own ledger). Negative => SwitchYard
+        # saw more spend than the cfg allowance predicts (rounding, or
+        # the cfg figure is too low). The board only surfaces the
+        # lower-bound phrasing when this is strictly positive.
+        off_router = None
+        if a_cfg is not None and a_cfg > 0 and delta_pct > 0:
+            off_router = a_cfg * (delta_pct / 100.0) - delta_yard
+        if a_cfg is not None and a_cfg > 0:
+            # Inference NEVER replaces A_cfg -- the cfg figure is what
+            # the operator typed, and a too-small upper bound would only
+            # tell them to lower plans.yaml. Surface the ceiling alongside.
+            return {"monthly_capacity_tokens": cfg_monthly,
+                    "capacity_basis": "bounded",
+                    "capacity_upper_tokens": cap_upper,
+                    "cfg_monthly_capacity_tokens": cfg_monthly,
+                    "off_router_tokens_est": off_router}
+        # No A_cfg: the inferred ceiling IS the monthly capacity. Mark
+        # it "bounded" (not "ledger") so the board shows that an
+        # inference produced it, not the fallback.
+        return {"monthly_capacity_tokens": cap_upper,
+                "capacity_basis": "bounded",
+                "capacity_upper_tokens": cap_upper,
+                "cfg_monthly_capacity_tokens": None,
+                "off_router_tokens_est": off_router}
+
+    # tier == 3 (or unknown -> treat as 3): ledger basis.
+    return _project_tier3(q, facts, wpm, a_cfg, cfg_monthly)
+
+
+def _project_tier3(q: Quota, facts: dict, wpm: float,
+                   a_cfg: float | None, cfg_monthly: float | None) -> dict:
+    """Tier 3: A = q.allowance else observed_allowance_tokens -> cap = A × wpm."""
+    a = a_cfg
+    if (a is None or a <= 0) and isinstance(
+            facts.get("observed_allowance_tokens"), float):
+        obs = float(facts["observed_allowance_tokens"])
+        if obs > 0:
+            a = obs
+    if a is None or a <= 0:
+        return {"monthly_capacity_tokens": None,
+                "capacity_basis": "ledger",
+                "capacity_upper_tokens": None,
+                "cfg_monthly_capacity_tokens": cfg_monthly,
+                "off_router_tokens_est": None}
+    return {"monthly_capacity_tokens": a * wpm,
+            "capacity_basis": "ledger",
+            "capacity_upper_tokens": None,
+            "cfg_monthly_capacity_tokens": cfg_monthly,
+            "off_router_tokens_est": None}
+
+
+def _infer_allowance_from_pair(facts: dict, used: dict
+                               ) -> tuple[float, float, float] | None:
+    """Infer A_inf from the (prev, current) (yard, pct) pair.
+
+    Reads `prev_pct_used`, `prev_pct_yard_tokens`, `reported_pct_used`,
+    and `reported_at_yard_tokens` from the window facts. Returns None
+    when the prev pair is missing or invalid (a single reading, a stale
+    prev, or a delta that would divide by zero).
+
+    Math: the prev snapshot says (Y0, P0); the current one says (Y1, P1).
+    The yard-tokens delta is Y1 - Y0, which is what SwitchYard saw pass
+    through between the two probes; the pct delta is P1 - P0, which is
+    what the vendor's percentage moved by. The implied per-window
+    allowance (assuming ALL traffic went through SwitchYard) is:
+
+        A_inf = (Y1 - Y0) * 100 / (P1 - P0)
+
+    The caller has A_cfg in scope (q.allowance) and computes the bypass
+    itself: bypass = A_cfg * (P1 - P0) / 100 - (Y1 - Y0). That form is
+    what the spec calls out -- the inference gives A_inf, the bypass
+    uses A_cfg as the reference. We surface (Δpct, Δyard) back so the
+    caller can reuse the same deltas without re-decoding `facts`.
+
+    `used` is the current window's `window_usage` dict; only its
+    `prompt_tokens` + `completion_tokens` is needed (Y1). If Y1 is
+    missing -- a window whose bucket TTL expired between the two probes
+    -- we fall back to `reported_at_yard_tokens` for Y1 (the figure
+    `note_reported_percent` stamps when the new reading lands), which
+    was taken at exactly the same instant.
+
+    Returns `(A_inf, delta_pct, delta_yard)` on success, None on any
+    failure path. The caller gates "observed (where it ran out last
+    time)" phrasing on a strictly positive `off_router_tokens_est`.
+    """
+    try:
+        prev_pct_f = float(facts.get("prev_pct_used"))
+        prev_yard_f = float(facts.get("prev_pct_yard_tokens"))
+        curr_pct_f = float(facts.get("reported_pct_used"))
+    except (TypeError, ValueError):
+        return None
+    # Prefer the stamp `note_reported_percent` wrote alongside the new
+    # reading, falling back to the live window_usage when that stamp is
+    # absent (a probe path that does not pass yard_tokens). The two
+    # should agree within rounding; we trust the stamp when present
+    # because it is a snapshot at the same instant as `reported_pct_used`.
+    curr_yard_raw = facts.get("reported_at_yard_tokens")
+    if curr_yard_raw is None:
+        curr_yard_f = (used.get("prompt_tokens", 0.0)
+                       + used.get("completion_tokens", 0.0))
+    else:
+        try:
+            curr_yard_f = float(curr_yard_raw)
+        except (TypeError, ValueError):
+            curr_yard_f = (used.get("prompt_tokens", 0.0)
+                           + used.get("completion_tokens", 0.0))
+    delta_pct = curr_pct_f - prev_pct_f
+    delta_yard = curr_yard_f - prev_yard_f
+    if delta_pct <= 0:
+        # Same-window pct delta must be positive: a non-positive means
+        # the readings are the same observation, the window rolled over
+        # between them (handled in the carry gate), or one of the pair
+        # is missing. We treat anything here as "no inference possible"
+        # -- the rollover case was already filtered by the carry rule
+        # in note_reported_percent.
+        return None
+    if delta_yard < 0:
+        # Negative yard delta means the bookkeeping rolled back between
+        # probes (a window-bucket TTL expired or a manual reset); not a
+        # basis for projection.
+        return None
+    a_inf = delta_yard * 100.0 / delta_pct
+    if a_inf <= 0 or a_inf != a_inf:  # NaN check via self-inequality
+        return None
+    return a_inf, delta_pct, delta_yard
 
 
 async def drain_risk(ledger: Ledger, plan: Plan,
@@ -903,16 +1350,116 @@ def _reset(facts: dict) -> dict:
 def effective_cost_per_mtok(plan: Plan, tokens_this_month: float, metered_cost: float) -> float | None:
     """The number that decides whether a subscription is worth renewing.
 
-    A $132 plan that delivered 40M tokens cost $3.30/Mtok; the same plan at
-    400M cost $0.33. Metered providers use actual spend. Returns None when
-    there is not enough traffic yet to mean anything.
+    Backwards-compatible wrapper for `effective_cost_fields(..., projected=None)`:
+    a metered plan keeps the historical rate (spend ÷ tokens so far); a
+    subscription without a projection also keeps the historical shape so the
+    existing tests stay meaningful. Issue #218: a subscription WITH a
+    projection now projects from the binding window instead. Use the
+    `_fields` variant for board rendering and `/api/state` — that is the
+    one that returns the tiered basis the board needs.
     """
+    return effective_cost_fields(plan, tokens_this_month, metered_cost,
+                                 projected=None)["rate"]
+
+
+def effective_cost_fields(
+    plan: Plan, tokens_this_month: float, metered_cost: float,
+    projected: dict | None = None,
+) -> dict:
+    """Effective $/Mtok with provenance — used by the board's Effective column
+    and `GET /api/state`.
+
+    Returns a dict `{"rate": float|None, "basis": str|None, "upper": float|None}`:
+
+      - `rate` — the figure to render, or None when nothing meaningful exists.
+      - `basis` — one of `"vendor"`, `"bounded"`, `"ledger"`. The board uses
+        this to pick the provenance glyph (vendor / ≤ / yard) and the
+        tooltip text. None when no figure was produced.
+      - `upper` — the inferred ceiling for `"bounded"` tiers, None otherwise.
+        When set, the board renders a range `$low–high/Mtok` instead of a
+        point estimate.
+
+    Tiers (subscription with `projected`):
+
+      - **vendor**: `projected["capacity_basis"] == "vendor"`. Cap came from
+        a vendor-stated absolute limit; rate = fee / (cap / 1e6) with NO
+        1M-token gate — the projection is independent of burn, which is
+        the whole point of the fix.
+      - **bounded**: `projected["capacity_basis"] == "bounded"` AND a
+        `cfg_capacity_tokens` exists. The cfg allowance wins as the rate
+        (the inference NEVER replaces A_cfg); `upper` carries the inferred
+        ceiling, so the board shows `$low–high/Mtok`.
+      - **bounded** (no A_cfg): the inferred ceiling IS the rate, marked
+        `"bounded"` so the board knows to prefix it with `≤`.
+      - **ledger**: `projected["capacity_basis"] == "ledger"`, or no
+        projection at all. The plan had no vendor reading and no inferred
+        allowance; we fall back to the historical `fee / tokens_so_far`
+        shape so the board still shows *something* (a fact-tinged
+        estimate).
+
+    Metered plans always take the historical branch (`fee / tokens`,
+    basis `"ledger"`, upper None), regardless of `projected` — the
+    metered economics are different and don't have a quota window to
+    project from.
+
+    Threshold rules:
+      - fee <= 0 -> rate 0.0 (the existing convention).
+      - capacity_tokens <= 0 or None -> fall back to historical if it has a
+        figure, else None (no projection possible).
+    """
+    if plan.metered:
+        # Metered plans keep the historical shape — no quota window to project from.
+        if tokens_this_month < 1_000_000:
+            return {"rate": None, "basis": None, "upper": None}
+        spend = plan.monthly_cost if plan.monthly_cost else metered_cost
+        if spend <= 0:
+            return {"rate": 0.0, "basis": "ledger", "upper": None}
+        return {"rate": round(spend / (tokens_this_month / 1_000_000), 4),
+                "basis": "ledger", "upper": None}
+
+    # Subscription plan.
+    fee = plan.monthly_cost or 0.0
+    if fee <= 0:
+        return {"rate": 0.0, "basis": None, "upper": None}
+
+    cap = (projected or {}).get("capacity_tokens")
+    cap_basis = (projected or {}).get("basis")
+    upper_cap = (projected or {}).get("upper_tokens")
+
+    if cap and cap > 0:
+        # Projection — independent of burn, no 1M-token gate.
+        rate = round(fee / (cap / 1_000_000), 4)
+        if cap_basis == "bounded":
+            # `upper` carries the inferred ceiling rate whenever a
+            # distinct ceiling exists; it represents "if the cfg
+            # allowance is wrong, the rate could be this high".
+            # `upper_cap < cap` is the common case (the inferred
+            # allowance is below the cfg figure), which produces a
+            # HIGHER rate from `upper_cap` than from `cap`. `upper_cap
+            # > cap` is also legitimate (the cfg under-counted the
+            # allowance), in which case `upper_cap` produces a LOWER
+            # rate — the template renders the range with `≤` on the
+            # high end so the upper bound always reads as the high end
+            # regardless of which side is bigger.
+            #
+            # Skip the `upper` field when `upper_cap == cap`: that
+            # branch is the no-A_cfg tier-2 path where the inferred
+            # allowance IS the cap, so a range would print the same
+            # number twice (the `≤` prefix already carries the
+            # "upper bound" semantics for that single figure).
+            upper = None
+            if upper_cap and upper_cap > 0 and upper_cap != cap:
+                upper = round(fee / (upper_cap / 1_000_000), 4)
+            return {"rate": rate, "basis": "bounded", "upper": upper}
+        # vendor or ledger basis: a single point estimate.
+        return {"rate": rate, "basis": cap_basis or "ledger", "upper": None}
+
+    # No knowable projection — historical fallback so the board still shows
+    # something (the existing fee / tokens_so_far shape).
     if tokens_this_month < 1_000_000:
-        return None
-    spend = plan.monthly_cost if plan.monthly_cost else metered_cost
-    if spend <= 0:
-        return 0.0
-    return round(spend / (tokens_this_month / 1_000_000), 4)
+        return {"rate": None, "basis": None, "upper": None}
+    return {"rate": round(fee / (tokens_this_month / 1_000_000), 4),
+            "basis": "ledger", "upper": None}
 
 
 def model_effective_cost_per_mtok(
@@ -920,32 +1467,79 @@ def model_effective_cost_per_mtok(
 ) -> float | None:
     """Per-model effective $/Mtok.
 
-    The threshold differs by plan kind, because the number's meaning does:
+    Backwards-compatible wrapper for `model_effective_cost_fields(...,
+    projected=None)`. Same threshold rules as before: metered plans gate on
+    1M model tokens, subscription plans gate on 1M PLAN tokens, and the
+    per-model share cancels for subscriptions (rate = plan monthly_cost /
+    plan_tokens). With a `projected` dict, subscription rows use the binding
+    window's projected capacity instead — the board passes the same
+    `projected` it computed at the plan level so per-model rows inherit
+    the projection verbatim.
+    """
+    return model_effective_cost_fields(
+        plan, model_tokens, model_cost, plan_tokens, projected=None)["rate"]
 
-    - metered plan: the rate is the model's own spend over its own tokens, so
-      it needs 1M model tokens before it means anything;
-    - subscription plan: the fee is allocated by token share, and the share
-      CANCELS — spend_m = fee·m/t, so $/Mtok = fee/(t/1M), the plan's own
-      rate. Every model that carried any traffic shows it as soon as the
-      PLAN crosses 1M tokens; gating on the model's own share would hide a
-      real number from a small slice of a subscription that is being used.
 
-    Returns None when the model saw no traffic, or the meaningful threshold
-    is not met yet; spend <= 0 -> 0.0; else rounded to 4 decimals.
+def model_effective_cost_fields(
+    plan: Plan, model_tokens: float, model_cost: float, plan_tokens: float,
+    projected: dict | None = None,
+) -> dict:
+    """Per-model effective $/Mtok with provenance.
+
+    Same return shape as `effective_cost_fields`. The per-model share
+    cancels for subscriptions (spend_m = fee·m/t), so the projected rate
+    is the same plan-level figure every model shows — passing the same
+    `projected` to every row keeps them aligned with the plan row, and the
+    spec calls for one canonical helper so board/gateway agree.
+
+    Threshold rules:
+      - metered plan: gates on 1M model tokens (the rate is meaningful
+        only once the model has its own token total).
+      - subscription plan: the fee is allocated by token share; the share
+        cancels, so the rate is the plan's own. Gates on 1M plan tokens
+        for the historical branch (the model's own share is irrelevant
+        once the projection is in scope).
+      - subscription with projection: NO 1M-token gate — the projection
+        is independent of burn, which is the point.
     """
     if model_tokens <= 0:
-        return None
+        return {"rate": None, "basis": None, "upper": None}
+
     if plan.metered:
         if model_tokens < 1_000_000:
-            return None
+            return {"rate": None, "basis": None, "upper": None}
         spend = model_cost
-    else:
-        if plan_tokens < 1_000_000:
-            return None
-        spend = (plan.monthly_cost or 0.0) * model_tokens / plan_tokens
+        if spend <= 0:
+            return {"rate": 0.0, "basis": "ledger", "upper": None}
+        return {"rate": round(spend / (model_tokens / 1_000_000), 4),
+                "basis": "ledger", "upper": None}
+
+    # Subscription plan.
+    fee = plan.monthly_cost or 0.0
+    cap = (projected or {}).get("capacity_tokens")
+    cap_basis = (projected or {}).get("basis")
+    upper_cap = (projected or {}).get("upper_tokens")
+
+    if cap and cap > 0:
+        rate = round(fee / (cap / 1_000_000), 4)
+        if cap_basis == "bounded":
+            # Skip `upper` when `upper_cap == cap` (no-A_cfg tier-2:
+            # the inferred allowance IS the cap, so a range would print
+            # the same number twice -- the `≤` prefix already carries
+            # the "upper bound" semantics for that single figure).
+            upper = None
+            if upper_cap and upper_cap > 0 and upper_cap != cap:
+                upper = round(fee / (upper_cap / 1_000_000), 4)
+            return {"rate": rate, "basis": "bounded", "upper": upper}
+        return {"rate": rate, "basis": cap_basis or "ledger", "upper": None}
+
+    if plan_tokens < 1_000_000:
+        return {"rate": None, "basis": None, "upper": None}
+    spend = fee * model_tokens / plan_tokens
     if spend <= 0:
-        return 0.0
-    return round(spend / (model_tokens / 1_000_000), 4)
+        return {"rate": 0.0, "basis": "ledger", "upper": None}
+    return {"rate": round(spend / (model_tokens / 1_000_000), 4),
+            "basis": "ledger", "upper": None}
 
 
 # Thresholds for `model_effective_cost_per_session`. Hardcoded for the same
