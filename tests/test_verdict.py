@@ -24,11 +24,12 @@ from plans_path import plans_path  # noqa: E402
 # someone's real config would otherwise silently become the fixture.
 os.environ["SWITCHYARD_PLANS"] = plans_path()
 
+import redis.exceptions  # noqa: E402
 from dataclasses import replace  # noqa: E402
 
 from switchyard import models  # noqa: E402
 from switchyard.classify import Outcome, Verdict  # noqa: E402
-from switchyard.hooks import SwitchyardHandler  # noqa: E402
+from switchyard.hooks import SwitchyardHandler, _provider_error  # noqa: E402
 from switchyard.policy import CapacityPolicy  # noqa: E402
 from switchyard.slots import SlotTable  # noqa: E402
 from switchyard.usage import Ledger  # noqa: E402
@@ -396,6 +397,161 @@ def test_transient_without_drop_lease_keeps_session_lease():
         f"a TRANSIENT without drop_lease must keep the lease, got {lease_after!r}")
     print(f"  TRANSIENT without drop_lease: streak {streak}, cooldown {ttl}s, "
           f"lease preserved ({lease_before} -> {lease_after})")
+
+
+class _RecordingPicker:
+    """Minimal Picker stand-in for the failure-path's release call.
+
+    `_finish_failure` invokes `picker.release(plan, request_id, model_ref)`
+    before calling `_handle_failure`, so any test of the gate wants to prove
+    the release still fires -- the gate only suppresses provider-cooldown
+    side effects, never the slot release. A real Picker touches Redis; this
+    stub records the call tuple and exits, which keeps the assertion surface
+    for "the slot released" exactly what the gate under test can change.
+    """
+
+    def __init__(self) -> None:
+        self.releases: list[tuple[str, str, str]] = []
+
+    async def release(self, plan: str, request_id: str, model_ref: str) -> None:
+        self.releases.append((plan, request_id, model_ref))
+
+
+def test_handle_failure_internal_fault_does_not_cool_or_bump_streak():
+    """A bare, non-provider-shaped exception must NOT cool the plan or bump
+    the TRANSIENT streak.
+
+    SwitchYard's own plumbing faults (Redis gone, asyncio cancellation, a
+    bookkeeping bug in the hook) reach `_handle_failure` carrying no signal
+    about who is at fault. Sending them through the existing HTTP-and-prose
+    classifier would let a bare ``redis.exceptions.ConnectionError`` land as
+    a TRANSIENT 5xx and cool the plan for a problem we caused. The gate
+    short-circuits to a Verdict(Outcome.INTERNAL, 0, ...) whose
+    ``is_our_fault`` is True -- so `_apply_verdict`'s first guard returns
+    immediately and writes nothing to Redis.
+
+    Control shape: a bare ``redis.exceptions.ConnectionError`` is a
+    non-APIError instance with no int-coercible ``status_code`` attribute
+    (a real ConnectionError has args=("redis went away",) and nothing else
+    provider-shaped). The picker.release call still fires because the gate
+    sits in `_handle_failure`, downstream of the release in
+    `_finish_failure`.
+    """
+    async def go():
+        h, reg, slots = _build(breaker_enabled=True)
+        plan = _first_plan(reg)
+        picker = _RecordingPicker()
+        # Inject the recording picker + an empty beats dict so
+        # _finish_failure's upstream cleanup (release + _stop_heartbeat)
+        # runs without missing-attribute errors. _handle_failure itself
+        # only reaches the slots + registry it already has wired.
+        h.__dict__["_picker"] = picker
+        h.__dict__["_beats"] = {}
+
+        exc = redis.exceptions.ConnectionError("redis went away")
+        # Sanity: the exception really is non-provider-shaped -- if a future
+        # refactor of _provider_error changes the rule this assertion fails
+        # before the test can, so the test cannot silently claim the gate
+        # fired when in fact the exception would have escaped the gate too.
+        assert _provider_error(exc) is False, (
+            "test premise broke: a bare redis ConnectionError must NOT be "
+            "provider-shaped, otherwise the gate cannot be exercising")
+        ctx = {
+            "plan": plan.key,
+            "request_id": "req-INT",
+            "session": "sess-INT",
+            "model": "some-model",
+        }
+
+        await h._finish_failure(ctx, exc)
+
+        cooled, ttl, reason = await slots.cooldown_state(plan.key)
+        streak = await slots.transient_failure_streak(plan.key)
+        return cooled, ttl, reason, streak, picker.releases, ctx
+
+    cooled, ttl, reason, streak, releases, ctx = _run(go())
+    # The gate short-circuited to Verdict(INTERNAL), so _apply_verdict's
+    # `is_our_fault` guard returned at the top -- no cooldown key, no
+    # streak bump, no drop_lease. Slot-table state is unchanged.
+    assert cooled is False, (
+        f"INTERNAL must NOT cool the plan, got cooled={cooled} reason={reason!r}")
+    assert streak == 0, f"INTERNAL must NOT bump the streak, got {streak}"
+    # And nothing was attributed as a provider verdict: no _verdict_applied
+    # marker (the marker is claimed only AFTER the is_our_fault guard
+    # returns, and INTERNAL hits that guard and exits without writing),
+    # and no cooldown / streak / drop_lease side effects above. That is
+    # exactly the "our fault, never cool the plan" contract.
+    assert ctx.get("_verdict_applied") is None, (
+        f"INTERNAL must NOT claim the provider-verdict marker, got "
+        f"{ctx.get('_verdict_applied')!r}")
+    # The slot was released -- the gate only suppresses the provider-side
+    # cooldown, never the upstream release in _finish_failure. Without
+    # this, a "real" picker would leak an inflight slot until the
+    # staleness sweep noticed 15 minutes later.
+    assert len(releases) == 1, (
+        f"_finish_failure must still release the slot, got {releases!r}")
+    assert releases[0][0] == "minimax-ultra", releases
+    assert releases[0][1] == "req-INT", releases
+    print(f"  INTERNAL: cooldown untouched (cooled={cooled}, streak={streak}); "
+          f"slot released ({releases[0]}); marker not claimed (our-fault path)")
+
+
+def test_handle_failure_provider_shaped_still_cools_and_bumps_streak():
+    """Control for the gate: a status_code=500 exception IS provider-shaped
+    (the SDK-less httpx/requests shape) so the gate must let it through --
+    the plan cools and the TRANSIENT streak bumps exactly the way it did
+    before the gate landed.
+
+    Without this control, a regression that mis-shaped the gate
+    (e.g. accidentally returning False for every exception) would
+    silently disable cooldowns for genuine provider outages too. The two
+    tests bracket the gate: INTERNAL suppresses cooldowns, status_code=500
+    does not.
+    """
+    async def go():
+        h, reg, slots = _build(breaker_enabled=True)
+        plan = _first_plan(reg)
+        picker = _RecordingPicker()
+        h.__dict__["_picker"] = picker
+        h.__dict__["_beats"] = {}
+
+        class _Fake500(Exception):
+            status_code = 500
+        exc = _Fake500("upstream 500")
+        # Sanity: the exception really is provider-shaped -- if a future
+        # refactor of _provider_error changes the rule, this assertion
+        # fails before the test can, so the control case cannot silently
+        # claim "the gate discriminates" when in fact both branches land
+        # on the same verdict.
+        assert _provider_error(exc) is True, (
+            "test premise broke: status_code=500 must be provider-shaped, "
+            "otherwise the control cannot be exercising the let-through path")
+        ctx = {
+            "plan": plan.key,
+            "request_id": "req-CTL",
+            "session": "sess-CTL",
+            "model": "some-model",
+        }
+
+        await h._finish_failure(ctx, exc)
+
+        cooled, ttl, reason = await slots.cooldown_state(plan.key)
+        streak = await slots.transient_failure_streak(plan.key)
+        return cooled, ttl, reason, streak, picker.releases
+
+    cooled, ttl, reason, streak, releases = _run(go())
+    # Same side effects as a normal TRANSIENT-with-breaker-ON 5xx: the
+    # sy:cool key is present with a TRANSIENT reason and the streak moved
+    # to 1. The gate must NOT have suppressed any of this.
+    assert cooled is True, "status_code=500 must still cool the plan"
+    assert reason == "transient", reason
+    assert streak == 1, f"status_code=500 must bump the streak to 1, got {streak}"
+    assert ttl > 0
+    # And the slot still released -- this part is independent of the gate.
+    assert len(releases) == 1, releases
+    assert releases[0][0] == "minimax-ultra", releases
+    print(f"  status_code=500: cooldown {reason} {ttl}s, streak={streak}; "
+          f"slot released (gate discriminates rather than disables)")
 
 
 if __name__ == "__main__":

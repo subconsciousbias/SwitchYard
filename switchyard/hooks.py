@@ -34,7 +34,7 @@ from litellm.proxy._types import UserAPIKeyAuth
 from redis.asyncio import Redis
 
 from . import caller_env, models
-from .classify import Outcome, classify, escalated_cooldown, extract_no_text_tokens, inspect_success_payload
+from .classify import Outcome, Verdict, classify, escalated_cooldown, extract_no_text_tokens, inspect_success_payload
 from .models import Group
 from .picker import LaneSaturated, Picker
 from .policy import CapacityPolicy
@@ -1303,6 +1303,25 @@ class SwitchyardHandler(CustomLogger):
         plan = self.registry.plans.get(ctx.get("plan", ""))
         if plan is None or exc is None:
             return
+        if not _provider_error(exc):
+            # A bare exception -- Redis gone, asyncio CancelledError, our own
+            # bookkeeping bug -- is SwitchYard's fault, never the provider's.
+            # Feed the verdict through _apply_verdict rather than returning
+            # directly so we share one verdict-handling path; the verdict is
+            # Outcome.INTERNAL, which is_our_fault, so _apply_verdict's first
+            # guard writes nothing to Redis and runs no streak bump / lease
+            # drop. The slot release + failure-ledger record already happened
+            # in _finish_failure and are untouched.
+            plan_key = ctx.get("plan", "?")
+            rid = ctx.get("request_id", "?")
+            log.exception(
+                "switchyard internal fault on plan=%s request_id=%s: %r",
+                plan_key, rid, exc,
+            )
+            await self._apply_verdict(
+                plan, Verdict(Outcome.INTERNAL, 0, "switchyard internal fault"), ctx,
+            )
+            return
         status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
         try:
             status = int(status) if status is not None else None
@@ -1321,7 +1340,7 @@ class SwitchyardHandler(CustomLogger):
     async def _apply_verdict(self, plan, verdict, ctx: dict) -> None:
         """Act on a classified failure: cool the plan, learn, release the lease."""
         if verdict.is_our_fault:
-            return  # a bad prompt is not the provider's problem
+            return  # our fault (bad prompt, our plumbing): never cool the provider
 
         # CRITICAL double-count guard. async_log_failure_event fires PER
         # ATTEMPT and async_post_call_failure_hook fires once more after the
@@ -1586,6 +1605,66 @@ def _retry_after(exc: Exception) -> float | None:
     except (TypeError, AttributeError):
         return None
     return _as_float(headers.get("retry-after"))
+
+
+def _provider_error(exc: BaseException) -> bool:
+    """True iff `exc` looks like a provider-side failure rather than ours.
+
+    A bare `redis.exceptions.ConnectionError`, an `asyncio.CancelledError`, or
+    any of SwitchYard's own bookkeeping bugs reaches ``_handle_failure``
+    carrying no signal about who is at fault. Sending those through
+    ``classify(...)`` would hand them to a string-and-HTTP classifier that
+    cannot tell them apart from a genuine 5xx, and the plan would cool on a
+    problem we caused. A provider-shaped exception either inherits from
+    ``litellm.exceptions.APIError`` or ``openai.APIError`` (the SDKs vendor
+    their own HTTP wrapper classes), or carries an int-coercible HTTP
+    ``status_code`` attribute on the exception itself (a hand-rolled bridge
+    or a small SDK that sets the attribute directly). Anything else is ours
+    to log, not the provider's to cool.
+
+    Note: ``httpx.HTTPStatusError`` and ``requests.HTTPError`` do NOT count
+    here -- they expose the status on ``exc.response.status_code``, not on a
+    bare ``exc.status_code``, so a 5xx raised through them is treated as
+    SwitchYard's fault and lands as INTERNAL (no cooldown). Nothing in the
+    current hook path raises either shape, so this gap is latent today;
+    widening the gate to catch ``.response.status_code`` is a behaviour
+    change reserved for a separate fix.
+
+    Both SDK modules are imported lazily: hooks.py only loads the
+    ``CustomLogger`` subclass path of litellm at module scope, and openai is
+    a sidecar-only dependency. A bare ``except (ImportError, AttributeError)``
+    keeps a future SDK refactor from breaking the gate -- if either import
+    path stops resolving, we conservatively fall through to "not provider
+    shaped" and the original (noisy, but safe) string-classifier path runs
+    instead.
+    """
+    # litellm and openai both raise subclasses of their own APIError for
+    # transport-level failures; isinstance against the base class catches
+    # every concrete HTTP shape either SDK has ever shipped.
+    try:
+        import litellm.exceptions as _litellm_exc
+        if isinstance(exc, _litellm_exc.APIError):
+            return True
+    except (ImportError, AttributeError):
+        pass
+    try:
+        import openai as _openai
+        if isinstance(exc, _openai.APIError):
+            return True
+    except (ImportError, AttributeError):
+        pass
+    # Bare ``status_code`` attribute on the exception itself (a hand-rolled
+    # bridge or a small SDK that mirrors the OpenAI HTTP wrapper's shape
+    # by setting the attribute directly). It only counts when it coerces
+    # cleanly to an HTTP-range number: a free-floating ``status_code`` of
+    # None or "abc" is just a misnamed attribute and proves nothing.
+    sc = getattr(exc, "status_code", None)
+    if sc is None:
+        return False
+    try:
+        return 100 <= int(sc) < 600
+    except (TypeError, ValueError):
+        return False
 
 
 def _as_float(v: Any) -> float | None:

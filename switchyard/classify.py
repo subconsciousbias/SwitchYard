@@ -33,6 +33,8 @@ class Outcome(str, Enum):
     AUTH = "auth"                         # credential broken -> alert
     CONTEXT = "context"                   # our fault, never cool the plan
     BAD_REQUEST = "bad_request"           # our fault, never cool the plan
+    INTERNAL = "internal"                 # SwitchYard's own fault (session store,
+                                          # hook plumbing) -- never cool the provider
     TRANSIENT = "transient"               # retry elsewhere, brief sit-out
     TEXT_LOST = "text_lost"               # model answered, CLI lost the text
 
@@ -183,7 +185,7 @@ class Verdict:
 
     @property
     def is_our_fault(self) -> bool:
-        return self.outcome in (Outcome.CONTEXT, Outcome.BAD_REQUEST)
+        return self.outcome in (Outcome.CONTEXT, Outcome.BAD_REQUEST, Outcome.INTERNAL)
 
 
 def _as_dict(body: Any) -> dict:
