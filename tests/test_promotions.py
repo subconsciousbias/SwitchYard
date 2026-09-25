@@ -109,7 +109,9 @@ def _portal_round_trip():
         assert missing.status_code == 404, missing.text
         foreign = client.post(f"/admin/plans/{plan}/promotions",
                               headers={"Origin": "http://evil.example"},
-                              json={"promotions": []})
+                              # Same list again, so the board checks below
+                              # hold whether or not the guard is present.
+                              json={"promotions": [_credit(3)], "source": "test"})
         assert foreign.status_code == 403, "the admin origin guard must cover it"
 
         html = client.get("/fragments/plans").text
