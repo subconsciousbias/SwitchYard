@@ -261,10 +261,28 @@ is the part that is much harder than it looks.
 
 **Session affinity.** A session keeps its provider for 30 minutes of inactivity,
 so a long Claude Code or Cursor conversation does not hop mid-task and its prompt
-cache stays warm. Clients that can set `X-Session-Id` get exact affinity; for
-everything else `switchyard/session.py` fingerprints the conversation prefix,
-which is stable across the turns of one session. If a leased plan runs out, the
-session re-leases rather than getting stranded on dead capacity.
+cache stays warm. Clients wanting exact stickiness should send the
+`x-switchyard-session` header (the Claude Code and Codex recipes above already
+set a model per lane — the session header is a separate concern); for everything
+else `switchyard/session.py` derives a session identity in order of preference
+from `x-switchyard-session` → `metadata.session_id` / `switchyard_session` /
+`conversation_id` → `metadata.user_id` (Claude Code's per-session UUID,
+shape-gated on its `_session_` marker so a plain end-user id falls through to
+the fingerprint) → `data["user"]` / `data["prompt_cache_key"]` (Codex / OpenAI
+equivalents, scoped by API key) → `metadata.litellm_trace_id`, and falls back
+to a fingerprint of the conversation prefix. The body-shaped identifier channels
+are scoped by API key so two virtual keys claiming the same identity do not
+share a lease. Within one key, two parallel conversations sharing the same
+`metadata.user_id` get distinct fingerprints (because the shape-gate routes a
+non-`_session_` value to the fingerprint), and a client that misuses
+`data["user"]` / `data["prompt_cache_key"]` as end-user identity will still
+merge those conversations onto one lease — a documented trade-off for that
+channel. `metadata.user_id` and `prompt_cache_key` are picked up automatically
+when the client supplies them. The fingerprint itself now includes the
+requested lane, so the same conversation under `forge` and again under `judge`
+derives two different sessions and never leaks across lanes it was not asked
+for (see also #93). If a leased plan runs out, the session re-leases rather
+than getting stranded on dead capacity.
 
 Verified by `python3 tests/test_routing.py` (no services needed).
 
