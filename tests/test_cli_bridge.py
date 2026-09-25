@@ -11,6 +11,7 @@ import base64
 import errno
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -3497,7 +3498,6 @@ def test_thinking_display_omitted_means_text_path_result_is_empty():
     print("  end-to-end: switchyard.thinking.type=enabled + display=omitted -> "
           "content=\"\", reasoning_content populated")
 
-
 def test_codex_usage_report_401_when_not_logged_in():
     """Issue #203: /usage on a codex seat that was never logged in returns
     401 (auth missing), not 503 (no rate-limits data yet). The two cases
@@ -4022,6 +4022,305 @@ def test_prune_codex_rollouts_removes_old_keeps_fresh():
             pass
         server.CODEX_ROLLOUT_RETENTION_HOURS = saved_retention
         shutil.rmtree(sessions_root, ignore_errors=True)
+
+# ---------------------------------------- keepalive on the text path (issue: sidecar stream stalls) ---
+def test_sse_keepalive_stream_emits_role_delta_first_and_keepalive_comments():
+    """`sse_keepalive_stream` yields the assistant role delta as the
+    first byte so the caller knows the stream is alive, then `: keepalive`
+    comment frames every `SSE_KEEPALIVE_SECONDS` while the turn runs, and
+    finally re-emits the finished completion through the unchanged
+    `sse_from_completion`. End-to-end on the text path: `_handle_chat` with
+    a slow `invoke` patch and a tight keepalive interval.
+
+    Without the role delta landing first, the gateway's streaming
+    collector has no event to attribute the eventual usage / finish_reason
+    to, and a long-running CLI turn would hold the HTTP connection open
+    without a single byte -- the exact bug the keepalive fixes.
+    """
+    import asyncio as _asyncio
+
+    saved_keepalive = server.SSE_KEEPALIVE_SECONDS
+    server.SSE_KEEPALIVE_SECONDS = 0.05
+    saved = (server.PROVIDER, server.PROFILE, server.CLI, server.invoke)
+    try:
+        server.PROVIDER = "opencode"
+        server.PROFILE = server.PROFILES["opencode"]
+        server.CLI = server.PROFILE["cli"]
+
+        async def slow_invoke(prompt, system, model, image_paths=None,
+                              fmt=None, *, web=False, effort=None,
+                              thinking=None):
+            await _asyncio.sleep(0.20)     # ~4x the keepalive interval
+            return {"result": "OK", "usage": {
+                "input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}
+        server.invoke = slow_invoke
+
+        body = {"model": "m", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}
+
+        async def collect():
+            from fastapi.responses import StreamingResponse
+            response = await server._handle_chat(body)
+            assert isinstance(response, StreamingResponse), type(response)
+            out = []
+            async for chunk in response.body_iterator:
+                out.append(chunk if isinstance(chunk, str) else chunk.decode())
+            return out
+
+        frames = _asyncio.run(collect())
+
+        # Role delta is the first frame.
+        first = json.loads(frames[0][len("data: "):])
+        assert first["choices"][0]["delta"]["role"] == "assistant", first
+        # At least one `: keepalive` comment frame lands before any
+        # completion frame (the slow_invoke sleeps 200ms with the
+        # keepalive interval at 50ms -- 3-4 keepalives expected; assert
+        # >= 1 to stay robust on slow CI hosts).
+        comment_idx = next(
+            (i for i, f in enumerate(frames) if f.startswith(":")), None)
+        assert comment_idx is not None, ("no keepalive comment frame", frames)
+        assert comment_idx > 0, ("role delta was not the first byte", frames)
+        # The completion content arrives AFTER all keepalives.
+        content_idx = next(
+            (i for i, f in enumerate(frames)
+             if f.startswith("data: ") and '"content": "OK"' in f), None)
+        assert content_idx is not None and content_idx > comment_idx, (
+            "completion content landed before the keepalive comments", frames)
+        # Terminal frame is `[DONE]`.
+        assert frames[-1] == "data: [DONE]\n\n", frames[-1]
+        print(f"  text-path keepalive: role delta first, "
+              f"{comment_idx} keepalive comment(s) before completion, "
+              f"[DONE] terminal")
+
+        # ---- mid-stream HTTPException -> terminal error frame ----
+        # `_run_turn` raising HTTPException (the only way to surface a
+        # known status to the caller AFTER the role delta has gone out)
+        # must produce `data: {"error": {"code": <status>, ...}}` and a
+        # terminal `[DONE]`. The frame's `code` field is what LiteLLM
+        # 1.102.1's `_extract_error_from_chunk` reads to pick a cooldown
+        # bucket -- a missing/None code would coerce every failure to
+        # TRANSIENT and cool the plan for caller-fault 4xx. This test
+        # pins both the unwrap (the in-bridge `detail={"error": {...}}`
+        # envelope becomes a single `{"error": {...}}` frame, NOT
+        # double-nested) and the `code` pin.
+        from fastapi import HTTPException
+
+        async def collect_http_error():
+            async def http_error_turn():
+                raise HTTPException(status_code=503,
+                                    detail="sidecar at capacity (1)")
+            out = []
+            async for frame in server.sse_keepalive_stream(
+                    http_error_turn, "claude-opus-5"):
+                out.append(frame)
+            return out
+
+        err_frames = _asyncio.run(collect_http_error())
+        assert json.loads(err_frames[0][len("data: "):])["choices"][0]["delta"]["role"] \
+            == "assistant", err_frames[0]
+        err_payload = json.loads(err_frames[1][len("data: "):])
+        assert err_payload["error"]["code"] == 503, err_payload
+        assert err_payload["error"]["message"] == "sidecar at capacity (1)", err_payload
+        assert err_frames[-1] == "data: [DONE]\n\n", err_frames[-1]
+        print("  text-path keepalive: HTTPException -> terminal error "
+              "frame with code=503 + [DONE]")
+
+        async def collect_dict_error():
+            async def dict_error_turn():
+                raise HTTPException(status_code=429,
+                                    detail={"error": {
+                                        "message": "codex usage limit reached",
+                                        "type": "usage_limit_reached",
+                                        "code": 429}})
+            out = []
+            async for frame in server.sse_keepalive_stream(
+                    dict_error_turn, "claude-opus-5"):
+                out.append(frame)
+            return out
+
+        dict_frames = _asyncio.run(collect_dict_error())
+        dict_payload = json.loads(dict_frames[1][len("data: "):])
+        assert dict_payload == {"error": {
+            "message": "codex usage limit reached",
+            "type": "usage_limit_reached",
+            "code": 429}}, dict_payload
+        assert dict_frames[-1] == "data: [DONE]\n\n", dict_frames[-1]
+        print("  text-path keepalive: dict-detail HTTPException unwrapped "
+              "one level; frame is {'error': {...}} not double-nested")
+
+        async def collect_bare_error():
+            async def bare_error_turn():
+                raise ValueError("parser saw no JSON in CLI stdout")
+            out = []
+            async for frame in server.sse_keepalive_stream(
+                    bare_error_turn, "claude-opus-5"):
+                out.append(frame)
+            return out
+
+        bare_frames = _asyncio.run(collect_bare_error())
+        bare_payload = json.loads(bare_frames[1][len("data: "):])
+        assert bare_payload["error"]["type"] == "ValueError", bare_payload
+        assert bare_payload["error"]["message"] == "parser saw no JSON in CLI stdout", \
+            bare_payload
+        assert "code" not in bare_payload["error"], bare_payload
+        assert bare_frames[-1] == "data: [DONE]\n\n", bare_frames[-1]
+        print("  text-path keepalive: bare Exception -> type/message shape + [DONE]")
+    finally:
+        server.SSE_KEEPALIVE_SECONDS = saved_keepalive
+        server.PROVIDER, server.PROFILE, server.CLI, server.invoke = saved
+
+
+# ---------------------------------------- process-group kill (grandchildren) ---
+def test_kill_process_group_kills_the_cli_and_its_grandchildren():
+    """`kill_process_group` must SIGKILL the whole session, not just the
+    CLI itself: the CLI forks `tool_server.py` (mcp_bridge) and node
+    workers that the bare `proc.kill()` used to leave alive and
+    re-attaching to the plan's connection limit.
+
+    The test spawns a parent Python (our CLI stand-in) with
+    `start_new_session=True`, the parent spawns a grandchild that sleeps
+    forever, captures the grandchild's pid, then runs the kill helper
+    and asserts `os.kill(grandchild_pid, 0)` raises `ProcessLookupError`.
+    The grandchild is gone -- it died with its parent process group.
+
+    Also pins the spawn shape: `cli_bridge._run_cli_attempt` and the
+    matching `_run_session_attempt` in mcp_bridge both call
+    `asyncio.create_subprocess_exec(..., start_new_session=True)`. A
+    regression that drops the flag would leave the grandchild alive
+    after `kill_process_group` (the parent PID exists but its pgid is
+    the parent's own group, not a new session).
+    """
+    import asyncio as _asyncio
+
+    # Grandchild: print its pid on stdout, then sleep forever. The parent
+    # reads the pid (from its own pipe) and prints GRANDCHILD_PID=<pid>
+    # to its own stdout (the test's pipe) so the test can capture it.
+    # `-u` makes both the parent and grandchild unbuffered so the test
+    # sees the pid before either sleeps. After the test asserts on
+    # `/proc/<pid>/status` the parent process exits cleanly so the
+    # kernel can reap the grandchild -- a leftover zombie after the
+    # test would only signal a regression in the kill, and we want it
+    # gone by the time the test ends.
+    parent_body = (
+        "import os, sys, subprocess, time\n"
+        "child = subprocess.Popen([sys.executable, '-u', '-c', "
+        "    'import os, sys, time\\n'"
+        "    'print(os.getpid(), flush=True)\\n'"
+        "    'time.sleep(3600)'], "
+        "    stdout=subprocess.PIPE)\n"
+        "pid_line = child.stdout.readline()\n"
+        "child_pid = int(pid_line.strip())\n"
+        "sys.stdout.write(f'GRANDCHILD_PID={child_pid}\\n')\n"
+        "sys.stdout.flush()\n"
+        "try:\n"
+        "    # Park the parent so the test can kill the group.\n"
+        "    time.sleep(3600)\n"
+        "except BaseException:\n"
+        "    pass\n"
+    )
+    workdir = Path(tempfile.mkdtemp(prefix="clib-pgkill-"))
+    parent_path = workdir / "parent_cli.py"
+    parent_path.write_text(parent_body)
+    try:
+        async def run():
+            proc = await _asyncio.create_subprocess_exec(
+                sys.executable, str(parent_path),
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+                cwd=str(workdir),
+                start_new_session=True)
+            # Read until GRANDCHILD_PID=... lands.
+            buf = b""
+            grandchild_pid = None
+            while b"GRANDCHILD_PID=" not in buf and proc.returncode is None:
+                chunk = await proc.stdout.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+                if b"\n" in buf:
+                    for line in buf.splitlines():
+                        if line.startswith(b"GRANDCHILD_PID="):
+                            grandchild_pid = int(line.split(b"=", 1)[1])
+                            break
+            assert grandchild_pid is not None, ("grandchild pid not seen",
+                                                 buf)
+            # Sanity: the grandchild is alive right now.
+            os.kill(grandchild_pid, 0)
+            # Run the kill helper -- it should take the parent and the
+            # grandchild with it (process group).
+            server.kill_process_group(proc)
+            # The parent is dead.
+            await _asyncio.wait_for(proc.wait(), 5.0)
+            # Cross-platform death probe: `os.kill(pid, 0)` raises
+            # `ProcessLookupError` when the pid is gone (POSIX) and is
+            # the only signal that works on every platform. On Linux
+            # we additionally check `/proc/<pid>/status` State to
+            # distinguish a SIGKILL'd child (State Z / X after parent
+            # exits and the kernel re-parents to PID 1) from one still
+            # running -- a regression that left the grandchild alive
+            # would not surface as a Linux error since `kill(pid, 0)`
+            # would still find it. The Linux refinement is a bonus
+            # check, NOT the load-bearing assertion -- the macOS
+            # conftest's guard against `/proc` is exactly the bug
+            # issue #143's runner item fixed, and we do not want to
+            # re-introduce it.
+            #
+            # `/proc/<pid>/status` IO is racy on Linux: the parent dies
+            # first, the grandchild is re-parented to PID 1, and PID 1
+            # can reap the orphan before the test's `open()`/`read()`
+            # finishes. The race can surface as FileNotFoundError
+            # (ENOENT, no such directory) or ProcessLookupError (ESRCH,
+            # kernel reports "no such process" on read). Catch both
+            # under the parent OSError -- "death is settled" means
+            # "any failure to read /proc is treated as the process is
+            # gone", which is exactly what we want here: the contract
+            # is `os.kill(pid, 0)` raises ProcessLookupError; the
+            # /proc check is decoration. The macOS path keeps using
+            # `os.kill(pid, 0)` only (no `/proc` to read), so this
+            # branch is Linux-exclusive.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(grandchild_pid, 0)
+                except ProcessLookupError:
+                    return grandchild_pid
+                if sys.platform == "linux":
+                    try:
+                        with open(f"/proc/{grandchild_pid}/status") as fh:
+                            status = fh.read()
+                    except OSError:
+                        # Fully reaped or re-parented-and-reaped:
+                        # death is settled. (FileNotFoundError on
+                        # missing /proc, ProcessLookupError on a
+                        # concurrent reap, etc.)
+                        return grandchild_pid
+                    for line in status.splitlines():
+                        if line.startswith("State:"):
+                            state_letter = line.split()[1]
+                            if state_letter not in ("R", "S", "D"):
+                                return grandchild_pid
+                            break
+                await _asyncio.sleep(0.05)
+            raise AssertionError(
+                f"grandchild pid={grandchild_pid} still running after "
+                f"kill_process_group")
+
+        grandchild_pid = _asyncio.run(run())
+        # Pin the spawn shape: _run_cli_attempt and _run_session_attempt
+        # both pass start_new_session=True. Grep the source for the
+        # call sites rather than exec'ing the bridge -- a regression
+        # here shows up as a test failure, not a live bug.
+        for path in (Path("sidecars/cli_bridge/server.py"),
+                     Path("sidecars/mcp_bridge/server.py")):
+            text = path.read_text()
+            assert "start_new_session=True" in text, (
+                f"{path} lost its start_new_session=True spawn flag")
+        print(f"  kill_process_group took out the CLI plus its "
+              f"grandchild pid={grandchild_pid}; both spawn sites pin "
+              f"start_new_session=True")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
 
 
 if __name__ == "__main__":

@@ -56,6 +56,7 @@ from typing import Any
 import asyncio
 import base64
 import binascii
+import collections
 import contextlib
 import errno
 import importlib.util as _il
@@ -64,6 +65,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -671,6 +673,34 @@ def subprocess_env() -> dict:
     widening this function to copy `os.environ`.
     """
     return {k: os.environ[k] for k in SUBPROCESS_ENV_KEYS if k in os.environ}
+
+
+def kill_process_group(proc) -> None:
+    """Kill `proc` and its whole process group, with fallbacks.
+
+    All vendor CLI spawns in this bridge (and in mcp_bridge, which imports
+    this helper) use `start_new_session=True`, so the CLI is its own
+    session leader and `os.killpg(os.getpgid(pid), SIGKILL)` reaches every
+    grandchild the CLI spawned -- `tool_server.py`, node workers,
+    whatever else the inner harness forked. Without the group kill, a
+    `proc.kill()` only reaches the CLI itself and leaves the grandchildren
+    alive and re-attaching to the plan's connection limit.
+
+    ProcessLookupError is suppressed: the process or its group can already
+    be gone (a CLI that just exited on its own, a session we lost track of).
+    `proc.kill()` is the fallback when the group kill raises for any other
+    reason (no pgid on this platform, e.g.).
+    """
+    pid = getattr(proc, "pid", None)
+    if pid is None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        return
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
 
 
 # ------------------------------------------------ claude tool lockdown ---
@@ -1351,18 +1381,27 @@ class Gate:
     can spill to the next plan in the lane instead of holding a worker open.
     The one exception is acquire_waiting, used only to resume a tool-calling
     session that was already committed to this plan — see mcp_bridge.
+
+    FIFO transfer semantics: a slot freed by `release()` is transferred
+    directly to the oldest queued waiter (re-incrementing `_in_flight` to
+    cancel the decrement, and resolving the waiter's future), so a brand-new
+    `acquire()` can never steal a slot from a woken waiter, and the
+    arrival-order contract of `acquire_waiting` is the real one.
     """
 
     def __init__(self) -> None:
         self._in_flight = 0
         self._lock = asyncio.Lock()
-        self._freed = asyncio.Condition()
+        # Waiters, oldest first. A future is set with True when release()
+        # transfers a slot directly to it (no Condition, no notify, no race).
+        self._waiters: collections.deque[asyncio.Future] = collections.deque()
 
     @property
     def in_flight(self) -> int:
         return self._in_flight
 
     async def acquire(self, limit: int) -> bool:
+        """Try to take a slot. Never queues: returns False on a full gate."""
         async with self._lock:
             if self._in_flight >= limit:
                 return False
@@ -1372,29 +1411,84 @@ class Gate:
     async def acquire_waiting(self, limit: int, timeout: float) -> bool:
         """Acquire, waiting up to `timeout` for a slot to come free.
 
-        Callers are woken in arrival order, so a queue of resuming sessions is
-        served first-come-first-served rather than by luck of scheduling.
+        Callers are queued in arrival order, and a slot is transferred
+        directly to the oldest queued waiter by `release()` -- no Condition
+        notify, no luck of scheduling. On timeout / cancellation the
+        bookkeeping (remove-or-keep the future, return-or-decrement the
+        transferred slot) is done under the lock so a release() that
+        transfers a slot to us in the same tick is always owned by us,
+        and a release() that did not transfer a slot is never silently
+        consumed by us. The previous shape re-checked the future outside
+        the lock; a release() that fired in that window leaked a slot.
         """
-        deadline = time.monotonic() + timeout
-        if await self.acquire(limit):
-            return True
-        async with self._freed:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                try:
-                    await asyncio.wait_for(self._freed.wait(), remaining)
-                except asyncio.TimeoutError:
-                    return False
-                if await self.acquire(limit):
-                    return True
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        async with self._lock:
+            if self._in_flight < limit:
+                self._in_flight += 1
+                return True
+            self._waiters.append(fut)
+        try:
+            try:
+                await asyncio.wait_for(asyncio.shield(fut), timeout)
+            except asyncio.TimeoutError:
+                # Resolve the timeout under the lock: a release() in the
+                # same tick may have transferred a slot to us, in which
+                # case the future is done with True and the slot is ours
+                # to keep (return True); otherwise the future is still
+                # pending (or already cancelled by a sibling caller) and
+                # we owe nothing.
+                async with self._lock:
+                    if fut.done() and not fut.cancelled() \
+                            and fut.result() is True:
+                        return True
+                    with contextlib.suppress(ValueError):
+                        self._waiters.remove(fut)
+                return False
+            return bool(fut.result())
+        except BaseException:
+            # Caller cancellation or unexpected exit. Do the abandon
+            # bookkeeping under the lock for the same reason as the
+            # timeout arm: a release() that transferred to us in the
+            # same tick owns the slot -- if the future is done with
+            # True we have to release it back, otherwise the gate
+            # permanently shrinks capacity.
+            async with self._lock:
+                if fut.done() and not fut.cancelled() \
+                        and fut.result() is True:
+                    # We were transferred a slot we no longer want; hand
+                    # it back. Re-enter release() semantics: prefer a
+                    # live waiter, otherwise decrement freely.
+                    while self._waiters:
+                        other = self._waiters.popleft()
+                        if other.done():
+                            continue
+                        other.set_result(True)
+                        return False
+                    self._in_flight = max(0, self._in_flight - 1)
+                else:
+                    with contextlib.suppress(ValueError):
+                        self._waiters.remove(fut)
+            if not fut.done():
+                fut.cancel()
+            raise
 
     async def release(self) -> None:
         async with self._lock:
             self._in_flight = max(0, self._in_flight - 1)
-        async with self._freed:
-            self._freed.notify()          # hand the slot to the longest waiter
+            # Hand the slot directly to the oldest waiter: re-increment to
+            # cancel the decrement and resolve the future. `fut.set_result`
+            # is synchronous, so doing it inside the lock is safe -- the
+            # waiter's `wait_for` will wake and see `_in_flight` already
+            # reflecting the transfer.
+            while self._waiters:
+                fut = self._waiters.popleft()
+                if fut.done():
+                    continue            # stale (already cancelled by its caller)
+                self._in_flight += 1
+                fut.set_result(True)
+                return
+            # No waiter -- the slot is simply freed.
 
 
 _gate = Gate()
@@ -1413,14 +1507,10 @@ _warmup_lock = asyncio.Lock()
 async def warm_gate():
     """Serialize the first call so a token refresh races exactly once.
 
-    Yields a dict with a single boolean key `success` (default True). The body
-    sets it to False when the body reports a logical failure that should leave
-    the gate closed -- no exception raised, but no real success either. The
-    mcp_bridge run_session uses this when a terminal error was already
-    resolved on the session's turn_future (no payload produced, no exception
-    escaping): the gate stays closed so the next caller acquires the lock and
-    retries alone, exactly the success-only semantics today's `invoke` had.
-
+    Yields a dict kept for backward compatibility with the prior contract;
+    no caller writes to it and the gate no longer reads it (mcp_bridge's
+    `gate["success"] = False` assignments were removed in the same
+    revision that flipped `_warm` to "set on completion, not on success").
     Three paths:
 
     * Fast path -- `_warm` is already set: the lock is never taken; the body
@@ -1429,15 +1519,17 @@ async def warm_gate():
       that beat us to the first run: the body runs again, in parallel from
       then on.
     * Solo path -- we are the first caller under the lock: the body runs
-      alone. `_warm` is set ONLY when the body completes without exception
-      AND `success` is still True. Either signal leaves the gate closed, so
-      a follow-up caller acquires the lock and retries alone.
+      alone. `_warm` is set once the body completes -- whether it returned
+      normally or raised. Serialising every later call behind `_warmup_lock`
+      while holding gate slots on a failed first attempt (e.g. a 429) is
+      worse than letting a second concurrent caller race; one failed refresh
+      is enough information to release the lock.
 
     Bridge-siblings rule: mcp_bridge imports this context manager and wraps
     `run_session` with it -- the cold-start token-refresh race is a property
     of the inner CLI, not the bridge that fronts it.
     """
-    state = {"success": True}
+    state: dict = {}
     if _warm.is_set():
         yield state
         return
@@ -1445,10 +1537,14 @@ async def warm_gate():
         if _warm.is_set():
             yield state
             return
-        yield state
-        if state["success"]:
+        try:
+            yield state
+        finally:
+            # Set _warm once the first attempt has run, regardless of
+            # outcome: a failed first call should not serialise every later
+            # call behind _warmup_lock while holding gate slots.
             _warm.set()
-            log.info("%s: first call succeeded, releasing full concurrency", PROVIDER)
+            log.info("%s: first call completed, releasing full concurrency", PROVIDER)
 
 
 async def invoke(prompt: str, system: str | None, model: str | None,
@@ -2565,6 +2661,13 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
             # grant to the inner CLI -- a single prompt injection exfiltrates
             # all of it (issue #116).
             env=spawn_env,
+            # The CLI is its own session leader so a timeout / supersede /
+            # reap can SIGKILL the whole group -- the CLI plus tool_server.py
+            # plus any node workers the inner harness forked. Without this
+            # a bare `proc.kill()` only reaches the CLI itself and leaves
+            # the grandchildren alive and re-attaching to the plan's
+            # connection limit. kill_process_group is the matching helper.
+            start_new_session=True,
         )
     except OSError as exc:
         shutil.rmtree(spawn_cwd, ignore_errors=True)
@@ -2591,7 +2694,7 @@ async def _run_cli_attempt(prompt: str, system: str | None, model: str | None,
                              else None),
             timeout=TIMEOUT)
     except asyncio.TimeoutError:
-        proc.kill()
+        kill_process_group(proc)
         shutil.rmtree(spawn_cwd, ignore_errors=True)
         _cleanup_project_dir(spawn_cwd)
         raise HTTPException(status_code=408, detail=f"{PROVIDER} cli timed out") from None
@@ -2861,6 +2964,15 @@ def to_openai(payload: dict, model: str, finish_reason: str = "stop",
 CLAUDE_PROJECTS = Path(os.environ.get(
     "CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude" / "projects")))
 USAGE_TIMEOUT = float(os.environ.get("USAGE_TIMEOUT_SECONDS", "120"))
+
+# How often the streaming reply yields a SSE comment frame (`: keepalive`)
+# while a turn is still running. The frame is comment-only, no `data:`, so
+# the gateway's streaming collector (switchyard/hooks.py:1228-1240) skips
+# it the same way it skips any other event without a payload. Long enough
+# not to spam the wire (a 15 s chat on Claude is rare); short enough that
+# a dropped connection is observed promptly. Patchable in tests via
+# `cli_bridge.SSE_KEEPALIVE_SECONDS = 0.05`.
+SSE_KEEPALIVE_SECONDS = float(os.environ.get("SSE_KEEPALIVE_SECONDS", "15"))
 
 
 def _mangled_project_name(cwd: Path) -> str:
@@ -3135,6 +3247,164 @@ async def sse_from_completion(result: dict, model: str):
     yield "data: [DONE]\n\n"
 
 
+async def sse_keepalive_stream(run_turn, model: str, *,
+                              release_on_abandon=None):
+    """An SSE stream that yields the assistant role delta immediately, then
+    `: keepalive` comment frames every `SSE_KEEPALIVE_SECONDS` while `run_turn`
+    runs, then re-emits the finished completion through `sse_from_completion`.
+
+    Used by the streaming reply path on both bridges: the role delta is the
+    first byte the caller sees, so a slow CLI no longer holds an
+    unresponsive stream open. The `: keepalive` frames are SSE comments --
+    no `data:` line -- which the gateway's streaming collector skips
+    (switchyard/hooks.py:1228-1240: frames without `data:` are not
+    payloads).
+
+    Mid-turn HTTPException becomes a terminal `data: {"error": ...}` frame
+    followed by `[DONE]`: once the first byte is out the response status
+    code is fixed, so 4xx cannot be raised any more and the only honest
+    signal to the caller is an error frame. Pre-stream validation must
+    stay in the caller (before this generator runs) so known-bad requests
+    still get real 4xx.
+
+    On GeneratorExit (client disconnect) the underlying task is cancelled
+    and awaited so the gate slot the caller was holding is released
+    promptly rather than waiting on the CLI's idle TTL.
+
+    `release_on_abandon` (optional) is an awaitable the caller passes when
+    it acquired a gate slot pre-stream: the wrapper awaits it if the
+    generator is closed BEFORE the turn task is created -- the realistic
+    case is a client disconnect between `StreamingResponse` being returned
+    and the first `body_iterator.__anext__()` (Starlette cancels the
+    stream task before anything in the generator ever runs beyond the
+    role-delta yield). Without this, the endpoint's pre-stream acquire
+    leaks the slot: every release path lives downstream of
+    `task = asyncio.create_task(run_turn())`, and a generator that never
+    gets there has no `finally` to release. The task's own `finally`
+    (when it does get to run) keeps doing its existing release on
+    normal / cancelled / failed exit; this callback only fires for the
+    pre-task-create window.
+
+    Loop shape: the consumer pulls chunks via the body_iterator; between
+    pulls we `asyncio.wait({task}, timeout=SSE_KEEPALIVE_SECONDS)` and yield
+    a `: keepalive` comment only when the task is still running at the
+    deadline. `asyncio.wait` wakes immediately when the task completes --
+    a turn finishing at t=T emits its completion frames at t=T, not at the
+    next interval boundary, so a 3-second turn no longer waits 15 s for the
+    next keepalive slot (pre-PR shape: sleep-first loop delayed every
+    streamed turn by up to `SSE_KEEPALIVE_SECONDS` of tail latency).
+    The wait yields control to the event loop the same way `asyncio.sleep`
+    does, so the task and the consumer both make progress between chunks
+    (a fixture's `resolve_final`, the CLI's stdout writes, etc.). A fast
+    turn therefore emits no keepalives -- one role delta, then the
+    completion frames.
+
+    `run_turn` is an async callable returning the completion dict that
+    `sse_from_completion` understands -- the cli_bridge caller passes a
+    closure that runs `_complete(body)` (with `merge_completions` and
+    `finish_completion`); the mcp_bridge caller passes a closure that
+    runs `handle_tool_request(...)` + `finish_completion(...)`.
+    """
+    base = {"id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model}
+    # `task` starts unset so the generator's `finally` can tell whether
+    # `run_turn` was ever scheduled. If the generator is closed at the
+    # role-delta yield below (before `asyncio.create_task(run_turn())`
+    # runs), the task is still None and the abandon-callback fires --
+    # without that, the endpoint's pre-stream acquire leaks the slot.
+    task = None
+    try:
+        # Role delta first -- a single byte that establishes the stream and
+        # tells the caller "yes, this is a chat completion". A client that
+        # times out waiting for this sees a 200 + first-byte-they-cannot-read,
+        # the same shape it would see on any other successful streamed call;
+        # the keepalives below keep the connection alive while we work.
+        yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+        task = asyncio.create_task(run_turn())
+        while True:
+            # Wait for the task with a deadline -- `asyncio.wait` wakes
+            # immediately on completion, so a turn that finishes at t=T
+            # emits its completion frames at t=T, not at the next
+            # interval boundary (the previous sleep-first loop added up
+            # to SSE_KEEPALIVE_SECONDS of tail latency to every streamed
+            # turn). Yield a `: keepalive` comment only when the task is
+            # still running at the deadline. The wait also yields control
+            # to the event loop, so the turn task AND the consumer both
+            # make progress between chunks (a fixture's `resolve_final`,
+            # the CLI's stdout writes, etc.).
+            done, _ = await asyncio.wait({task}, timeout=SSE_KEEPALIVE_SECONDS)
+            if done:
+                break
+            yield ": keepalive\n\n"
+        result = task.result()
+    except asyncio.CancelledError:
+        # Client disconnected (GeneratorExit path). Cancel the task so the
+        # gate slot is released, then re-raise so the generator protocol
+        # closes cleanly.
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+        raise
+    except HTTPException as exc:
+        # Mid-turn failure: surface as an SSE error frame and [DONE].
+        # The status code cannot be changed any more.
+        # Unwrap one level if the detail is the in-bridge
+        # `detail={"error": {...}}` envelope (image unsupported, 502
+        # upstream, usage-limit, caller_environment_required, ...) -- the
+        # repo's convention is `detail={"error": {...}}`, not
+        # `detail={"error": {"error": {...}}}`. LiteLLM 1.102.1's
+        # `_extract_error_from_chunk` reads `error.get("message")` and
+        # `error.get("code")` off the OUTER dict; double-nesting makes
+        # it find neither, raises `OpenAIError(status_code=500)` and
+        # burns a TRANSIENT cooldown for a caller-fault 4xx. Pin the
+        # status code on the frame so the parser maps it correctly.
+        detail = exc.detail
+        if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
+            detail = detail["error"]
+        if not isinstance(detail, dict):
+            detail = {"message": str(detail), "type": "http_error"}
+        if "code" not in detail:
+            detail = {**detail, "code": exc.status_code}
+        yield f"data: {json.dumps({'error': detail})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    except Exception as exc:
+        yield f"data: {json.dumps({'error': {'message': str(exc), 'type': type(exc).__name__}})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    finally:
+        # Pre-task-create abandon window: the generator was closed (a
+        # client disconnect, a streaming middleware cancellation) at or
+        # before the role-delta yield, so `run_turn` never started. The
+        # endpoint acquired the slot pre-stream and is waiting for us
+        # to release it -- the abandon callback is the only place that
+        # can. When `task` is set, the task's own `finally` (and the
+        # downstream release chain -- end_session in cli_bridge,
+        # end_session / park_session in mcp_bridge) owns the release;
+        # we do NOT fire the abandon callback or we would double-release.
+        if task is None and release_on_abandon is not None:
+            with contextlib.suppress(BaseException):
+                await release_on_abandon()
+        # Belt and braces for the post-task-create path: if we exited
+        # without completing the task (client cancelled between the
+        # wait_for timing out and our processing of the result), cancel
+        # and await it now so its gate slot is released.
+        elif task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+
+    # Re-emit the finished completion through the unchanged sse_from_completion.
+    # tool_calls, reasoning_content, and finish_reason all ride the same frames
+    # they always did -- the only difference on the wire is the keepalives
+    # before them.
+    async for frame in sse_from_completion(result, model):
+        yield frame
+
+
 async def usage_report() -> dict:
     """What the vendor's own client last reported about this plan's headroom.
 
@@ -3180,7 +3450,7 @@ async def usage_report() -> dict:
         raise HTTPException(status_code=501,
                             detail=f"no usage report implemented for {PROVIDER!r}")
     started = time.time()
-    # Spawn `claude -p /usage` in a fresh per-call temp cwd (same `sy-cli-`
+# Spawn `claude -p /usage` in a fresh per-call temp cwd (same `sy-cli-`
     # prefix as the text path). Without this the CLI would write its
     # transcript to whatever the container's cwd is at the time -- usually
     # `/app`, which is also where the live code is -- and leave a project
@@ -3191,18 +3461,22 @@ async def usage_report() -> dict:
     # (missing binary, wrong arch, renames mid-deploy) leaves a sy-cli-*
     # cwd behind if the cleanup only followed the spawn, so the finally
     # starts before the await (reviewer finding, PR #322 cycle 2).
+    # Match the spawn shape used by `_run_cli_attempt`: the CLI is its own
+    # session leader, so a timeout SIGKILLs the whole group (CLI plus any
+    # grandchildren the inner harness forked). kill_process_group is the
+    # matching helper.
     spawn_cwd = Path(tempfile.mkdtemp(prefix="sy-cli-"))
     try:
         proc = await asyncio.create_subprocess_exec(
             PROFILE["cli"], "-p", "/usage",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             cwd=spawn_cwd,
-            env=subprocess_env())
+            env=subprocess_env(),
+            start_new_session=True)
         try:
             _, err = await asyncio.wait_for(proc.communicate(), USAGE_TIMEOUT)
         except asyncio.TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+            kill_process_group(proc)
             raise HTTPException(
                 status_code=504,
                 detail=f"/usage did not finish within {USAGE_TIMEOUT:.0f}s") from None
@@ -3282,20 +3556,85 @@ async def _handle_chat(body: dict):
     and it never 429s against itself; `stop` and `response_format` are
     applied to the finished answer (finish_completion). Both are checked
     before anything spawns.
+
+    Streaming path uses `sse_keepalive_stream`: it yields the assistant
+    role delta immediately and a `: keepalive` comment frame every
+    `SSE_KEEPALIVE_SECONDS` while the turn runs, then re-emits the finished
+    completion through `sse_from_completion`. Pre-stream validation
+    (request_n, validate_stop, response_schema) stays exactly where it is
+    above -- known-bad requests still get real 4xx; only failures that
+    surface AFTER the role delta has been sent become SSE error frames.
+
+    The fail-fast gate acquire for the stream case happens HERE, before
+    `StreamingResponse` is returned, so a saturated plan answers 429 with
+    `Retry-After: 5` before any byte of the role delta lands on the wire
+    -- the gate's documented "never queue, spill to the next plan"
+    contract (`Gate.acquire`'s docstring + the comment above the
+    `if not await _gate.acquire(limit): raise HTTPException(...)` lines)
+    depends on that 429 reaching LiteLLM pre-stream. Occupancy is
+    unchanged: the slot is held for the turn either way; the streaming
+    closure just inherits it and releases in its own cleanup. The
+    `_complete` call below receives `gate_already_held=True` so it
+    doesn't try to acquire a second slot.
     """
     n = request_n(body)
     validate_stop(body)
     response_schema(body)
-    result = merge_completions([await _complete(body) for _ in range(n)])
-    result = finish_completion(result, body)
     if not body.get("stream"):
+        result = merge_completions([await _complete(body) for _ in range(n)])
+        result = finish_completion(result, body)
         return result
-    return StreamingResponse(sse_from_completion(result, result.get("model") or ""),
-                             media_type="text/event-stream")
+
+    limit = config().concurrency
+    if not await _gate.acquire(limit):
+        raise HTTPException(status_code=429,
+                            detail=f"sidecar at capacity ({limit})",
+                            headers={"Retry-After": "5"})
+
+    async def _release_slot() -> None:
+        # Belt-and-braces release: `_complete`'s `finally` releases
+        # on every path where the task actually ran, but if the SSE
+        # generator is abandoned BEFORE `run_turn`'s task is created
+        # (a client disconnect between StreamingResponse being
+        # returned and the first body_iterator __anext__) there is no
+        # task and therefore no `_complete` finally. The wrapper's
+        # abandon-callback fires this; without it the pre-stream
+        # acquire leaks. Idempotent: `gate.release` max-clamps to 0,
+        # so a double-release from a downstream path is harmless.
+        await _gate.release()
+
+    async def _run_turn() -> dict:
+        # Same composition as the non-streaming path: n completions,
+        # finish_completion. `_complete` skips its own acquire/release
+        # because this closure owns the slot -- ownership was acquired
+        # above so a saturated plan answers 429 pre-stream. The slot
+        # is released in `finally` so a mid-turn HTTPException, a
+        # generator exit, or a task crash all give the slot back.
+        try:
+            result = merge_completions(
+                [await _complete(body, gate_already_held=True)
+                 for _ in range(n)])
+            return finish_completion(result, body)
+        finally:
+            await _gate.release()
+
+    return StreamingResponse(
+        sse_keepalive_stream(_run_turn, body.get("model") or "",
+                             release_on_abandon=_release_slot),
+        media_type="text/event-stream")
 
 
-async def _complete(body: dict) -> dict:
-    """One CLI run for a text-only request, as a non-streamed completion."""
+async def _complete(body: dict, *, gate_already_held: bool = False) -> dict:
+    """One CLI run for a text-only request, as a non-streamed completion.
+
+    `gate_already_held=True` is used by the streaming path: the endpoint
+    acquired the slot before returning `StreamingResponse` so a saturated
+    plan answers 429 pre-stream, and the streaming closure is responsible
+    for releasing. In that mode this function neither acquires nor
+    releases, and a mid-turn HTTPException does not unwind a slot it
+    never took. Default (`False`) keeps the historical non-streamed
+    behaviour intact (acquire here, release in the local `finally`).
+    """
     # Refuse max_tokens on lanes that cannot honor it honestly (issue #70).
     # Placed BEFORE the tools_refusal block: a request carrying both max_tokens
     # AND tools should report the more specific max_tokens reason rather than a
@@ -3433,20 +3772,33 @@ async def _complete(body: dict) -> dict:
                 prompt = f"{reminder}\n\n{prompt}" if prompt else reminder
 
         limit = config().concurrency
-        if not await _gate.acquire(limit):
-            # Never queue: SwitchYard needs to hear "full" immediately so it can
-            # spill to the next plan in the lane instead of holding a worker open.
-            raise HTTPException(status_code=429,
-                                detail=f"sidecar at capacity ({limit})",
-                                headers={"Retry-After": "5"})
-        thinking_policy = request_thinking(body)
-        try:
+        # `gate_already_held` is the streaming path's handoff: the
+        # endpoint acquired the slot pre-stream so a saturated plan
+        # answers 429 before any byte lands on the wire. In that mode
+        # neither this acquire nor the matching release fires here --
+        # the streaming closure inherits ownership and releases in
+        # its own cleanup.
+        if gate_already_held:
+            thinking_policy = request_thinking(body)
             payload = await invoke(prompt, system, model, image_paths or None,
                                    fmt if native else None, web=web,
                                    effort=request_effort(body),
                                    thinking=thinking_policy)
-        finally:
-            await _gate.release()
+        else:
+            if not await _gate.acquire(limit):
+                # Never queue: SwitchYard needs to hear "full" immediately so it can
+                # spill to the next plan in the lane instead of holding a worker open.
+                raise HTTPException(status_code=429,
+                                    detail=f"sidecar at capacity ({limit})",
+                                    headers={"Retry-After": "5"})
+            thinking_policy = request_thinking(body)
+            try:
+                payload = await invoke(prompt, system, model, image_paths or None,
+                                       fmt if native else None, web=web,
+                                       effort=request_effort(body),
+                                       thinking=thinking_policy)
+            finally:
+                await _gate.release()
         payload, finish_reason = enforce_max_tokens(
             payload, request_max_tokens(body))
         # `display` rides on the same policy we just read into `thinking_policy`

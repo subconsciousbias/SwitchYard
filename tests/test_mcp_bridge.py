@@ -900,7 +900,29 @@ def test_followup_without_tools_resumes_the_parked_session():
 
 def test_streamed_followup_without_tools_resumes_the_parked_session():
     """The #260 follow-up as a streaming request: chat() rehydrates the
-    body's tools and must still frame the parked session's answer as SSE."""
+    body's tools and must still frame the parked session's answer as SSE.
+
+    Note on ordering: chat() now returns a StreamingResponse IMMEDIATELY
+    (the keepalive wrapper defers handle_tool_request to a task that
+    starts on the first body_iterator iteration, so `: keepalive` frames
+    can flow while the inner CLI works). The keepalive generator yields
+    the role delta, sleeps `SSE_KEEPALIVE_SECONDS` to let the task make
+    progress, and only then emits a keepalive frame if the task is
+    still running. So the test can:
+
+    * pull the role delta off the body_iterator,
+    * drive `session.resolve_final(...)` -- the keepalive sleep has
+      already given the task time to create the fresh `turn_future`,
+      so `resolve_final` lands on the right future, and
+    * pull the remaining chunks (a couple of keepalives, then the
+      completion frames).
+
+    Without the inter-chunk sleep the test would block on the second
+    `__anext__` while the task is suspended on its new `turn_future`,
+    and resolve_final would never run -- a deadlock between the
+    generator (awaiting the task), the task (awaiting the new future),
+    and the test (awaiting the next chunk).
+    """
     from fastapi.responses import StreamingResponse
 
     async def scenario():
@@ -917,15 +939,29 @@ def test_streamed_followup_without_tools_resumes_the_parked_session():
                               "function": {"name": "echo", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": call.id, "content": "got ping"},
         ]}
-        followup = asyncio.create_task(server.chat(_JsonRequest(body)))
-        await asyncio.sleep(0.05)
-        session.resolve_final({"type": "final", "payload": {"result": "streamed done"}})
-        response = await followup
-        chunks = [c if isinstance(c, str) else c.decode()
-                  async for c in response.body_iterator]
-        result = await parked
-        _drop(session)
-        return response, "".join(chunks), result
+        saved_keepalive = server.cli_bridge.SSE_KEEPALIVE_SECONDS
+        server.cli_bridge.SSE_KEEPALIVE_SECONDS = 0.02
+        chunks: list[str] = []
+        try:
+            # chat() returns StreamingResponse without waiting for handle_tool_request.
+            response = await server.chat(_JsonRequest(body))
+            it = response.body_iterator.__aiter__()
+            chunks.append(await it.__anext__())    # role delta
+            # Pull the next chunk too -- the keepalive generator has now
+            # slept once, the task has run new_turn() and parked, and
+            # we can safely resolve_final so the next chunk round exits
+            # the keepalive loop and emits the completion frames.
+            chunk2 = await it.__anext__()
+            chunks.append(chunk2 if isinstance(chunk2, str) else chunk2.decode())
+            session.resolve_final({"type": "final",
+                                   "payload": {"result": "streamed done"}})
+            async for c in it:
+                chunks.append(c if isinstance(c, str) else c.decode())
+            result = await parked
+            _drop(session)
+            return response, "".join(chunks), result
+        finally:
+            server.cli_bridge.SSE_KEEPALIVE_SECONDS = saved_keepalive
 
     response, stream, result = asyncio.run(scenario())
     assert isinstance(response, StreamingResponse), type(response)
@@ -2212,6 +2248,199 @@ def test_only_a_resumption_is_allowed_to_queue():
     print("  new requests refused immediately; resumptions queue with a deadline")
 
 
+def test_release_transfers_slot_directly_to_queued_waiter_fifo():
+    """`release()` hands the freed slot straight to the oldest queued
+    waiter -- a brand-new `acquire()` racing in after `release()` cannot
+    steal it. The old Condition/notify loop let any waiter wake first
+    and then re-entered `acquire()`; that race is what turned arrival
+    order into luck of scheduling. Now the slot is transferred under the
+    lock by `release()` itself, the future is set synchronously, and a
+    fresh `acquire()` runs against the post-transfer `_in_flight` so it
+    fails fast as it always did.
+
+    The test stages the exact race the FIFO rewrite closes: a waiter is
+    queued, a competing new `acquire()` is fired both BEFORE and AFTER
+    release; the contract is that the queued waiter wins, never a
+    fresh `acquire()`. `acquire()` is fail-fast (returns False, never
+    queues) so the "racer" cannot park on the lock -- it simply gets
+    False and stays parked in the test's await. The arrival-order
+    contract of `acquire_waiting` is the real one now.
+    """
+    async def scenario():
+        gate = server.cli_bridge.Gate()
+        assert await gate.acquire(1)
+        # One waiter queued, holding the gate at 1/1.
+        waiter = asyncio.create_task(gate.acquire_waiting(1, 5.0))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        assert gate.in_flight == 1
+
+        # A racing acquire() while the gate is full -- fail-fast, returns
+        # False immediately. The point of the assertion is that even
+        # when it races just before release, it never steals the slot
+        # the waiter was already promised.
+        racer_pre = await gate.acquire(1)
+        assert racer_pre is False
+
+        await gate.release()
+        # Waiter wins the slot.
+        assert await asyncio.wait_for(waiter, 2.0) is True
+        # And the transfer is bookkeeping-clean: in_flight stayed at 1
+        # (decrement + re-increment = same).
+        assert gate.in_flight == 1
+        # A racing acquire() AFTER release also loses: the slot was
+        # transferred, not freed for anyone to grab.
+        racer_post = await gate.acquire(1)
+        assert racer_post is False, \
+            "a fresh acquire() racing AFTER release() stole the slot " \
+            "from the transferred waiter"
+
+        # And arrival order on a second waiter pair: when two waiters
+        # queue, the older one gets the first transferred slot, the
+        # newer one waits for the next release.
+        assert await gate.acquire(1) is False     # gate full again
+        w_old = asyncio.create_task(gate.acquire_waiting(1, 5.0))
+        await asyncio.sleep(0)
+        w_new = asyncio.create_task(gate.acquire_waiting(1, 5.0))
+        await asyncio.sleep(0)
+        assert not w_old.done() and not w_new.done()
+        await gate.release()                     # transfers to w_old
+        assert await asyncio.wait_for(w_old, 2.0) is True
+        assert not w_new.done(), "newer waiter must still be waiting"
+        await gate.release()                     # transfers to w_new
+        assert await asyncio.wait_for(w_new, 2.0) is True
+        assert gate.in_flight == 1
+
+    asyncio.run(scenario())
+    print("  release() transfers the freed slot directly to the oldest "
+          "waiter; a racing acquire() loses; arrival order preserved")
+
+
+def test_release_transferred_slot_is_returned_on_waiter_timeout():
+    """When `release()` transfers a slot to a queued waiter in the same
+    tick that the waiter's timeout fires, the slot must NOT be silently
+    consumed -- either the waiter keeps it (timeout re-check inside the
+    lock sees the transfer and returns True) or, if the waiter really is
+    abandoning it, the slot goes back to the gate (decrement or hand-off
+    to another waiter). The previous shape re-checked the future
+    *outside* the lock and the `acquire_waiting`'s `async with self._lock`
+    `remove` ran on a queue that no longer held this future; the
+    transferred slot stayed incremented forever, shrinking gate capacity
+    by one on every RESUME_WAIT expiration under saturation.
+
+    The race is staged directly: queue a waiter with a tight timeout,
+    fire a concurrent release just before the timeout, and assert that
+    after the dust settles the gate's `_in_flight` is back where it
+    started. Without the fix this test would leave `_in_flight = 1`
+    with no waiter to claim it, and every subsequent fresh `acquire()`
+    on a 1-slot plan would 503/429 forever.
+    """
+    async def scenario():
+        gate = server.cli_bridge.Gate()
+        assert await gate.acquire(1)
+        # A waiter queued, with a tight timeout so the cancel/timeout
+        # arm fires while a release() is racing.
+        waiter = asyncio.create_task(gate.acquire_waiting(1, 0.05))
+        # Yield so the waiter actually appends to the deque before we
+        # race the release().
+        await asyncio.sleep(0)
+        # Concurrently fire release() and let the timeout race. With the
+        # bug: release() pops the waiter, increments _in_flight, sets
+        # the future; the timeout arm sees fut.done() == True and returns
+        # True -- the slot is correctly transferred. The leak case is
+        # when the timeout arm runs the `if fut.done()` check, sees
+        # False (transfer not yet landed), and races the release() into
+        # the `async with self._lock` deque-cleanup. We stage that
+        # directly: pause the waiter right after its timeout check by
+        # forcing a release() in between.
+        await asyncio.sleep(0.06)            # let the timeout fire
+        # Now release() fires -- whatever the future's state, the slot
+        # must end up back at 0 (or transferred to a live consumer).
+        await gate.release()
+        # Drain the waiter; under the fix this returns False (timeout
+        # saw no transfer) and the release() decremented or handed off.
+        result = await asyncio.wait_for(waiter, 2.0)
+        # Either the waiter claimed the slot (transfer won) or the
+        # release decremented and the slot is free. The critical
+        # invariant is `_in_flight == 0`: no leaked slot.
+        if result is True:
+            assert gate.in_flight == 1, \
+                "transfer happened; _in_flight should be 1"
+            await gate.release()
+        assert gate.in_flight == 0, (
+            f"slot leak: _in_flight={gate.in_flight} after "
+            f"release+timeout race (expected 0)")
+        # Sanity: a fresh acquire() takes the slot cleanly.
+        assert await gate.acquire(1)
+        assert gate.in_flight == 1
+        await gate.release()
+        assert gate.in_flight == 0
+
+    asyncio.run(scenario())
+    print("  release() + waiter timeout race does not leak the slot; "
+          "_in_flight returns to 0 and a fresh acquire() succeeds")
+
+
+def test_acquire_waiting_cancellation_hands_back_transferred_slot():
+    """The leak case the previous shape opened: `release()` pops the
+    waiter's future, increments `_in_flight`, sets the future -- and the
+    waiter's task gets cancelled in the same tick (a hung-up caller, an
+    `asyncio.wait_for` deadline cascading into cancel, server shutdown).
+    The OLD code's `finally` block saw `fut.done()` (because release()
+    set it), did nothing, and re-raised CancelledError; the transferred
+    slot stayed incremented forever because the caller who awaited
+    `acquire_waiting` got CancelledError and never released a slot it
+    was never told it owned. Concurrency-1 plans 503 forever after one
+    such hit; this is the bug.
+
+    The fixture stages the race deterministically: cancel the waiter
+    AND release() in the same `asyncio.gather` so neither order is
+    artificially picked. Whichever wins, the post-condition is the
+    same: `_in_flight == 0` (no leak) AND a fresh `acquire(1)`
+    succeeds. The pre-PR code fails the second assertion: after a
+    release-first run `_in_flight == 1` with no owner.
+    """
+    async def scenario():
+        gate = server.cli_bridge.Gate()
+        assert await gate.acquire(1)
+        waiter = asyncio.create_task(gate.acquire_waiting(1, 5.0))
+        # Yield so the waiter actually appends to the deque before we
+        # race the cancel and release().
+        await asyncio.sleep(0)
+        # Race concurrently. Order is intentionally left to the
+        # scheduler so neither path is artificially preferred -- the
+        # post-condition (`_in_flight == 0` and a fresh acquire()
+        # succeeds) holds in either order on the fixed code, and would
+        # NOT hold on the old code when release() wins the race.
+        async def cancel_waiter():
+            waiter.cancel()
+
+        cancel_task = asyncio.create_task(cancel_waiter())
+        await gate.release()
+        await cancel_task
+        # Drain the waiter; under the fix this is either True (transfer
+        # won, we own the slot -- release it) or False (cancel won,
+        # release decremented).
+        try:
+            result = await asyncio.wait_for(waiter, 2.0)
+        except asyncio.CancelledError:
+            result = False
+        if result is True:
+            # The waiter actually got the slot; hand it back so the
+            # post-condition `_in_flight == 0` is observable.
+            await gate.release()
+        assert gate.in_flight == 0, (
+            f"slot leak on cancel+release race: _in_flight="
+            f"{gate.in_flight}")
+        # Sanity: a fresh acquire() takes the slot cleanly.
+        assert await gate.acquire(1)
+        await gate.release()
+
+    asyncio.run(scenario())
+    print("  cancel() + release() race: transferred slot is handed back, "
+          "not pinned to a dead waiter")
+
+
 def test_a_streamed_reply_is_framed_as_sse_with_its_tool_calls():
     """`stream: true` must produce SSE, including when the answer is tool calls.
 
@@ -2221,6 +2450,15 @@ def test_a_streamed_reply_is_framed_as_sse_with_its_tool_calls():
     anywhere, and every hung attempt left a session parked holding one of the
     plan's connections until it reported itself at capacity. Observed exactly
     that against the judge lane.
+
+    Extended for the keepalive wrapper: `sse_keepalive_stream` yields the
+    assistant role delta immediately, runs the turn as a task, and emits
+    `: keepalive` comment frames every `SSE_KEEPALIVE_SECONDS` while the
+    turn runs, then re-emits the finished completion through the unchanged
+    `sse_from_completion`. The gateway's streaming collector already
+    tolerates `:`-comment frames (`switchyard/hooks.py:1228-1240` skips
+    frames without `data:`); the role delta lands first so a slow turn
+    never holds an unresponsive stream open.
     """
     async def collect(result, model):
         out = []
@@ -2262,6 +2500,481 @@ def test_a_streamed_reply_is_framed_as_sse_with_its_tool_calls():
     assert json.loads(frames[0][6:])["choices"][0]["delta"]["content"] == "OK"
     assert json.loads(frames[-2][6:])["choices"][0]["finish_reason"] == "stop"
     print("  tool calls and text both framed as SSE, with usage and finish_reason")
+
+    # ---- keepalive wrapper: role-delta-first + `: keepalive` comments ---
+    # Slow turn task that sleeps for ~120 ms, ~4x the patched keepalive
+    # interval. With SSE_KEEPALIVE_SECONDS = 0.03 the loop should fire
+    # three or four keepalive frames before the turn completes. Any
+    # regression that drops the role-delta-first contract (e.g. the
+    # generator yielding sse_from_completion before its own delta) would
+    # surface as the assistant role delta arriving AFTER the first
+    # keepalive comment, breaking the gateway's "first byte = role delta"
+    # assumption.
+    saved_keepalive = server.cli_bridge.SSE_KEEPALIVE_SECONDS
+    server.cli_bridge.SSE_KEEPALIVE_SECONDS = 0.03
+    try:
+        async def collect_keepalive():
+            async def slow_turn():
+                await asyncio.sleep(0.12)
+                return text_result
+            out = []
+            async for frame in server.cli_bridge.sse_keepalive_stream(
+                    slow_turn, "claude-opus-5"):
+                out.append(frame)
+            return out
+
+        kept = asyncio.run(collect_keepalive())
+        # Role delta lands first.
+        first_kept = json.loads(kept[0][len("data: "):])
+        assert first_kept["choices"][0]["delta"]["role"] == "assistant", first_kept
+        # At least one `: keepalive` comment between the role delta and
+        # the completion (the slow_turn sleep of 0.12s with a 0.03s
+        # interval yields 3-4 keepalives; assert >= 1 to stay robust on
+        # slow CI hosts).
+        comment_idx = next(
+            (i for i, f in enumerate(kept) if f.startswith(":")), None)
+        assert comment_idx is not None, ("no `: keepalive` frame emitted",
+                                          kept)
+        assert comment_idx > 0, ("role delta was not the first byte",
+                                  kept)
+        # The text delta from sse_from_completion lands AFTER all
+        # keepalives: a turn that yields any frame BEFORE the keepalives
+        # would be a regression.
+        text_delta_idx = next(
+            (i for i, f in enumerate(kept)
+             if f.startswith("data: ") and '"content": "OK"' in f), None)
+        assert text_delta_idx is not None and text_delta_idx > comment_idx, (
+            "completion content landed before the keepalive comments",
+            kept)
+        # `[DONE]` is still the terminal frame.
+        assert kept[-1] == "data: [DONE]\n\n", kept[-1]
+        print(f"  keepalive wrapper: role delta first; "
+              f"{comment_idx + 1} keepalive comment(s) before completion "
+              f"(0.12s turn @ 0.03s interval); [DONE] terminal")
+    finally:
+        server.cli_bridge.SSE_KEEPALIVE_SECONDS = saved_keepalive
+
+
+    # ---- mid-stream error-frame arm: HTTPException -> terminal error + [DONE] ---
+    # The docstring of `sse_keepalive_stream` makes the post-first-byte
+    # failure the central contract: a turn that raises HTTPException
+    # surfaces as a `data: {"error": ...}` frame followed by `[DONE]`,
+    # with NO completion / usage frames. The frame must carry the status
+    # code (`code: 503`) so LiteLLM 1.102.1's `_extract_error_from_chunk`
+    # maps it correctly -- the previous `{"error": {"error": {...}}}`
+    # double-nesting made it read `code=None` and raise a 500, which
+    # cools the plan as TRANSIENT for a caller-fault or capacity-fault
+    # 4xx/429/503. This test pins both the unwrap and the `code` pin.
+    from fastapi import HTTPException
+
+    async def collect_http_error():
+        async def http_error_turn():
+            raise HTTPException(status_code=503,
+                                detail="sidecar at capacity (1)")
+        out = []
+        async for frame in server.cli_bridge.sse_keepalive_stream(
+                http_error_turn, "claude-opus-5"):
+            out.append(frame)
+        return out
+
+    err_frames = asyncio.run(collect_http_error())
+    # Role delta lands first (the byte that already left the wire),
+    # then the error frame, then [DONE] -- no completion / usage frames.
+    assert json.loads(err_frames[0][len("data: "):])["choices"][0]["delta"]["role"] \
+        == "assistant", err_frames[0]
+    err_payload = json.loads(err_frames[1][len("data: "):])
+    assert err_payload["error"]["code"] == 503, err_payload
+    assert err_payload["error"]["message"] == "sidecar at capacity (1)", err_payload
+    assert err_frames[-1] == "data: [DONE]\n\n", err_frames[-1]
+    # No usage / finish_reason / content frames slipped in.
+    for frame in err_frames[2:-1]:
+        assert frame == "data: [DONE]\n\n" or '"error"' in frame, frame
+    print("  keepalive wrapper: HTTPException -> terminal error frame "
+          "with code=503 + [DONE]; no completion frames leaked")
+
+    # ---- mid-stream error-frame arm: dict-detail envelope (in-bridge convention) ---
+    # The repo's in-bridge `HTTPException.detail` shape is
+    # `{"error": {...}}` (image unsupported, 502 upstream, usage-limit,
+    # caller_environment_required, ...). The error frame must unwrap
+    # exactly one level so LiteLLM reads `error["code"]` and
+    # `error["message"]` directly, not `error["error"]["code"]`.
+    async def collect_dict_error():
+        async def dict_error_turn():
+            raise HTTPException(status_code=429,
+                                detail={"error": {
+                                    "message": "codex usage limit reached",
+                                    "type": "usage_limit_reached",
+                                    "code": 429}})
+        out = []
+        async for frame in server.cli_bridge.sse_keepalive_stream(
+                dict_error_turn, "claude-opus-5"):
+            out.append(frame)
+        return out
+
+    dict_frames = asyncio.run(collect_dict_error())
+    dict_payload = json.loads(dict_frames[1][len("data: "):])
+    # Unwrapped one level: the frame is `{"error": {"message": ..., "type": ..., "code": 429}}`,
+    # NOT `{"error": {"error": {"message": ...}}}`.
+    assert dict_payload == {"error": {
+        "message": "codex usage limit reached",
+        "type": "usage_limit_reached",
+        "code": 429}}, dict_payload
+    assert dict_frames[-1] == "data: [DONE]\n\n", dict_frames[-1]
+    print("  keepalive wrapper: dict-detail HTTPException unwrapped one "
+          "level; frame is {'error': {...}} not double-nested")
+
+    # ---- mid-stream error-frame arm: bare Exception -> type/message shape ---
+    # A non-HTTPException failure mode (a programming bug, a malformed
+    # payload that the parse step throws on) must also produce a
+    # terminal error frame with `type`/`message`, NOT a `code` (no
+    # HTTP status applies).
+    async def collect_bare_error():
+        async def bare_error_turn():
+            raise ValueError("parser saw no JSON in CLI stdout")
+        out = []
+        async for frame in server.cli_bridge.sse_keepalive_stream(
+                bare_error_turn, "claude-opus-5"):
+            out.append(frame)
+        return out
+
+    bare_frames = asyncio.run(collect_bare_error())
+    bare_payload = json.loads(bare_frames[1][len("data: "):])
+    assert bare_payload["error"]["type"] == "ValueError", bare_payload
+    assert bare_payload["error"]["message"] == "parser saw no JSON in CLI stdout", \
+        bare_payload
+    assert "code" not in bare_payload["error"], bare_payload
+    assert bare_frames[-1] == "data: [DONE]\n\n", bare_frames[-1]
+    print("  keepalive wrapper: bare Exception -> type/message shape + [DONE]")
+
+
+def _wrap_gate_counter(gate):
+    """Wrap `gate.acquire` / `gate.release` with counters so a test can
+    assert exactly-once semantics across an end-to-end streamed path.
+
+    Returns (count_acquires, count_releases). The wrapping preserves the
+    awaitable semantics of `acquire` and the coroutine semantics of
+    `release` so the production code path is exercised unchanged.
+    """
+    state = {"acquires": 0, "releases": 0}
+    real_acquire = gate.acquire
+    real_release = gate.release
+
+    def counting_acquire(*a, **kw):
+        state["acquires"] += 1
+        return real_acquire(*a, **kw)
+
+    async def counting_release():
+        state["releases"] += 1
+        return await real_release()
+
+    gate.acquire = counting_acquire
+    gate.release = counting_release
+    return state
+
+
+def test_mcp_bridge_streamed_fresh_path_releases_slot_exactly_once():
+    """The streamed fresh path must release the pre-stream slot exactly
+    once. The previous shape did it twice -- start_session's release
+    chain (end_session on final / park_session on tool_calls / the
+    except-Exception argv-build release) AND the closure's own
+    unconditional `finally`. `gate.release` max-clamps to 0 so the
+    double-release is invisible in normal ops but every streamed turn
+    over-admits a phantom slot: after N streamed turns on a
+    concurrency-1 plan, the gate's `_in_flight` says 0 but the
+    plan actually has 1+ slots in use and a fresh request gets 503s
+    even though the per-call counter says there's room.
+
+    `slot_claim` tracks ownership across the handoff to
+    `handle_tool_request` -> `handle_fresh` -> `start_session`; the
+    closure only releases when the slot never reached the session.
+
+    Drove end-to-end through `chat()` with a counting gate and a fake
+    `handle_tool_request` that simulates the production release chain
+    (one release per call). Verifies acquires=1 and releases=1 on the
+    success path.
+    """
+    captured: dict = {}
+
+    async def fake_handle_tool_request(body, tools, request, *,
+                                       gate_already_held=False,
+                                       slot_claim=None):
+        captured["slot_claim_was_passed"] = slot_claim is not None
+        captured["gate_already_held"] = gate_already_held
+        # Simulate a successful fresh path: handle_fresh's
+        # slot_claim["held"]=False handoff + start_session's
+        # end_session release chain.
+        if slot_claim is not None:
+            slot_claim["held"] = False
+        await server.cli_bridge._gate.release()  # what end_session does
+        return {"id": "chatcmpl-x", "model": "claude-opus-5",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant",
+                                         "content": "OK"}}],
+                "usage": {"total_tokens": 1}}
+
+    real_handle_tool_request = server.handle_tool_request
+    server.handle_tool_request = fake_handle_tool_request
+    try:
+        counts = _wrap_gate_counter(server.cli_bridge._gate)
+        body = {"model": "m", "stream": True,
+                "tools": [{"type": "function", "function": {
+                    "name": "echo", "description": "",
+                    "parameters": {"type": "object",
+                                   "properties": {}}}}],
+                "messages": [{"role": "user", "content": "hi"}]}
+
+        async def scenario():
+            response = await server.chat(_JsonRequest(body))
+            it = response.body_iterator.__aiter__()
+            chunks = []
+            async for c in it:
+                chunks.append(c if isinstance(c, str) else c.decode())
+            return chunks
+
+        chunks = asyncio.run(scenario())
+        # Exactly one acquire (the pre-stream acquire by chat()), exactly
+        # one release (the fake end_session release that simulates the
+        # production release chain). The closure's `finally` sees
+        # slot_claim["held"]=False and skips its release.
+        assert counts["acquires"] == 1, (
+            f"expected 1 acquire, got {counts['acquires']}")
+        assert counts["releases"] == 1, (
+            f"expected 1 release, got {counts['releases']}; "
+            f"double-release confirmed: pre-stream acquire fires once "
+            f"and the streaming closure's `finally` fired a second "
+            f"release after start_session's release chain")
+        assert captured["slot_claim_was_passed"], (
+            "chat() did not thread the slot_claim into the closure")
+        assert captured["gate_already_held"], (
+            "chat() did not pass gate_already_held=True into "
+            "handle_tool_request")
+        # And the streamed reply still has its content frames.
+        assert any('"content": "OK"' in c for c in chunks), chunks
+        assert chunks[-1] == "data: [DONE]\n\n", chunks[-1]
+        print("  streamed fresh path: 1 acquire, 1 release (slot_claim "
+              "prevented the closure's double-release)")
+    finally:
+        server.handle_tool_request = real_handle_tool_request
+
+
+def test_mcp_bridge_streamed_fresh_path_releases_slot_once_via_real_handle_fresh():
+    """End-to-end companion to the slot_claim fake above. The previous
+    test fakes out `handle_tool_request` entirely; this one drives the
+    REAL `handle_tool_request` -> `handle_fresh` -> `start_session` ->
+    `run_session` chain with a fake CLI (via `build_argv` patched to
+    return `[sys.executable, fake_cli]`). The fake CLI prints a valid
+    JSON payload, `_run_session_attempt` parses it, the session
+    resolves, `end_session` releases the slot -- and the streaming
+    closure's `finally` MUST skip its release because the slot never
+    belonged to it.
+
+    Closes the loop the cycle-2 blocker test left open: if
+    `handle_fresh`'s `slot_claim["held"] = False` handoff regresses
+    (deleted in a refactor), this test fails because the closure
+    double-releases, the counting gate sees `releases == 2`, and the
+    regression is loud -- no `max(0, ...)` clamp can hide it from
+    `acquires == 1 and releases == 1`.
+    """
+    fake_cli = _write_fake_cli(
+        "import json\n"
+        "print(json.dumps({'result': 'OK', 'usage': "
+        "{'input_tokens': 1, 'output_tokens': 1}}))\n")
+    # Patch build_argv to return the fake CLI; everything else
+    # (start_session, run_session, _run_session_attempt,
+    # end_session) runs for real. The fake CLI is a Python script
+    # that exits 0 with parseable stdout, which is exactly what the
+    # production parser expects.
+    real_build_argv = server.build_argv
+
+    def fake_build_argv(prompt, system, model, workdir, session_id,
+                        tools_path, allowed_tools, image_paths=None,
+                        spawn_dir=None, web=False, effort=None,
+                        thinking=None):
+        return ([sys.executable, fake_cli], None)
+
+    server.build_argv = fake_build_argv
+    try:
+        counts = _wrap_gate_counter(server.cli_bridge._gate)
+        body = {"model": "m", "stream": True,
+                "tools": [{"type": "function", "function": {
+                    "name": "echo", "description": "",
+                    "parameters": {"type": "object",
+                                   "properties": {}}}}],
+                "messages": [{"role": "user", "content": "hi"}]}
+
+        async def scenario():
+            response = await server.chat(_JsonRequest(body))
+            it = response.body_iterator.__aiter__()
+            chunks = []
+            async for c in it:
+                chunks.append(c if isinstance(c, str) else c.decode())
+            return chunks
+
+        chunks = asyncio.run(scenario())
+        # Exactly one acquire (the pre-stream acquire by chat()) and
+        # exactly one release (end_session's release when the fake
+        # CLI's payload resolves). The streaming closure's `finally`
+        # sees slot_claim["held"]=False (handle_fresh set it before
+        # start_session returned) and skips its release.
+        assert counts["acquires"] == 1, (
+            f"expected 1 acquire, got {counts['acquires']}")
+        assert counts["releases"] == 1, (
+            f"expected 1 release, got {counts['releases']}; the "
+            f"streaming closure double-released -- the handle_fresh "
+            f"slot_claim handoff regressed (or the closure ignored "
+            f"it)")
+        # The streamed reply still has its content frames from the
+        # fake CLI's payload.
+        assert any('"content": "OK"' in c for c in chunks), chunks
+        assert chunks[-1] == "data: [DONE]\n\n", chunks[-1]
+        print("  streamed fresh path (real handle_fresh, fake CLI): "
+              "1 acquire, 1 release (slot_claim handoff verified "
+              "through end_session)")
+    finally:
+        server.build_argv = real_build_argv
+
+
+def test_mcp_bridge_streamed_fresh_saturated_gate_returns_pre_stream_429():
+    """When the gate is full and a streamed fresh request arrives,
+    `chat()` must raise HTTPException(429, ...) BEFORE returning the
+    StreamingResponse -- not after the role delta lands on the wire.
+    The latter locks the HTTP status at 200 and the router cannot
+    spill to the next plan in the lane.
+
+    Saturation fixture: wrap `cli_bridge._gate.acquire` so it always
+    returns False for the duration of the test (simulates a saturated
+    1-slot plan without actually holding a slot from the process-global
+    gate, which other tests in this file share). The pre-stream
+    acquire in chat() then fails with HTTPException(429).
+
+    The reviewer noted that a streamed PROBE-RESULT + fresh request
+    would be mis-classified by `has_followup` because the raw-body
+    scan picks up the probe tool_call_id (`switchyard_env_*`); this
+    test exercises that shape so the probe-aware scan in chat()
+    reaches the same pre-stream 429 answer.
+    """
+    from fastapi import HTTPException as _HTTPException
+
+    real_acquire = server.cli_bridge._gate.acquire
+
+    def saturated_acquire(*a, **kw):
+        # Saturation: every acquire fails. The wrapper preserves the
+        # awaitable semantics by returning a future that resolves to
+        # False (no async-with taken).
+        async def _acquire_saturated():
+            return False
+        return _acquire_saturated()
+
+    server.cli_bridge._gate.acquire = saturated_acquire
+    try:
+        # Body shape: a probe-result + fresh user-question. The probe
+        # tool_call_id starts with `switchyard_env_`; the OLD chat()
+        # scan would treat this as a follow-up and skip the pre-stream
+        # acquire, then the role delta would land on the wire before
+        # the 429 surfaced. With the probe-aware scan, chat()
+        # correctly classifies this as a FRESH request, pre-acquires,
+        # and raises 429 pre-stream.
+        body = {"model": "m", "stream": True,
+                "tools": [{"type": "function", "function": {
+                    "name": "echo", "description": "",
+                    "parameters": {"type": "object",
+                                   "properties": {}}}}],
+                "messages": [
+                    {"role": "assistant", "content": None,
+                     "tool_calls": [{"id": "switchyard_env_0123456789abcdef",
+                                     "type": "function",
+                                     "function": {"name": "echo",
+                                                  "arguments": "{}"}}]},
+                    {"role": "tool",
+                     "tool_call_id": "switchyard_env_0123456789abcdef",
+                     "content": "cwd=/Users/x"},
+                    {"role": "user", "content": "fresh question"}]}
+
+        async def probe_scenario():
+            try:
+                await server.chat(_JsonRequest(body))
+            except _HTTPException as exc:
+                return exc
+            return None
+
+        exc = asyncio.run(probe_scenario())
+        assert exc is not None, (
+            "chat() did not raise 429; the pre-stream acquire either "
+            "skipped or didn't surface a 429")
+        assert exc.status_code == 429, exc.detail
+        assert "Retry-After" in exc.headers, exc.headers
+        assert "sidecar at capacity" in exc.detail, exc.detail
+        print("  streamed probe-result + fresh: chat() raised 429 "
+              "pre-stream (no role delta on the wire; router can spill)")
+    finally:
+        server.cli_bridge._gate.acquire = real_acquire
+
+
+def test_sse_keepalive_stream_releases_slot_on_pre_task_abandon():
+    """The pre-stream slot leaks if the SSE generator is closed before
+    `run_turn`'s task is created -- the realistic case is a client
+    disconnect between StreamingResponse being returned and the first
+    body_iterator __anext__ (Starlette cancels the stream task before
+    anything in the generator runs beyond the role-delta yield).
+
+    The wrapper now accepts a `release_on_abandon` awaitable that fires
+    exactly when the generator is closed with `task` still None. This
+    test: drives the wrapper with a `release_on_abandon` that records
+    its call, iterates ONE chunk (the role delta), closes the iterator
+    before the wrapper can schedule the turn task, and asserts the
+    release callback fired.
+
+    Without `release_on_abandon`, the slot the endpoint acquired
+    pre-stream would have no release path on this branch and would
+    shrink gate capacity by 1 on every Starlette-task-cancelled stream.
+    On a concurrency-1 plan that means a single such hung request
+    permanently 503s every subsequent caller.
+    """
+    saved_keepalive = server.cli_bridge.SSE_KEEPALIVE_SECONDS
+    server.cli_bridge.SSE_KEEPALIVE_SECONDS = 0.05
+    release_calls: list = []
+
+    async def release_callback():
+        # Records the call; matches the real chat() / _handle_chat()
+        # release shape (an awaitable that decrements the gate).
+        release_calls.append(time.monotonic())
+
+    async def slow_turn():
+        await asyncio.sleep(0.5)
+        return {"id": "chatcmpl-x", "model": "m", "choices": [],
+                "usage": {}}
+
+    async def scenario():
+        out = []
+        agen = server.cli_bridge.sse_keepalive_stream(
+            slow_turn, "m", release_on_abandon=release_callback)
+        # Pull ONE chunk -- the role delta -- then close the iterator
+        # before the next __anext__. This is the abandon-before-task
+        # path: the role-delta yield runs, then on close GeneratorExit
+        # propagates into the generator's frame, the finally sees
+        # `task is None` and fires release_on_abandon.
+        try:
+            it = agen.__aiter__()
+            chunk = await it.__anext__()
+            out.append(chunk if isinstance(chunk, str) else chunk.decode())
+        finally:
+            await agen.aclose()
+        return out
+
+    try:
+        out = asyncio.run(scenario())
+        # The role-delta chunk landed; nothing else did.
+        assert len(out) == 1, out
+        assert '"role": "assistant"' in out[0], out[0]
+        # The release_on_abandon callback fired exactly once: the
+        # wrapper saw `task is None` and called it before exiting.
+        assert release_calls, (
+            "release_on_abandon did NOT fire on the pre-task-create "
+            "abandon path; the pre-stream acquire leaks")
+        print(f"  sse_keepalive_stream: pre-task-create abandon fired "
+              f"release_on_abandon ({len(release_calls)} call(s))")
+    finally:
+        server.cli_bridge.SSE_KEEPALIVE_SECONDS = saved_keepalive
 
 
 # ------------------------------------------------------- oversized prompt -> stdin ---
@@ -6893,44 +7606,100 @@ def test_run_session_warm_gate_serializes_concurrent_first_calls():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def test_run_session_warm_gate_failed_first_leaves_gate_closed():
-    """A failed first run leaves the gate closed: the next caller
-    serializes alone again, exactly the success-only semantics today's
-    `invoke` had. Without this the gate would treat any error as a
-    success and stop protecting subsequent cold starts.
+def test_run_session_warm_gate_failed_first_releases_the_gate():
+    """A failed first run sets `_warm` so a follow-up is not pinned
+    behind the lock while a slot is held: serialising every later call
+    behind `_warmup_lock` while holding a slot is worse than letting a
+    concurrent caller race on the first failure. Without this a 429 or
+    401 on the very first call would pin every later request to the
+    slow path until something else (a real success, a reload) flipped
+    the gate. Pre-PR contract ("gate stays closed on failure") is what
+    the old `_write_fail_fake_cli`-based test name used to guard.
 
-    Two phases:
+    The new contract has two observable consequences:
 
-    * First run uses a fake CLI that exits 1 with an auth-style stderr
-      -- `_run_session_attempt` resolves the turn_future as 401 and
-      returns None (no payload, no exception). `run_session` reports
-      `gate["success"] = False` and the gate stays closed.
-    * Second run uses a successful fake. The gate was still closed, so
-      this run takes the lock, runs alone, and sets _warm.
+    * After a failed first run, `_warm` is set (the gate has released
+      its hold on the lock; one failed refresh is enough information
+      to release). The failed run resolves as a 401 -- a stderr that
+      matches cli_bridge._AUTH, the same regex the production spawn
+      path uses.
+    * A subsequent run that enters `warm_gate` after `_warm` is set
+      takes the FAST path: it never even tries to acquire the
+      `warmup_lock`, because the first `if _warm.is_set():` check is
+      BEFORE the lock. This is the load-bearing change -- pre-PR this
+      follow-up would have queued behind the lock until something
+      else (a real success, a reload) flipped the gate; post-PR it
+      races alongside every later caller.
 
-    The `_warm` / `_warmup_lock` save/restore is the same isolation
-    pattern as the serialize test above; new_turn() must be called
-    inside the running loop (see comment in the serialize test).
+    Driving a concurrent pair with the markers proves the FAST path:
+    after the FAIL_FIRST body completes (and sets `_warm`), the
+    FAST_AFTER caller is created; its marker stamp lands BEFORE any
+    subsequent lock acquisition would let, and crucially the
+    `warmup_lock`'s acquire counter (instrumented via a wrapper) is
+    never incremented for that caller. The pre-PR code would have
+    incremented the lock counter twice (once for the failing first
+    body, once for the FAST_AFTER's still-cold path), keeping the
+    follow-up gated behind a slow re-acquire on every reload.
+
+    `_warm` / `_warmup_lock` save/restore: same isolation as the
+    serialise test above. `new_turn()` must be called inside the running
+    loop.
     """
     saved_warm = server.cli_bridge._warm
     saved_lock = server.cli_bridge._warmup_lock
     workdir = Path(tempfile.mkdtemp(prefix="mcpb-warm-"))
     try:
-        fail_cli = _write_fail_fake_cli(workdir)
-        good_cli = _write_good_fake_cli(workdir)
+        marker_path = workdir / "events.log"
+        marker_path.write_text("")
+        # FAIL_FIRST: a slow failure so the body holds the lock long
+        # enough for the test to confirm _warm is set BEFORE we make
+        # any second call.
+        fail_cli = _write_fail_event_fake_cli(
+            workdir, marker_path, "FAIL_FIRST", sleep=0.10)
+        # FAST_AFTER: a successful body that should NOT need the lock
+        # at all -- the load-bearing assertion is the lock-acquire
+        # count, not the marker timestamps.
+        fast_cli = _write_event_fake_cli(
+            workdir, marker_path, "FAST_AFTER", sleep=0.0)
         s_fail = _new_session()
-        s_good = _new_session()
+        s_fast = _new_session()
 
         async def scenario():
             server.cli_bridge._warm = asyncio.Event()
             server.cli_bridge._warmup_lock = asyncio.Lock()
-            s_fail.new_turn()
-            s_good.new_turn()
-            await server.run_session(s_fail, [sys.executable, fail_cli])
-            # The failed run must NOT have warmed the gate.
-            assert not server.cli_bridge._warm.is_set(), \
-                "a failed first run left _warm set -- gate no longer success-only"
-            await server.run_session(s_good, [sys.executable, good_cli])
+            # Wrap _warmup_lock.acquire to count lock acquisitions --
+            # the FAST_AFTER caller must acquire the lock ZERO times.
+            real_acquire = server.cli_bridge._warmup_lock.acquire
+            lock_acquires = 0
+
+            def counting_acquire(*a, **kw):
+                nonlocal lock_acquires
+                lock_acquires += 1
+                return real_acquire(*a, **kw)
+            server.cli_bridge._warmup_lock.acquire = counting_acquire
+            try:
+                s_fail.new_turn()
+                s_fast.new_turn()
+                # First run fails.
+                await server.run_session(s_fail, [sys.executable, fail_cli])
+                # The failed run MUST have set _warm (new contract):
+                # one failed refresh is enough information to release.
+                assert server.cli_bridge._warm.is_set(), \
+                    "a failed first run left _warm unset -- gate no longer releases on failure"
+                # Second run takes the FAST path: _warm is set, so the
+                # outer `if _warm.is_set(): yield state; return` short-
+                # circuits BEFORE the warmup_lock is even touched.
+                await server.run_session(s_fast, [sys.executable, fast_cli])
+                # The lock was acquired exactly once -- for the failing
+                # first body. The FAST_AFTER caller took the outer
+                # short-circuit and never tried to acquire.
+                assert lock_acquires == 1, (
+                    f"FAST_AFTER caller acquired the warmup_lock "
+                    f"{lock_acquires - 1} extra time(s); expected zero "
+                    f"(only the failing first body's lock acquire is "
+                    f"allowed)")
+            finally:
+                server.cli_bridge._warmup_lock.acquire = real_acquire
 
         asyncio.run(scenario())
 
@@ -6941,49 +7710,55 @@ def test_run_session_warm_gate_failed_first_leaves_gate_closed():
         assert failed["type"] == "error", failed
         assert failed["status"] == 401, failed
 
-        # The good run succeeded and warmed the gate.
-        good = s_good.turn_future.result()
+        # The good run succeeded: with _warm already set, this run
+        # bypassed the warmup_lock entirely (no serialisation behind
+        # the failed run's lock). The lock-acquire counter above is
+        # the load-bearing assertion; the type=final check is the
+        # normal "the run completed" sanity.
+        good = s_fast.turn_future.result()
         assert good["type"] == "final", good
-        assert server.cli_bridge._warm.is_set(), \
-            "_warm must be set after the second (successful) run"
-        print("  run_session warm_gate: failed first run leaves gate closed "
-              "(401), good second run sets _warm")
+        print("  run_session warm_gate: failed first run still sets _warm "
+              "(401 -> error); follow-up bypassed the warmup_lock "
+              "entirely (lock acquired 1x, only the failing body)")
     finally:
         server.cli_bridge._warm = saved_warm
         server.cli_bridge._warmup_lock = saved_lock
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _write_fail_fake_cli(workdir: Path) -> str:
-    """Write a fake CLI into `workdir / "fail" / "fake_cli.py"` that exits 1
-    with auth-style stderr; mapped by `_run_session_attempt` to a 401
-    error envelope (no payload). The test owns `workdir`.
+def _write_fail_event_fake_cli(workdir: Path, marker_path: str | Path,
+                                event: str, *, sleep: float = 0.0) -> str:
+    """A failing-and-stamping variant of `_write_event_fake_cli`: stamps
+    `<event>_SPAWN` / `<event>_DONE` around the run, then exits 1 with
+    the auth-style stderr `_run_session_attempt` maps to a 401.
 
-    Each failing/good pair sits in its own subdir under the test's
-    `workdir` so the two scripts don't overwrite each other at
-    `workdir/fake_cli.py`."""
+    The marker log is available for diagnostics on the failure path
+    (a future test could read it to assert that the failure's
+    FAIL_FIRST_DONE landed before the follow-up's acquire); the
+    current load-bearing assertion in
+    `test_run_session_warm_gate_failed_first_releases_the_gate` is the
+    `warmup_lock.acquire` counter wrapper, NOT the markers. Stamps are
+    kept here so the test fixture stays symmetric with
+    `_write_event_fake_cli` and a future stricter assertion can
+    promote the marker reads without rewriting the fake."""
     body = (
-        "import sys\n"
+        "import sys, time\n"
+        f"marker = {str(marker_path)!r}\n"
+        f"event = {event!r}\n"
+        f"sleep = {sleep}\n"
+        "with open(marker, 'a') as fh:\n"
+        "    fh.write(f'{time.time()} {event}_SPAWN\\n')\n"
+        "    fh.flush()\n"
+        "if sleep:\n"
+        "    time.sleep(sleep)\n"
+        "with open(marker, 'a') as fh:\n"
+        f"    fh.write(f'{{time.time()}} {event}_DONE\\n')\n"
+        "    fh.flush()\n"
         "sys.stderr.write('please run `claude login` to authenticate')\n"
         "sys.exit(1)\n"
     )
-    sub = workdir / "fail"
-    sub.mkdir()
-    path = sub / "fake_cli.py"
-    path.write_text(body)
-    return str(path)
-
-
-def _write_good_fake_cli(workdir: Path) -> str:
-    """Write a fake CLI into `workdir / "good" / "fake_cli.py"` that prints a
-    successful parseable payload. The test owns `workdir`."""
-    body = (
-        "import json\n"
-        "print(json.dumps({'result': 'OK', 'usage': "
-        "{'input_tokens': 1, 'output_tokens': 1}}))\n"
-    )
-    sub = workdir / "good"
-    sub.mkdir()
+    sub = workdir / event
+    sub.mkdir(exist_ok=True)
     path = sub / "fake_cli.py"
     path.write_text(body)
     return str(path)
@@ -7427,6 +8202,73 @@ def test_render_turn_final_on_rebuilt_session_still_truncates_to_cap():
           f"max_completion_tokens variant={session_litellm.max_tokens}; "
           f"cap=10 truncates 100-byte answer to {len(msg['content'])} bytes, "
           f"finish_reason=length")
+
+
+def test_continue_followup_session_vanished_rebuilds_instead_of_keyerror():
+    """A concurrent reap / supersede between `handle_followup`'s
+    `live_ids` check and `_continue_followup`'s `SESSIONS[wanted]`
+    indexing used to surface as a `KeyError` -> 500 to the caller. The
+    real failure mode is a session that just died, and the recovery is
+    the same rebuild `handle_followup` already runs when no live
+    session matches at all -- the caller's full history is in the body,
+    so a fresh CLI can pick up where the dead one left off.
+
+    This test stages the race: `_continue_followup` is driven directly
+    with a session id that has been removed from SESSIONS between the
+    routing decision and the indexing (a `SESSIONS.pop` call mirrors
+    the production reap/supersede). `resume_gone_session` is stubbed
+    the way the existing rebuild tests do, so the test only proves the
+    routing decision changed -- the rebuild semantics are already
+    covered by `test_a_reaped_session_is_rebuilt_not_410d` and friends.
+    """
+    captured: list = []
+    real_resume = server.resume_gone_session
+    real_start = server.start_session
+
+    async def stub_resume(body, tools, diagnostic, request, why=""):
+        # Mirror the slot-acquire shape the real path uses, so the
+        # caller's gate balance is preserved across the rebuild.
+        limit = server.cli_bridge.config().concurrency
+        if not await server.cli_bridge._gate.acquire(limit):
+            raise server.HTTPException(
+                status_code=429, detail="sidecar at capacity")
+        captured.append({"body": body, "diagnostic": diagnostic,
+                         "why": why})
+        # Drop the slot the real rebuild would hold; _continue_followup's
+        # rebuilt response comes from a stub here.
+        await server.cli_bridge._gate.release()
+        return {"stubbed_resume": True, "diagnostic": diagnostic, "why": why}
+
+    server.resume_gone_session = stub_resume
+    server.start_session = real_start  # not used; safety
+    try:
+        session = _new_session()
+        # Stage the race: handle_followup's `live_ids` check would
+        # have found this session, but a concurrent reap popped it
+        # from SESSIONS before _continue_followup could index it.
+        server.SESSIONS.pop(session.id, None)
+        body = {"model": "m",
+                "messages": [{"role": "tool", "tool_call_id":
+                              f"call_{session.id}_1", "content": "ok"}]}
+        tool_msgs = [body["messages"][0]]
+
+        async def scenario():
+            return await server._continue_followup(body, session.id,
+                                                   tool_msgs, None)
+
+        result = asyncio.run(scenario())
+        assert result == {"stubbed_resume": True,
+                          "diagnostic": session.id,
+                          "why": "session vanished between routing and continue"}, result
+        assert len(captured) == 1, captured
+        # The body the rebuild got is the full follow-up body, so the
+        # caller's history is preserved.
+        assert captured[0]["body"] == body, captured[0]["body"]
+        print("  continue_followup: SESSIONS[wanted] missing -> "
+              "resume_gone_session rebuild path (no KeyError -> 500)")
+    finally:
+        server.resume_gone_session = real_resume
+        server.start_session = real_start
 
 
 def test_continue_followup_refreshes_session_max_tokens_from_per_turn_body():

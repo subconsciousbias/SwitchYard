@@ -1485,6 +1485,14 @@ async def _run_session_attempt(session: Session, argv: list[str],
             # allowlist is the one being shared (bridge-siblings rule).
             # spawn_env only adds allowlisted keys (see session_env).
             env={**cli_bridge.subprocess_env(), **session.spawn_env},
+            # Match cli_bridge._run_cli_attempt: the CLI is its own session
+            # leader, so a timeout / supersede / reap can SIGKILL the whole
+            # group -- the CLI plus tool_server.py plus any node workers the
+            # inner harness forked. Without this a bare `proc.kill()` only
+            # reaches the CLI itself and the grandchildren re-attach to the
+            # plan's connection limit. kill_process_group is the matching
+            # helper (also defined on cli_bridge; bridge-siblings rule).
+            start_new_session=True,
         )
     except OSError as exc:
         # Same mapping cli_bridge._run_cli applies to a failed spawn (issue
@@ -1509,7 +1517,7 @@ async def _run_session_attempt(session: Session, argv: list[str],
                              else None),
             timeout=PROCESS_TIMEOUT)
     except asyncio.TimeoutError:
-        proc.kill()
+        cli_bridge.kill_process_group(proc)
         session.resolve_final({"type": "error", "status": 408,
                                 "detail": f"{PROVIDER} cli timed out after "
                                           f"{PROCESS_TIMEOUT:.0f}s"})
@@ -1595,15 +1603,16 @@ async def run_session(session: Session, argv: list[str],
     The whole attempt block is wrapped in cli_bridge.warm_gate so the cold
     start token-refresh race (issue #137 parity) is serialized once across
     the bridge: the first concurrent caller runs alone, every other one
-    waits on the warmup lock and runs solo too. Success is reported only
-    when an attempt produced a payload -- a terminal error that was already
-    resolved on the session's turn_future (payload is None) leaves the gate
-    closed, matching invoke's success-only semantics. The startup selfcheck
-    is the only spawn outside this gate; it is one-shot and doesn't share
-    the per-process credential refresh concern.
+    waits on the warmup lock and runs solo too. `warm_gate` releases the
+    lock and sets `_warm` as soon as the body completes -- whether it
+    returned or raised, payload or no payload -- so a failed first attempt
+    does not serialise every later call behind the lock while holding a
+    gate slot. The startup selfcheck is the only spawn outside this gate;
+    it is one-shot and doesn't share the per-process credential refresh
+    concern.
     """
     try:
-        async with cli_bridge.warm_gate() as gate:
+        async with cli_bridge.warm_gate():
             try:
                 payload = await _run_session_attempt(session, argv, stdin_data)
             except cli_bridge.CliNoTextError as exc:
@@ -1621,20 +1630,16 @@ async def run_session(session: Session, argv: list[str],
                     session.resolve_final({
                         "type": "error", "status": 502,
                         "detail": cli_bridge.format_no_text_detail(PROVIDER, combined)})
-                    # Two text-lost attempts in a row: no real success -- the
-                    # gate stays closed so a follow-up caller serializes
-                    # alone again.
-                    gate["success"] = False
                     return
                 # Successful retry: attempt 1's tokens are still real, fold them
                 # into the payload so the ledger books both attempts exactly once.
                 payload.setdefault("usage", {})
                 cli_bridge._sum_usage(payload["usage"], exc.usage)
-            if payload is None:
-                # a terminal error was already resolved -- gate stays closed.
-                gate["success"] = False
-                return
-            session.resolve_final({"type": "final", "payload": payload})
+            session.resolve_final(
+                {"type": "final", "payload": payload}
+                if payload is not None
+                else {"type": "error", "status": 502,
+                      "detail": f"{PROVIDER} cli returned no payload"})
     except Exception as exc:                        # never leave a session parked forever
         log.exception("mcp session %s crashed", session.id)
         session.resolve_final({"type": "error", "status": 500, "detail": str(exc)})
@@ -1714,8 +1719,12 @@ async def supersede_session(session: Session, reason: str) -> None:
             _SupersedeSignal(
                 f"session {session.id} superseded ({reason})", reason))
     if session.proc is not None and session.proc.returncode is None:
-        with contextlib.suppress(ProcessLookupError):
-            session.proc.kill()
+        # Group kill: SIGKILL the whole session (CLI + tool_server.py +
+        # grandchildren), not just the CLI. Bare proc.kill() used to leave
+        # tool_server.py and node workers alive and re-attaching to the
+        # plan's connection limit. kill_process_group suppresses
+        # ProcessLookupError internally and falls back to proc.kill().
+        cli_bridge.kill_process_group(session.proc)
     await end_session(session)
 
 
@@ -1852,8 +1861,11 @@ async def reap_session(session: Session) -> None:
     if session.turn_future is not None and not session.turn_future.done():
         session.turn_future.set_exception(_ReapedSignal("session reaped"))
     if session.proc is not None and session.proc.returncode is None:
-        with contextlib.suppress(ProcessLookupError):
-            session.proc.kill()
+        # Group kill -- same rationale as supersede_session above: SIGKILL
+        # the whole session (CLI + tool_server.py + grandchildren), not
+        # just the CLI. kill_process_group suppresses ProcessLookupError
+        # internally and falls back to proc.kill().
+        cli_bridge.kill_process_group(session.proc)
     await end_session(session)
 
 
@@ -2184,7 +2196,9 @@ def render_turn(session: Session, result: dict, requested_model: str | None) -> 
 
 
 async def handle_fresh(body: dict, tools: list[dict],
-                       request: "Request | None" = None) -> dict:
+                       request: "Request | None" = None,
+                       *, gate_already_held: bool = False,
+                       slot_claim: dict | None = None) -> dict:
     mcp_tools = translate_tools(tools)
     if not mcp_tools:
         raise HTTPException(status_code=400, detail="no usable tool definitions")
@@ -2246,14 +2260,38 @@ async def handle_fresh(body: dict, tools: list[dict],
             env = _caller_env.CallerEnvironment.unknown() if _caller_env else None
 
         limit = cli_bridge.config().concurrency
-        if not await cli_bridge._gate.acquire(limit):
-            # Never queue, same contract as cli_bridge: SwitchYard needs "full"
-            # immediately so it can spill to the next plan in the lane. Only a
-            # follow-up waits, because it has nowhere else to go.
-            raise HTTPException(status_code=429, detail=f"sidecar at capacity ({limit})",
-                                 headers={"Retry-After": "5"})
+        # Streaming handoff: the endpoint acquired the slot pre-stream
+        # so a saturated plan answers 429 before any byte lands on the
+        # wire. In that mode this function neither acquires nor
+        # releases; the streaming closure inherits ownership via
+        # `slot_claim` and releases in its own cleanup. Default
+        # (non-streamed) keeps the historical behaviour: acquire here,
+        # release on the success path inside start_session / on the
+        # failure path below. The release on the streamed path is the
+        # streaming closure's responsibility -- but only if the slot
+        # never reached start_session. handle_fresh sets
+        # `slot_claim["held"] = False` right before the start_session
+        # call so the closure's `finally` skips the second release
+        # when start_session's release chain has already released
+        # exactly once.
+        if not gate_already_held:
+            if not await cli_bridge._gate.acquire(limit):
+                # Never queue, same contract as cli_bridge: SwitchYard
+                # needs "full" immediately so it can spill to the next
+                # plan in the lane. Only a follow-up waits, because it
+                # has nowhere else to go.
+                raise HTTPException(status_code=429,
+                                    detail=f"sidecar at capacity ({limit})",
+                                    headers={"Retry-After": "5"})
 
         mcp_tools, system = fit_tool_surface(mcp_tools, system, body)
+        # Hand ownership to start_session: from here, start_session's
+        # release chain (end_session on final, park_session on
+        # tool_calls, except-Exception on argv build failures) owns
+        # the release. The closure's `finally` will see held=False and
+        # skip its release, so the slot is freed exactly once.
+        if slot_claim is not None:
+            slot_claim["held"] = False
         return await start_session(body, mcp_tools, prompt, system, model, request,
                                    image_paths, img_dir, env=env)
     except Exception as exc:
@@ -2837,8 +2875,23 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
     BEFORE the resolve loop so a 503 on a saturated gate leaves the parked
     calls parked and `awaiting_followup` true; the resolve loop only runs once
     the slot is in hand.
+
+    The session is read with `SESSIONS.get(wanted)`, not `SESSIONS[wanted]`:
+    a concurrent reap / supersede between handle_followup's `live_ids` check
+    and this indexing can remove the session. Falling through to the rebuild
+    path here is the same recovery a missing session already triggers in
+    handle_followup -- the caller never learns the session died, and a bare
+    KeyError no longer escapes as a 500.
     """
-    session = SESSIONS[wanted]
+    session = SESSIONS.get(wanted)
+    if session is None or session.dead:
+        log.info(
+            "live session %s vanished between routing and continue (in "
+            "SESSIONS=%s, dead=%s); rebuilding from request",
+            wanted, wanted in SESSIONS, session.dead if session else None)
+        return await resume_gone_session(
+            body, body.get("tools") or [], wanted, request,
+            why="session vanished between routing and continue")
     delivered_ids = [m["tool_call_id"] for m in tool_msgs]
     # Defect 1 (issue #13): every delivered id is already resolved and the
     # session is still parked, so this is a duplicate delivery of a batch we
@@ -3070,7 +3123,9 @@ async def _continue_followup(body: dict, wanted: str, tool_msgs: list[dict],
 
 
 async def handle_tool_request(body: dict, tools: list[dict],
-                              request: "Request | None" = None) -> dict:
+                              request: "Request | None" = None,
+                              *, gate_already_held: bool = False,
+                              slot_claim: dict | None = None) -> dict:
     await require_host_mirror()
     # Probe results travel as ordinary `tool` messages whose tool_call_id
     # carries `switchyard_env_`. Consume them FIRST (before any session
@@ -3103,7 +3158,9 @@ async def handle_tool_request(body: dict, tools: list[dict],
         probe_response = await probe_future
         if probe_response is not None:
             return probe_response
-    return await handle_fresh(body, tools, request)
+    return await handle_fresh(body, tools, request,
+                              gate_already_held=gate_already_held,
+                              slot_claim=slot_claim)
 
 
 @app.get("/health")
@@ -3193,14 +3250,109 @@ async def chat(request: Request):
             "type": "invalid_request_error", "param": "n"}})
     cli_bridge.validate_stop(body)
     cli_bridge.response_schema(body)
-    result = cli_bridge.finish_completion(
-        await handle_tool_request(body, tools, request), body)
     if not body.get("stream"):
+        result = cli_bridge.finish_completion(
+            await handle_tool_request(body, tools, request), body)
         return result
     # A caller that asked for SSE and got a JSON body does not error -- it waits
     # for events that never arrive. That is a client hanging with no log line
     # anywhere, and each hung attempt parks a session holding a connection until
-    # the plan reports itself full.
+    # the plan reports itself full. Streamed path runs the tool loop through
+    # `sse_keepalive_stream` (same one cli_bridge uses for the text path), so
+    # the assistant role delta lands immediately and `: keepalive` comment
+    # frames keep the connection alive while the tool turn runs -- the
+    # gateway's streaming collector (switchyard/hooks.py:1228-1240) skips
+    # frames without a `data:` payload. Pre-stream validation above
+    # (request_n, validate_stop, response_schema) stays exactly where it is
+    # so known-bad requests still get real 4xx.
+
+    # Pre-stream 429 is for the FRESH path only. A follow-up (body carries
+    # a `tool` message with one of OUR tool_call_ids) routes to
+    # `handle_followup` and then to either `_continue_followup` (live
+    # session, no gate) or `resume_gone_session` (no live session,
+    # `acquire_resume_slot` blocks up to RESUME_WAIT then returns 503).
+    # Both follow-up outcomes are by design -- a follow-up has nowhere
+    # else to spill to and waiting for a slot is the only honest answer.
+    # Acquiring here for a follow-up would either be a no-op (live) or
+    # deadlock against resume_gone_session's acquire_waiting (gone).
+    # `handle_tool_request` decides fresh-vs-follow-up the same way it
+    # does on the non-streamed path, AFTER consuming probe results via
+    # `_consume_probe_results` (which strips the synthetic
+    # `switchyard_env_*` probe tool messages). Mirror that decision by
+    # running the same consumption up front -- a streamed probe-result
+    # + fresh-request would otherwise scan the raw body and read every
+    # probe response as a follow-up, so chat() would skip the pre-stream
+    # acquire and the router would lose its fail-fast 429.
+    # `_consume_probe_results` is idempotent by construction (the
+    # underlying call caches parsed envs by fingerprint and is safe
+    # to run twice on the same body). chat() consumes into a fresh
+    # returned dict for the `has_followup` scan, but `body` itself
+    # is unchanged -- `handle_tool_request` below re-consumes from
+    # the raw body and re-parses the same probe results, returning
+    # the cached env again. On a failed probe the second pass
+    # re-fires `mark_probe_failed` and logs the failure line twice,
+    # which is harmless duplication of an idempotent log/info.
+    _, body_for_check = _consume_probe_results(body)
+    body_for_check = dict(body_for_check)
+    body_for_check["messages"] = _strip_synthetic_assistant(
+        body_for_check.get("messages") or [])
+    has_followup = any(m.get("role") == "tool" and m.get("tool_call_id")
+                       for m in (body_for_check.get("messages") or []))
+    # `slot_claim` tracks ownership of the pre-stream acquire across the
+    # handoff to handle_tool_request / handle_fresh / start_session. The
+    # streaming closure only releases on its `finally` if the slot never
+    # reached the session -- otherwise start_session's release chain
+    # (end_session on final, park_session on tool_calls, the local
+    # except-Exception release on argv build failures) already released
+    # exactly once and a second release would over-admit concurrent
+    # CLIs past the plan's connection limit. Without this flag, every
+    # streamed turn released twice and `_in_flight` under-counted real
+    # workers (verified end-to-end with a counting gate).
+    slot_claim: dict = {"held": False}
+    limit = cli_bridge.config().concurrency
+    if not has_followup:
+        if not await cli_bridge._gate.acquire(limit):
+            raise HTTPException(status_code=429,
+                                detail=f"sidecar at capacity ({limit})",
+                                headers={"Retry-After": "5"})
+        slot_claim["held"] = True
+
+    async def _release_slot() -> None:
+        # Belt-and-braces release for the pre-task-create abandon window
+        # only -- the wrapper fires this when the SSE generator is
+        # closed before `run_turn`'s task is created (a client
+        # disconnect between StreamingResponse being returned and the
+        # first body_iterator __anext__). After task creation, the
+        # session's own end_session / park_session / except-Exception
+        # release chain owns it; the streaming closure's finally
+        # consults `slot_claim["held"]` and skips the second release.
+        if slot_claim["held"]:
+            slot_claim["held"] = False
+            await cli_bridge._gate.release()
+
+    async def _run_turn() -> dict:
+        try:
+            return cli_bridge.finish_completion(
+                await handle_tool_request(body, tools, request,
+                                          gate_already_held=slot_claim["held"],
+                                          slot_claim=slot_claim),
+                body)
+        finally:
+            # Release ONLY if the slot never reached start_session --
+            # otherwise start_session's release chain has already
+            # released exactly once and a second release here would
+            # over-admit concurrent CLIs past the plan's connection
+            # limit (the max(0, ...) clamp hides the creep instead of
+            # surfacing it). handle_fresh sets slot_claim["held"]=False
+            # right before it returns (whether normally or by
+            # exception), so this branch only fires on paths where
+            # handle_fresh raised BEFORE start_session -- e.g. the
+            # CallerEnvironmentRequired 400 path.
+            if slot_claim["held"]:
+                slot_claim["held"] = False
+                await cli_bridge._gate.release()
+
     return StreamingResponse(
-        cli_bridge.sse_from_completion(result, result.get("model") or ""),
+        cli_bridge.sse_keepalive_stream(_run_turn, body.get("model") or "",
+                                         release_on_abandon=_release_slot),
         media_type="text/event-stream")

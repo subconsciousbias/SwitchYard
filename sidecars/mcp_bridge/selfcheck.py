@@ -320,12 +320,19 @@ async def run(bridge: Any, timeout: float = 180.0) -> dict:
                 *argv, *extra_argv, cwd=str(workdir), env=env,
                 stdin=asyncio.subprocess.PIPE if stdin_data is not None
                 else asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                # Same spawn shape as cli_bridge / mcp_bridge production
+                # spawns: the CLI is its own session leader, so a timeout
+                # SIGKILLs the whole group (CLI + tool_server.py +
+                # grandchildren). Bare proc.kill() would leave the
+                # grandchildren alive and risk leaking state on the next
+                # self-check.
+                start_new_session=True)
             try:
                 _, err = await asyncio.wait_for(
                     proc.communicate(stdin_data.encode() if stdin_data else None), timeout)
             except asyncio.TimeoutError:
-                proc.kill()
+                bridge.cli_bridge.kill_process_group(proc)
                 await proc.wait()
                 err = b"timed out"
             result = evaluate(provider, fake.requests,
