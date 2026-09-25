@@ -51,6 +51,16 @@ def build(plans_path: str) -> dict:
                 "auth": plan.auth,
                 "supports_tools": plan.can_use_tools,
                 "enabled": plan.enabled and model.enabled and not plan.expired,
+                # Deterministic id for the served-deployment re-attribution
+                # in hooks._check_served_deployment. LiteLLM 1.101.0 stamps
+                # ``model_info.id`` onto ``response._hidden_params["model_id"]``
+                # (response_metadata.py:set_hidden_params:71-75), and stamps
+                # ``router.py:9223-9225`` a sha256 hexdigest onto this field
+                # when it is missing -- an opaque value the SwitchYard side
+                # cannot resolve back to a Model. The ``.id`` suffix keeps
+                # this distinct from ``model_name`` so it does not collide
+                # with any built-in cost-map entry.
+                "id": model.router_id,
             }
             if model.context_window:
                 info["max_input_tokens"] = model.context_window

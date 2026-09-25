@@ -159,6 +159,19 @@ class Model:
         return f"sy.{self.plan_key}.{self.key}"
 
     @property
+    def router_id(self) -> str:
+        """The deterministic id we stamp onto ``model_info.id`` for this
+        pairing. LiteLLM 1.101.0 stamps the router with a sha256 hexdigest
+        of (model_name, litellm_params) when ``model_info.id`` is absent
+        (router.py:9223-9225); without an explicit id the value is opaque
+        and unmatchable from the response object's ``_hidden_params
+        ["model_id"]``. The ``.id`` suffix keeps it distinct from the
+        deployment string (model_name) so it does not collide with any
+        litellm-model-cost-map entry.
+        """
+        return f"sy.{self.plan_key}.{self.key}.id"
+
+    @property
     def display(self) -> str:
         return self.label or self.key
 
@@ -544,6 +557,23 @@ class Registry:
     def model_for_deployment(self, deployment: str) -> Model | None:
         for m in self.models.values():
             if m.deployment == deployment:
+                return m
+        return None
+
+    def model_for_router_id(self, router_id: str) -> Model | None:
+        """Resolve a router-side deployment id (``_hidden_params["model_id"]``)
+        back to a known Model. LiteLLM 1.101.0 fills this with the deployment's
+        ``model_info.id`` at router init (router.py:8676), which
+        ``switchyard/gen_litellm.py`` now stamps with ``Model.router_id`` --
+        a deterministic string ``sy.{plan}.{model}.id``. Without the stamp
+        the router fills the id with a sha256 hexdigest of (model_name,
+        litellm_params) and there is no way to map it back. ``model_for_deployment``
+        is for callers that pass a deployment string (the picker, the
+        pre-call hook's direct-pick path); this is for the post-call side,
+        where LiteLLM hands us the router id and we need to recognise it.
+        """
+        for m in self.models.values():
+            if m.router_id == router_id:
                 return m
         return None
 

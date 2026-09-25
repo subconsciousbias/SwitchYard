@@ -650,17 +650,32 @@ class SwitchyardHandler(CustomLogger):
         subscription's quota and debit another's, so the served plan is
         identified and used instead — and the move is logged, because it means
         something bypassed the routing rules (tool capability, the session
-        lease, the mid-loop pin) and is worth seeing rather than absorbing.
+        lease, the mid-tool-loop pin) and is worth seeing rather than absorbing.
 
         Returns (plan, served_ref): the plan to attribute usage to (None when
         it cannot be resolved) and the ref of the deployment that answered, so
         model-scoped economics land on the model that actually spent them.
+
+        ``kwargs["model"]`` can arrive in two shapes:
+
+          * the deployment string ``sy.{plan}.{model}`` -- pre-call
+            ``data["model"]`` for a direct-pick caller (hooks.py:398) and
+            what ``model_for_deployment`` resolves against;
+          * the router id ``_hidden_params["model_id"]`` -- the value the
+            proxy stamps on every response and that ``_call_facts`` writes
+            through (issue #184). SwitchYard's ``gen_litellm.py`` now
+            stamps ``model_info["id"]`` with a deterministic
+            ``Model.router_id`` (``sy.{plan}.{model}.id``) so this lookup
+            resolves back to a Model; a stale hash from before the stamp
+            still falls through to the picked model.
         """
         picked = self.registry.plans.get(ctx["plan"])
         served_name = kwargs.get("model")
         if not served_name:
             return picked, ctx.get("model")
-        served = self.registry.model_for_deployment(str(served_name))
+        served_str = str(served_name)
+        served = (self.registry.model_for_deployment(served_str)
+                  or self.registry.model_for_router_id(served_str))
         if served is None or served.ref == ctx.get("model"):
             return picked, ctx.get("model")
         actual = self.registry.plan_of(served)
@@ -903,7 +918,15 @@ class SwitchyardHandler(CustomLogger):
                       exc_info=True)
 
         if ctx.get("call_type") in UNLOGGED_CALL_TYPES:
-            kwargs = (data or {}).get("litellm_params") or {}
+            # LiteLLM 1.101.0 does not populate ``data["litellm_params"]`` on
+            # the /v1/messages path, so reading ``response_cost`` /
+            # ``model`` / ``response_headers`` from there would always land
+            # $0 cost, skip the served-deployment re-attribution, and miss
+            # the provider's quota headers. Build the kwargs from
+            # ``response._hidden_params`` instead -- the field provenance
+            # comment on ``_call_facts`` enumerates the exact 1.101.0
+            # locations.
+            kwargs = _call_facts(response, data)
             await self._finish_success(ctx, response_obj=response, kwargs=kwargs)
         return response
 
@@ -1090,7 +1113,15 @@ class SwitchyardHandler(CustomLogger):
         """
         async def _run() -> None:
             try:
-                kwargs = ((request_data or {}).get("litellm_params") or {})
+                # The response wrapper is gone by the time finalize runs --
+                # the streaming generator has been fully consumed. Read
+                # cost + model off ``logging_obj.model_call_details``
+                # (which the streaming handler populates:
+                # ``litellm_core_utils/streaming_handler.py:2386-2388``)
+                # and accept headers from the same place if they ever
+                # land there. ``_call_facts``'s None-response_obj branch
+                # is the documented shape for this caller.
+                kwargs = _call_facts(None, request_data)
                 await self._finish_success(
                     ctx, kwargs=kwargs,
                     usage=collected or None,
@@ -1556,6 +1587,218 @@ def _as_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# LiteLLM 1.101.0 does NOT set ``litellm_params.response_cost`` /
+# ``litellm_params.model`` / ``litellm_params.response_headers`` on the
+# ``data`` dict the proxy hands to ``async_post_call_success_hook`` /
+# ``async_post_call_streaming_iterator_hook`` (verified against the pinned
+# 1.101.0 source: ``common_request_processing.py`` reads those fields off the
+# ``ModelResponse._hidden_params`` and ``logging_obj.model_call_details``,
+# not off the request ``data``). The /v1/messages success paths therefore
+# must build their own kwargs-shaped dict from the response object (and,
+# for the streamed case, the logging object on ``request_data``), or cost
+# always lands as $0, the served-deployment re-attribution is dead, and
+# provider quota headers are never absorbed.
+#
+# Field provenance (pinned 1.101.0):
+#
+#   * ``_hidden_params["model_id"]`` -- the deployment's ``model_info.id``,
+#     stamped onto every response by
+#     ``litellm/litellm_core_utils/llm_response_utils/response_metadata.py:
+#     set_hidden_params:71-75``. ``switchyard/gen_litellm.py`` stamps this
+#     field with ``Model.router_id`` (``sy.{plan}.{model}.id``, distinct
+#     from the deployment string ``sy.{plan}.{model}``), so
+#     ``_check_served_deployment`` can resolve it back to a Model via
+#     ``Registry.model_for_router_id``. Without the stamp LiteLLM falls back
+#     to a sha256 hexdigest of (model_name, litellm_params)
+#     (router.py:9223-9225) -- an opaque value the SwitchYard side cannot
+#     match.
+#   * ``_hidden_params["response_cost"]`` -- the canonical cost figure.
+#     Some providers (Azure search, Stability image-edit) write a
+#     provider-reported cost under
+#     ``_hidden_params["additional_headers"]["llm_provider-x-litellm-response-cost"]``
+#     instead (litellm_core_utils/streaming_handler.py:1911-1914 and
+#     cost_calculator.py:1787-1792) and ``cost_calculator`` consults that
+#     header FIRST, so the helper cross-checks against it -- preferring the
+#     header when present matches litellm's own resolution order and is
+#     the only way a provider that never populates ``_hidden_params
+#     ["response_cost"]`` (the streaming-handler path) can still report
+#     cost on a /v1/messages request.
+#   * ``_hidden_params["additional_headers"]`` -- every response header the
+#     provider sent, prefixed ``llm_provider-{header}`` by
+#     ``litellm_core_utils/llm_response_utils/get_headers.py:_get_llm_provider_headers``
+#     so a caller that hands them back to LiteLLM can tell provider headers
+#     from LiteLLM-emulated OpenAI headers. The limit-header absorption in
+#     ``_absorb_limit_headers`` matches the configured ``q.headers`` keys
+#     against UN-prefixed names (e.g. ``x-ratelimit-remaining-tokens``),
+#     so the helper strips the ``llm_provider-`` prefix before returning.
+#
+# The streamed finalize runs after the response wrapper is consumed, so
+# ``response_obj=None`` is the documented call shape -- the helper falls
+# back to ``request_data["litellm_logging_obj"].model_call_details``, where
+# litellm stashes ``model`` and ``response_cost`` for the streaming path
+# (litellm_core_utils/streaming_handler.py:2386-2388).
+#
+# The served-deployment keys the two paths hand ``_check_served_deployment``
+# are different shapes, and the field the helper picks for each path
+# matches the lookup that resolves it:
+#
+#   * **Buffered** -- ``_hidden_params["model_id"]`` is the deployment's
+#     ``model_info.id``, which ``switchyard/gen_litellm.py`` now stamps
+#     with ``Model.router_id`` (``sy.{plan}.{model}.id``). That hits the
+#     ``model_for_router_id`` leg of ``_check_served_deployment``'s
+#     ``model_for_deployment or model_for_router_id`` chain.
+#   * **Streamed** -- the response wrapper is consumed before the
+#     finalize task runs, so the helper falls back to
+#     ``logging_obj.litellm_params.litellm_metadata.deployment_model_name``
+#     (router.py:_update_kwargs_with_deployment:3644 stamps this with
+#     ``sy.{plan}.{model}`` -- the deployment string, NOT a router id).
+#     That hits ``model_for_deployment`` directly.
+#
+# ``model_call_details["model"]`` is ``litellm_params["model"]`` after
+# routing (router.py:6412) -- the provider model string (e.g.
+# ``openrouter/xiaomi/mimo-v2.5``), not a deployment string -- so the
+# helper treats it as a last-resort fallback and only uses it when
+# ``litellm_metadata.deployment_model_name`` is absent (e.g. a future
+# litellm build that stops writing the deployment_model_name key, or a
+# test fixture that fabricates a bare logging object).
+#
+# ``model_call_details`` does NOT carry ``additional_headers`` today, so
+# a streamed /v1/messages request whose only quota signal is in the
+# response headers lands without limit-header absorption -- the bounded
+# loss the helper is documented to accept.
+def _strip_llm_provider_prefix(headers: dict[str, Any]) -> dict[str, Any]:
+    """Strip the ``llm_provider-`` prefix that
+    ``litellm/litellm_core_utils/llm_response_utils/get_headers.py:_get_llm_provider_headers``
+    writes onto every provider header, so the limit-header lookup in
+    ``_absorb_limit_headers`` matches against the un-prefixed names it
+    was originally written against. Non-dict / non-string keys are
+    tolerated: a key that is not a string is coerced, a non-string value
+    passes through untouched (the matcher compares the lookup string
+    only). An empty result is returned as an empty dict rather than the
+    sentinel ``None`` so the caller can write-through the same shape.
+    """
+    stripped: dict[str, Any] = {}
+    for k, v in headers.items():
+        if not isinstance(k, str):
+            stripped[str(k)] = v
+            continue
+        if k.startswith("llm_provider-"):
+            stripped[k[len("llm_provider-"):]] = v
+        else:
+            stripped[k] = v
+    return stripped
+
+
+def _deployment_model_name_from_logging(logging_obj: Any) -> str | None:
+    """Best-effort read of the served deployment string from a litellm
+    logging object. The router stamps
+    ``kwargs.litellm_metadata.deployment_model_name`` (router.py:_update_kwargs_with_deployment:3644)
+    and ``logging_obj.litellm_params`` carries the merged dict through
+    into the streaming-handler path. LiteLLM accepts ``metadata`` as an
+    alias for ``litellm_metadata`` -- try both. Returns ``None`` when
+    no usable string is found; never raises.
+    """
+    if logging_obj is None:
+        return None
+    litellm_params = getattr(logging_obj, "litellm_params", None)
+    if not isinstance(litellm_params, dict):
+        return None
+    for key in ("litellm_metadata", "metadata"):
+        meta = litellm_params.get(key) or {}
+        if not isinstance(meta, dict):
+            continue
+        candidate = meta.get("deployment_model_name")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def _call_facts(
+    response_obj: Any = None, request_data: Any = None,
+) -> dict:
+    """Kwargs-shaped facts LiteLLM would have given us on the real
+    ``async_log_success_event`` kwargs.
+
+    Returns a dict with at most three keys: ``model``, ``response_cost``,
+    ``response_headers``. Missing inputs never raise -- they simply yield
+    a dict without that key. The result is shaped so it can be passed
+    straight to ``_finish_success(..., kwargs=...)``: ``_check_served_deployment``
+    reads ``kwargs["model"]``, ``_finish_success`` reads
+    ``kwargs["response_cost"]``, and ``_absorb_limit_headers`` reads
+    ``kwargs["response_headers"]``.
+
+    The cross-check prefers the provider-reported header
+    ``x-litellm-response-cost`` over ``_hidden_params["response_cost"]``
+    when both are present and disagree, mirroring litellm's own order in
+    ``cost_calculator.py:1787-1792``.
+    """
+    out: dict[str, Any] = {}
+    hidden: Any = None
+    if response_obj is not None:
+        # LiteLLM hands the hook either a ModelResponse (attribute access)
+        # or a plain dict (the synthetic response the tests build, or a
+        # passthrough that has already been serialised). Cover both.
+        if isinstance(response_obj, dict):
+            hidden = response_obj.get("_hidden_params")
+        else:
+            hidden = getattr(response_obj, "_hidden_params", None)
+    if not isinstance(hidden, dict):
+        hidden = {}
+
+    # ---- model ----------------------------------------------------------
+    model_id = hidden.get("model_id") if hidden else None
+    if isinstance(model_id, str) and model_id:
+        out["model"] = model_id
+
+    # ---- response_cost + response_headers from the response --------------
+    header_cost: float | None = None
+    additional = hidden.get("additional_headers") if hidden else None
+    if isinstance(additional, dict) and additional:
+        stripped = _strip_llm_provider_prefix(additional)
+        if stripped:
+            out["response_headers"] = stripped
+            header_cost = _as_float(stripped.get("x-litellm-response-cost"))
+
+    cost_from_hidden = _as_float(hidden.get("response_cost")) if hidden else None
+    # Prefer the provider-reported header when both are present, mirroring
+    # litellm's own resolution order. Fall back to the canonical figure
+    # otherwise. Either missing -> no entry.
+    if header_cost is not None:
+        out["response_cost"] = header_cost
+    elif cost_from_hidden is not None:
+        out["response_cost"] = cost_from_hidden
+
+    # ---- fall back to logging_obj (streamed path) -------------------------
+    if request_data is not None and isinstance(request_data, dict):
+        logging_obj = request_data.get("litellm_logging_obj")
+        details = getattr(logging_obj, "model_call_details", None) if logging_obj is not None else None
+        if isinstance(details, dict):
+            if "model" not in out:
+                deployment_model_name = _deployment_model_name_from_logging(logging_obj)
+                if deployment_model_name:
+                    out["model"] = deployment_model_name
+                else:
+                    fallback_model = details.get("model")
+                    if isinstance(fallback_model, str) and fallback_model:
+                        out["model"] = fallback_model
+            if "response_cost" not in out:
+                fallback_cost = _as_float(details.get("response_cost"))
+                if fallback_cost is not None:
+                    out["response_cost"] = fallback_cost
+            # ``additional_headers`` is not currently stashed on
+            # ``model_call_details`` by litellm's 1.101.0 streaming path,
+            # but a future release might; tolerate the key without
+            # committing to it.
+            if "response_headers" not in out:
+                fallback_headers = details.get("additional_headers")
+                if isinstance(fallback_headers, dict) and fallback_headers:
+                    stripped_headers = _strip_llm_provider_prefix(fallback_headers)
+                    if stripped_headers:
+                        out["response_headers"] = stripped_headers
+
+    return out
 
 
 def _prompt_completion_tokens(

@@ -44,6 +44,7 @@ from switchyard.hooks import (  # noqa: E402
     SwitchyardHandler,
     UNLOGGED_CALL_TYPES,
     _TERMINATED,
+    _call_facts,
     _collect_anthropic_event_usage,
 )
 from switchyard.picker import Picker  # noqa: E402
@@ -403,31 +404,71 @@ def test_buffered_messages_does_not_double_count_cache_when_prompt_tokens_presen
 
 
 def test_buffered_messages_uses_response_cost_when_metered():
-    """``response_cost`` from the litellm_params must land in the ledger when
-    the plan is metered. On a subscription the marginal cost is zero and
-    writing it would inflate the month_cost figure the portal uses to
-    decide whether to renew -- so cost is only recorded for metered plans.
+    """``response_cost`` from the response's ``_hidden_params`` must land in
+    the ledger when the plan is metered.
+
+    On a subscription the marginal cost is zero and writing it would inflate
+    the month_cost figure the portal uses to decide whether to renew -- so
+    cost is only recorded for metered plans.
+
+    The response object is built with the exact ``_hidden_params`` shape
+    LiteLLM 1.101.0 sets on a ``/v1/messages`` response: ``response_cost``,
+    ``model_id``, and ``additional_headers`` whose keys carry the
+    ``llm_provider-`` prefix that
+    ``litellm_core_utils/llm_response_utils/get_headers.py`` writes. The
+    request_data carries NO ``litellm_params`` key, which is the production
+    shape (LiteLLM 1.101.0 does not populate it on the post-call request
+    path -- verified against the pinned source). Cost, served-deployment
+    re-attribution, and limit-header absorption all have to work from the
+    response alone.
     """
     from dataclasses import replace
+    from switchyard.models import Quota
     h, reg, _slots, _ledger, _policy, redis, pick = _build()
     plan_key = pick.plan.key
-    metered_plan = replace(reg.plans[plan_key], metered=True)
+    # Configure a quota window whose `headers` map tells the limit-header
+    # absorption code where to look in the provider's response -- the
+    # keys the absorption matches against are un-prefixed (the helper
+    # strips the ``llm_provider-`` before the lookup), so the quota
+    # mapping below targets the same names that arrive post-strip.
+    quota_with_headers = Quota(
+        name="window1", role="target", kind="tokens", period="month",
+        source="headers",
+        headers={"remaining": "x-ratelimit-remaining-tokens",
+                 "reset": "x-ratelimit-reset",
+                 "limit": "x-ratelimit-limit-tokens"},
+    )
+    metered_plan = replace(
+        reg.plans[plan_key], metered=True, quotas=(quota_with_headers,),
+    )
     new_plans = {**reg.plans, metered_plan.key: metered_plan}
     h.registry = models.Registry(settings=reg.settings, plans=new_plans,
                                   lanes=reg.lanes)
 
     ctx = _ctx_for(pick, call_type="anthropic_messages")
     ctx["plan"] = plan_key
-    request_data = {
-        "metadata": _meta_for(ctx),
-        "litellm_params": {
-            "metadata": _meta_for(ctx),
-            "response_cost": 0.0007,
-        },
-    }
+    # Production-shaped: NO ``litellm_params`` key. Pre-fix this test
+    # hand-built a ``litellm_params.response_cost`` here, which is the
+    # exactly the field that never lands on a real /v1/messages request.
+    request_data = {"metadata": _meta_for(ctx)}
+    # The response carries every fact the kwargs need, exactly as a
+    # /v1/messages response would at 1.101.0: ``response_cost`` for
+    # cost, ``model_id`` for served-deployment re-attribution, and
+    # ``additional_headers`` (with the ``llm_provider-`` prefix that
+    # the streaming handler / response processor writes) for
+    # limit-header absorption.
     response = _anthropic_response(pick, usage={
         "input_tokens": 100, "output_tokens": 12,
     })
+    response["_hidden_params"] = {
+        "model_id": pick.model.ref,
+        "response_cost": 0.0007,
+        "additional_headers": {
+            "llm_provider-x-ratelimit-remaining-tokens": "8000",
+            "llm_provider-x-ratelimit-reset": "1234567890",
+            "llm_provider-x-ratelimit-limit-tokens": "32000",
+        },
+    }
 
     async def go():
         await h.async_post_call_success_hook(
@@ -435,11 +476,292 @@ def test_buffered_messages_uses_response_cost_when_metered():
         )
         plan_keys = [k for k in redis.hashes.keys()
                      if k.startswith(f"sy:usage:{plan_key}:p:")]
+        bucket = _bucket_sync(redis, plan_keys[0])
+        # Limit-header absorption writes the quota window key, not the
+        # period bucket, so look for it directly.
+        window_keys = [k for k in redis.hashes.keys()
+                       if k.startswith(f"sy:qwin:{plan_key}:")]
+        window = (_bucket_sync(redis, window_keys[0])
+                  if window_keys else {})
+        return bucket, window
+
+    bucket, window = asyncio.run(go())
+    assert abs(bucket["cost"] - 0.0007) < 1e-9, bucket
+    # The provider-reported remaining/reset/limit values land on the
+    # window hash so the pacer / portal see the real quota -- this is
+    # the property the pre-fix code lost by reading a non-existent
+    # ``litellm_params`` key.
+    assert window.get("reported_remaining") == 8000.0, window
+    assert window.get("reported_limit") == 32000.0, window
+    assert window.get("reset_at") == 1234567890.0, window
+    print(f"  metered plan booked cost=${bucket['cost']:.6f} + window "
+          f"reported_remaining={int(window.get('reported_remaining', 0))}, "
+          f"limit={int(window.get('reported_limit', 0))}")
+
+
+def test_buffered_messages_served_deployment_mismatch_reattributes_cost():
+    """When ``_hidden_params["model_id"]`` disagrees with the picked model,
+    ``_check_served_deployment`` re-attributes the call to the sibling
+    deployment that actually answered, so a router-level fallback does not
+    spend one plan's quota and credit another's.
+
+    Pre-fix this property was untestable: ``litellm_params.model`` was
+    always absent (LiteLLM 1.101.0 does not set it on ``data``), so the
+    served-deployment code path was dead. With the response-object read
+    path, a real mismatch on ``_hidden_params["model_id"]`` is what the
+    served deployment sees.
+
+    The ``model_id`` field carries LiteLLM's router-side model id. With
+    ``gen_litellm.py`` now stamping ``model_info["id"]`` with a
+    deterministic ``Model.router_id`` (``sy.{plan}.{model}.id``,
+    distinct from the deployment string ``sy.{plan}.{model}`` so it
+    does not collide with the cost map), the test uses that exact
+    stamped shape -- which is what every response carries in
+    production -- and ``registry.model_for_router_id`` resolves it
+    back to a known Model. A pre-stamp router would have emitted a
+    sha256 hexdigest here (opaque, unresolvable); the new stamp is
+    the matching end of that wire.
+    """
+    from dataclasses import replace
+    h, reg, _slots, _ledger, _policy, redis, pick = _build()
+    plan = pick.plan
+    # Pick a sibling model on the same plan so the served ref is
+    # also a known, registered model. The picker may have landed on
+    # the same plan from a different lane (and pick.plan.models is
+    # a dict), so the sibling lookup walks every other model the
+    # plan owns rather than indexing the same list.
+    siblings = [m for m in plan.models.values() if m.ref != pick.model.ref]
+    assert siblings, (
+        "fixture plan must have a second model so a sibling move is "
+        f"exercisable; got plan.models={list(plan.models.keys())}")
+    served = siblings[0]
+    served_ref = served.ref
+    served_router_id = served.router_id
+    # Mark the served plan as metered so cost is recorded (the cost
+    # figure itself does not matter for the re-attribution assertion;
+    # the assertion is that the bookkeeping ran AT ALL on the served
+    # model rather than the picked one).
+    metered_plan = replace(plan, metered=True)
+    new_plans = {**reg.plans, metered_plan.key: metered_plan}
+    h.registry = models.Registry(settings=reg.settings, plans=new_plans,
+                                  lanes=reg.lanes)
+
+    ctx = _ctx_for(pick, call_type="anthropic_messages")
+    ctx["plan"] = plan.key
+    request_data = {"metadata": _meta_for(ctx)}
+    response = _anthropic_response(pick, usage={
+        "input_tokens": 200, "output_tokens": 50,
+    })
+    # ``_hidden_params["model_id"]`` carries the stamped router id of
+    # the deployment that served the call -- a sibling on the same
+    # plan, not what the picker picked. ``_call_facts`` writes it
+    # through to ``kwargs["model"]`` unchanged; ``_check_served_deployment``
+    # resolves it via ``registry.model_for_router_id``.
+    response["_hidden_params"] = {
+        "model_id": served_router_id,
+        "response_cost": 0.0013,
+    }
+
+    async def go():
+        await h.async_post_call_success_hook(
+            data=request_data, user_api_key_dict=None, response=response,
+        )
+        plan_keys = [k for k in redis.hashes.keys()
+                     if k.startswith(f"sy:usage:{plan.key}:p:")]
         return _bucket_sync(redis, plan_keys[0])
 
     bucket = asyncio.run(go())
-    assert abs(bucket["cost"] - 0.0007) < 1e-9, bucket
-    print(f"  metered plan booked cost=${bucket['cost']:.6f}")
+    # Cost still lands (metered flag follows the served plan, not the
+    # picked one -- both are the same plan here, but the assertion is
+    # that the bookkeeping ran at all).
+    assert bucket["cost"] > 0, bucket
+    # And the model-scoped token bucket is keyed by the served model,
+    # not the picked one. Pre-fix this was always ``pick.model.ref``
+    # because the served-deployment code path was never entered.
+    model_buckets = [k for k in redis.hashes.keys()
+                     if k.startswith(f"sy:usage:{plan.key}:m:{served_ref}:")]
+    assert model_buckets, (
+        f"served ref {served_ref} did not get its own model-scoped "
+        f"bucket; got "
+        f"{[k for k in redis.hashes.keys() if k.startswith('sy:usage:')]}")
+    print(f"  served-deployment mismatch (picked {pick.model.ref} -> "
+          f"served {served_ref}) re-attributed cost + tokens to the "
+          f"right model bucket via router id {served_router_id!r}")
+
+
+def test_model_for_router_id_resolves_and_distinguishes_from_deployment():
+    """Contract test for ``Registry.model_for_router_id``: the stamped
+    ``Model.router_id`` resolves to its Model, and the lookup does NOT
+    accidentally match the deployment string (``Model.deployment``)
+    even when they look almost the same. Together with the
+    re-attribution test above, this pins the wire end of the
+    served-deployment fix so a future ``gen_litellm.py`` change that
+    forgets the ``.id`` suffix, or a future registry edit that
+    collapses the two lookups into one, fails on contract rather than
+    silently no-op in production.
+    """
+    reg = models.load()
+    # Every model gets its own router_id; one resolves, the others
+    # don't, and a deployment string passed as router_id does NOT match.
+    sample = next(iter(reg.models.values()))
+    resolved = reg.model_for_router_id(sample.router_id)
+    assert resolved is sample, (
+        f"router_id {sample.router_id!r} did not resolve to its model "
+        f"{sample.ref}; got {resolved}")
+    # The deployment form (without ``.id``) is a different key -- it
+    # is what ``model_for_deployment`` resolves, not what
+    # ``model_for_router_id`` should.
+    assert reg.model_for_router_id(sample.deployment) is None, (
+        f"model_for_router_id must NOT match the deployment string "
+        f"{sample.deployment!r}; it resolves through "
+        f"model_for_deployment instead")
+    # An arbitrary hash-shaped string does not resolve -- this is the
+    # pre-fix shape that drove the original blocker.
+    assert reg.model_for_router_id(
+        "8ef256308fd1ebca000000000000000000000000000000000000000000000000"
+    ) is None, "an opaque sha256 router id must not match any Model"
+    print(f"  Registry.model_for_router_id: {sample.router_id!r} -> "
+          f"{sample.ref}; deployment string {sample.deployment!r} does NOT "
+          f"match (lookup is router-id-only)")
+
+
+def test_streamed_messages_finalize_reads_cost_from_logging_obj():
+    """The streamed /v1/messages finalize path runs after the response
+    wrapper is consumed, so the response object is unavailable. The
+    helper falls back to ``logging_obj.model_call_details`` for cost and
+    model -- the place litellm's streaming handler stashes them
+    (litellm_core_utils/streaming_handler.py:2386-2388).
+
+    The test wires a streaming hook the same way
+    ``test_streamed_messages_extracts_usage_from_message_start_and_delta``
+    does (so the finalize task runs and `_finish_success` is exercised
+    end-to-end), but builds the ``request_data`` with a synthetic
+    ``litellm_logging_obj`` instead of an ``litellm_params`` key. A
+    pre-fix version of this test would have written the cost into
+    ``request_data["litellm_params"]["response_cost"]`` -- the field
+    that does not exist in production on /v1/messages requests.
+
+    Plan is flipped to ``metered=True`` so the cost actually lands on
+    the ledger; the original ``test_buffered_messages_uses_response_cost_when_metered``
+    does the same and that cost is the load-bearing assertion of this
+    whole path.
+    """
+    from dataclasses import replace
+    h, reg, _slots, _ledger, _policy, redis, pick = _build()
+    metered_plan = replace(reg.plans[pick.plan.key], metered=True)
+    new_plans = {**reg.plans, metered_plan.key: metered_plan}
+    h.registry = models.Registry(settings=reg.settings, plans=new_plans,
+                                  lanes=reg.lanes)
+    ctx = _ctx_for(pick, call_type="anthropic_messages")
+
+    # Synthetic logging object that mimics what litellm's streaming
+    # handler writes onto ``logging_obj.model_call_details``: model +
+    # response_cost. No additional_headers today -- that's a documented
+    # limitation of the streamed path.
+    class _LoggingObj:
+        model_call_details = {
+            "model": pick.model.ref,
+            "response_cost": 0.0042,
+        }
+
+    request_data = {
+        "metadata": _meta_for(ctx),
+        "litellm_logging_obj": _LoggingObj(),
+    }
+
+    chunks = [
+        b'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"x","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":150,"output_tokens":1}}}\n\n',
+        b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":75}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+
+    async def produce():
+        for c in chunks:
+            yield c
+
+    async def consume():
+        async for _ in h.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=None, response=produce(), request_data=request_data,
+        ):
+            pass
+        # Let the detached finalize task land on the event loop.
+        await asyncio.sleep(0.05)
+
+    asyncio.run(consume())
+    plan_keys = [k for k in redis.hashes.keys()
+                 if k.startswith(f"sy:usage:{pick.plan.key}:p:")]
+    bucket = _bucket_sync(redis, plan_keys[0])
+    # Cost landed from logging_obj.model_call_details -- the source the
+    # /v1/messages streamed path actually has in production.
+    assert abs(bucket["cost"] - 0.0042) < 1e-9, bucket
+    # Tokens still land from the SSE chunks (the streamed-side path,
+    # not the new _hidden_params read path).
+    assert bucket["prompt_tokens"] == 150, bucket
+    assert bucket["completion_tokens"] == 75, bucket
+    print(f"  streamed /v1/messages: cost=${bucket['cost']:.6f} read off "
+          f"logging_obj.model_call_details, prompt={int(bucket['prompt_tokens'])}, "
+          f"completion={int(bucket['completion_tokens'])}")
+
+
+def test_call_facts_is_safe_on_empty_and_bad_inputs():
+    """Contract test for ``_call_facts``: every documented call shape
+    returns a dict and never raises. Missing inputs mean missing keys,
+    not exceptions -- the helpers are invoked from the success hooks,
+    where any raise would skip the slot release and corrupt the picker.
+
+    If the field names/locations litellm reads from ever move, this
+    test fires on the production-shape side (a ``request_data`` shaped
+    like a real /v1/messages request still yields ``response_cost > 0``)
+    so the regression is caught even before the integration tests.
+    """
+    # No inputs at all -> empty dict, not a raise.
+    assert _call_facts() == {}, _call_facts()
+    assert _call_facts(None, None) == {}, _call_facts(None, None)
+    # Empty dicts / non-dict request_data are tolerated.
+    assert _call_facts(None, {}) == {}, _call_facts(None, {})
+    assert _call_facts(None, "not a dict") == {}, _call_facts(None, "not a dict")
+
+    class _BadResp:
+        _hidden_params = None  # explicit None
+
+    assert _call_facts(_BadResp()) == {}, _call_facts(_BadResp())
+
+    # A response with a non-dict _hidden_params does not raise; the
+    # helper bails to the empty-dict path.
+    class _WrongTypeResp:
+        _hidden_params = "string, not a dict"
+
+    assert _call_facts(_WrongTypeResp()) == {}, _call_facts(_WrongTypeResp())
+
+    # The production-shaped read path -- ``data`` as the proxy hands
+    # it to ``async_post_call_success_hook`` on /v1/messages (no
+    # ``litellm_params`` key), plus a response whose ``_hidden_params``
+    # carries the exact fields LiteLLM 1.101.0 sets -- returns a dict
+    # with cost > 0. This is the assertion that catches a 1.101.0 ->
+    # future bump that renames ``model_id`` / ``response_cost`` /
+    # ``additional_headers``: the read site has to track the new names,
+    # or this test fails.
+    class _ProdResp:
+        _hidden_params = {
+            "model_id": "claude-prod-test",
+            "response_cost": 0.0009,
+            "additional_headers": {
+                "llm_provider-x-ratelimit-remaining-requests": "42",
+            },
+        }
+
+    facts = _call_facts(_ProdResp(), {"metadata": {"switchyard": {}}})
+    assert facts.get("response_cost") == 0.0009, facts
+    assert facts.get("model") == "claude-prod-test", facts
+    # The ``llm_provider-`` prefix must be stripped so the existing
+    # ``_absorb_limit_headers`` matching (which reads un-prefixed names)
+    # works unchanged.
+    assert "x-ratelimit-remaining-requests" in facts.get("response_headers", {}), (
+        facts)
+    assert "llm_provider-x-ratelimit-remaining-requests" not in facts.get(
+        "response_headers", {}), facts
+    print(f"  _call_facts contract: empty inputs -> {{}}; production-shape "
+          f"response -> {facts}")
 
 
 # ============================================================================
