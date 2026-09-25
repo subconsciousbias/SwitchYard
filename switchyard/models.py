@@ -254,6 +254,16 @@ class Settings:
     # own retry delay into the gateway. Cooled plans and cap==0 plans are
     # never waited on.
     pin_wait_seconds: float = 10.0
+    # How long an UNPINNED turn with an existing session lease waits for a
+    # slot on its leased plan before spilling to a peer. Zero means spill
+    # immediately — current behaviour, preserved as the default. The same
+    # prompt-cache and burst-absorption case as `pin_wait_seconds` applies
+    # to non-pinned turns that follow a session's previous pick, so giving
+    # the lease a chance to land its plan before spilling reduces the
+    # rate at which a chatty session bounces across plans. Cooled plans
+    # and cap==0 plans are never waited on; the shared `ctx.wait` path
+    # already enforces that for both wait knobs.
+    affinity_wait_seconds: float = 0.0
     # Move inline <think>...</think> out of streamed content and into
     # reasoning_content, the way a buffered response already does.
     split_reasoning_tags: bool = True

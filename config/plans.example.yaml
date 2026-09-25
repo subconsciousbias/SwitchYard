@@ -37,6 +37,16 @@ settings:
   # plans and cap==0 plans are never waited on (they will not lift inside the
   # deadline).
   pin_wait_seconds: 10
+  # How long an UNPINNED turn that already has a session lease waits for a
+  # slot on its leased plan before spilling to a peer. The same prompt-cache /
+  # burst-absorption rationale as `pin_wait_seconds`, but for the common
+  # chatty-session case where the loop is NOT explicitly pinning and the
+  # lease is the only signal pointing back at the previous plan. Default 0
+  # keeps today's spill-immediately behaviour — set a positive value to let
+  # the lease ride out a short burst on its plan. Cooled plans and cap==0
+  # plans are never waited on (the shared `ctx.wait` path already enforces
+  # that).
+  affinity_wait_seconds: 0
   # Providers that wrap chain-of-thought in <think>...</think> leak it into
   # streamed content — LiteLLM lifts it into reasoning_content only for a
   # buffered reply. Set false to pass the tags through untouched.

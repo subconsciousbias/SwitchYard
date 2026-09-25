@@ -693,7 +693,10 @@ class Picker:
             exclude=exclude or frozenset(), needs_tools=needs_tools,
             needs_images=needs_images, image_mode=image_mode,
             wait=(self.registry.settings.pin_wait_seconds
-                  if pinned and session else 0.0),
+                  if pinned and session
+                  else self.registry.settings.affinity_wait_seconds
+                  if session
+                  else 0.0),
         )
         # The parsed body and an optional implicit-perishable wrap. Empty
         # body or a lane that has nothing on the wire at all: refuse before

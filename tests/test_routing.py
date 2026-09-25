@@ -1842,6 +1842,154 @@ def test_a_pinned_followup_waits_then_spills_to_a_peer():
           f"plan spills to {cooled_to} without waiting")
 
 
+def test_an_unpinned_turn_with_a_session_lease_waits_then_spills():
+    """An unpinned turn on a leased plan rides out a short burst on its plan,
+    then gives way to a peer.
+
+    Same shape as the pinned-follow-up case: the unpick waits for
+    `affinity_wait_seconds` on the leased plan, holding no slot, so other
+    sessions keep being placed while it does. A slot freed inside the deadline
+    is claimed; one that doesn't free in time gives way to a peer plan, the
+    same way a fresh request would. Default `affinity_wait_seconds=0` keeps
+    today's spill-immediately behaviour, so an unpinned pick on a full
+    leased plan does not block.
+    """
+    import time as _time
+
+    async def go():
+        reg, slots, picker = build()
+        from dataclasses import replace
+        reg = replace(reg, settings=replace(reg.settings,
+                                            affinity_wait_seconds=3.0))
+        picker.registry = reg
+        lane = "forge"
+        session = "sess-unpinned-affinity"
+
+        # Establish a lease by picking first with the session, then release
+        # the slot but keep the lease — the way a real conversation leaves
+        # the lease in place between turns.
+        first = await picker.pick(lane, session)
+        held_ref = first.ref
+        await picker.release(first.plan.key, first.request_id, first.ref)
+        held_after_release = await slots.get_lease(session)
+        assert held_after_release == held_ref, (held_after_release, held_ref)
+
+        # Fill every remaining slot of the leased plan so the next claim must
+        # fail — the way a burst of concurrent turns does.
+        plan = reg.plan_of(first.model)
+        filler = None
+        for n in range(plan.max_parallel * 2):
+            rid = f"unpinned-filler-{n}"
+            if await slots.try_claim(plan.key, plan.max_parallel, rid,
+                                     first.ref, first.model.max_parallel) != 1:
+                break
+            filler = rid
+        assert filler is not None, "could not fill the leased plan"
+
+        # (a) The unpinned turn waits and claims a slot the moment it frees.
+        async def free_soon():
+            await asyncio.sleep(0.3)
+            await picker.release(plan.key, filler, first.ref)
+
+        freer = asyncio.create_task(free_soon())
+        started = _time.monotonic()
+        resumed = await picker.pick(lane, session)
+        elapsed = _time.monotonic() - started
+        await freer
+        assert resumed.ref == first.ref, (resumed.ref, first.ref)
+        assert resumed.sticky, "an unpinned turn on its leased plan is sticky"
+        assert 0.3 <= elapsed < 2.5, elapsed
+        await picker.release(resumed.plan.key, resumed.request_id, resumed.ref)
+
+        # (b) With no slot ever freeing, the wait runs to the deadline and
+        # the unpinned turn spills to a peer. The wait happened (elapsed is
+        # past the deadline) and the spill is honest — a different ref,
+        # not sticky.
+        refilled = []
+        for n in range(plan.max_parallel * 2):
+            rid = f"unpinned-filler-b-{n}"
+            if await slots.try_claim(plan.key, plan.max_parallel, rid,
+                                     first.ref, first.model.max_parallel) != 1:
+                break
+            refilled.append(rid)
+        started = _time.monotonic()
+        spilled = await picker.pick(lane, session)
+        elapsed = _time.monotonic() - started
+        assert spilled.ref != first.ref, (
+            "wait past the deadline must give way to a peer, not refuse")
+        assert not spilled.sticky
+        assert elapsed >= 2.5, f"the wait should have run its course: {elapsed}"
+        await picker.release(spilled.plan.key, spilled.request_id, spilled.ref)
+        # The spill re-leased onto the peer — put the lease back so the
+        # next scenario exercises the unpinned-on-the-original-plan path.
+        await slots.set_lease(session, first.ref, reg.settings.lease_ttl_seconds)
+
+        for rid in refilled:
+            await picker.release(plan.key, rid, first.ref)
+
+        return first.ref, spilled.ref
+
+    held, spilled_to = run(go())
+    print(f"  unpinned on {held} (wait=3s): a free slot in <3s lands here; "
+          f"a held plan spills to {spilled_to} after the deadline")
+
+
+def test_unpinned_session_spills_immediately_with_default_affinity_wait():
+    """With the default `affinity_wait_seconds=0`, an unpinned turn on a full
+    leased plan spills immediately — current behaviour preserved.
+
+    The pre-routing hook picks with `pinned=False`; before the affinity-wait
+    knob was introduced, that wait was always 0. The default keeps that
+    path bit-for-bit so callers that do not opt in see no change.
+    """
+    async def go():
+        reg, slots, picker = build()
+        # Confirm the default is 0 — the entire point of this test is that
+        # nothing in the registry changes today's behaviour.
+        assert reg.settings.affinity_wait_seconds == 0.0, (
+            reg.settings.affinity_wait_seconds)
+
+        lane = "forge"
+        session = "sess-unpinned-default"
+
+        first = await picker.pick(lane, session)
+        held_ref = first.ref
+        await picker.release(first.plan.key, first.request_id, first.ref)
+        held_after_release = await slots.get_lease(session)
+        assert held_after_release == held_ref, (held_after_release, held_ref)
+
+        # Fill every remaining slot of the leased plan.
+        plan = reg.plan_of(first.model)
+        filled = []
+        for n in range(plan.max_parallel * 2):
+            rid = f"default-filler-{n}"
+            if await slots.try_claim(plan.key, plan.max_parallel, rid,
+                                     first.ref, first.model.max_parallel) != 1:
+                break
+            filled.append(rid)
+        assert filled, "could not fill the leased plan"
+
+        import time as _time
+        started = _time.monotonic()
+        spilled = await picker.pick(lane, session)
+        elapsed = _time.monotonic() - started
+        assert spilled.ref != first.ref, (
+            "with affinity_wait_seconds=0 an unpinned turn must spill "
+            "immediately, not wait on the leased plan")
+        assert not spilled.sticky
+        assert elapsed < 0.5, (
+            f"default affinity_wait_seconds=0 must not wait: {elapsed}")
+
+        await picker.release(spilled.plan.key, spilled.request_id, spilled.ref)
+        for rid in filled:
+            await picker.release(plan.key, rid, first.ref)
+        return first.ref, spilled.ref, elapsed
+
+    held, spilled_to, elapsed = run(go())
+    print(f"  default unpinned on {held} (wait=0s): spills immediately to "
+          f"{spilled_to} in {elapsed:.3f}s")
+
+
 def test_pick_honours_exclusions():
     """A failed member is excluded from the candidate set on a re-pick.
 
