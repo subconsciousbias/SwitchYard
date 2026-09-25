@@ -30,8 +30,10 @@ from dataclasses import replace  # noqa: E402
 from switchyard import models  # noqa: E402
 from switchyard.classify import Outcome, Verdict  # noqa: E402
 from switchyard.hooks import SwitchyardHandler, _provider_error  # noqa: E402
+from switchyard.picker import Picker  # noqa: E402
 from switchyard.policy import CapacityPolicy  # noqa: E402
-from switchyard.slots import SlotTable  # noqa: E402
+from switchyard.session import CLI_HEADER  # noqa: E402
+from switchyard.slots import K_INFLIGHT, SlotTable  # noqa: E402
 from switchyard.usage import Ledger  # noqa: E402
 from tests.fake_redis import FakeRedis  # noqa: E402
 
@@ -552,6 +554,250 @@ def test_handle_failure_provider_shaped_still_cools_and_bumps_streak():
     assert releases[0][0] == "minimax-ultra", releases
     print(f"  status_code=500: cooldown {reason} {ttl}s, streak={streak}; "
           f"slot released (gate discriminates rather than disables)")
+
+
+class _InjectionFailingRedis(FakeRedis):
+    """FakeRedis subclass: lets every key flow normally EXCEPT
+    ``sy:inject:{session}`` — both reads and writes raise
+    ``redis.exceptions.ConnectionError``.
+
+    The picker's slot claim runs first (the Lua claim writes to
+    ``sy:inflight:{plan}`` / ``sy:cool:{plan}`` /
+    ``sy:inflight:m:{ref}`` / ``sy:inflight:lane:{plan}``, none of
+    which match the prefix), succeeds, and only THEN does the
+    CLI-session injection block at hooks.py:580-597 reach
+    ``slots.injected`` / ``slots.mark_injected`` — those hit the
+    ``K_INJECTED`` prefix and raise. The raise is the exact failure
+    mode the failure-cleanup path must absorb cleanly without cooling
+    the plan for SwitchYard's own plumbing fault.
+    """
+    PREFIX = "sy:inject:"
+
+    async def get(self, key, *args, **kwargs):
+        if str(key).startswith(self.PREFIX):
+            raise redis.exceptions.ConnectionError(
+                "fake redis: injection marker read refused")
+        return await super().get(key, *args, **kwargs)
+
+    async def set(self, key, *args, **kwargs):
+        if str(key).startswith(self.PREFIX):
+            raise redis.exceptions.ConnectionError(
+                "fake redis: injection marker write refused")
+        return await super().set(key, *args, **kwargs)
+
+
+def test_precall_redis_error_during_cli_injection_releases_slot_without_verdict():
+    """Regression: a Redis ConnectionError raised from the CLI-session
+    injection marker path AFTER the picker has claimed a slot must reach
+    ``async_post_call_failure_hook`` cleanly without cooling the plan.
+
+    Drives the production failure-handoff end-to-end (LiteLLM's
+    ``/chat/completions`` handler fires
+    ``post_call_failure_hook(request_data=data)`` on an exception
+    propagated out of ``pre_call_hook``, verified against litellm
+    1.102.1 proxy source). The picker's slot claim runs first (Lua
+    claim writes to ``sy:inflight:{plan}`` / ``sy:cool:{plan}`` /
+    ``sy:inflight:m:{ref}`` / ``sy:inflight:lane:{plan}``, none
+    matching the prefix), the injection block at hooks.py:580-597
+    then calls ``slots.injected`` -> ``redis.get(K_INJECTED)``, and a
+    wrapper that raises on that prefix forces the pre-call hook to
+    fail mid-flow.
+    That is the failure mode that, without the gate, would let a bare
+    ``redis.exceptions.ConnectionError`` land as a TRANSIENT 5xx and
+    cool the plan for a problem we caused.
+
+    ``async_post_call_failure_hook`` -> ``_finish_failure`` must:
+
+      (1) record the slot release via ``picker.release`` — same
+          ``_RecordingPicker`` shape the existing
+          ``test_handle_failure_*`` tests use (tests/test_verdict.py:
+          402-417); pattern at tests/test_verdict.py:448-449.
+      (2) NOT cool the plan: ``redis.exceptions.ConnectionError`` is
+          non-provider-shaped, so the gate short-circuits to
+          ``Verdict(Outcome.INTERNAL, ...)``, whose ``is_our_fault`` is
+          True and skips every provider-side side effect at
+          ``_apply_verdict``.
+      (3) NOT bump the transient-failure streak: same gate.
+      (4) NOT claim ``_verdict_applied``: the marker write sits
+          downstream of the ``is_our_fault`` early-return.
+
+    Wiring mirrors ``test_session_injection.py::_build`` (real Picker +
+    ``_beats={}`` so the pre-call hook's ``_start_heartbeat`` writes
+    somewhere) plus a swap to a recording picker before
+    ``async_post_call_failure_hook``, following the pattern at
+    tests/test_verdict.py:448-449. The ``async_post_call_failure_hook``
+    wrapper (hooks.py:1287-1300) extracts the ctx from
+    ``request_data["metadata"][META_KEY]`` and forwards to
+    ``_finish_failure`` — driving the wrapper pins the metadata handoff
+    for the acompletion path the issue traced (only the
+    ``/v1/messages`` tests currently exercise it).
+    """
+    async def go():
+        reg = models.load()
+        # Failing FakeRedis so the injection block raises mid-flow.
+        # Real Picker so the pre-call hook can claim a slot; the
+        # claim Lua script touches only K_INFLIGHT / K_COOL /
+        # K_INFLIGHT_MODEL / K_INFLIGHT_LANE — none of which match
+        # the wrapper's prefix.
+        # NOTE: deliberately NOT named ``redis`` so the import of
+        # ``redis.exceptions.ConnectionError`` at module scope is not
+        # shadowed inside this function (the test re-raises on purpose,
+        # see the ``except`` block below).
+        fake_redis = _InjectionFailingRedis()
+        slots = SlotTable(fake_redis, reg.settings.inflight_max_age_seconds)
+        ledger = Ledger(fake_redis)
+        policy = CapacityPolicy(fake_redis, reg.settings, ledger)
+        picker = Picker(reg, slots, policy)
+
+        h = SwitchyardHandler.__new__(SwitchyardHandler)
+        h.__dict__["registry"] = reg
+        h.__dict__["_slots"] = slots
+        h.__dict__["_ledger"] = ledger
+        h.__dict__["_policy"] = policy
+        h.__dict__["_redis"] = fake_redis
+        h.__dict__["_picker"] = picker
+        # _start_heartbeat (called unconditionally by the pre-call
+        # hook) writes to self._beats; without this stub it would
+        # surface as a confusing AttributeError on the path the test
+        # is trying to exercise.
+        h.__dict__["_beats"] = {}
+
+        # Fresh-state baseline so (2) and (3) start at the known
+        # shape; anything else and the assertions below couldn't tell
+        # "INTERNAL didn't write" from "the test set up dirty state".
+        first = _first_plan(reg)
+        cooled_pre, ttl_pre, _ = await slots.cooldown_state(first.key)
+        streak_pre = await slots.transient_failure_streak(first.key)
+        assert cooled_pre is False, "fixture sanity: no pre-existing cooldown"
+        assert streak_pre == 0, "fixture sanity: no pre-existing streak"
+
+        # CLI-session path: opencode is in INJECT_CLIS, so the
+        # injection block at hooks.py:580-597 actually fires. forge is
+        # the lane the existing test_session_injection tests use, so
+        # this re-uses a proven request shape.
+        session = "sess-PRE-call-redis"
+        data: dict = {
+            "model": "forge",
+            "messages": [{"role": "user", "content": "list the repo"}],
+            "proxy_server_request": {"headers": {
+                "x-switchyard-session": session,
+                CLI_HEADER: "opencode",
+            }},
+        }
+
+        # Run the pre-call hook. The picker claims a slot (FakeRedis
+        # records the inflight zset write cleanly), then the injection
+        # block raises ``redis.exceptions.ConnectionError`` from
+        # ``slots.injected -> redis.get(K_INJECTED)``. Capture the
+        # exception for the failure-handoff path below.
+        raised: redis.exceptions.ConnectionError | None = None
+        try:
+            await h.async_pre_call_hook(None, None, data, "acompletion")
+        except redis.exceptions.ConnectionError as exc:
+            raised = exc
+
+        # The pre-call hook stamps the ctx on
+        # ``data["metadata"][META_KEY]`` BEFORE the injection block
+        # runs (meta at hooks.py:500-536, injection at hooks.py:580+),
+        # so a raised exception still leaves a populated ctx for
+        # ``async_post_call_failure_hook`` to read. The three keys
+        # below are the minimum it requires; if any are missing the
+        # test is exercising a different code path than intended.
+        ctx = data["metadata"]["switchyard"]
+        assert ctx["plan"] in reg.plans, ctx
+        assert ctx["request_id"], ctx
+        assert ctx["model"], ctx
+
+        # Pin the "claim succeeds, then injection raises" ordering.
+        # ``_finish_failure`` records ``picker.release`` unconditionally,
+        # so the slot-release assertion alone would keep passing even if
+        # the injection block ever stopped running after a successful
+        # claim (in which case the test would no longer exercise the
+        # issue's "after a slot is claimed" scenario). Reading K_INFLIGHT
+        # on the real FakeRedis — the recording picker below never
+        # touches Redis, so the claim's zset entry is still there if it
+        # happened — proves the claim landed before the raise. The
+        # ordering is real today (pick at hooks.py:472-474, injection
+        # gate at :580); this just keeps the test honest if it drifts.
+        assert await fake_redis.zcard(
+            K_INFLIGHT.format(plan=ctx["plan"])) == 1, (
+            f"picker must have claimed a slot before the injection "
+            f"raise; zcard={await fake_redis.zcard(K_INFLIGHT.format(plan=ctx['plan']))}")
+
+        # Swap in the recording picker + a fresh ``_beats = {}`` so
+        # ``_finish_failure``'s ``picker.release`` and
+        # ``_stop_heartbeat`` calls land on observable stubs. Pattern
+        # at tests/test_verdict.py:448-449 (the existing
+        # ``test_handle_failure_*`` tests). The pre-call hook's
+        # heartbeat task is keyed by ``request_id`` string, so the
+        # fresh ``_beats = {}`` doesn't strand it — ``_stop_heartbeat``
+        # looks up by string and silently no-ops, which is what we
+        # want (the heartbeat was started against the real picker
+        # and never gets a chance to fire ``slots.touch`` before
+        # cancellation; the test is fast enough that the 30s
+        # ``heartbeat_seconds`` interval never elapses).
+        recording = _RecordingPicker()
+        h.__dict__["_picker"] = recording
+        h.__dict__["_beats"] = {}
+
+        # Drive the production failure-handoff wrapper rather than
+        # calling ``_finish_failure`` directly — the wrapper is what
+        # LiteLLM calls from its ``except Exception`` arm with the
+        # same ``data`` dict the pre-call hook stamped before raising,
+        # and pinning the metadata handoff on the acompletion path is
+        # exactly what the issue traced (only the ``/v1/messages``
+        # tests currently exercise this wrapper).
+        await h.async_post_call_failure_hook(data, raised, None)
+
+        # Read the slot-table state for whichever plan the picker
+        # actually picked. forge's first member lives in a
+        # ``round_robin`` group on the minimax twins, so the picked
+        # plan is non-deterministic across runs; read off
+        # ``ctx["plan"]`` rather than assuming the
+        # ``_first_plan`` fixture.
+        plan_key = ctx["plan"]
+        cooled, ttl, reason = await slots.cooldown_state(plan_key)
+        streak = await slots.transient_failure_streak(plan_key)
+        return (raised, ctx, recording.releases, cooled, ttl, reason,
+                streak, streak_pre)
+
+    raised, ctx, releases, cooled, ttl, reason, streak, streak_pre = _run(go())
+
+    # The exception is what the wrapper raised; type matters more
+    # than its message because the production code branches on
+    # ``_provider_error(exc)``, which dispatches on instance shape
+    # (status_code / code attrs), not on the message string.
+    assert isinstance(raised, redis.exceptions.ConnectionError), (
+        f"pre-call hook must raise redis.exceptions.ConnectionError, "
+        f"got {type(raised).__name__}: {raised!r}")
+
+    # (1) Slot release must fire -- the gate only suppresses the
+    # provider-side cooldown, never the upstream release. Without
+    # this, a "real" picker would leak the inflight slot until the
+    # staleness sweep noticed ``inflight_max_age_seconds`` later.
+    assert len(releases) == 1, (
+        f"_finish_failure must still release the slot, got {releases!r}")
+    assert releases[0] == (ctx["plan"], ctx["request_id"], ctx["model"]), (
+        f"release tuple must match the picked (plan, request_id, model), "
+        f"got {releases[0]!r} vs ctx={ctx!r}")
+
+    # (2) No cooldown key: INTERNAL is_our_fault returns at the top
+    # of ``_apply_verdict``, before any sy:cool write would happen.
+    assert cooled is False, (
+        f"INTERNAL must NOT cool the plan, got cooled={cooled}, "
+        f"reason={reason!r}, ttl={ttl}")
+    # (3) Streak unchanged: same path as (2).
+    assert streak == streak_pre, (
+        f"INTERNAL must NOT bump the streak, got {streak} (was {streak_pre})")
+    # (4) Provider-verdict marker never claimed: the marker write sits
+    # AFTER the is_our_fault early-return, so INTERNAL never reaches
+    # it.
+    assert ctx.get("_verdict_applied") is None, (
+        f"INTERNAL must NOT claim _verdict_applied, got "
+        f"{ctx.get('_verdict_applied')!r}")
+    print(f"  pre-call redis ConnectionError: picker.release recorded once "
+          f"({releases[0]}); INTERNAL gate suppresses cooldown/streak/marker "
+          f"(cooled={cooled}, streak={streak})")
 
 
 if __name__ == "__main__":
