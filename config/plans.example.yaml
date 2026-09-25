@@ -699,7 +699,9 @@ plans:
       #      {"kind":"session","percent":2,"resets_at":"2026-09-21T09:10:00+00:00"},
       #      {"kind":"weekly_all","percent":98,"resets_at":"2026-09-23T03:00:00+00:00",
       #       "severity":"critical"},
-      #      {"kind":"weekly_scoped","percent":12,"scope":{"model":{...}}}]}}
+      #      {"kind":"weekly_scoped","percent":12,"scope":{"model":{...}}}],
+      #    "extra_usage":{"is_enabled":false,"monthly_limit":null,
+      #                   "used_credits":null,"utilization":null,"currency":null}}}
       #
       # `weekly_scoped` is deliberately not mapped: it is one model's share of
       # the same week, so showing it as the weekly window would understate what
@@ -717,6 +719,11 @@ plans:
         weekly:
           used_percent: [rate_limits.limits.kind=weekly_all.percent]
           reset_at: [rate_limits.limits.kind=weekly_all.resets_at]
+      # Pay-as-you-go guard. With extra usage ON, a request past the 5-hour or
+      # weekly limit is billed instead of refused. The picker skips this plan
+      # while the flag reads true, or cannot be read at all, unless the plan
+      # sets `use_extra_quota: true`. The flag is only ever read, never set.
+      extra_usage: [rate_limits.extra_usage.is_enabled]
     notes: >
       Critical logic only. All three models share the plan's 2 connections and
       its quota windows, so apex and judge can never exceed them between them.

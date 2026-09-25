@@ -624,6 +624,28 @@ class Ledger:
             raw = raw.decode()
         return raw in ("1", "1.0", "True")
 
+    async def extra_usage(self, plan: Plan) -> str:
+        """The plan's pay-as-you-go overflow state: off | on | unknown |
+        not_checked.
+
+        `not_checked` when the plan has no probe, its probe does not map
+        `extra_usage`, or no probe has succeeded yet -- none of which is
+        evidence either way, so the picker leaves those plans alone. A stored
+        value outside the known set reads as `unknown` (fail closed), the same
+        as a response that carried no readable flag.
+        """
+        if plan.probe is None or not plan.probe.extra_usage:
+            return "not_checked"
+        raw = await self.redis.hget(self.K_PROBE.format(plan=plan.key),
+                                    "extra_usage")
+        if raw is None:
+            return "not_checked"
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        if raw in ("", "not_checked"):
+            return "not_checked"
+        return raw if raw in ("off", "on") else "unknown"
+
     async def _in_grace_window(
         self, plan_windows: list[tuple[str, str]]
     ) -> bool:

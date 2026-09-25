@@ -20,6 +20,7 @@ from redis.asyncio import Redis
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import models
+from ..models import EXTRA_USAGE_BLOCKING
 from ..picker import Picker
 from ..policy import CapacityPolicy
 from ..probes import Prober
@@ -819,6 +820,7 @@ async def collect_plans() -> list[dict]:
         facts = await ledger.quota_facts(plan.key)
         capacity = await policy.effective(plan)
         probe = await state["prober"].status(plan.key) if plan.probe else None
+        extra_usage = await ledger.extra_usage(plan)
         # Models are what lanes name; the plan is what owns the limits. Named
         # `model_rows` rather than `models`, which is the imported module.
         model_refs = [m.ref for m in plan.models.values()]
@@ -941,6 +943,15 @@ async def collect_plans() -> list[dict]:
                 alerting.append(
                     f"quota probe failing: {probe.get('last_error') or 'probe is misconfigured — check portal logs'}"
                 )
+        # Pay-as-you-go overflow: requests past the limit are billed, not
+        # refused. The picker skips such a plan unless `use_extra_quota: true`,
+        # so say which of the two is happening.
+        if extra_usage in EXTRA_USAGE_BLOCKING:
+            what = ("extra usage on" if extra_usage == "on"
+                    else "extra usage unreadable")
+            alerting.append(
+                f"{what} — pay-as-you-go allowed (use_extra_quota)"
+                if plan.use_extra_quota else f"{what} — skipped by the picker")
         # A provider refusing us on connection count means max_parallel is set
         # higher than the plan allows. Different fix from a quota wall, so it
         # gets its own warning instead of looking like rate limiting.
@@ -981,6 +992,7 @@ async def collect_plans() -> list[dict]:
             "capacity": capacity,
             "pace": pace,
             "probe": probe,
+            "extra_usage": extra_usage,
             "windows": windows_remaining(plan.quota.period, plan.expires),
             "models": model_rows,
             "cli_backed": plan.is_cli_backed,
@@ -1035,6 +1047,10 @@ async def api_state() -> dict:
                 "learned_cap": r["capacity"].learned,
                 "cap_reason": r["capacity"].reason,
                 "pacing": r["pace"],
+                # off | on | unknown | not_checked -- the provider's
+                # pay-as-you-go overflow switch as the last probe read it.
+                "extra_usage": r["extra_usage"],
+                "use_extra_quota": r["plan"].use_extra_quota,
                 "alerting": r["alerting"],
             }
             for r in plans

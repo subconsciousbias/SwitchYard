@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import Group, Model, Plan, Registry
+from .models import EXTRA_USAGE_BLOCKING, Group, Model, Plan, Registry
 from .policy import CapacityPolicy
 from .slots import SlotTable
 from .usage import (
@@ -223,6 +223,8 @@ class Picker:
         self.registry = registry
         self.slots = slots
         self.policy = policy
+        # plan key -> the blocking extra-usage state last logged for it.
+        self._extra_usage_logged: dict[str, str] = {}
 
     # -- shared capacity primitives (unchanged shape) ---------------------
     async def _cap(self, model: Model, allow_spent: bool = False) -> tuple[int, str]:
@@ -242,8 +244,40 @@ class Picker:
         # left, silently spending whatever overflow the provider allows.
         if not allow_spent and await self.is_spent(plan):
             return 0, "quota spent"
+        # Same treatment for a plan whose provider will bill past the limit:
+        # with pay-as-you-go overflow on, the request that crosses the limit
+        # is not refused, it is charged -- so a plan with it on (or with a
+        # reading we cannot parse) gets no capacity unless it opted in.
+        if not allow_spent:
+            extra = await self.extra_usage_blocks(plan)
+            if extra:
+                return 0, f"extra usage {extra}"
         cap = await self.policy.effective(plan)
         return cap.cap, cap.reason
+
+    async def extra_usage_blocks(self, plan) -> str | None:
+        """The plan's extra-usage state when it should keep the plan out of
+        rotation (`on` / `unknown` without `use_extra_quota: true`), else None.
+
+        Logs once per plan when it starts blocking and once when it stops, not
+        on every request: `_cap` runs for every member of every pick and for
+        every row of the capacity board.
+        """
+        if plan.use_extra_quota or self.policy is None:
+            return None
+        state = await self.policy.ledger.extra_usage(plan)
+        blocking = state in EXTRA_USAGE_BLOCKING
+        last = self._extra_usage_logged.get(plan.key)
+        if blocking and last != state:
+            log.warning(
+                "plan %s skipped: provider reports pay-as-you-go extra usage %s "
+                "(set use_extra_quota: true to route to it anyway)",
+                plan.key, state)
+            self._extra_usage_logged[plan.key] = state
+        elif not blocking and last is not None:
+            log.info("plan %s back in rotation: extra usage %s", plan.key, state)
+            self._extra_usage_logged.pop(plan.key, None)
+        return state if blocking else None
 
     async def is_spent(self, plan) -> bool:
         """The provider reports the target window at 100%, and this plan is not

@@ -129,6 +129,24 @@ class Probe:
     # cannot point the ceremony at one provider and have it POST cookies to a
     # different plan's allowlist.
     login_url: str = ""
+    # Candidate paths to the provider's "pay-as-you-go past the limit" switch
+    # (a boolean), e.g. `rate_limits.extra_usage.is_enabled` on a Claude seat.
+    # Empty means this probe does not check it: the plan's extra-usage state
+    # is then `not_checked` and the picker does not act on it. When set, a
+    # successful probe records `on` / `off`, or `unknown` when the response
+    # carries no readable boolean there -- and the picker skips a plan in
+    # `on` or `unknown` unless the plan sets `use_extra_quota: true`.
+    extra_usage: tuple[str, ...] = ()
+
+
+# What a probe says about a plan's pay-as-you-go overflow. `not_checked` is
+# "this plan's probe does not look" (or there is no probe, or no reading yet);
+# `unknown` is "it looks, and the answer was missing or unreadable".
+EXTRA_USAGE_STATES = ("off", "on", "unknown", "not_checked")
+# The states the picker refuses to route into without `use_extra_quota: true`.
+# `unknown` is here on purpose: a seat that may be billing past its allowance
+# is treated as one that is, until the provider says otherwise.
+EXTRA_USAGE_BLOCKING = frozenset({"on", "unknown"})
 
 
 @dataclass(frozen=True)
@@ -346,7 +364,9 @@ class Plan:
     # What to do once the provider reports the target window fully spent.
     # False (the default) stops routing to the plan until the window resets;
     # True keeps using it, which is right where a plan overflows into credits
-    # or on-demand billing and you would rather spend that than queue.
+    # or on-demand billing and you would rather spend that than queue. It also
+    # lifts the pay-as-you-go guard: a plan whose probe reports extra usage
+    # `on` (or `unknown`) is skipped entirely unless this is True.
     use_extra_quota: bool = False
     # How many tool-calling sessions may sit parked awaiting a caller's result.
     # A parked session runs no inference and holds no concurrency slot, but it
@@ -785,6 +805,10 @@ def _parse_probe(raw: Any) -> Probe | None:
     # to know which form the config used.
     if fields and not windows:
         windows = {body.get("window") or "": fields}
+    # One path or a list of candidates, like every other probe field path.
+    extra_usage = body.pop("extra_usage", None) or ()
+    extra_usage = tuple(str(p) for p in (
+        extra_usage if isinstance(extra_usage, (list, tuple)) else [extra_usage]))
     login_ceremony = bool(body.pop("login_ceremony", False))
     login_url = str(body.pop("login_url", "") or "")
     if login_ceremony:
@@ -813,7 +837,7 @@ def _parse_probe(raw: Any) -> Probe | None:
                 f"probe.url host (so the cookie allowlist matches the page "
                 f"the operator is logging into); got url host {url_host!r} "
                 f"and login_url host {login_host!r}")
-    return Probe(fields=fields, windows=windows,
+    return Probe(fields=fields, windows=windows, extra_usage=extra_usage,
                  login_ceremony=login_ceremony, login_url=login_url, **body)
 
 

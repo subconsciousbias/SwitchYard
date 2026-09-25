@@ -474,6 +474,157 @@ def test_polling_runs_for_a_kind_none_plan_without_a_cookie():
           f"sees the plan as spent")
 
 
+def test_extra_usage_state_reads_the_flag_and_fails_closed():
+    """on / off from a real boolean; anything else at a mapped path is unknown."""
+    from switchyard.probes import extra_usage_state
+    path = ("rate_limits.extra_usage.is_enabled",)
+    on = {"rate_limits": {"extra_usage": {"is_enabled": True}}}
+    off = {"rate_limits": {"extra_usage": {"is_enabled": False}}}
+    missing = {"rate_limits": {"limits": []}}
+    null = {"rate_limits": {"extra_usage": None}}
+    stringy = {"rate_limits": {"extra_usage": {"is_enabled": "false"}}}
+    assert extra_usage_state(on, path) == "on"
+    assert extra_usage_state(off, path) == "off"
+    assert extra_usage_state(missing, path) == "unknown"
+    assert extra_usage_state(null, path) == "unknown"
+    # A string is not a boolean: reading "false" as off is how money leaks.
+    assert extra_usage_state(stringy, path) == "unknown"
+    assert extra_usage_state(on, ()) == "not_checked"
+    print("  true->on, false->off, missing/null/string->unknown, no path->not_checked")
+
+
+def _claude_usage(extra):
+    """A Claude seat /usage report, shaped like the sidecar returns it.
+    `extra` is the extra_usage block; `...` leaves the block out entirely."""
+    doc = {"rate_limits": {"limits": [
+        {"kind": "session", "percent": 14, "resets_at": "2099-01-01T00:00:00+00:00"},
+        {"kind": "weekly_all", "percent": 40, "resets_at": "2099-01-02T00:00:00+00:00"},
+    ]}}
+    if extra is not ...:
+        doc["rate_limits"]["extra_usage"] = extra
+    return doc
+
+
+def _probe_claude(payload, *, use_extra_quota=False, fail_after=False):
+    """Run the example claude-max probe against a stub serving `payload`, then
+    return (extra-usage state, the fable model's cap reason, the ref the apex
+    lane picks). With `fail_after`, a second poll gets a 500 first."""
+    import http.server
+    import json
+    import threading
+    from dataclasses import replace
+    from switchyard.picker import Picker
+    from switchyard.policy import CapacityPolicy
+    from switchyard.slots import SlotTable
+
+    failing = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if failing:
+                self.send_response(500)
+                self.send_header("content-length", "0")
+                self.end_headers()
+                return
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+    async def go():
+        redis = FakeRedis()
+        ledger = Ledger(redis)
+        prober = Prober(redis, ledger)
+        loaded = models.load()
+        plan = loaded.plans["claude-max"]
+        plan = replace(plan, use_extra_quota=use_extra_quota,
+                       probe=replace(plan.probe, url=base + "/usage"))
+        result = await prober.run(plan)
+        assert result.ok, result
+        if fail_after:
+            failing.append(True)
+            again = await prober.run(plan)
+            assert not again.ok, again
+        plans = dict(loaded.plans)
+        plans["claude-max"] = plan
+        reg = models.Registry(settings=loaded.settings, plans=plans,
+                              lanes=loaded.lanes)
+        policy = CapacityPolicy(redis, reg.settings, ledger)
+        slots = SlotTable(redis, reg.settings.inflight_max_age_seconds)
+        picker = Picker(reg, slots, policy)
+        _, reason = await picker._cap(plan.models["fable"])
+        pick = await picker.pick("apex", None)
+        await picker.release(pick.plan.key, pick.request_id, pick.ref)
+        return await ledger.extra_usage(plan), reason, pick.ref
+
+    try:
+        return run(go())
+    finally:
+        srv.shutdown()
+
+
+def test_pay_as_you_go_on_takes_a_claude_seat_out_of_rotation():
+    """The seat is skipped while extra usage is on, used again once it is off."""
+    state, reason, ref = _probe_claude(_claude_usage({"is_enabled": True}))
+    assert state == "on" and reason == "extra usage on", (state, reason)
+    assert ref != "claude-max/fable", f"a billing seat must be skipped: {ref}"
+
+    state, _, ref = _probe_claude(_claude_usage({"is_enabled": False}))
+    assert state == "off", state
+    assert ref == "claude-max/fable", f"a seat with it off must be used: {ref}"
+    print("  extra usage on -> skipped; off -> first in the lane again")
+
+
+def test_an_unreadable_extra_usage_flag_is_treated_as_on():
+    """No extra_usage block in a reply that otherwise parsed: fail closed."""
+    state, reason, ref = _probe_claude(_claude_usage(...))
+    assert state == "unknown" and reason == "extra usage unknown", (state, reason)
+    assert ref != "claude-max/fable", ref
+    print("  missing flag -> unknown -> skipped")
+
+
+def test_a_failed_poll_keeps_the_last_extra_usage_reading():
+    """A poll that fails after an `on` reading must not make the seat look safe."""
+    state, _, ref = _probe_claude(_claude_usage({"is_enabled": True}),
+                                  fail_after=True)
+    assert state == "on", state
+    assert ref != "claude-max/fable", ref
+    print("  on, then a 500 -> still on, still skipped")
+
+
+def test_use_extra_quota_opts_a_billing_seat_back_in():
+    """The explicit opt-in is the only way a billing seat gets traffic."""
+    state, reason, ref = _probe_claude(_claude_usage({"is_enabled": True}),
+                                       use_extra_quota=True)
+    assert state == "on", state
+    assert reason != "extra usage on", reason
+    assert ref == "claude-max/fable", ref
+    print("  on + use_extra_quota: true -> used on purpose")
+
+
+def test_plans_whose_probe_does_not_map_extra_usage_are_untouched():
+    """glm maps no extra_usage path: its state is not_checked, never blocking."""
+    async def go():
+        redis = FakeRedis()
+        ledger = Ledger(redis)
+        plan = models.load().plans["glm"]
+        assert not plan.probe.extra_usage
+        # Even a stray stored value must not block a plan that never opted in.
+        await redis.hset(f"sy:probe:{plan.key}", mapping={"extra_usage": "on"})
+        return await ledger.extra_usage(plan)
+    assert run(go()) == "not_checked"
+    print("  no extra_usage mapping -> not_checked")
+
+
 def test_set_cookie_is_not_captured_without_a_response_header():
     """When the server does not return a Set-Cookie header, the stored
     credential is left untouched. A capture path that invented a value from

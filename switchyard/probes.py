@@ -81,6 +81,8 @@ class ProbeResult:
     # unchanged, but a provider reporting a weekly allowance AND a 5-hour burst
     # no longer has half of it discarded.
     windows: list["WindowReading"] = field(default_factory=list)
+    # off | on | unknown | not_checked -- see `extra_usage_state`.
+    extra_usage: str = "not_checked"
 
     def reading(self, name: str) -> "WindowReading | None":
         return next((w for w in self.windows if w.window == name), None)
@@ -187,6 +189,28 @@ def first_percent(doc: Any, paths: list[str]) -> float | None:
         except ValueError:
             continue
     return None
+
+
+def extra_usage_state(doc: Any, paths: tuple[str, ...] | list[str]) -> str:
+    """Whether the provider will bill past the plan's allowance: on | off |
+    unknown | not_checked.
+
+    A Claude seat's `/usage` report carries
+    `rate_limits.extra_usage.is_enabled`; true means requests past the weekly
+    or 5-hour limit keep being served and are charged as pay-as-you-go usage.
+    No paths configured is `not_checked` (this probe does not look). Paths
+    configured but no boolean at any of them -- the block is missing, null, or
+    a shape we do not recognise -- is `unknown`, which the picker treats the
+    same as `on`: a reading we cannot trust must not route money-spending
+    traffic.
+    """
+    if not paths:
+        return "not_checked"
+    for path in paths:
+        value = dig(doc, path)
+        if isinstance(value, bool):
+            return "on" if value else "off"
+    return "unknown"
 
 
 def first_number(doc: Any, paths: list[str]) -> float | None:
@@ -307,6 +331,10 @@ class Prober:
             # absolute remaining count, which is blank for every provider that
             # publishes percentages — i.e. the ones the panel exists to serve.
             "windows": probe.get("windows", ""),
+            # What the last successful probe said about pay-as-you-go overflow;
+            # "" until one has run. `Ledger.extra_usage` is the reader the
+            # picker and the board use -- it also folds in the plan's config.
+            "extra_usage": probe.get("extra_usage", ""),
         }
 
     # -- the probe itself --------------------------------------------------
@@ -462,6 +490,10 @@ class Prober:
                         window=r.window, yard_tokens=yard_tokens)
 
         primary = next((r for r in found if r.window == target), found[0])
+        # Only recorded alongside a reading that parsed: a failed probe leaves
+        # the last known state in place rather than clearing it, so a seat
+        # that was billing overflow does not look safe because a poll timed out.
+        extra = extra_usage_state(doc, probe.extra_usage)
 
         def summarise(r: WindowReading) -> str:
             if r.remaining is not None:
@@ -473,12 +505,15 @@ class Prober:
             "remaining": primary.remaining if primary.remaining is not None else "",
             "total": primary.total if primary.total is not None else "",
             "windows": ",".join(summarise(r) for r in found),
+            "extra_usage": extra,
         })
         log.info("probe %s: %s", plan.key, "; ".join(summarise(r) for r in found)
-                 + (f" (no data for {', '.join(missing)})" if missing else ""))
+                 + (f" (no data for {', '.join(missing)})" if missing else "")
+                 + (f"; extra usage {extra}" if extra != "not_checked" else ""))
         detail = "ok" if not missing else f"ok; no data for {', '.join(missing)}"
         return ProbeResult(True, detail, primary.remaining, primary.total,
-                           primary.reset_at, raw=body[:1500], windows=readings)
+                           primary.reset_at, raw=body[:1500], windows=readings,
+                           extra_usage=extra)
 
     def _readings(self, probe: Probe, plan: Plan, doc: Any) -> list[WindowReading]:
         """Pure parse: response body + probe config -> WindowReading list.
