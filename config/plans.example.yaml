@@ -94,6 +94,21 @@ settings:
   # itself is operator-set (same governance as `x-switchyard-session`); no
   # client sets it today, so the filter is inert until opted in.
   # --------------------------------------------------------------------------
+
+  # --------------------------------------------------------------------------
+  # CONTEXT-WINDOW OVERFLOW GATE (issue #104). When true, the picker refuses
+  # to land an oversized request on a peer whose `context_window` cannot hold
+  # it, and lets the body walk pick a larger peer instead. Default off
+  # preserves today's behaviour: the LiteLLM-side `context_window_fallbacks`
+  # already redirects overflow to a larger-context peer for operators who
+  # opted in at the router level. Set this true on deployments whose lanes
+  # have no usable fallback chain — a single-member lane, or peers that
+  # 4xx on overflow rather than auto-failing over — so the gate fires before
+  # the provider does. `load()` also pre-fills `context_window` from
+  # `litellm.model_cost.max_input_tokens` for any model the operator left
+  # unset, so the gate has data to act on without a per-model config edit.
+  # --------------------------------------------------------------------------
+  enforce_context_window: false
   cli_tool_block:
     opencode:
       - bash

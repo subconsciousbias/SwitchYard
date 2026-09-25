@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -67,6 +68,76 @@ def _why(result: int, plan_cap: int, model_cap: int | None) -> str:
     return f"plan full at {plan_cap}"
 
 
+def _estimate_input_tokens(data: Any) -> int:
+    """Best-effort rough approximation of the input token count for `data`.
+
+    Used by the per-peer overflow gate (`settings.enforce_context_window`,
+    issue #104) to decide whether a request would blow a peer's
+    `context_window` before the picker claims a slot. The exact token count
+    is unknowable here — the provider's tokenizer disagrees across vendors,
+    and we are running before any model is chosen — so a cheap bytes-based
+    heuristic is the right shape: serialise `messages` to JSON and divide
+    the byte count by 4.
+
+    The `bytes // 4` heuristic is a rough approximation that errs
+    conservatively for English-text requests (~1 token per 4 bytes), and
+    ONLY for English-text requests. The estimate can undershoot for
+    base64-encoded image parts, dense code, or short-token scripts where
+    each byte carries more than one token, and it can over-count when JSON
+    escaping inflates the byte count. The provider's hard 400 is still the
+    source of truth — this gate is best-effort and opt-in.
+
+    This is NOT a guaranteed upper bound. A false-positive (skipping a
+    borderline-large request) costs one extra hop in the body walk, which
+    is the right failure direction. A false-negative (landing an
+    overflowing request) is the cost of an inaccurate estimate; the
+    picker never claims "this will fit" with certainty, only "this is
+    plausibly too large".
+
+    Returns 0 when `data` is None, not a dict, or has no `messages` list,
+    so the gate never fires spuriously for a caller that did not pass a
+    body. Non-serialisable message content (a custom `ImagePart` object,
+    say) is coerced via `default=str`, which still gives a bytes figure
+    the gate can compare against.
+    """
+    if not isinstance(data, dict):
+        return 0
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return 0
+    try:
+        size = len(json.dumps(messages, default=str).encode())
+    except Exception:
+        return 0
+    return size // 4
+
+
+# Sentinel meaning "the input-size estimate has not been computed for this
+# ctx yet". Distinct from 0 (an estimate of 0 tokens is a legal value -- it
+# means the request has no measurable messages). Used by `_VisitCtx` to
+# drive lazy computation: a default-off operator never enters the gate,
+# so the estimate stays at the sentinel forever and `json.dumps` never
+# runs on the request path.
+_EST_UNSET = -1
+
+
+def _ensure_estimated(ctx) -> int:
+    """Compute and memoize the input-size estimate on `ctx` if needed.
+
+    Returns the (possibly newly-computed) estimate. The expensive work
+    is `json.dumps(messages, default=str).encode()`, so we run it at
+    most once per ctx -- the gate in `_visit_ref` runs on a per-peer
+    loop and would otherwise re-serialize the full message list on
+    every visited peer. Lazy on the first call so default-off
+    operators pay nothing.
+    """
+    if ctx.estimated_tokens != _EST_UNSET:
+        return ctx.estimated_tokens
+    value = _estimate_input_tokens(ctx.data)
+    ctx.estimated_tokens = value
+    return value
+
+
 # A context object threaded through every _visit call. Carries everything the
 # recursion needs without polluting the picker method's signature, and lets
 # `_visit_ref` (a Ref) and `_visit_group` (a Group) share state cleanly.
@@ -86,6 +157,22 @@ class _VisitCtx:
     needs_images: bool = False
     image_mode: str = "off"
     wait: float = 0.0
+    # The request body, kept on the ctx (rather than a global) so the
+    # per-peer context-window gate in `_visit_ref` can compare an estimated
+    # input size against each member's `context_window` without re-walking
+    # the hook signature. None when the caller did not pass a body; the
+    # gate is then a no-op (the estimate is 0).
+    data: dict | None = None
+    # Input-size estimate for the context-window gate. LAZILY computed
+    # on first use by `_visit_ref` / `_affinity` only when the gate
+    # would fire (`enforce_context_window` on AND `model.context_window`
+    # set). Default-off operators never enter the gate, so the estimate
+    # never runs -- the cost is zero per request, not the unconditional
+    # `json.dumps` of the full message list per pick. PR #330 cycle-3
+    # review: lazy beats eager memoization when the consumer is opt-in.
+    # `_EST_UNSET` (a sentinel below the legal range) signals
+    # "not computed yet"; reading code calls `_ensure_estimated()` first.
+    estimated_tokens: int = _EST_UNSET
 
 
 def _member_refs(node: Any) -> list[str]:
@@ -333,6 +420,25 @@ class Picker:
                 and not model.supports_images:
             ctx.skipped.append(f"{ref}(no image support)")
             return None
+        # Context-window overflow gate (issue #104). Fires only when the
+        # operator opted in (`settings.enforce_context_window`) AND we know
+        # the request size AND the peer's window. The estimate is bytes /
+        # 4 — a rough approximation that errs conservatively for
+        # English-text requests but is NOT a guaranteed upper bound (see
+        # `_estimate_input_tokens`). A borderline-large request may skip
+        # rather than land and 4xx, which is the right failure direction
+        # for this gate; the provider's hard 400 stays the source of truth.
+        # The body walk continues to the next peer exactly like every
+        # other gate, so a larger-context peer listed earlier in the lane
+        # order is hit naturally and the capacity board sees the skip in
+        # `considered`.
+        if (getattr(self.registry.settings, "enforce_context_window", False)
+                and model.context_window is not None):
+            est = _ensure_estimated(ctx)
+            if est > model.context_window:
+                ctx.skipped.append(
+                    f"{ref}(context_overflow:{est}>{model.context_window})")
+                return None
         # Cooldown gate: a plan under an active cooldown cannot serve. Note
         # the same way `_members` does NOT — this is intentional: a ref nested
         # inside a Group that the body iteration would have skipped anyway
@@ -680,7 +786,8 @@ class Picker:
     async def pick(self, lane: str, session: str | None,
                    needs_tools: bool = False, pinned: bool = False,
                    exclude: frozenset[str] | None = None,
-                   needs_images: bool = False) -> Pick:
+                   needs_images: bool = False,
+                   data: dict | None = None) -> Pick:
         rid = uuid.uuid4().hex
         # Resolve the lane's image_routing here, where the lane is known to
         # exist (the public call already proved `lane` was in the registry).
@@ -697,6 +804,15 @@ class Picker:
                   else self.registry.settings.affinity_wait_seconds
                   if session
                   else 0.0),
+            data=data,
+            # `estimated_tokens` defaults to `_EST_UNSET`; `_visit_ref`
+            # and `_affinity` compute it lazily on first use, and only
+            # when the context-window gate would actually fire (an
+            # opted-in operator + a peer with a known window). A
+            # default-off operator never enters that branch, so the
+            # `_estimate_input_tokens` json.dumps never runs on the
+            # request path. PR #330 cycle-3 review: lazy beats eager
+            # memoization when the consumer is opt-in.
         )
         # The parsed body and an optional implicit-perishable wrap. Empty
         # body or a lane that has nothing on the wire at all: refuse before
@@ -902,6 +1018,35 @@ class Picker:
                 and not model.supports_images:
             await self.slots.drop_lease(ctx.session)
             return None
+        # Context-window overflow gate in affinity (issue #104, PR #330
+        # review). `_visit_ref` skips a too-small member in the body walk,
+        # but a sticky lease on a too-small peer would otherwise re-claim
+        # the same peer without ever going through `_visit_ref`. Drop the
+        # lease (CAS, see below) and let the body walk re-place the
+        # session on a fitting peer.
+        #
+        # CAS, not blind DEL, for the same reason the tail gate above
+        # uses `drop_lease_if`: between `held = await self.slots.get_lease(...)`
+        # (line 833) and now we have awaited the `is_draining` check above
+        # and possibly the `drop_lease_if` branch — a parallel same-session
+        # turn (a body walk on a different request, drain migration, or a
+        # pinned follow-up) may have `set_lease`d a new value, and a blind
+        # DEL would clobber that turn's state including its injection
+        # marker and per-plan reverse-index entry (slots.py:514-527). The
+        # CAS no-ops on a value mismatch, and the body walk below
+        # re-places via `_visit_ref`, whose own gate records the skip
+        # reason so the board does not lose the `context_overflow` line.
+        # The skip append is only fired when the CAS actually dropped,
+        # mirroring the tail gate's "do not advertise a skip that did not
+        # happen" discipline.
+        if (getattr(self.registry.settings, "enforce_context_window", False)
+                and model.context_window is not None):
+            est = _ensure_estimated(ctx)
+            if est > model.context_window:
+                if await self.slots.drop_lease_if(ctx.session, held):
+                    ctx.skipped.append(
+                        f"{held}(context_overflow:{est}>{model.context_window})")
+                return None
         plan = self.registry.plan_of(model)
         cap, reason = await self._cap(model, allow_spent=ctx.pinned)
         cooled, _, _ = await self.slots.cooldown_state(plan.key)
@@ -933,7 +1078,8 @@ class Picker:
             if ctx.pinned else f"{held}(lease unusable)")
         return None
 
-    async def pick_direct(self, model: Model, session: str | None = None) -> Pick:
+    async def pick_direct(self, model: Model, session: str | None = None,
+                         data: dict | None = None) -> Pick:
         """Claim a slot for a caller that named one deployment, not a lane.
 
         Asking for `sy.claude-max.opus` is a legitimate thing to want -- you
@@ -963,6 +1109,26 @@ class Picker:
             raise LaneSaturated(model.ref, f"{model.ref}(expired)")
         if not plan.enabled or not model.enabled:
             raise LaneSaturated(model.ref, f"{model.ref}(disabled)")
+        # Context-window overflow gate (issue #104). Mirrors the same gate
+        # in `_visit_ref`: only fires when opted in AND the peer's window is
+        # known AND the request body is provided. `pick_direct` does not
+        # route through `_visit_ref` (a deployment name has no spill, so
+        # the inline gate is the only place it can fire), so duplicating
+        # it here keeps the direct-routed path consistent with the body
+        # walk. Same heuristic (`bytes // 4`, see `_estimate_input_tokens`)
+        # and same skip shape so the capacity board reads uniformly.
+        if (getattr(self.registry.settings, "enforce_context_window", False)
+                and model.context_window is not None):
+            # Lazy: a default-off operator never enters the outer `if`,
+            # so `_estimate_input_tokens` runs at most once per
+            # `pick_direct` call (no per-peer loop here), and only when
+            # the gate would fire. Mirrors the lazy contract in
+            # `_visit_ref` / `_affinity`.
+            est = _estimate_input_tokens(data)
+            if est > model.context_window:
+                raise LaneSaturated(
+                    model.ref,
+                    f"{model.ref}(context_overflow:{est}>{model.context_window})")
         cap, reason = await self._cap(model)
         if cap <= 0:
             raise LaneSaturated(model.ref, f"{model.ref} unavailable: {reason}")

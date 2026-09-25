@@ -462,9 +462,17 @@ class SwitchyardHandler(CustomLogger):
         pinned = _carries_tool_results(data.get("messages"))
 
         try:
-            pick = (await self.picker.pick_direct(direct, session) if direct
+            # Thread the request body into the picker so the
+            # `enforce_context_window` gate (issue #104) can consult each
+            # peer's `context_window` against the inbound `messages`. Without
+            # `data=data` here, `_estimate_input_tokens(None)` short-circuits
+            # to 0 and the gate never fires from `/v1/messages`; the
+            # picker-side gate is opt-in, so non-opted operators are
+            # unaffected.
+            pick = (await self.picker.pick_direct(direct, session, data=data) if direct
                     else await self.picker.pick(
-                        lane, session, needs_tools, pinned, None, needs_images))
+                        lane, session, needs_tools, pinned, None, needs_images,
+                        data=data))
         except LaneSaturated as exc:
             # Surfacing this as a 429 is what lets clients back off instead of
             # hammering a lane whose paid capacity is genuinely gone.

@@ -308,6 +308,15 @@ class Settings:
     cli_tool_block: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: {k: tuple(v) for k, v in _DEFAULT_CLI_TOOL_BLOCK.items()}
     )
+    # Whether the picker should refuse to land an oversized request on a peer
+    # whose `context_window` is too small. Default off (issue #104) preserves
+    # today's behaviour: the LiteLLM-side `context_window_fallbacks` already
+    # redirects an overflow to a larger-context peer, so non-opted operators
+    # see no change. Setting this true moves the gate into the picker itself,
+    # which means the overflow never reaches the provider's 4xx — useful for
+    # plans that have no usable fallback chain (a single-member lane, or a
+    # peer that just 400s on overflow rather than auto-failing over).
+    enforce_context_window: bool = False
     concurrency_learning: ConcurrencyLearning = field(default_factory=ConcurrencyLearning)
     pacing: Pacing = field(default_factory=Pacing)
     transient_breaker: TransientBreaker = field(default_factory=TransientBreaker)
@@ -941,6 +950,52 @@ def litellm_known_vision_models() -> set[str]:
     return out
 
 
+def litellm_known_context_windows() -> dict[str, int]:
+    """Model-name -> `max_input_tokens` from `litellm.model_cost`.
+
+    The mirror of `litellm_known_vision_models`, but for context size: a
+    pre-fill that lets `load()` know a model's window without the operator
+    having to type it. The `Picker` enforces a per-peer overflow gate only
+    when `settings.enforce_context_window` is true (default off, issue
+    #104); the LiteLLM-side `context_window_fallbacks` is what handles the
+    common case of an overflow that has a larger peer to redirect to, and
+    it stays the load-bearing mechanism for non-opted operators.
+
+    Each entry in `model_cost` is `{name: {max_input_tokens: N, ...}}`;
+    only positive integers are kept — a missing, non-int or zero/negative
+    value is treated as "no useful number", and the entry is skipped.
+    Lazy import + broad except for the same reasons as
+    `litellm_known_vision_models`: a missing or shifted litellm must not
+    stop `load()` from returning a Registry. Returns `{}` on any failure.
+    """
+    try:
+        import litellm                                 # noqa: F401
+        from litellm import model_cost
+    except Exception:
+        return {}
+    out: dict[str, int] = {}
+    try:
+        entries = model_cost.items()
+    except Exception:
+        return {}
+    for name, info in entries:
+        if not isinstance(info, dict):
+            continue
+        try:
+            value = info.get("max_input_tokens")
+        except Exception:
+            continue
+        if isinstance(value, bool):
+            # bool is an int subclass; "True"/"False" are not windows.
+            continue
+        if not isinstance(value, int):
+            continue
+        if value <= 0:
+            continue
+        out[str(name)] = value
+    return out
+
+
 def _group_id(lane_key: str, strategy: str, leaf_refs: list[str]) -> str:
     """A stable id for a group, derived from lane + strategy + sorted leaves.
 
@@ -1280,6 +1335,34 @@ def load(path: str | None = None) -> Registry:
                 touched[plan_key] = replace(plan, models=merged)
         if touched:
             plans = {**registry.plans, **touched}
+            registry = Registry(
+                settings=registry.settings, plans=plans, lanes=registry.lanes,
+            )
+
+    # Pre-fill `context_window` from `litellm.model_cost` for any model the
+    # operator left at None. Same contract as the supports_images pre-fill:
+    # operator-set values win, the litellm hint only fills the unset gap.
+    # The picker refuses to land an oversized request on a peer with a known
+    # small window only when `settings.enforce_context_window` is true; this
+    # pre-fill just makes the gate have data to act on without a config edit.
+    known_context = litellm_known_context_windows()
+    if known_context:
+        touched_ctx: dict[str, Plan] = {}
+        for plan_key, plan in registry.plans.items():
+            rebuilt_ctx: dict[str, Model] = {}
+            for model_key, model in plan.models.items():
+                if model.context_window is not None:
+                    continue
+                cap = (known_context.get(model_key)
+                       or known_context.get(model.model))
+                if cap is None:
+                    continue
+                rebuilt_ctx[model_key] = replace(model, context_window=cap)
+            if rebuilt_ctx:
+                merged_ctx = {**plan.models, **rebuilt_ctx}
+                touched_ctx[plan_key] = replace(plan, models=merged_ctx)
+        if touched_ctx:
+            plans = {**registry.plans, **touched_ctx}
             registry = Registry(
                 settings=registry.settings, plans=plans, lanes=registry.lanes,
             )
